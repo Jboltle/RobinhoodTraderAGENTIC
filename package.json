@@ -1,0 +1,36 @@
+{
+  "name": "rh-discord-trader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Discord-driven Robinhood auto-trader: listens to a channel and executes equity orders via the Robinhood Trading MCP.",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "trader": "tsx src/trader/index.ts",
+    "bot": "tsx src/bot/index.ts",
+    "connect": "tsx src/scripts/rhConnect.ts",
+    "import-tokens": "tsx src/scripts/importCodexTokens.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.102.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.8.5",
+    "ngrok": "^5.0.0-beta.2",
+    "openai": "^6.42.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.9"
+  }
+}
