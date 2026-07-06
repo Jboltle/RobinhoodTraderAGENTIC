@@ -1,182 +1,51 @@
 import { createLogger } from '../../shared/logger.js';
-import type { CallToolResult, RobinhoodMcpClient } from './mcpClient.js';
+import type { RobinhoodMcpClient } from './mcpClient.js';
+import type {
+  AccountScopedArgs,
+  BuyingPowerResult,
+  CallToolResult,
+  OptionPosition,
+  OptionPositionsResult,
+  OptionsQuoteResult,
+  PlaceOptionsOrderArgs,
+  PlaceOptionsOrderPayload,
+  PlaceOptionsOrderResult,
+  PlaceOrderArgs,
+  PlaceOrderPayload,
+  PlaceOrderResult,
+  Position,
+  PositionsResult,
+  QuoteResult,
+  RhToolMap,
+  ToolArgs,
+  ToolKind,
+  ToolRegistry,
+  ToolResult,
+} from './types.js';
+
+export type * from './types.js';
 
 const log = createLogger('trader:rh:tools');
 
 // =============================================================================
 // Tool registry
 //
-// Each entry binds a logical capability (`ToolKind`) to:
-//   - the exact MCP tool name advertised by Robinhood,
-//   - a typed args shape sent on the wire,
-//   - a typed result shape returned to callers,
-//   - a parser that turns the raw `CallToolResult` into that shape.
-//
-// The registry is the single source of truth: `RobinhoodTools.call(kind, args)`
+// Each entry binds a logical capability (`ToolKind`) to the exact MCP tool
+// name advertised by Robinhood and a parser that turns the raw
+// `CallToolResult` into the typed result registered for that kind. The
+// registry is the single source of truth: `RobinhoodTools.call(kind, args)`
 // is a fully type-safe dispatch — args/result are inferred from `kind`.
+// See ./types.ts for the full tool map and payload shapes.
 // =============================================================================
-
-/** `get_equity_quotes` accepts a list of symbols (note the plural tool name). */
-export interface QuoteArgs {
-  readonly symbols: readonly string[];
-}
-
-export interface QuoteResult {
-  readonly price: number;
-  readonly raw: unknown;
-}
-
-export type EmptyArgs = Record<string, never>;
-
-export interface BuyingPowerResult {
-  readonly amountUsd: number;
-  readonly raw: unknown;
-}
-
-export interface Position {
-  readonly symbol: string;
-  readonly quantity: number;
-  readonly raw: unknown;
-}
-
-export interface PositionsResult {
-  readonly positions: readonly Position[];
-  readonly raw: unknown;
-}
-
-export type OrderSide = 'buy' | 'sell';
-export type OrderType = 'market' | 'limit';
-export type TimeInForce = 'day' | 'gtc';
-
-/** Wire-format payload sent to the `place_equity_order` MCP tool. */
-export interface PlaceOrderPayload {
-  readonly symbol: string;
-  readonly side: OrderSide;
-  readonly type: OrderType;
-  readonly quantity: number;
-  readonly time_in_force: TimeInForce;
-  readonly limit_price?: number;
-  readonly price?: number;
-}
-
-/** Ergonomic camelCase shape used by callers (e.g. `executeTrade`). */
-export interface PlaceOrderArgs {
-  readonly symbol: string;
-  readonly side: OrderSide;
-  readonly orderType: OrderType;
-  readonly quantity: number;
-  readonly limitPrice?: number;
-  readonly timeInForce?: TimeInForce;
-}
-
-export interface PlaceOrderResult {
-  readonly orderId: string | null;
-  readonly status: string | null;
-  readonly raw: unknown;
-}
-
-export interface OrdersListResult {
-  readonly raw: unknown;
-}
-
-// ---------------------------------------------------------------------------
-// Options-specific types
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Options quote — used to estimate premium for market-order sizing
-// ---------------------------------------------------------------------------
-
-export interface OptionsQuoteArgs {
-  readonly symbol: string;
-  readonly option_type: 'call' | 'put';
-  readonly strike_price: number;
-  readonly expiration_date: string; // YYYY-MM-DD
-}
-
-export interface OptionsQuoteResult {
-  /** Mid-market (mark) premium per contract unit (not × 100). */
-  readonly markPrice: number;
-  readonly raw: unknown;
-}
-
-/** Wire-format payload sent to the `place_options_order` MCP tool. */
-export interface PlaceOptionsOrderPayload {
-  readonly symbol: string;
-  readonly option_type: 'call' | 'put';
-  readonly strike_price: number;
-  readonly expiration_date: string; // YYYY-MM-DD
-  readonly quantity: number;        // contracts (each controls 100 shares)
-  readonly side: OrderSide;
-  readonly type: OrderType;
-  readonly time_in_force: TimeInForce;
-  /** Per-contract limit premium (required for limit orders). */
-  readonly price?: number;
-}
-
-/** Ergonomic camelCase shape used by callers. */
-export interface PlaceOptionsOrderArgs {
-  readonly symbol: string;
-  readonly optionType: 'call' | 'put';
-  readonly strike: number;
-  readonly expiration: string;      // YYYY-MM-DD
-  readonly contracts: number;
-  readonly side: OrderSide;
-  readonly orderType: OrderType;
-  readonly limitPremium?: number;
-  readonly timeInForce?: TimeInForce;
-}
-
-export interface PlaceOptionsOrderResult {
-  readonly orderId: string | null;
-  readonly status: string | null;
-  readonly raw: unknown;
-}
-
-export interface RhToolMap {
-  quote: { name: 'get_equity_quotes'; args: QuoteArgs; result: QuoteResult };
-  optionsQuote: {
-    name: 'get_option_quotes';
-    args: OptionsQuoteArgs;
-    result: OptionsQuoteResult;
-  };
-  // RH does not advertise a dedicated buying-power tool. `get_accounts`
-  // typically returns buying_power on each account row; `get_portfolio`
-  // is the alternate candidate. We default to `get_accounts` and let
-  // `parseBuyingPower` deep-find for the relevant key.
-  buyingPower: { name: 'get_accounts'; args: EmptyArgs; result: BuyingPowerResult };
-  positions: { name: 'get_equity_positions'; args: EmptyArgs; result: PositionsResult };
-  placeOrder: { name: 'place_equity_order'; args: PlaceOrderPayload; result: PlaceOrderResult };
-  listOrders: { name: 'get_equity_orders'; args: EmptyArgs; result: OrdersListResult };
-  placeOptionsOrder: {
-    name: 'place_option_order';
-    args: PlaceOptionsOrderPayload;
-    result: PlaceOptionsOrderResult;
-  };
-  listOptionsOrders: { name: 'get_option_orders'; args: EmptyArgs; result: OrdersListResult };
-}
-
-export type ToolKind = keyof RhToolMap;
-export type ToolName = RhToolMap[ToolKind]['name'];
-export type ToolArgs<K extends ToolKind> = RhToolMap[K]['args'];
-export type ToolResult<K extends ToolKind> = RhToolMap[K]['result'];
-
-interface ToolDescriptor<K extends ToolKind> {
-  readonly name: RhToolMap[K]['name'];
-  readonly parse: (raw: CallToolResult) => RhToolMap[K]['result'];
-}
-
-type ToolRegistry = { [K in ToolKind]: ToolDescriptor<K> };
 
 const TOOL_REGISTRY: ToolRegistry = {
   quote: { name: 'get_equity_quotes', parse: parseQuote },
   optionsQuote: { name: 'get_option_quotes', parse: parseOptionsQuote },
   buyingPower: { name: 'get_accounts', parse: parseBuyingPower },
   positions: { name: 'get_equity_positions', parse: parsePositions },
+  optionPositions: { name: 'get_option_positions', parse: parseOptionPositions },
   placeOrder: { name: 'place_equity_order', parse: parsePlaceOrder },
-  listOrders: { name: 'get_equity_orders', parse: parseListOrders },
   placeOptionsOrder: { name: 'place_option_order', parse: parsePlaceOrder },
-  listOptionsOrders: { name: 'get_option_orders', parse: parseListOrders },
 };
 
 /** Canonical MCP tool name expected for each ToolKind. Read-only view of the registry. */
@@ -185,10 +54,9 @@ export const TOOL_NAMES: { readonly [K in ToolKind]: RhToolMap[K]['name'] } = {
   optionsQuote: TOOL_REGISTRY.optionsQuote.name,
   buyingPower: TOOL_REGISTRY.buyingPower.name,
   positions: TOOL_REGISTRY.positions.name,
+  optionPositions: TOOL_REGISTRY.optionPositions.name,
   placeOrder: TOOL_REGISTRY.placeOrder.name,
-  listOrders: TOOL_REGISTRY.listOrders.name,
   placeOptionsOrder: TOOL_REGISTRY.placeOptionsOrder.name,
-  listOptionsOrders: TOOL_REGISTRY.listOptionsOrders.name,
 };
 
 // =============================================================================
@@ -196,6 +64,8 @@ export const TOOL_NAMES: { readonly [K in ToolKind]: RhToolMap[K]['name'] } = {
 // =============================================================================
 
 export class RobinhoodTools {
+  private accountNumber: string | undefined;
+
   constructor(private readonly mcp: RobinhoodMcpClient) {}
 
   /**
@@ -253,15 +123,20 @@ export class RobinhoodTools {
     return this.call('buyingPower', {});
   }
 
-  getPositions(): Promise<PositionsResult> {
-    return this.call('positions', {});
+  async getPositions(): Promise<PositionsResult> {
+    return this.call('positions', { account_number: await this.getDefaultAccountNumber() });
   }
 
-  placeOrder(args: PlaceOrderArgs): Promise<PlaceOrderResult> {
+  async getOptionPositions(): Promise<OptionPositionsResult> {
+    return this.call('optionPositions', { account_number: await this.getDefaultAccountNumber() });
+  }
+
+  async placeOrder(args: PlaceOrderArgs): Promise<PlaceOrderResult> {
     if (args.orderType === 'limit' && typeof args.limitPrice !== 'number') {
       throw new Error('limitPrice required for limit orders');
     }
     const payload: PlaceOrderPayload = {
+      account_number: await this.getDefaultAccountNumber(),
       symbol: args.symbol,
       side: args.side,
       type: args.orderType,
@@ -274,15 +149,12 @@ export class RobinhoodTools {
     return this.call('placeOrder', payload);
   }
 
-  listRecentOrders(): Promise<OrdersListResult> {
-    return this.call('listOrders', {});
-  }
-
-  placeOptionsOrder(args: PlaceOptionsOrderArgs): Promise<PlaceOptionsOrderResult> {
+  async placeOptionsOrder(args: PlaceOptionsOrderArgs): Promise<PlaceOptionsOrderResult> {
     if (args.orderType === 'limit' && typeof args.limitPremium !== 'number') {
       throw new Error('limitPremium (per-contract price) required for limit options orders');
     }
     const payload: PlaceOptionsOrderPayload = {
+      account_number: await this.getDefaultAccountNumber(),
       symbol: args.symbol,
       option_type: args.optionType,
       strike_price: args.strike,
@@ -298,8 +170,14 @@ export class RobinhoodTools {
     return this.call('placeOptionsOrder', payload);
   }
 
-  listRecentOptionsOrders(): Promise<OrdersListResult> {
-    return this.call('listOptionsOrders', {});
+  private async getDefaultAccountNumber(): Promise<string> {
+    if (this.accountNumber) return this.accountNumber;
+    const buyingPower = await this.getBuyingPower();
+    if (!buyingPower.accountNumber) {
+      throw new Error('could not determine Robinhood account_number from get_accounts');
+    }
+    this.accountNumber = buyingPower.accountNumber;
+    return this.accountNumber;
   }
 }
 
@@ -332,6 +210,7 @@ function parseQuote(result: CallToolResult): QuoteResult {
 
 function parseBuyingPower(result: CallToolResult): BuyingPowerResult {
   const data = structuredOrJson(result);
+  const accountNumber = deepFindString(data, ['account_number', 'accountNumber', 'account_id', 'id']);
   const amountUsd =
     deepFindNumber(data, [
       'buying_power',
@@ -340,22 +219,44 @@ function parseBuyingPower(result: CallToolResult): BuyingPowerResult {
       'cash_available_for_withdrawal',
       'cash_balance',
     ]) ?? 0;
-  return { amountUsd, raw: data ?? result };
+  return { amountUsd, accountNumber, raw: data ?? result };
 }
 
 function parsePositions(result: CallToolResult): PositionsResult {
   const data = structuredOrJson(result);
-  const list = Array.isArray(data)
-    ? data
-    : asRecord(data)?.positions ?? asRecord(data)?.results ?? [];
+  const list = extractList(data);
   const positions: Position[] = [];
-  if (Array.isArray(list)) {
-    for (const item of list) {
-      const symbol = deepFindString(item, ['symbol', 'ticker', 'instrument_symbol']);
-      const quantity = deepFindNumber(item, ['quantity', 'shares', 'qty']) ?? 0;
-      if (symbol) positions.push({ symbol, quantity, raw: item });
+  for (const item of list) {
+    const symbol = deepFindString(item, ['symbol', 'ticker', 'instrument_symbol']);
+    const quantity = deepFindNumber(item, ['quantity', 'shares', 'qty']) ?? 0;
+    if (symbol) positions.push({ symbol, quantity, raw: item });
+  }
+  return { positions, raw: data ?? result };
+}
+
+function parseOptionPositions(result: CallToolResult): OptionPositionsResult {
+  const data = structuredOrJson(result);
+  const positions: OptionPosition[] = [];
+
+  for (const item of extractList(data)) {
+    const symbol = deepFindString(item, ['symbol', 'chain_symbol', 'underlying_symbol', 'ticker']);
+    const optionType = normalizeOptionType(deepFindString(item, ['option_type', 'type', 'optionType']));
+    const strike = deepFindNumber(item, ['strike_price', 'strike']);
+    const expiration = deepFindString(item, ['expiration_date', 'expiration', 'expires_at']);
+    const quantity = deepFindNumber(item, ['quantity', 'contracts', 'qty']) ?? 0;
+
+    if (symbol && optionType && strike !== null && expiration) {
+      positions.push({
+        symbol: symbol.toUpperCase(),
+        optionType,
+        strike,
+        expiration: expiration.slice(0, 10),
+        quantity,
+        raw: item,
+      });
     }
   }
+
   return { positions, raw: data ?? result };
 }
 
@@ -364,10 +265,6 @@ function parsePlaceOrder(result: CallToolResult): PlaceOrderResult {
   const orderId = deepFindString(data, ['order_id', 'id', 'client_order_id']);
   const status = deepFindString(data, ['status', 'state']) ?? (orderId ? 'submitted' : null);
   return { orderId, status, raw: data ?? result };
-}
-
-function parseListOrders(result: CallToolResult): OrdersListResult {
-  return { raw: structuredOrJson(result) ?? result };
 }
 
 // =============================================================================
@@ -424,6 +321,23 @@ function structuredOrJson(result: CallToolResult): unknown {
   } catch {
     return text;
   }
+}
+
+function extractList(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  const rec = asRecord(value);
+  const candidates = [rec?.positions, rec?.results, rec?.items, rec?.data];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+  return [];
+}
+
+function normalizeOptionType(value: string | null): 'call' | 'put' | null {
+  const normalized = value?.toLowerCase();
+  if (normalized === 'call' || normalized === 'c') return 'call';
+  if (normalized === 'put' || normalized === 'p') return 'put';
+  return null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

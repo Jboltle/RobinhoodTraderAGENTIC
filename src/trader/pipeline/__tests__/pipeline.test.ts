@@ -14,7 +14,7 @@ import type {
 } from '../../../shared/types.js';
 import type { RobinhoodTools } from '../../rh/tools.js';
 import { DecisionLog } from '../../decisionLog.js';
-import { BTO_QQQ_PUT, TRIM_QQQ_FIRST, HYPE_BANG, envelopeFromFixture } from './fixtures/discordMessages.js';
+import { BTO_QQQ_PUT, TRIM_QQQ_DOUBLE, TRIM_QQQ_FIRST, RUNNERS_ONLY_QQQ, HYPE_BANG, envelopeFromFixture } from './fixtures/discordMessages.js';
 
 // ---------------------------------------------------------------------------
 // Config mock — pipeline reads maxSingleContractPct / maxOptionsNotionalPct
@@ -34,6 +34,7 @@ vi.mock('../../../shared/config.js', () => ({
     positionSmallPct: 25,
     positionMediumPct: 50,
     riskStatePath: '/tmp/test-pipeline-risk.json',
+    tradeExecutionMode: 'immediate',
   },
   isAllowed: () => true,
 }));
@@ -57,6 +58,19 @@ function makeTools(overrides: Partial<RobinhoodTools> = {}): RobinhoodTools {
     placeOrder: vi.fn().mockResolvedValue({ orderId: 'eq-001', status: 'queued' }),
     placeOptionsOrder: vi.fn().mockResolvedValue({ orderId: 'opt-001', status: 'queued' }),
     getPositions: vi.fn().mockResolvedValue([]),
+    getOptionPositions: vi.fn().mockResolvedValue({
+      positions: [
+        {
+          symbol: 'QQQ',
+          optionType: 'call',
+          strike: 707,
+          expiration: '2026-06-11',
+          quantity: 5,
+          raw: {},
+        },
+      ],
+      raw: {},
+    }),
     ...overrides,
   } as unknown as RobinhoodTools;
 }
@@ -140,6 +154,84 @@ describe('runPipeline — TRIM exit', () => {
     expect(call.side).toBe('sell');
     expect(call.strike).toBe(707);
     expect(call.optionType).toBe('call');
+    expect(call.contracts).toBe(1);
+    expect(tools.getBuyingPower).not.toHaveBeenCalled();
+    expect(tools.getOptionPositions).toHaveBeenCalledOnce();
+  });
+
+  it('sells most and leaves one contract for TRIM TRIM / heavy exits', async () => {
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(TRIM_QQQ_DOUBLE),
+      TRIM_QQQ_DOUBLE.expectedCallout
+    );
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order?.quantity).toBe(4);
+    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(call.contracts).toBe(4);
+  });
+
+  it('caps heavy exits to one contract when only one is held', async () => {
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(RUNNERS_ONLY_QQQ),
+      RUNNERS_ONLY_QQQ.expectedCallout,
+      {
+        getOptionPositions: vi.fn().mockResolvedValue({
+          positions: [
+            {
+              symbol: 'QQQ',
+              optionType: 'call',
+              strike: 707,
+              expiration: '2026-06-11',
+              quantity: 1,
+              raw: {},
+            },
+          ],
+          raw: {},
+        }),
+      }
+    );
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order?.quantity).toBe(1);
+    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(call.contracts).toBe(1);
+  });
+
+  it('rejects option exits when the matching position is not open', async () => {
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(TRIM_QQQ_FIRST),
+      TRIM_QQQ_FIRST.expectedCallout,
+      { getOptionPositions: vi.fn().mockResolvedValue({ positions: [], raw: {} }) }
+    );
+
+    expect(decision.kind).toBe('risk_rejected');
+    expect(decision.reason).toMatch(/no open QQQ 707C 2026-06-11 position/);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+});
+
+describe('runPipeline — approval mode', () => {
+  it('records pending_approval and does not submit when approval mode is enabled', async () => {
+    const { config } = await import('../../../shared/config.js');
+    const original = config.tradeExecutionMode;
+    (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = 'approval';
+
+    try {
+      const { decision, tools, postReceipt } = await runWith(
+        envelopeFromFixture(BTO_QQQ_PUT),
+        BTO_QQQ_PUT.expectedCallout
+      );
+
+      expect(decision.kind).toBe('pending_approval');
+      expect(decision.reason).toMatch(/Approval required/);
+      expect(decision.order).toBeNull();
+      expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+      expect(tools.getBuyingPower).not.toHaveBeenCalled();
+      expect(postReceipt).toHaveBeenCalledOnce();
+    } finally {
+      (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
+    }
   });
 });
 

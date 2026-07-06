@@ -8,9 +8,11 @@
     "node": ">=20.10"
   },
   "scripts": {
+    "dev": "tsx src/scripts/dev.ts",
     "trader": "tsx src/trader/index.ts",
     "bot": "tsx src/bot/index.ts",
     "connect": "tsx src/scripts/rhConnect.ts",
+    "auth:reset": "tsx src/scripts/rhResetAuth.ts",
     "import-tokens": "tsx src/scripts/importCodexTokens.ts",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -23,7 +25,6 @@
     "discord.js": "^14.26.4",
     "dotenv": "^17.4.2",
     "fastify": "^5.8.5",
-    "ngrok": "^5.0.0-beta.2",
     "openai": "^6.42.0",
     "zod": "^4.4.3"
   },

@@ -173,10 +173,10 @@ export const TRIM_QQQ_DOUBLE: DiscordMessageFixture = {
     orderType: 'market',
     limitPrice: null,
     sizeHint: null,
-    positionSize: 'medium',
+    positionSize: 'full',
     option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
     confidence: 0.89,
-    rationale: 'TRIM TRIM QQQ 707C — larger partial exit',
+    rationale: 'TRIM TRIM QQQ 707C — heavy trim, sell most and keep a runner',
   },
 };
 

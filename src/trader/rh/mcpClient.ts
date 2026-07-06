@@ -8,16 +8,14 @@ import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
 import { awaitAuthorizationCode } from './oauthCallback.js';
 import { FileOAuthProvider } from './oauthProvider.js';
+import { importCodexTokensIfNeeded, readTokenStatus } from './tokenBootstrap.js';
+import type { CallToolResult } from './types.js';
+
+export type { CallToolResult } from './types.js';
 
 const log = createLogger('trader:rh:mcp');
 
 const CLIENT_INFO = { name: 'rh-discord-trader', version: '0.1.0' };
-
-export interface CallToolResult {
-  readonly content: Array<{ type: string; text?: string; [k: string]: unknown }>;
-  readonly isError?: boolean;
-  readonly structuredContent?: Record<string, unknown>;
-}
 
 export class RobinhoodMcpClient {
   private client: Client | undefined;
@@ -42,6 +40,22 @@ export class RobinhoodMcpClient {
 
   private async connect(): Promise<void> {
     const redirectUrl = new URL(config.robinhoodOAuthRedirectUri);
+
+    // Detect the local auth state and, when the saved tokens can't carry us,
+    // try to import fresh ones from Codex before falling back to browser OAuth.
+    const status = await readTokenStatus(config.rhTokensPath);
+    log.info('Robinhood token status', {
+      state: status.state,
+      expiresInMin: status.expiresInSec !== null ? Math.round(status.expiresInSec / 60) : null,
+      hasRefreshToken: status.hasRefreshToken,
+    });
+    if (status.state === 'missing' || status.state === 'expired') {
+      await importCodexTokensIfNeeded({
+        path: config.rhTokensPath,
+        redirectUri: config.robinhoodOAuthRedirectUri,
+        clientName: config.robinhoodOAuthClientName,
+      });
+    }
 
     const provider = new FileOAuthProvider({
       path: config.rhTokensPath,
@@ -68,11 +82,39 @@ export class RobinhoodMcpClient {
       await client.connect(transport);
     } catch (err) {
       if (!(err instanceof UnauthorizedError)) throw err;
+
+      // Unauthorized despite the preflight — try a Codex import once more (the
+      // local tokens may have just expired), then reconnect before prompting.
+      if (await importCodexTokensIfNeeded({
+        path: config.rhTokensPath,
+        redirectUri: config.robinhoodOAuthRedirectUri,
+        clientName: config.robinhoodOAuthClientName,
+      })) {
+        transport = new StreamableHTTPClientTransport(new URL(config.robinhoodMcpUrl), {
+          authProvider: provider,
+        });
+        client = new Client(CLIENT_INFO);
+        try {
+          await client.connect(transport);
+          this.client = client;
+          await this.introspect(client);
+          return;
+        } catch (retryErr) {
+          if (!(retryErr instanceof UnauthorizedError)) throw retryErr;
+        }
+      }
+
       log.info('starting OAuth callback listener');
       const callbackPath = redirectUrl.pathname || '/oauth/callback';
       const port = config.robinhoodOAuthCallbackPort;
-      const host = redirectUrl.hostname || '127.0.0.1';
+      const host = config.robinhoodOAuthCallbackHost;
 
+      log.info('OAuth callback listener starting', {
+        listenHost: host,
+        port,
+        callbackPath,
+        redirectUri: config.robinhoodOAuthRedirectUri,
+      });
       const { code } = await awaitAuthorizationCode(host, port, callbackPath);
       log.info('received authorization code, exchanging for tokens');
       await transport.finishAuth(code);
@@ -87,6 +129,10 @@ export class RobinhoodMcpClient {
     }
 
     this.client = client;
+    await this.introspect(client);
+  }
+
+  private async introspect(client: Client): Promise<void> {
     const list = await client.listTools();
     this.toolNames = list.tools.map((t) => t.name);
     log.info('connected to Robinhood MCP', {
@@ -100,13 +146,8 @@ export class RobinhoodMcpClient {
     return this.toolNames;
   }
 
-  /**
-   * Returns the first tool name from `candidates` that the MCP server
-   * advertises. Used so we can keep wrappers resilient to small naming
-   * differences in the live Robinhood MCP surface.
-   */
-  resolveToolName(candidates: readonly string[]): string | undefined {
-    return candidates.find((name) => this.toolNames.includes(name));
+  isConnected(): boolean {
+    return this.client !== undefined;
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {

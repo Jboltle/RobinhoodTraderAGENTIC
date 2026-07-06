@@ -1,7 +1,7 @@
 import { REST, Routes } from 'discord.js';
 import Fastify from 'fastify';
 
-import { config } from '../shared/config.js';
+import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import { DiscordEnvelopeSchema, PostReceipt } from '../shared/types.js';
 import { verifyWebhookBody } from '../shared/webhookAuth.js';
@@ -9,6 +9,7 @@ import { DecisionLog } from './decisionLog.js';
 import { runPipeline } from './pipeline/index.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { RobinhoodMcpClient } from './rh/mcpClient.js';
+import { readTokenStatus } from './rh/tokenBootstrap.js';
 import { RobinhoodTools } from './rh/tools.js';
 
 const log = createLogger('trader');
@@ -38,17 +39,40 @@ function buildPostReceipt(rest: REST): PostReceipt {
   };
 }
 
+function buildDisabledRobinhoodTools(): RobinhoodTools {
+  const disabled = async (): Promise<never> => {
+    throw new Error('Robinhood tools are disabled while TRADE_EXECUTION_MODE=approval');
+  };
+
+  return {
+    getBuyingPower: disabled,
+    getQuote: disabled,
+    getOptionsMarkPrice: disabled,
+    placeOrder: disabled,
+    placeOptionsOrder: disabled,
+    getPositions: disabled,
+    getOptionPositions: disabled,
+  } as unknown as RobinhoodTools;
+}
+
 async function main(): Promise<void> {
+  assertConfigValid('trader');
+
   const parser = new LlmCalloutParser();
   const decisions = new DecisionLog(config.decisionLogPath);
   const discordRest = buildDiscordRestClient();
   const postReceipt = buildPostReceipt(discordRest);
 
-  const mcp = new RobinhoodMcpClient();
-  log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
-  await mcp.ensureConnected();
-  const tools = new RobinhoodTools(mcp);
-  log.info('Robinhood MCP connected', { tools: mcp.getToolNames() });
+  const mcp = config.tradeExecutionMode === 'immediate' ? new RobinhoodMcpClient() : null;
+  const tools = mcp ? new RobinhoodTools(mcp) : buildDisabledRobinhoodTools();
+
+  if (mcp) {
+    log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
+    await mcp.ensureConnected();
+    log.info('Robinhood MCP connected', { tools: mcp.getToolNames() });
+  } else {
+    log.warn('Robinhood MCP disabled in approval mode; no orders will be submitted');
+  }
 
   // Serialize pipeline so we never have two trades in flight on the same session.
   let chain: Promise<void> = Promise.resolve();
@@ -102,7 +126,15 @@ async function main(): Promise<void> {
   });
 
   fastify.get('/health', async (_request, reply) => {
-    return reply.send({ ok: true, rhTools: mcp.getToolNames() });
+    const tokenStatus = mcp ? await readTokenStatus(config.rhTokensPath) : null;
+    return reply.send({
+      ok: true,
+      executionMode: config.tradeExecutionMode,
+      rhConnected: mcp?.isConnected() ?? false,
+      rhTokenState: tokenStatus?.state ?? null,
+      rhTokenExpiresInSec: tokenStatus?.expiresInSec ?? null,
+      rhTools: mcp?.getToolNames() ?? [],
+    });
   });
 
   await fastify.listen({ port: config.traderPort, host: '0.0.0.0' });

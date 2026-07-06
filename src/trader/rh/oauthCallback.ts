@@ -46,6 +46,11 @@ export function awaitAuthorizationCode(
     }, timeoutMs);
 
     server = createServer((req, res) => {
+      log.info('OAuth callback request received', {
+        method: req.method,
+        url: req.url,
+        remoteAddress: req.socket.remoteAddress,
+      });
       const url = new URL(req.url ?? '/', `http://${host}:${port}`);
 
       // Anything other than the callback path is a stray probe (favicon,
@@ -84,6 +89,7 @@ export function awaitAuthorizationCode(
       }
 
       // Real success.
+      log.info('OAuth callback code received', { statePresent: state !== null });
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(HTML_OK);
       clearTimeout(timer);
       server?.close();

@@ -1,89 +1,41 @@
 /**
- * One-shot migration: copy Robinhood OAuth tokens that Codex already obtained
- * into state/rh-tokens.json so the standalone trader can start without its
- * own browser OAuth flow.
+ * Manual one-shot import of Robinhood OAuth tokens that Codex already obtained
+ * into state/rh-tokens.json, so the standalone trader can start without its own
+ * browser OAuth flow.
  *
  *   npm run import-tokens
+ *
+ * The trader also does this automatically at startup (see tokenBootstrap); this
+ * script is retained for explicit manual imports and to force a refresh-token
+ * import via IMPORT_CODEX_REFRESH_TOKEN=true.
  */
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
 import { config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
+import { importCodexTokens } from '../trader/rh/tokenBootstrap.js';
 
 const log = createLogger('import-codex-tokens');
 
-const CODEX_CREDS_PATH = `${process.env.HOME}/.codex/.credentials.json`;
-
-interface CodexCredential {
-  server_name: string;
-  server_url: string;
-  client_id: string;
-  access_token: string;
-  expires_at: number; // ms since epoch
-  refresh_token: string;
-  scopes: string[];
-}
-
 async function main(): Promise<void> {
-  // ---- Read Codex credentials ------------------------------------------
-  let raw: string;
-  try {
-    raw = await readFile(CODEX_CREDS_PATH, 'utf8');
-  } catch {
-    throw new Error(`Codex credentials not found at ${CODEX_CREDS_PATH}. Run Codex with the Robinhood MCP first.`);
-  }
+  const includeRefreshToken =
+    (process.env.IMPORT_CODEX_REFRESH_TOKEN ?? 'false').toLowerCase() === 'true';
 
-  const creds = JSON.parse(raw) as Record<string, CodexCredential>;
-
-  // Find any key that references the Robinhood trading server.
-  const entry = Object.values(creds).find(
-    (c) => c.server_url?.includes('agent.robinhood.com') || c.server_name?.includes('robinhood')
-  );
-
-  if (!entry) {
-    throw new Error('No Robinhood MCP entry found in Codex credentials. Available: ' + Object.keys(creds).join(', '));
-  }
-
-  const nowMs = Date.now();
-  const expiresInSeconds = Math.max(0, Math.floor((entry.expires_at - nowMs) / 1000));
-
-  log.info('found Robinhood tokens in Codex credentials', {
-    client_id: entry.client_id,
-    server_url: entry.server_url,
-    expires_in_seconds: expiresInSeconds,
-    expires_in_hours: (expiresInSeconds / 3600).toFixed(1),
+  const result = await importCodexTokens({
+    path: config.rhTokensPath,
+    redirectUri: config.robinhoodOAuthRedirectUri,
+    clientName: config.robinhoodOAuthClientName,
+    includeRefreshToken,
   });
 
-  if (expiresInSeconds < 60) {
-    throw new Error(`Access token expires in ${expiresInSeconds}s — too soon. Re-authenticate Codex first.`);
+  if (!result.imported) {
+    throw new Error(result.reason);
   }
-
-  // ---- Build the PersistedState expected by FileOAuthProvider ----------
-  const tokenState = {
-    client: {
-      client_id: entry.client_id,
-      redirect_uris: [config.robinhoodOAuthRedirectUri],
-      token_endpoint_auth_method: 'none',
-      client_name: config.robinhoodOAuthClientName,
-    },
-    tokens: {
-      access_token: entry.access_token,
-      token_type: 'Bearer',
-      refresh_token: entry.refresh_token,
-      scope: entry.scopes.join(' '),
-      expires_in: expiresInSeconds,
-    },
-  };
-
-  // ---- Write to state/rh-tokens.json -----------------------------------
-  await mkdir(dirname(config.rhTokensPath), { recursive: true });
-  await writeFile(config.rhTokensPath, JSON.stringify(tokenState, null, 2), 'utf8');
 
   log.info('tokens written', {
     path: config.rhTokensPath,
-    expires_in_hours: (expiresInSeconds / 3600).toFixed(1),
+    expiresInHours: (result.expiresInSec / 3600).toFixed(1),
+    refreshTokenImported: includeRefreshToken,
   });
-  log.info('you can now run: npm run trader');
+  log.info('you can now run: npm run dev');
 }
 
 main()

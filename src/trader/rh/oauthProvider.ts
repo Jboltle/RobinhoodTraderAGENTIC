@@ -10,22 +10,11 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import { createLogger } from '../../shared/logger.js';
+import type { FileOAuthProviderOptions, PersistedState } from './types.js';
+
+export type { FileOAuthProviderOptions } from './types.js';
 
 const log = createLogger('trader:rh:oauth');
-
-export interface FileOAuthProviderOptions {
-  readonly path: string;
-  readonly clientName: string;
-  readonly redirectUri: string;
-  readonly onAuthorizationUrl: (url: URL) => void | Promise<void>;
-}
-
-interface PersistedState {
-  client?: OAuthClientInformationFull;
-  tokens?: OAuthTokens;
-  codeVerifier?: string;
-}
-
 
 /**
  * OAuthClientProvider that persists DCR client info, PKCE verifier, and tokens

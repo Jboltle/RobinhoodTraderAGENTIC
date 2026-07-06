@@ -26,6 +26,7 @@ class AnthropicProvider implements LlmProvider {
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: opts.maxTokens ?? 1024,
+      temperature: 0,
       system: opts.system,
       tools: [
         {
@@ -70,6 +71,7 @@ class OpenAiProvider implements LlmProvider {
     const completion = await this.client.chat.completions.create({
       model: this.model,
       max_tokens: opts.maxTokens ?? 1024,
+      temperature: 0,
       messages: [
         { role: 'system', content: opts.system },
         { role: 'user', content: opts.user },

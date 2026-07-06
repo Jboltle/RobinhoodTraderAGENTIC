@@ -1,7 +1,5 @@
 import { z } from 'zod';
 
-import tickers from './tickers.json' with { type: 'json' };
-
 // =============================================================================
 // Discord envelope
 // =============================================================================
@@ -22,7 +20,7 @@ export type DiscordEnvelope = z.infer<typeof DiscordEnvelopeSchema>;
 // Callout — the structured trade signal extracted from a Discord message
 // =============================================================================
 
-const validateTicker = (ticker: string): boolean => tickers.includes(ticker.toUpperCase());
+const validateTicker = (ticker: string): boolean => /^[A-Z][A-Z0-9]{0,5}$/.test(ticker.toUpperCase());
 
 export const OptionContractSchema = z.object({
   optionType: z.enum(['call', 'put']),
@@ -102,6 +100,17 @@ export interface CalloutParser {
 }
 
 // =============================================================================
+// Logging
+// =============================================================================
+
+export interface Logger {
+  debug(message: string, meta?: Record<string, unknown>): void;
+  info(message: string, meta?: Record<string, unknown>): void;
+  warn(message: string, meta?: Record<string, unknown>): void;
+  error(message: string, meta?: Record<string, unknown>): void;
+}
+
+// =============================================================================
 // Risk check — result of evaluating a callout against risk rules
 // =============================================================================
 
@@ -140,6 +149,7 @@ export type DecisionKind =
   | 'not_callout'
   | 'parser_error'
   | 'risk_rejected'
+  | 'pending_approval'
   | 'submitted'
   | 'execution_failed';
 

@@ -54,13 +54,13 @@ describe('message fixtures — exit / management (TRIM / RUNNERS ONLY)', () => {
     expect(result.orderType).toBe('market');
   });
 
-  it('TRIM sequence: first trim → medium, double trim → medium, runners only → full', async () => {
+  it('TRIM sequence: first trim → medium, double trim → full, runners only → full', async () => {
     const trimFirst = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'trim-qqq-707c-first')!);
     const trimDouble = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'trim-qqq-707c-double')!);
     const runners = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'runners-only-qqq-707c')!);
 
     expect(trimFirst.positionSize).toBe('medium');
-    expect(trimDouble.positionSize).toBe('medium');
+    expect(trimDouble.positionSize).toBe('full');
     expect(runners.positionSize).toBe('full');
   });
 });
@@ -86,7 +86,7 @@ describe('message fixtures — full catalog schema acceptance', () => {
 
 describe('message fixtures — prompt includes message content', () => {
   it('passes envelope content and timestamp to the LLM provider', async () => {
-    const fixture = ALL_FIXTURES[0]!;
+    const fixture = ALL_FIXTURES.find((f) => f.id === 'trim-qqq-707c-first')!;
     const mockCall = vi.fn().mockResolvedValue(fixture.expectedCallout);
     const parser = new LlmCalloutParser({ callStructured: mockCall });
     const envelope = envelopeFromFixture(fixture);

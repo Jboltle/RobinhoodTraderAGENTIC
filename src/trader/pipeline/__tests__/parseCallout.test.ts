@@ -85,7 +85,7 @@ describe('parseCallout — schema normalisation', () => {
     expect(result.isCallout).toBe(false);
   });
 
-  it('throws on invalid schema (bad expiration format)', async () => {
+  it('treats invalid schema output as non-callout', async () => {
     const parser = parserWithMock({
       isCallout: true,
       assetType: 'option',
@@ -100,7 +100,8 @@ describe('parseCallout — schema normalisation', () => {
       rationale: 'bad date format from LLM',
     });
 
-    await expect(parser.parse(makeEnvelope('SPY 755C'))).rejects.toThrow();
+    const result = await parser.parse(makeEnvelope('SPY 755C'));
+    expect(result.isCallout).toBe(false);
   });
 });
 
@@ -113,6 +114,120 @@ describe('parseCallout — schema normalisation', () => {
 // ---------------------------------------------------------------------------
 
 describe('parseCallout — BTO / entry signals', () => {
+  it('compact option line in multi-idea alert parses first concrete entry', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      '$KEEL shares',
+      '$KEEL 6c 8/21 1.15 fill ',
+      'Or 2028 JAN 7c super leap for $300',
+    ].join('\n'), '2026-07-01T14:35:00.000Z'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'KEEL',
+      orderType: 'limit',
+      limitPrice: 1.15,
+      option: { optionType: 'call', strike: 6, expiration: '2026-08-21' },
+    });
+  });
+  it('labeled entering option alert parses deterministically', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      "I'm Entering",
+      'Option: MRNA 75 C 7/17',
+      '',
+      'Entry: 3.40',
+      '',
+      'Notes:',
+    ].join('\n'), '2026-07-01T14:35:00.000Z'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'MRNA',
+      orderType: 'limit',
+      limitPrice: 3.4,
+      option: { optionType: 'call', strike: 75, expiration: '2026-07-17' },
+    });
+  });
+  it('labeled entering option alert with entry range parses deterministically', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      "I'm Entering",
+      'Option: HOOD 110 C 7/17',
+      '',
+      'Entry: 5.55-5.60',
+      '',
+      'Notes: ​',
+    ].join('\n'), '2026-07-01T14:35:00.000Z'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'HOOD',
+      orderType: 'limit',
+      limitPrice: 5.6,
+      option: { optionType: 'call', strike: 110, expiration: '2026-07-17' },
+    });
+  });
+  it('SPX 7500C - 4.8 - chase parses as a deterministic 0DTE buy', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('SPX 7500C - 4.8 - chase @Pro'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPX',
+      orderType: 'limit',
+      limitPrice: 4.8,
+      option: { optionType: 'call', strike: 7500, expiration: '2026-06-15' },
+    });
+  });
+  it('BTO $SPY 755C 0DTE $0.71 parses deterministically without the LLM', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('BTO $SPY 755C 0DTE $0.71'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'limit',
+      limitPrice: 0.71,
+      positionSize: null,
+      option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+    });
+  });
   it('BTO SPY 755C 0DTE $0.71 → buy call limit 0.71, today expiry', async () => {
     const parser = parserWithMock({
       isCallout: true,
@@ -298,6 +413,182 @@ describe('parseCallout — exit / management signals', () => {
   });
 });
 
+describe('parseCallout — invalid model output repair', () => {
+  it('retries once with validation feedback and uses corrected output', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn()
+        .mockResolvedValueOnce({ isCallout: true, assetType: 'option', option: null })
+        .mockResolvedValueOnce({
+          isCallout: true,
+          assetType: 'option',
+          action: 'buy',
+          ticker: 'KEEL',
+          orderType: 'limit',
+          limitPrice: 1.15,
+          sizeHint: null,
+          positionSize: null,
+          option: { optionType: 'call', strike: 6, expiration: '2026-08-21' },
+          confidence: 0.9,
+          rationale: 'KEEL 6C 8/21 at 1.15',
+        }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('KEEL looks interesting here', '2026-07-01T14:35:00.000Z'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      ticker: 'KEEL',
+      option: { optionType: 'call', strike: 6, expiration: '2026-08-21' },
+    });
+  });
+});
+describe('parseCallout — pre-LLM chatter gate', () => {
+  it('skips the LLM for a bare P/L line (no ticker or verb)', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('70% 🔥 5.10 to 8.53 🚀'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(false);
+  });
+
+  it('skips the LLM for lowercase hype with no ticker or verb', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('lets gooo, dont let it go red @pro'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(false);
+  });
+
+  it('still calls the LLM when a ticker-like token is present', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: false,
+        assetType: 'equity',
+        action: null,
+        ticker: null,
+        orderType: 'market',
+        limitPrice: null,
+        sizeHint: null,
+        positionSize: null,
+        option: null,
+        confidence: 0.1,
+        rationale: 'commentary about SBUX',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    await parser.parse(makeEnvelope('still watching SBUX here'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+
+  it('still calls the LLM when a trade verb is present (lowercase)', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: false,
+        assetType: 'equity',
+        action: null,
+        ticker: null,
+        orderType: 'market',
+        limitPrice: null,
+        sizeHint: null,
+        positionSize: null,
+        option: null,
+        confidence: 0.1,
+        rationale: 'ambiguous buy chatter',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    await parser.parse(makeEnvelope('might buy something soon idk'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('parseCallout — partial model output coercion', () => {
+  it('coerces a chatter response missing assetType/orderType without a repair retry', async () => {
+    // Mirrors the production log: the model returned everything except
+    // assetType and orderType for a non-callout. Coercion should fill the
+    // structural defaults so it validates on the first attempt.
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: false,
+        action: null,
+        ticker: null,
+        limitPrice: null,
+        sizeHint: null,
+        positionSize: null,
+        option: null,
+        confidence: 0.02,
+        rationale: 'general chatter, no trade directive',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('anyone else watching SPY today?'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: false,
+      assetType: 'equity',
+      orderType: 'market',
+    });
+  });
+
+  it('infers assetType=option from a present option block when omitted', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: true,
+        action: 'buy',
+        ticker: 'SPY',
+        limitPrice: 0.71,
+        sizeHint: null,
+        positionSize: null,
+        option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+        confidence: 0.95,
+        rationale: 'BTO SPY 755C',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('SPY 755C 0.71'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      orderType: 'market',
+      ticker: 'SPY',
+      option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+    });
+  });
+});
+
+describe('parseCallout — invalid model output fallback', () => {
+  it('treats malformed LLM output for P/L chatter as a non-callout', async () => {
+    const parser = parserWithMock({ assetType: 'status_update' });
+
+    const result = await parser.parse(makeEnvelope('70% 🔥5.10 to 8.53 🚀'));
+
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: false,
+      action: null,
+      ticker: null,
+      option: null,
+    });
+  });
+});
 describe('parseCallout — non-callouts (should be rejected)', () => {
   it('"Still in $SBUX!" commentary → isCallout false', async () => {
     const parser = parserWithMock({

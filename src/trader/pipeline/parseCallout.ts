@@ -119,7 +119,7 @@ REAL-WORLD CHANNEL FORMAT (with noise lines stripped):
    TRIM TRIM
    QQQ 707C 2026-06-11
    1.5900  →  2.03   P/L: +27.67% ($44.00)"           <- P/L is status, not a limit price
-  -> option sell QQQ call, strike 707, exp 2026-06-11, positionSize medium
+  -> option sell QQQ call, strike 707, exp 2026-06-11, positionSize full
 
   "@Pro                                                <- ignore
    Close or Trim & Set SL to BE
@@ -167,7 +167,7 @@ POSITION SIZE KEYWORDS (positionSize field):
 Classify based on qualitative size language in the message. Ignore this field if an explicit sizeHint is present.
 - 'small'  -> "small", "light", "quick", "scalp", "tiny", "starter"
 - 'medium' -> "medium", "half", "half size", "partial", "trim", "TRIM"
-- 'full'   -> "full", "full size", "max", "heavy", "load up", "all in", "full send", "trimming most", "TRIM TRIM", "RUNNERS ONLY" (sell most, keep tiny runner)
+- 'full'   -> "full", "full size", "max", "heavy", "load up", "all in", "full send", "trimming most", "TRIM TRIM", "RUNNERS ONLY" (heavy exit: sell most, keep a runner when possible)
 - null     -> no size qualifier present.
 
 OPTION CONTRACT FIELDS (option must be populated when assetType='option', else null):
@@ -188,6 +188,242 @@ OTHER:
 - confidence: 0.0 - 1.0.
 - rationale: <=200 char summary of the trade extracted (or why rejected).
 - Always call the report_callout tool exactly once.`;
+function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null {
+  const ownContent = envelope.content
+    .split(/\r?\n/)
+    .filter((line) => !line.trimStart().startsWith('>'))
+    .join('\n');
+  const normalized = ownContent
+    .replace(/\r/g, '\n')
+    .replace(/[\u2192\u21d2]/g, ' -> ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return (
+    parseBtoOption(normalized, envelope.timestamp) ??
+    parseChaseOption(normalized, envelope.timestamp) ??
+    parseCompactOptionLine(ownContent, envelope.timestamp) ??
+    parseLabeledEntryOption(ownContent, envelope.timestamp)
+  );
+}
+
+function parseBtoOption(content: string, timestamp: string): Callout | null {
+  const match = content.match(
+    /^(?:BTO|BUY\s+TO\s+OPEN)\b.*?\$?([A-Z]{1,5})\s+(\d+(?:\.\d+)?)([CP])\b\s+(0DTE|TODAY|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})\s+(?:@|\$)?\s*(\d+(?:\.\d+)?)/i
+  );
+  if (!match) return null;
+
+  const [, tickerRaw, strikeRaw, typeRaw, expirationRaw, limitRaw] = match;
+  return buildDeterministicOptionCallout({
+    tickerRaw: tickerRaw!,
+    strikeRaw: strikeRaw!,
+    typeRaw: typeRaw!,
+    expirationRaw: expirationRaw!,
+    limitRaw: limitRaw!,
+    timestamp,
+    content,
+    rationalePrefix: 'BTO',
+  });
+}
+
+function parseChaseOption(content: string, timestamp: string): Callout | null {
+  const match = content.match(
+    /^\$?([A-Z]{1,5})\s+(\d+(?:\.\d+)?)([CP])\b\s*[-–—]\s*(?:@|\$)?\s*(\d+(?:\.\d+)?)\b.*\b(?:chase|starter|small|lotto|risk)\b/i
+  );
+  if (!match) return null;
+
+  const [, tickerRaw, strikeRaw, typeRaw, limitRaw] = match;
+  return buildDeterministicOptionCallout({
+    tickerRaw: tickerRaw!,
+    strikeRaw: strikeRaw!,
+    typeRaw: typeRaw!,
+    expirationRaw: '0DTE',
+    limitRaw: limitRaw!,
+    timestamp,
+    content,
+    rationalePrefix: 'CHASE',
+  });
+}
+
+function parseCompactOptionLine(content: string, timestamp: string): Callout | null {
+  const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (!/\b(?:fill|entry)\b/i.test(line)) continue;
+    const match = line.match(
+      /^\$?([A-Z]{1,6})\s+(\d+(?:\.\d+)?)([CP])\b\s+(0DTE|TODAY|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})\s+(?:@|\$)?\s*(\d+(?:\.\d+)?)(?:\b|\s)/i
+    );
+    if (!match) continue;
+
+    const [, tickerRaw, strikeRaw, typeRaw, expirationRaw, limitRaw] = match;
+    return buildDeterministicOptionCallout({
+      tickerRaw: tickerRaw!,
+      strikeRaw: strikeRaw!,
+      typeRaw: typeRaw!,
+      expirationRaw: expirationRaw!,
+      limitRaw: limitRaw!,
+      timestamp,
+      content: line,
+      rationalePrefix: 'ENTRY',
+    });
+  }
+
+  return null;
+}
+
+function parseLabeledEntryOption(content: string, timestamp: string): Callout | null {
+  if (!/\b(?:entering|entry)\b/i.test(content)) return null;
+
+  const optionMatch = content.match(
+    /^\s*Option\s*:\s*\$?([A-Z]{1,5})\s+(\d+(?:\.\d+)?)\s*([CP]|calls?|puts?)\s+(0DTE|TODAY|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})\s*$/im
+  );
+  const entryMatch = content.match(
+    /^\s*Entry\s*:\s*(?:@|\$)?\s*(\d+(?:\.\d+)?)(?:\s*[-–—]\s*(?:@|\$)?\s*(\d+(?:\.\d+)?))?\s*$/im
+  );
+  if (!optionMatch || !entryMatch) return null;
+
+  const [, tickerRaw, strikeRaw, typeRaw, expirationRaw] = optionMatch;
+  const [, lowerLimitRaw, upperLimitRaw] = entryMatch;
+  const limitRaw = upperLimitRaw ?? lowerLimitRaw;
+  return buildDeterministicOptionCallout({
+    tickerRaw: tickerRaw!,
+    strikeRaw: strikeRaw!,
+    typeRaw: typeRaw![0]!,
+    expirationRaw: expirationRaw!,
+    limitRaw: limitRaw!,
+    timestamp,
+    content,
+    rationalePrefix: 'ENTRY',
+  });
+}
+
+function buildDeterministicOptionCallout(opts: {
+  tickerRaw: string;
+  strikeRaw: string;
+  typeRaw: string;
+  expirationRaw: string;
+  limitRaw: string;
+  timestamp: string;
+  content: string;
+  rationalePrefix: string;
+}): Callout | null {
+  const expiration = resolveDeterministicExpiration(opts.expirationRaw, opts.timestamp);
+  if (!expiration) return null;
+
+  const candidate = {
+    isCallout: true,
+    assetType: 'option',
+    action: 'buy',
+    ticker: opts.tickerRaw.toUpperCase(),
+    orderType: 'limit',
+    limitPrice: Number(opts.limitRaw),
+    sizeHint: null,
+    positionSize: /\b(risky|lotto|small|light|tiny|starter|scalp)\b/i.test(opts.content) ? 'small' : null,
+    option: {
+      optionType: opts.typeRaw.toUpperCase() === 'C' ? 'call' : 'put',
+      strike: Number(opts.strikeRaw),
+      expiration,
+    },
+    confidence: 0.99,
+    rationale: [opts.rationalePrefix, opts.tickerRaw.toUpperCase(), opts.strikeRaw + opts.typeRaw.toUpperCase(), opts.expirationRaw, 'at', '$' + opts.limitRaw].join(' '),
+  };
+
+  const parsed = CalloutSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
+/**
+ * Fill the structural fields a strict `CalloutSchema` requires when the model
+ * omits them. Models frequently return a partial object for plain chatter
+ * (e.g. missing `assetType`/`orderType`); coercing to the full shape lets a
+ * non-callout validate on the first attempt instead of forcing a repair retry
+ * and then dropping the message. Invalid enum *values* are left untouched so
+ * the schema still rejects genuinely malformed output.
+ */
+function coerceCalloutShape(raw: unknown): unknown {
+  if (typeof raw !== 'object' || raw === null) return raw;
+  const r = raw as Record<string, unknown>;
+  const hasOption = typeof r.option === 'object' && r.option !== null;
+  return {
+    isCallout: typeof r.isCallout === 'boolean' ? r.isCallout : false,
+    assetType: r.assetType ?? (hasOption ? 'option' : 'equity'),
+    action: r.action ?? null,
+    ticker: r.ticker ?? null,
+    orderType: r.orderType ?? 'market',
+    limitPrice: r.limitPrice ?? null,
+    sizeHint: r.sizeHint ?? null,
+    positionSize: r.positionSize ?? null,
+    option: r.option ?? null,
+    confidence: typeof r.confidence === 'number' ? r.confidence : 0,
+    rationale: typeof r.rationale === 'string' ? r.rationale : '',
+  };
+}
+
+// A standalone 1-5 letter uppercase token, optionally $-prefixed, not glued to
+// other letters. Matches "SPY", "$QQQ", "NVDA"; ignores "@Pro", "0DTE", prose.
+const TICKER_LIKE = /(?:^|[^A-Za-z0-9$])\$?[A-Z]{1,5}(?![A-Za-z])/;
+
+// Words that plausibly signal a buy/sell/manage directive. Deliberately broad:
+// a false positive just means we still ask the LLM (safe), whereas a false
+// negative would skip a real callout (unsafe).
+const TRADE_VERB =
+  /\b(?:buy|buys|buying|bought|sell|sells|selling|sold|bto|btc|stc|sto|long|short|trim|trimming|close|closing|closed|add|adds|adding|scale|scaling|enter|entering|entered|entry|grab|grabbing|took|take|taking|chase|chasing|load|loading|lotto|call|calls|put|puts|leap|leaps|runner|runners)\b/i;
+
+/**
+ * Conservative pre-LLM gate: a message can only be a callout if it contains a
+ * ticker-like token or a trade verb. When it has neither (pure hype, emoji, or
+ * a bare P/L line) we can safely classify it as a non-callout without spending
+ * an LLM call. Biased toward calling the LLM — only obvious chatter is skipped.
+ */
+function messageHasTradeSignal(content: string): boolean {
+  return TICKER_LIKE.test(content) || TRADE_VERB.test(content);
+}
+
+function buildNonCallout(rationale: string): Callout {
+  return {
+    isCallout: false,
+    assetType: 'equity',
+    action: null,
+    ticker: null,
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: null,
+    option: null,
+    confidence: 0,
+    rationale,
+  };
+}
+
+function resolveDeterministicExpiration(raw: string, referenceTimestamp: string): string | null {
+  const upper = raw.toUpperCase();
+  const reference = new Date(referenceTimestamp);
+  if (!Number.isFinite(reference.getTime())) return null;
+
+  if (upper === '0DTE' || upper === 'TODAY') {
+    return reference.toISOString().slice(0, 10);
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+
+  const parts = raw.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (!parts) return null;
+
+  const month = Number(parts[1]);
+  const day = Number(parts[2]);
+  const refYear = reference.getUTCFullYear();
+  const year = parts[3]
+    ? Number(parts[3].length === 2 ? '20' + parts[3] : parts[3])
+    : refYear;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return date.toISOString().slice(0, 10);
+}
 
 // =============================================================================
 // Public parser — model-agnostic; delegates to whatever LlmProvider is injected
@@ -201,10 +437,29 @@ export class LlmCalloutParser implements CalloutParser {
   }
 
   async parse(envelope: DiscordEnvelope): Promise<Callout> {
+    const deterministic = tryParseDeterministicCallout(envelope);
+    if (deterministic) {
+      log.debug('parsed deterministic callout', {
+        messageId: envelope.messageId,
+        ticker: deterministic.ticker,
+        option: deterministic.option,
+        limitPrice: deterministic.limitPrice,
+      });
+      return deterministic;
+    }
+
+    if (!messageHasTradeSignal(envelope.content)) {
+      log.debug('no ticker or trade verb; skipping LLM', {
+        messageId: envelope.messageId,
+        content: envelope.content.slice(0, 200),
+      });
+      return buildNonCallout('no ticker or trade verb present; skipped LLM (pre-filter)');
+    }
+
     const userMessage = [
-      `Reference timestamp (use as "now" for relative dates): ${envelope.timestamp}`,
-      `Author: ${envelope.authorName}`,
-      `Message: ${envelope.content}`,
+      'Reference timestamp (use as "now" for relative dates): ' + envelope.timestamp,
+      'Author: ' + envelope.authorName,
+      'Message: ' + envelope.content,
     ].join('\n');
 
     const args = await this.provider.callStructured({
@@ -213,7 +468,41 @@ export class LlmCalloutParser implements CalloutParser {
       tool: { name: TOOL_NAME, description: TOOL_DESCRIPTION, schema: TOOL_SCHEMA },
     });
 
-    const callout = CalloutSchema.parse(args);
+    let result = CalloutSchema.safeParse(coerceCalloutShape(args));
+    if (!result.success) {
+      log.warn('LLM callout failed schema validation; retrying with validation feedback', {
+        messageId: envelope.messageId,
+        content: envelope.content.slice(0, 200),
+        error: result.error.message,
+      });
+
+      const repairArgs = await this.provider.callStructured({
+        system: SYSTEM_PROMPT,
+        user: [
+          userMessage,
+          '',
+          'Your previous structured output failed validation:',
+          result.error.message,
+          '',
+          'Return exactly one corrected report_callout object that satisfies the schema.',
+          'If the message has multiple alternatives, choose the first concrete entry with both a contract and entry price.',
+          'If it is only a P/L update or status update, return isCallout=false with every nullable field set to null.',
+        ].join('\n'),
+        tool: { name: TOOL_NAME, description: TOOL_DESCRIPTION, schema: TOOL_SCHEMA },
+      });
+      result = CalloutSchema.safeParse(coerceCalloutShape(repairArgs));
+    }
+
+    if (!result.success) {
+      log.warn('LLM callout failed schema validation after retry; treating message as non-callout', {
+        messageId: envelope.messageId,
+        content: envelope.content.slice(0, 200),
+        error: result.error.message,
+      });
+      return buildNonCallout('LLM output failed schema validation after retry; treated as non-callout');
+    }
+
+    const callout = result.data;
     const normalized: Callout = callout.ticker
       ? { ...callout, ticker: callout.ticker.toUpperCase() }
       : callout;
