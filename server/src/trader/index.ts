@@ -7,6 +7,7 @@ import { createCalloutHistory } from './callouts.js';
 import { DecisionLog } from './decisionLog.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { RobinhoodMcpClient } from './rh/mcpClient.js';
+import { backupTokens, restoreTokens } from './rh/tokenVault.js';
 import { RobinhoodTools } from './rh/tools.js';
 import { buildServer } from './server.js';
 
@@ -61,7 +62,22 @@ async function main(): Promise<void> {
   const discordRest = buildDiscordRestClient();
   const postReceipt = buildPostReceipt(discordRest);
 
-  const mcp = config.tradeExecutionMode === 'immediate' ? new RobinhoodMcpClient() : null;
+  // Token vault: serialized backups (chained like server.ts's pipeline chain
+  // so concurrent persists never interleave). Null channel = vault disabled.
+  const vaultChannelId = config.rhTokensVaultChannelId;
+  let backupChain: Promise<void> = Promise.resolve();
+  const onTokensPersisted = vaultChannelId
+    ? () => {
+        backupChain = backupChain.then(() =>
+          backupTokens(discordRest, vaultChannelId, config.rhTokensPath)
+        );
+      }
+    : undefined;
+
+  const mcp =
+    config.tradeExecutionMode === 'immediate'
+      ? new RobinhoodMcpClient({ onTokensPersisted })
+      : null;
   const tools = mcp ? new RobinhoodTools(mcp) : buildDisabledRobinhoodTools();
 
   if (!mcp) {
@@ -84,6 +100,9 @@ async function main(): Promise<void> {
   log.info('trader listening', { host: config.traderHost, port: config.traderPort });
 
   if (mcp) {
+    if (vaultChannelId) {
+      await restoreTokens(discordRest, vaultChannelId, config.rhTokensPath);
+    }
     log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
     void mcp
       .ensureConnected()

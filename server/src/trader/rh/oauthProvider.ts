@@ -135,5 +135,6 @@ export class FileOAuthProvider implements OAuthClientProvider {
     } catch (err) {
       log.warn('failed to chmod tokens file', { error: (err as Error).message });
     }
+    this.opts.onPersist?.();
   }
 }

@@ -22,7 +22,14 @@ interface AuthCodeSubmission {
   readonly state: string | null;
 }
 
+export interface RobinhoodMcpClientOptions {
+  /** Fire-and-forget hook invoked after each successful token persist (e.g. vault backup). */
+  readonly onTokensPersisted?: () => void;
+}
+
 export class RobinhoodMcpClient {
+  constructor(private readonly options: RobinhoodMcpClientOptions = {}) {}
+
   private client: Client | undefined;
   private toolNames: string[] = [];
   private connectPromise: Promise<void> | undefined;
@@ -79,6 +86,7 @@ export class RobinhoodMcpClient {
         process.stdout.write(`${redirectUrl.origin}${redirectUrl.pathname} ...\n`);
         process.stdout.write('========================================\n\n');
       },
+      onPersist: this.options.onTokensPersisted,
     });
 
     let transport = new StreamableHTTPClientTransport(new URL(config.robinhoodMcpUrl), {

@@ -167,6 +167,12 @@ export const config = {
   decisionLogPath: env.DECISION_LOG_PATH ?? 'state/decisions.jsonl',
   riskStatePath: env.RISK_STATE_PATH ?? 'state/risk.json',
   rhTokensPath: env.RH_TOKENS_PATH ?? 'state/rh-tokens.json',
+  /**
+   * Private Discord channel ID for the encrypted Robinhood token backup
+   * (survives free-tier deploys with no persistent disk). Unset = vault
+   * disabled entirely.
+   */
+  rhTokensVaultChannelId: env.RH_TOKENS_VAULT_CHANNEL_ID?.trim() || null,
   settingsPath: env.SETTINGS_PATH ?? 'state/settings.json',
 } as const;
 

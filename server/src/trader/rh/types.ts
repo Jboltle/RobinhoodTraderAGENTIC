@@ -108,6 +108,8 @@ export interface FileOAuthProviderOptions {
   readonly clientName: string;
   readonly redirectUri: string;
   readonly onAuthorizationUrl: (url: URL) => void | Promise<void>;
+  /** Fire-and-forget hook invoked after each successful persist (e.g. vault backup). */
+  readonly onPersist?: () => void;
 }
 
 export interface PersistedState {
