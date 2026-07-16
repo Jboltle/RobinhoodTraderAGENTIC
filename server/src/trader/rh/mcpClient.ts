@@ -17,10 +17,19 @@ const log = createLogger('trader:rh:mcp');
 
 const CLIENT_INFO = { name: 'rh-discord-trader', version: '0.1.0' };
 
+interface AuthCodeSubmission {
+  readonly code: string;
+  readonly state: string | null;
+}
+
 export class RobinhoodMcpClient {
   private client: Client | undefined;
   private toolNames: string[] = [];
   private connectPromise: Promise<void> | undefined;
+  /** Authorization URL awaiting user consent; null once connected. */
+  private pendingAuthUrl: string | null = null;
+  /** Resolver for a manually pasted redirect URL (dashboard flow); null when no auth is pending. */
+  private manualAuthResolve: ((submission: AuthCodeSubmission) => void) | null = null;
 
   /**
    * Idempotent: connects on first call, returns the same connection thereafter.
@@ -60,6 +69,7 @@ export class RobinhoodMcpClient {
         // The working consent SPA (captured from Codex CLI's flow) lives at
         // robinhood.com/mcp/trading with identical query params.
         if (url.pathname === '/oauth') url.pathname = '/mcp/trading';
+        this.pendingAuthUrl = url.toString();
         log.info('OAuth authorization required');
         process.stdout.write('\n========================================\n');
         process.stdout.write('Robinhood authorization required.\n');
@@ -93,7 +103,23 @@ export class RobinhoodMcpClient {
         callbackPath,
         redirectUri: config.robinhoodOAuthRedirectUri,
       });
-      const { code, state } = await awaitAuthorizationCode(host, port, callbackPath);
+      // Race the loopback listener (local dev) against a manually pasted
+      // redirect URL (deployed dashboard, POST /api/auth/callback).
+      // ponytail: a listener failure (port in use, 30-min timeout) must not
+      // kill the race while the manual path is viable, so it collapses into a
+      // never-resolving promise. The manual path has no timeout — a single-user
+      // service just waits for a paste that may never come.
+      const manualSubmission = new Promise<AuthCodeSubmission>((resolve) => {
+        this.manualAuthResolve = resolve;
+      });
+      const localListener = awaitAuthorizationCode(host, port, callbackPath).catch((err) => {
+        log.warn('OAuth callback listener unavailable; manual paste still works', {
+          error: (err as Error).message,
+        });
+        return new Promise<never>(() => {});
+      });
+      const { code, state } = await Promise.race([localListener, manualSubmission]);
+      this.manualAuthResolve = null;
       if (provider.expectedState !== undefined && state !== provider.expectedState) {
         throw new Error('OAuth state mismatch on callback; aborting token exchange');
       }
@@ -110,7 +136,30 @@ export class RobinhoodMcpClient {
     }
 
     this.client = client;
+    this.pendingAuthUrl = null;
     await this.introspect(client);
+  }
+
+  /** Authorization URL awaiting user consent, or null when none is pending. */
+  getPendingAuthUrl(): string | null {
+    return this.pendingAuthUrl;
+  }
+
+  /**
+   * Completes the OAuth flow with a code the user pasted into the dashboard
+   * (the deployed alternative to the loopback listener). Throws when no auth
+   * flow is waiting for a code.
+   */
+  submitAuthCode(code: string, state: string | null): void {
+    if (!this.manualAuthResolve) {
+      throw new Error('no OAuth authorization is pending');
+    }
+    this.manualAuthResolve({ code, state });
+    this.manualAuthResolve = null;
+  }
+
+  isAuthPending(): boolean {
+    return this.manualAuthResolve !== null;
   }
 
   private async introspect(client: Client): Promise<void> {

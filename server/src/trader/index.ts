@@ -64,21 +64,7 @@ async function main(): Promise<void> {
   const mcp = config.tradeExecutionMode === 'immediate' ? new RobinhoodMcpClient() : null;
   const tools = mcp ? new RobinhoodTools(mcp) : buildDisabledRobinhoodTools();
 
-  if (mcp) {
-    log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
-    await mcp.ensureConnected();
-    log.info('Robinhood MCP connected', { tools: mcp.getToolNames() });
-
-    // ponytail: fail-fast on purpose — immediate mode is useless if the account
-    // can't be read, and main().catch already exits 1. Also warms the
-    // accountNumber cache in RobinhoodTools for later order placement.
-    const account = await tools.getBuyingPower();
-    log.info('Robinhood account snapshot', {
-      accountNumber: account.accountNumber,
-      portfolioValueUsd: account.portfolioValueUsd,
-      buyingPowerUsd: account.amountUsd,
-    });
-  } else {
+  if (!mcp) {
     log.warn('Robinhood MCP disabled in approval mode; no orders will be submitted');
   }
 
@@ -91,8 +77,33 @@ async function main(): Promise<void> {
     callouts: createCalloutHistory(),
   });
 
+  // Listen before connecting: on Render the OAuth flow can only complete via
+  // the dashboard hitting /api/auth/*, so the port must be open while auth is
+  // pending. No fail-fast on auth errors — a deployed server must stay up.
   await fastify.listen({ port: config.traderPort, host: config.traderHost });
   log.info('trader listening', { host: config.traderHost, port: config.traderPort });
+
+  if (mcp) {
+    log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
+    void mcp
+      .ensureConnected()
+      .then(async () => {
+        log.info('Robinhood MCP connected', { tools: mcp.getToolNames() });
+        // Also warms the accountNumber cache in RobinhoodTools for later orders.
+        const account = await tools.getBuyingPower();
+        log.info('Robinhood account snapshot', {
+          accountNumber: account.accountNumber,
+          portfolioValueUsd: account.portfolioValueUsd,
+          buyingPowerUsd: account.amountUsd,
+        });
+      })
+      .catch((err) => {
+        log.error('Robinhood MCP connection failed', {
+          error: (err as Error).message,
+          stack: (err as Error).stack,
+        });
+      });
+  }
 }
 
 main().catch((err) => {

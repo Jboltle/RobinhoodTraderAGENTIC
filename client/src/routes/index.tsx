@@ -2,6 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
 
 import { CalloutCard } from '../components/CalloutCard'
+import { ConnectBanner } from '../components/ConnectBanner'
 import { fetchCallouts, fetchPortfolio } from '../lib/api'
 import type {
   CalloutItem,
@@ -36,6 +37,7 @@ function Dashboard() {
 
   return (
     <div className="flex flex-col gap-8">
+      <ConnectBanner />
       <LiveStageBanner />
       <PortfolioSummaryBar />
       <section>

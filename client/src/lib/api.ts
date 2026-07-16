@@ -147,6 +147,14 @@ export interface TradeSettings {
   regularHoursOnly: boolean
 }
 
+/** GET /api/auth/status: Robinhood OAuth state for the connect banner. */
+export interface AuthStatus {
+  connected: boolean
+  /** Authorization URL to open when auth is pending; null once connected (or before the server triggers OAuth). */
+  authUrl: string | null
+  executionMode: 'immediate' | 'approval'
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${TRADER_URL}${path}`)
   if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`)
@@ -169,3 +177,19 @@ export const fetchCallouts = (): Promise<CalloutItem[]> =>
 
 export const fetchPortfolio = (): Promise<PortfolioSummary> =>
   getJson<PortfolioSummary>('/api/portfolio')
+
+export const fetchAuthStatus = (): Promise<AuthStatus> =>
+  getJson<AuthStatus>('/api/auth/status')
+
+/** POST the dead-end 127.0.0.1 redirect URL the user pasted after approving in Robinhood. */
+export async function submitAuthRedirect(redirectUrl: string): Promise<void> {
+  const res = await fetch(`${TRADER_URL}/api/auth/callback`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirectUrl }),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `POST /api/auth/callback failed: ${res.status}`)
+  }
+}

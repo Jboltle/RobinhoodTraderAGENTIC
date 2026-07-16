@@ -48,6 +48,7 @@ import type { Callout, CalloutParser, Decision } from '../../shared/types.js';
 import { signWebhookBody } from '../../shared/webhookAuth.js';
 import type { CalloutHistory, CalloutMessage } from '../callouts.js';
 import { DecisionLog } from '../decisionLog.js';
+import type { RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { RobinhoodTools } from '../rh/tools.js';
 import { buildServer } from '../server.js';
 
@@ -105,7 +106,8 @@ interface Harness {
 
 function makeHarness(
   toolsOverrides: Partial<RobinhoodTools> = {},
-  callouts: CalloutHistory = { getToday: vi.fn().mockResolvedValue([]) }
+  callouts: CalloutHistory = { getToday: vi.fn().mockResolvedValue([]) },
+  mcp: RobinhoodMcpClient | null = null
 ): Harness {
   const decisions = new DecisionLog(`${TEST_DIR}/decisions.jsonl`);
   const appendSpy = vi.spyOn(decisions, 'append');
@@ -115,7 +117,7 @@ function makeHarness(
     tools,
     decisions,
     postReceipt: vi.fn().mockResolvedValue(undefined),
-    mcp: null,
+    mcp,
     callouts,
   });
   return { app, decisions, tools, appendSpy };
@@ -602,6 +604,83 @@ describe('GET /api/portfolio', () => {
     const response = await harness.app.inject({ method: 'GET', url: '/api/portfolio' });
     expect(response.statusCode).toBe(503);
     expect(response.json()).toMatchObject({ error: 'robinhood unavailable' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OAuth-over-dashboard
+// ---------------------------------------------------------------------------
+
+function makeMcp(overrides: Partial<RobinhoodMcpClient> = {}): RobinhoodMcpClient {
+  return {
+    isConnected: vi.fn().mockReturnValue(false),
+    getPendingAuthUrl: vi.fn().mockReturnValue('https://robinhood.com/mcp/trading?state=abc'),
+    isAuthPending: vi.fn().mockReturnValue(true),
+    submitAuthCode: vi.fn(),
+    ...overrides,
+  } as unknown as RobinhoodMcpClient;
+}
+
+describe('GET /api/auth/status', () => {
+  it('reports pending auth URL while disconnected', async () => {
+    const harness = makeHarness({}, undefined, makeMcp());
+    const response = await harness.app.inject({ method: 'GET', url: '/api/auth/status' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      connected: false,
+      authUrl: 'https://robinhood.com/mcp/trading?state=abc',
+      executionMode: 'immediate',
+    });
+  });
+
+  it('reports disconnected with no URL when mcp is null (approval mode)', async () => {
+    const harness = makeHarness();
+    const response = await harness.app.inject({ method: 'GET', url: '/api/auth/status' });
+    expect(response.json()).toMatchObject({ connected: false, authUrl: null });
+  });
+});
+
+describe('POST /api/auth/callback', () => {
+  const post = (harness: Harness, body: unknown) =>
+    harness.app.inject({
+      method: 'POST',
+      url: '/api/auth/callback',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify(body),
+    });
+
+  it('extracts code and state from the pasted redirect URL', async () => {
+    const mcp = makeMcp();
+    const harness = makeHarness({}, undefined, mcp);
+    const response = await post(harness, {
+      redirectUrl: '  http://127.0.0.1:8788/oauth/callback?code=the-code&state=the-state ',
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ ok: true });
+    expect(mcp.submitAuthCode).toHaveBeenCalledWith('the-code', 'the-state');
+  });
+
+  it('400s on an unparseable URL and on a URL without a code', async () => {
+    const harness = makeHarness({}, undefined, makeMcp());
+    expect((await post(harness, { redirectUrl: 'not a url' })).statusCode).toBe(400);
+    expect(
+      (await post(harness, { redirectUrl: 'http://127.0.0.1:8788/oauth/callback?state=x' }))
+        .statusCode
+    ).toBe(400);
+    expect((await post(harness, { wrong: 'shape' })).statusCode).toBe(400);
+  });
+
+  it('409s when no auth is pending or mcp is null', async () => {
+    const noPending = makeHarness(
+      {},
+      undefined,
+      makeMcp({ isAuthPending: vi.fn().mockReturnValue(false) })
+    );
+    const url = 'http://127.0.0.1:8788/oauth/callback?code=x&state=y';
+    expect((await post(noPending, { redirectUrl: url })).statusCode).toBe(409);
+
+    const nullMcp = makeHarness();
+    expect((await post(nullMcp, { redirectUrl: url })).statusCode).toBe(409);
   });
 });
 

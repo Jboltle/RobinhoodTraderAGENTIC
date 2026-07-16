@@ -42,6 +42,9 @@ const WebhookBodySchema = z.object({
   settings: TradeSettingsSchema.optional(),
 });
 
+/** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
+const AuthCallbackBodySchema = z.object({ redirectUrl: z.string() });
+
 export interface ServerDeps extends PipelineDeps {
   readonly mcp: RobinhoodMcpClient | null;
   readonly callouts: CalloutHistory;
@@ -118,6 +121,42 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       rhTokenExpiresInSec: tokenStatus?.expiresInSec ?? null,
       rhTools: deps.mcp?.getToolNames() ?? [],
     });
+  });
+
+  // OAuth-over-dashboard: Robinhood only allows loopback redirect URIs, so on
+  // a deployed server the post-consent redirect dead-ends on the user's own
+  // 127.0.0.1. The dashboard shows the auth URL from here, the user approves,
+  // then pastes the dead-end redirect URL into POST /api/auth/callback.
+  fastify.get('/api/auth/status', async (_request, reply) => {
+    return reply.send({
+      connected: deps.mcp?.isConnected() ?? false,
+      authUrl: deps.mcp?.getPendingAuthUrl() ?? null,
+      executionMode: config.tradeExecutionMode,
+    });
+  });
+
+  fastify.post('/api/auth/callback', async (request, reply) => {
+    const parsed = AuthCallbackBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'body must be { redirectUrl: string }' });
+    }
+    let url: URL;
+    try {
+      url = new URL(parsed.data.redirectUrl.trim());
+    } catch {
+      return reply.status(400).send({ error: 'redirectUrl is not a valid URL' });
+    }
+    const code = url.searchParams.get('code');
+    if (!code) {
+      return reply.status(400).send({ error: 'redirectUrl has no code parameter' });
+    }
+    if (!deps.mcp || !deps.mcp.isAuthPending()) {
+      return reply.status(409).send({ error: 'no OAuth authorization is pending' });
+    }
+    deps.mcp.submitAuthCode(code, url.searchParams.get('state'));
+    // Token exchange happens asynchronously inside the pending connect();
+    // the client polls /api/auth/status until `connected` flips.
+    return reply.send({ ok: true });
   });
 
   // Returns decisions newest-first (dashboard shows the latest activity on top).
