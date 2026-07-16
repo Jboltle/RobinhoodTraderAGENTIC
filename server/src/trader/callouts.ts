@@ -23,6 +23,7 @@ const log = createLogger('trader:callouts');
 const DISCORD_API = 'https://discord.com/api/v10';
 const PAGE_SIZE = 100;
 const CACHE_TTL_MS = 60_000;
+const FAILURE_COOLDOWN_MS = 30_000;
 /** Discord message types the bot treats as non-system: DEFAULT and REPLY. */
 const USER_MESSAGE_TYPES = new Set([0, 19]);
 
@@ -170,12 +171,17 @@ async function discordGet(url: URL, fetchImpl: typeof fetch): Promise<unknown> {
 }
 
 export interface CalloutHistory {
-  /** Today's displayable callouts across all allowlisted channels, newest-first. Cached ~60s. */
+  /**
+   * Today's displayable callouts across all allowlisted channels, newest-first.
+   * Cached ~60s; on Discord failure serves the last successful result (stale)
+   * and backs off for 30s. Throws only when no fetch has ever succeeded.
+   */
   getToday(): Promise<CalloutMessage[]>;
 }
 
 export function createCalloutHistory(fetchImpl: typeof fetch = fetch): CalloutHistory {
   let cache: { at: number; messages: CalloutMessage[] } | null = null;
+  let lastFailure: { at: number; error: Error } | null = null;
   // Channel names change rarely; cache them for the process lifetime.
   const channelNames = new Map<string, string | null>();
 
@@ -199,28 +205,47 @@ export function createCalloutHistory(fetchImpl: typeof fetch = fetch): CalloutHi
     async getToday(): Promise<CalloutMessage[]> {
       if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.messages;
 
-      const since = localMidnight();
-      const messages: CalloutMessage[] = [];
-      for (const channelId of config.discordAllowedChannelIds) {
-        const name = await channelName(channelId);
-        const raw = await fetchChannelMessagesSince(channelId, since, fetchImpl);
-        for (const msg of raw) {
-          if (!isDisplayableCallout(msg, config.discordAllowedAuthorIds)) continue;
-          messages.push({
-            messageId: msg.id,
-            channelId: msg.channel_id,
-            channelName: name,
-            authorName: msg.author.global_name ?? msg.author.username,
-            timestamp: msg.timestamp,
-            content: flattenRestMessage(msg),
-            embeds: msg.embeds ?? [],
-          });
-        }
+      // ponytail: naive fixed cooldown after a failed fetch, not a bucket-aware
+      // limiter; upgrade path is honoring Discord rate-limit headers here.
+      if (lastFailure && Date.now() - lastFailure.at < FAILURE_COOLDOWN_MS) {
+        if (cache) return cache.messages;
+        throw lastFailure.error;
       }
-      messages.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
 
-      cache = { at: Date.now(), messages };
-      return messages;
+      try {
+        const since = localMidnight();
+        const messages: CalloutMessage[] = [];
+        for (const channelId of config.discordAllowedChannelIds) {
+          const name = await channelName(channelId);
+          const raw = await fetchChannelMessagesSince(channelId, since, fetchImpl);
+          for (const msg of raw) {
+            if (!isDisplayableCallout(msg, config.discordAllowedAuthorIds)) continue;
+            messages.push({
+              messageId: msg.id,
+              channelId: msg.channel_id,
+              channelName: name,
+              authorName: msg.author.global_name ?? msg.author.username,
+              timestamp: msg.timestamp,
+              content: flattenRestMessage(msg),
+              embeds: msg.embeds ?? [],
+            });
+          }
+        }
+        messages.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+
+        cache = { at: Date.now(), messages };
+        lastFailure = null;
+        return messages;
+      } catch (err) {
+        lastFailure = { at: Date.now(), error: err as Error };
+        if (cache) {
+          log.warn('serving stale callouts; discord unavailable', {
+            error: (err as Error).message,
+          });
+          return cache.messages;
+        }
+        throw err;
+      }
     },
   };
 }
