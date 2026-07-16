@@ -23,10 +23,10 @@ const log = createLogger('trader:rh:tools');
 export const TOOL_NAMES = {
   quote: 'get_equity_quotes',
   optionsQuote: 'get_option_quotes',
-  // RH does not advertise a dedicated buying-power tool. `get_accounts`
-  // typically returns buying_power on each account row; `parseBuyingPower`
-  // deep-finds the relevant key.
-  buyingPower: 'get_accounts',
+  // `get_accounts` lists accounts (no dollar values); `get_portfolio` returns
+  // buying power / total value for one account_number.
+  accounts: 'get_accounts',
+  portfolio: 'get_portfolio',
   positions: 'get_equity_positions',
   optionPositions: 'get_option_positions',
   placeOrder: 'place_equity_order',
@@ -75,8 +75,17 @@ export class RobinhoodTools {
     }
   }
 
-  getBuyingPower(): Promise<BuyingPowerResult> {
-    return this.callTool(TOOL_NAMES.buyingPower, {}, parseBuyingPower);
+  async getBuyingPower(): Promise<BuyingPowerResult> {
+    if (!this.mcp.getToolNames().includes(TOOL_NAMES.portfolio)) {
+      // ponytail: older MCP versions don't advertise get_portfolio; fall back
+      // to deep-finding dollar fields on get_accounts rows (current servers
+      // omit them, yielding amountUsd 0 / portfolioValueUsd null).
+      return this.callTool(TOOL_NAMES.accounts, {}, parseBuyingPower);
+    }
+    const accountNumber = await this.getDefaultAccountNumber();
+    return this.callTool(TOOL_NAMES.portfolio, { account_number: accountNumber }, (raw) =>
+      parsePortfolio(raw, accountNumber)
+    );
   }
 
   async getPositions(): Promise<PositionsResult> {
@@ -149,6 +158,14 @@ export class RobinhoodTools {
     args: Record<string, unknown>,
     parse: (raw: CallToolResult) => T
   ): Promise<T> {
+    // Distinguish "not connected yet" (startup/OAuth pending) from a server
+    // that is connected but genuinely lacks the tool — the empty-list error
+    // ("Available: ") sent users hunting for the wrong problem.
+    if (!this.mcp.isConnected()) {
+      throw new Error(
+        'Robinhood MCP not connected yet (startup or OAuth authorization pending)'
+      );
+    }
     const advertised = this.mcp.getToolNames();
     if (!advertised.includes(name)) {
       throw new Error(
@@ -158,13 +175,25 @@ export class RobinhoodTools {
     return withRetry(name, async () => parse(await this.mcp.callTool(name, args)));
   }
 
+  /**
+   * Resolve and cache the trading account from `get_accounts`, preferring the
+   * agentic-allowed account: the `is_default` account is often one the agent
+   * is NOT allowed to act on (agentic_allowed: false).
+   */
   private async getDefaultAccountNumber(): Promise<string> {
     if (this.accountNumber) return this.accountNumber;
-    const buyingPower = await this.getBuyingPower();
-    if (!buyingPower.accountNumber) {
-      throw new Error('could not determine Robinhood account_number from get_accounts');
+    const account = await this.callTool(TOOL_NAMES.accounts, {}, selectAccount);
+    this.accountNumber = account.accountNumber;
+    const masked = `••••${account.accountNumber.slice(-4)}`;
+    log.info('selected Robinhood account', {
+      account: masked,
+      agenticAllowed: account.agenticAllowed,
+    });
+    if (!account.agenticAllowed) {
+      log.warn('selected account is not agentic_allowed — order placement may be rejected', {
+        account: masked,
+      });
     }
-    this.accountNumber = buyingPower.accountNumber;
     return this.accountNumber;
   }
 }
@@ -193,6 +222,55 @@ function parseQuote(result: CallToolResult): QuoteResult {
     throw new Error(`could not parse quote price: ${extractText(result).slice(0, 200)}`);
   }
   return { price, raw: data ?? result };
+}
+
+interface SelectedAccount {
+  readonly accountNumber: string;
+  readonly agenticAllowed: boolean;
+}
+
+/**
+ * Pick the tradable account from the get_accounts list, in priority order:
+ * agentic-allowed + active, then is_default, then the first row.
+ */
+function selectAccount(result: CallToolResult): SelectedAccount {
+  const data = structuredOrJson(result);
+  const rows = extractAccountRows(data);
+  const pick =
+    rows.find((r) => r.agentic_allowed === true && r.state === 'active') ??
+    rows.find((r) => r.is_default === true) ??
+    rows[0];
+  const accountNumber = pick
+    ? deepFindString(pick, ['account_number', 'accountNumber', 'account_id', 'id'])
+    : null;
+  if (!accountNumber) {
+    throw new Error('could not determine Robinhood account_number from get_accounts');
+  }
+  return { accountNumber, agenticAllowed: pick?.agentic_allowed === true };
+}
+
+function extractAccountRows(value: unknown): Record<string, unknown>[] {
+  const accounts =
+    deepFind(value, ['accounts'], (v): v is unknown[] => Array.isArray(v)) ?? extractList(value);
+  return accounts
+    .map(asRecord)
+    .filter((r): r is Record<string, unknown> => r !== null);
+}
+
+function parsePortfolio(result: CallToolResult, accountNumber: string): BuyingPowerResult {
+  const data = structuredOrJson(result);
+  // buying_power is nested ({ buying_power: { buying_power: "100.0000" } }),
+  // so search for it alone first — otherwise a sibling `cash` key wins.
+  const amountUsd =
+    deepFindNumber(data, ['buying_power']) ??
+    deepFindNumber(data, ['unleveraged_buying_power', 'cash']) ??
+    0;
+  const portfolioValueUsd = deepFindNumber(data, [
+    'total_value',
+    'portfolio_value',
+    'equity_value',
+  ]);
+  return { amountUsd, accountNumber, portfolioValueUsd, raw: data ?? result };
 }
 
 function parseBuyingPower(result: CallToolResult): BuyingPowerResult {
@@ -334,8 +412,17 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+// RH MCP payloads encode dollar amounts as strings ("100.0000"); coerce
+// numeric strings so parsers work with either convention.
 function deepFindNumber(value: unknown, keys: readonly string[]): number | null {
-  return deepFind(value, keys, (v): v is number => typeof v === 'number' && Number.isFinite(v));
+  const found = deepFind(
+    value,
+    keys,
+    (v): v is number | string =>
+      (typeof v === 'number' && Number.isFinite(v)) ||
+      (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)))
+  );
+  return found === null ? null : Number(found);
 }
 
 function deepFindString(value: unknown, keys: readonly string[]): string | null {

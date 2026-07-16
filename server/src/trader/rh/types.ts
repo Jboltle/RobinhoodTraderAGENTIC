@@ -26,7 +26,7 @@ export interface QuoteResult {
 export interface BuyingPowerResult {
   readonly amountUsd: number;
   readonly accountNumber: string | null;
-  /** Total account value from the same get_accounts row; null when absent. */
+  /** Total account value (get_portfolio total_value); null when absent. */
   readonly portfolioValueUsd: number | null;
   readonly raw: unknown;
 }

@@ -135,9 +135,12 @@ export class RobinhoodMcpClient {
       await client.connect(transport);
     }
 
+    // Introspect BEFORE exposing the client: isConnected()/getToolNames() must
+    // never report connected-with-zero-tools, or concurrent API calls fail with
+    // 'does not advertise "get_accounts"'.
+    await this.introspect(client);
     this.client = client;
     this.pendingAuthUrl = null;
-    await this.introspect(client);
   }
 
   /** Authorization URL awaiting user consent, or null when none is pending. */
