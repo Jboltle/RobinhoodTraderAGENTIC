@@ -8,13 +8,21 @@
 import { config } from '../shared/config.js';
 import type { DiscordEnvelope } from '../shared/types.js';
 import { signWebhookBody } from '../shared/webhookAuth.js';
-import type { ForwardRequest } from './types.js';
 
-export type { ForwardRequest } from './types.js';
+/** The signed HTTP request (url + HMAC headers + body) delivered to the trader. */
+export interface ForwardRequest {
+  readonly url: string;
+  readonly headers: Record<string, string>;
+  readonly body: string;
+}
 
-/** Build the signed HTTP request (url + HMAC headers + body) for a given envelope. */
+/**
+ * Build the signed HTTP request (url + HMAC headers + body) for a given
+ * envelope. The trader expects a `{ envelope, settings? }` wrapper; the bot
+ * never sends settings, so the body is just `{ envelope }`.
+ */
 export function buildForwardRequest(envelope: DiscordEnvelope): ForwardRequest {
-  const body = JSON.stringify(envelope);
+  const body = JSON.stringify({ envelope });
   return {
     url: config.traderWebhookUrl,
     headers: {

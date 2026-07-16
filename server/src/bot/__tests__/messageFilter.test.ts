@@ -88,7 +88,10 @@ describe('classifyMessage', () => {
   });
 
   it('ignores all messages when the channel allow-list is empty (fail-closed)', () => {
-    const emptyCfg: MessageFilterConfig = { discordAllowedChannelIds: [], discordAllowedAuthorIds: [] };
+    const emptyCfg: MessageFilterConfig = {
+      discordAllowedChannelIds: [],
+      discordAllowedAuthorIds: [],
+    };
     const result = classifyMessage(mockMessage({ channelId: '111' }), emptyCfg);
     expect(result).toEqual({ forward: false, reason: 'channel_not_allowed' });
   });
@@ -98,14 +101,21 @@ describe('classifyMessage', () => {
     expect(result).toEqual({ forward: false, reason: 'system_message' });
   });
 
-  it('ignores webhook-authored messages', () => {
-    const result = classifyMessage(mockMessage({ channelId: '111', webhookId: 'wh-1' }), ALLOW);
-    expect(result).toEqual({ forward: false, reason: 'webhook_message' });
+  it('forwards bot- and webhook-authored alert messages', () => {
+    const bot = classifyMessage(mockMessage({ channelId: '111', author: { id: 'alertbot', bot: true } }), ALLOW);
+    expect(bot).toEqual({ forward: true, reason: 'allowed' });
+
+    const webhook = classifyMessage(mockMessage({ channelId: '111', webhookId: 'wh-1' }), ALLOW);
+    expect(webhook).toEqual({ forward: true, reason: 'allowed' });
   });
 
-  it('ignores bot-authored messages', () => {
-    const result = classifyMessage(mockMessage({ channelId: '111', author: { id: 'b', bot: true } }), ALLOW);
-    expect(result).toEqual({ forward: false, reason: 'bot_author' });
+  it('always ignores the bot’s own messages', () => {
+    const result = classifyMessage(
+      mockMessage({ channelId: '111', author: { id: 'self-bot', bot: true } }),
+      ALLOW,
+      'self-bot'
+    );
+    expect(result).toEqual({ forward: false, reason: 'self_author' });
   });
 
   it('empty author allow-list means every author is allowed', () => {
@@ -170,11 +180,15 @@ describe('shouldMirrorMessage', () => {
 describe('configured DISCORD_ALLOWED_CHANNEL_IDS', () => {
   const configured = config.discordAllowedChannelIds;
 
+  // Use an allow-listed author (when one is configured) so this test isolates
+  // the channel gate from the separate author allow-list.
+  const allowedAuthorId = config.discordAllowedAuthorIds[0] ?? 'author-001';
+
   it.skipIf(configured.length === 0)(
     'forwards a normal message from each configured allow-listed channel',
     () => {
       for (const channelId of configured) {
-        const result = classifyMessage(mockMessage({ channelId }), {
+        const result = classifyMessage(mockMessage({ channelId, author: { id: allowedAuthorId } }), {
           discordAllowedChannelIds: configured,
           discordAllowedAuthorIds: config.discordAllowedAuthorIds,
         });

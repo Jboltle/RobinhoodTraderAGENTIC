@@ -1,63 +1,37 @@
 import { createLogger } from '../../shared/logger.js';
 import type { RobinhoodMcpClient } from './mcpClient.js';
 import type {
-  AccountScopedArgs,
   BuyingPowerResult,
   CallToolResult,
   OptionPosition,
   OptionPositionsResult,
   OptionsQuoteResult,
   PlaceOptionsOrderArgs,
-  PlaceOptionsOrderPayload,
   PlaceOptionsOrderResult,
   PlaceOrderArgs,
-  PlaceOrderPayload,
   PlaceOrderResult,
   Position,
   PositionsResult,
   QuoteResult,
-  RhToolMap,
-  ToolArgs,
-  ToolKind,
-  ToolRegistry,
-  ToolResult,
 } from './types.js';
 
 export type * from './types.js';
 
 const log = createLogger('trader:rh:tools');
 
-// =============================================================================
-// Tool registry
-//
-// Each entry binds a logical capability (`ToolKind`) to the exact MCP tool
-// name advertised by Robinhood and a parser that turns the raw
-// `CallToolResult` into the typed result registered for that kind. The
-// registry is the single source of truth: `RobinhoodTools.call(kind, args)`
-// is a fully type-safe dispatch — args/result are inferred from `kind`.
-// See ./types.ts for the full tool map and payload shapes.
-// =============================================================================
-
-const TOOL_REGISTRY: ToolRegistry = {
-  quote: { name: 'get_equity_quotes', parse: parseQuote },
-  optionsQuote: { name: 'get_option_quotes', parse: parseOptionsQuote },
-  buyingPower: { name: 'get_accounts', parse: parseBuyingPower },
-  positions: { name: 'get_equity_positions', parse: parsePositions },
-  optionPositions: { name: 'get_option_positions', parse: parseOptionPositions },
-  placeOrder: { name: 'place_equity_order', parse: parsePlaceOrder },
-  placeOptionsOrder: { name: 'place_option_order', parse: parsePlaceOrder },
-};
-
-/** Canonical MCP tool name expected for each ToolKind. Read-only view of the registry. */
-export const TOOL_NAMES: { readonly [K in ToolKind]: RhToolMap[K]['name'] } = {
-  quote: TOOL_REGISTRY.quote.name,
-  optionsQuote: TOOL_REGISTRY.optionsQuote.name,
-  buyingPower: TOOL_REGISTRY.buyingPower.name,
-  positions: TOOL_REGISTRY.positions.name,
-  optionPositions: TOOL_REGISTRY.optionPositions.name,
-  placeOrder: TOOL_REGISTRY.placeOrder.name,
-  placeOptionsOrder: TOOL_REGISTRY.placeOptionsOrder.name,
-};
+/** Canonical MCP tool names advertised by the Robinhood trading server. */
+export const TOOL_NAMES = {
+  quote: 'get_equity_quotes',
+  optionsQuote: 'get_option_quotes',
+  // RH does not advertise a dedicated buying-power tool. `get_accounts`
+  // typically returns buying_power on each account row; `parseBuyingPower`
+  // deep-finds the relevant key.
+  buyingPower: 'get_accounts',
+  positions: 'get_equity_positions',
+  optionPositions: 'get_option_positions',
+  placeOrder: 'place_equity_order',
+  placeOptionsOrder: 'place_option_order',
+} as const;
 
 // =============================================================================
 // Public client
@@ -68,30 +42,8 @@ export class RobinhoodTools {
 
   constructor(private readonly mcp: RobinhoodMcpClient) {}
 
-  /**
-   * Single type-safe dispatch. Validates that the live MCP server advertises
-   * the canonical tool name, calls it with retries, and parses the response
-   * into the typed result registered for `kind`.
-   */
-  async call<K extends ToolKind>(kind: K, args: ToolArgs<K>): Promise<ToolResult<K>> {
-    const descriptor = TOOL_REGISTRY[kind];
-    const advertised = this.mcp.getToolNames();
-    if (!advertised.includes(descriptor.name)) {
-      throw new Error(
-        `Robinhood MCP does not advertise "${descriptor.name}" (${kind}). ` +
-          `Available: ${advertised.join(', ')}`
-      );
-    }
-    return withRetry(descriptor.name, async () => {
-      const result = await this.mcp.callTool(descriptor.name, args as Record<string, unknown>);
-      return descriptor.parse(result);
-    });
-  }
-
-  // -- Ergonomic typed facades over `call(...)` ------------------------------
-
   getQuote(symbol: string): Promise<QuoteResult> {
-    return this.call('quote', { symbols: [symbol] });
+    return this.callTool(TOOL_NAMES.quote, { symbols: [symbol] }, parseQuote);
   }
 
   /**
@@ -108,66 +60,102 @@ export class RobinhoodTools {
   ): Promise<OptionsQuoteResult | null> {
     if (!this.mcp.getToolNames().includes(TOOL_NAMES.optionsQuote)) return null;
     try {
-      return await this.call('optionsQuote', {
-        symbol,
-        option_type: optionType,
-        strike_price: strike,
-        expiration_date: expiration,
-      });
+      return await this.callTool(
+        TOOL_NAMES.optionsQuote,
+        {
+          symbol,
+          option_type: optionType,
+          strike_price: strike,
+          expiration_date: expiration,
+        },
+        parseOptionsQuote
+      );
     } catch {
       return null;
     }
   }
 
   getBuyingPower(): Promise<BuyingPowerResult> {
-    return this.call('buyingPower', {});
+    return this.callTool(TOOL_NAMES.buyingPower, {}, parseBuyingPower);
   }
 
   async getPositions(): Promise<PositionsResult> {
-    return this.call('positions', { account_number: await this.getDefaultAccountNumber() });
+    return this.callTool(
+      TOOL_NAMES.positions,
+      { account_number: await this.getDefaultAccountNumber() },
+      parsePositions
+    );
   }
 
   async getOptionPositions(): Promise<OptionPositionsResult> {
-    return this.call('optionPositions', { account_number: await this.getDefaultAccountNumber() });
+    return this.callTool(
+      TOOL_NAMES.optionPositions,
+      { account_number: await this.getDefaultAccountNumber() },
+      parseOptionPositions
+    );
   }
 
   async placeOrder(args: PlaceOrderArgs): Promise<PlaceOrderResult> {
     if (args.orderType === 'limit' && typeof args.limitPrice !== 'number') {
       throw new Error('limitPrice required for limit orders');
     }
-    const payload: PlaceOrderPayload = {
-      account_number: await this.getDefaultAccountNumber(),
-      symbol: args.symbol,
-      side: args.side,
-      type: args.orderType,
-      quantity: args.quantity,
-      time_in_force: args.timeInForce ?? 'day',
-      ...(args.orderType === 'limit' && args.limitPrice !== undefined
-        ? { limit_price: args.limitPrice, price: args.limitPrice }
-        : {}),
-    };
-    return this.call('placeOrder', payload);
+    return this.callTool(
+      TOOL_NAMES.placeOrder,
+      {
+        account_number: await this.getDefaultAccountNumber(),
+        symbol: args.symbol,
+        side: args.side,
+        type: args.orderType,
+        quantity: args.quantity,
+        time_in_force: args.timeInForce ?? 'day',
+        ...(args.orderType === 'limit' && args.limitPrice !== undefined
+          ? { limit_price: args.limitPrice, price: args.limitPrice }
+          : {}),
+      },
+      parsePlaceOrder
+    );
   }
 
   async placeOptionsOrder(args: PlaceOptionsOrderArgs): Promise<PlaceOptionsOrderResult> {
     if (args.orderType === 'limit' && typeof args.limitPremium !== 'number') {
       throw new Error('limitPremium (per-contract price) required for limit options orders');
     }
-    const payload: PlaceOptionsOrderPayload = {
-      account_number: await this.getDefaultAccountNumber(),
-      symbol: args.symbol,
-      option_type: args.optionType,
-      strike_price: args.strike,
-      expiration_date: args.expiration,
-      quantity: args.contracts,
-      side: args.side,
-      type: args.orderType,
-      time_in_force: args.timeInForce ?? 'day',
-      ...(args.orderType === 'limit' && args.limitPremium !== undefined
-        ? { price: args.limitPremium }
-        : {}),
-    };
-    return this.call('placeOptionsOrder', payload);
+    return this.callTool(
+      TOOL_NAMES.placeOptionsOrder,
+      {
+        account_number: await this.getDefaultAccountNumber(),
+        symbol: args.symbol,
+        option_type: args.optionType,
+        strike_price: args.strike,
+        expiration_date: args.expiration,
+        quantity: args.contracts,
+        side: args.side,
+        type: args.orderType,
+        time_in_force: args.timeInForce ?? 'day',
+        ...(args.orderType === 'limit' && args.limitPremium !== undefined
+          ? { price: args.limitPremium }
+          : {}),
+      },
+      parsePlaceOrder
+    );
+  }
+
+  /**
+   * Validate the live MCP server advertises the tool, call it with retries,
+   * and parse the raw response into the typed result.
+   */
+  private async callTool<T>(
+    name: string,
+    args: Record<string, unknown>,
+    parse: (raw: CallToolResult) => T
+  ): Promise<T> {
+    const advertised = this.mcp.getToolNames();
+    if (!advertised.includes(name)) {
+      throw new Error(
+        `Robinhood MCP does not advertise "${name}". Available: ${advertised.join(', ')}`
+      );
+    }
+    return withRetry(name, async () => parse(await this.mcp.callTool(name, args)));
   }
 
   private async getDefaultAccountNumber(): Promise<string> {
@@ -182,8 +170,7 @@ export class RobinhoodTools {
 }
 
 // =============================================================================
-// Per-tool parsers (kept as `function` declarations so they can be referenced
-// from `TOOL_REGISTRY` above thanks to hoisting).
+// Per-tool parsers
 // =============================================================================
 
 function parseOptionsQuote(result: CallToolResult): OptionsQuoteResult {
@@ -219,7 +206,16 @@ function parseBuyingPower(result: CallToolResult): BuyingPowerResult {
       'cash_available_for_withdrawal',
       'cash_balance',
     ]) ?? 0;
-  return { amountUsd, accountNumber, raw: data ?? result };
+  // Total account value from the same get_accounts row ('equity' is
+  // Robinhood's name for total portfolio value, not stock-only).
+  const portfolioValueUsd = deepFindNumber(data, [
+    'portfolio_value',
+    'total_equity',
+    'equity',
+    'market_value',
+    'total_value',
+  ]);
+  return { amountUsd, accountNumber, portfolioValueUsd, raw: data ?? result };
 }
 
 function parsePositions(result: CallToolResult): PositionsResult {
@@ -271,20 +267,12 @@ function parsePlaceOrder(result: CallToolResult): PlaceOrderResult {
 // Internal helpers
 // =============================================================================
 
-interface RetryOptions {
-  readonly attempts?: number;
-  readonly initialDelayMs?: number;
-}
+const RETRY_ATTEMPTS = 3;
+const RETRY_INITIAL_DELAY_MS = 250;
 
-async function withRetry<T>(
-  label: string,
-  fn: () => Promise<T>,
-  opts: RetryOptions = {}
-): Promise<T> {
-  const attempts = opts.attempts ?? 3;
-  const initialDelayMs = opts.initialDelayMs ?? 250;
+async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
   let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
+  for (let i = 0; i < RETRY_ATTEMPTS; i++) {
     try {
       return await fn();
     } catch (err) {
@@ -292,17 +280,17 @@ async function withRetry<T>(
       log.warn('tool call failed, will retry', {
         label,
         attempt: i + 1,
-        attempts,
+        attempts: RETRY_ATTEMPTS,
         error: (err as Error).message,
       });
-      if (i < attempts - 1) {
-        await new Promise((r) => setTimeout(r, initialDelayMs * Math.pow(2, i)));
+      if (i < RETRY_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, RETRY_INITIAL_DELAY_MS * Math.pow(2, i)));
       }
     }
   }
   throw lastErr instanceof Error
-    ? new Error(`${label} failed after ${attempts} attempts: ${lastErr.message}`)
-    : new Error(`${label} failed after ${attempts} attempts`);
+    ? new Error(`${label} failed after ${RETRY_ATTEMPTS} attempts: ${lastErr.message}`)
+    : new Error(`${label} failed after ${RETRY_ATTEMPTS} attempts`);
 }
 
 function extractText(result: CallToolResult): string {

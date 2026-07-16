@@ -20,14 +20,27 @@ import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import type { DiscordEnvelope } from '../shared/types.js';
 import { forwardToTrader } from './forwarder.js';
-import { buildEnvelope, buildMessageContent } from './messageAssembly.js';
+import {
+  buildEnvelope,
+  buildMessageContent,
+  buildMirrorPayload,
+  type MirrorPayload,
+} from './messageAssembly.js';
 import {
   classifyMessage,
   getChannelParentId,
   hasForwardableContent,
   shouldMirrorMessage,
 } from './messageFilter.js';
-import type { TextSendableChannel } from './types.js';
+
+/** Minimal structural shape of a discord.js channel we can post messages to. */
+type TextSendableChannel = {
+  readonly id: string;
+  readonly name?: string;
+  readonly guildId?: string;
+  isTextBased?: () => boolean;
+  send: (payload: MirrorPayload) => Promise<unknown>;
+};
 
 const log = createLogger('bot');
 
@@ -130,16 +143,6 @@ async function validateForwardChannel(client: Client<true>): Promise<void> {
   }
 }
 
-function formatMirroredMessage(envelope: DiscordEnvelope): string {
-  const header = [
-    `From: ${envelope.authorName} (${envelope.authorId})`,
-    `Source channel: ${envelope.channelId}`,
-    `Message ID: ${envelope.messageId}`,
-  ].join('\n');
-  const content = `${header}\n\n${envelope.content}`;
-  return content.length <= 2000 ? content : content.slice(0, 1997) + '...';
-}
-
 async function mirrorToDiscordChannel(client: Client, message: Message, envelope: DiscordEnvelope): Promise<void> {
   if (!shouldMirrorMessage(message, config.discordForwardChannelId)) return;
 
@@ -149,10 +152,7 @@ async function mirrorToDiscordChannel(client: Client, message: Message, envelope
     throw new Error(`Discord forward channel ${config.discordForwardChannelId} is not sendable`);
   }
 
-  await sendable.send({
-    content: formatMirroredMessage(envelope),
-    allowedMentions: { parse: [] },
-  });
+  await sendable.send(buildMirrorPayload(envelope));
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ async function main(): Promise<void> {
 
   client.on(Events.MessageCreate, async (message) => {
     try {
-      const classification = classifyMessage(message, config);
+      const classification = classifyMessage(message, config, client.user?.id ?? null);
       if (!classification.forward) {
         logIgnoredMessage(message, classification.reason);
         return;

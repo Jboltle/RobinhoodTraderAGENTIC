@@ -1,121 +1,78 @@
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
+import { chat } from '@tanstack/ai';
+import { createAnthropicChat } from '@tanstack/ai-anthropic';
+import { createOllamaChat } from '@tanstack/ai-ollama';
+import { createOpenaiChat } from '@tanstack/ai-openai';
 
 import { config } from './config.js';
-import type { LlmProvider, ToolJsonSchema } from './types.js';
+import type { AnyTextAdapter, JSONSchema } from '@tanstack/ai';
+import type { LlmProvider } from './types.js';
 
-// =============================================================================
-// Anthropic (Claude)
-// =============================================================================
-
-class AnthropicProvider implements LlmProvider {
-  private readonly client: Anthropic;
-  private readonly model: string;
-
-  constructor(opts?: { client?: Anthropic; model?: string }) {
-    this.client = opts?.client ?? new Anthropic({ apiKey: config.anthropicApiKey });
-    this.model = opts?.model ?? config.anthropicModel;
-  }
-
-  async callStructured(opts: {
-    system: string;
-    user: string;
-    tool: { name: string; description: string; schema: ToolJsonSchema };
-    maxTokens?: number;
-  }): Promise<unknown> {
-    const response = await this.client.messages.create({
-      model: this.model,
-      max_tokens: opts.maxTokens ?? 1024,
-      temperature: 0,
-      system: opts.system,
-      tools: [
-        {
-          name: opts.tool.name,
-          description: opts.tool.description,
-          input_schema: opts.tool.schema as unknown as Anthropic.Tool.InputSchema,
-        },
-      ],
-      tool_choice: { type: 'tool', name: opts.tool.name },
-      messages: [{ role: 'user', content: opts.user }],
-    });
-
-    const block = response.content.find(
-      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use'
-    );
-    if (!block) {
-      throw new Error('Anthropic did not produce a tool_use block');
-    }
-    return block.input;
-  }
+interface AdapterSetup {
+  adapter: AnyTextAdapter;
+  /** Provider-shaped options; each provider spells "deterministic" differently. */
+  modelOptions: Record<string, unknown>;
 }
 
-// =============================================================================
-// OpenAI (GPT)
-// =============================================================================
-
-class OpenAiProvider implements LlmProvider {
-  private readonly client: OpenAI;
-  private readonly model: string;
-
-  constructor(opts?: { client?: OpenAI; model?: string }) {
-    this.client = opts?.client ?? new OpenAI({ apiKey: config.openaiApiKey });
-    this.model = opts?.model ?? config.openaiModel;
-  }
-
-  async callStructured(opts: {
-    system: string;
-    user: string;
-    tool: { name: string; description: string; schema: ToolJsonSchema };
-    maxTokens?: number;
-  }): Promise<unknown> {
-    const completion = await this.client.chat.completions.create({
-      model: this.model,
-      max_tokens: opts.maxTokens ?? 1024,
-      temperature: 0,
-      messages: [
-        { role: 'system', content: opts.system },
-        { role: 'user', content: opts.user },
-      ],
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: opts.tool.name,
-            description: opts.tool.description,
-            parameters: opts.tool.schema as unknown as Record<string, unknown>,
-          },
-        },
-      ],
-      tool_choice: { type: 'function', function: { name: opts.tool.name } },
-    });
-
-    const toolCall = completion.choices[0]?.message?.tool_calls?.[0];
-    if (!toolCall || toolCall.type !== 'function') {
-      throw new Error('OpenAI did not produce a function tool_call');
-    }
-    try {
-      return JSON.parse(toolCall.function.arguments);
-    } catch (err) {
-      throw new Error(
-        `OpenAI tool_call arguments were not valid JSON: ${(err as Error).message}`
-      );
-    }
-  }
+// OpenAI rejects the `temperature` param on reasoning models (o-series, gpt-5*).
+function isOpenaiReasoningModel(model: string): boolean {
+  return /^o\d/.test(model) || model.startsWith('gpt-5');
 }
 
-// =============================================================================
-// Factory
-// =============================================================================
-
-export function createLlmProvider(): LlmProvider {
+function createAdapter(): AdapterSetup {
   switch (config.llmProvider) {
+    case 'ollama':
+      return {
+        adapter: createOllamaChat(config.llmModel, config.ollamaBaseUrl),
+        // `think: false` is a top-level /api/chat param (not inside `options`);
+        // without it qwen3 defaults to thinking mode (~60s/call vs ~0.7s).
+        modelOptions: { think: false, options: { temperature: 0 } },
+      };
     case 'openai':
-      return new OpenAiProvider();
+      return {
+        adapter: createOpenaiChat(
+          config.llmModel as Parameters<typeof createOpenaiChat>[0],
+          config.openaiApiKey
+        ),
+        modelOptions: isOpenaiReasoningModel(config.llmModel) ? {} : { temperature: 0 },
+      };
     case 'anthropic':
-      return new AnthropicProvider();
+      return {
+        adapter: createAnthropicChat(
+          config.llmModel as Parameters<typeof createAnthropicChat>[0],
+          config.anthropicApiKey
+        ),
+        modelOptions: { temperature: 0 },
+      };
     default: {
       const exhaustive: never = config.llmProvider;
       throw new Error(`Unknown LLM_PROVIDER: ${String(exhaustive)}`);
     }
   }
+}
+
+/**
+ * Single provider-agnostic implementation over TanStack AI: the tool JSON
+ * schema is passed straight through as `outputSchema` (TanStack accepts plain
+ * JSON Schema) and each adapter's native structured-output API enforces it.
+ * Zod validation of the returned object stays at the call site (parseCallout).
+ */
+export function createLlmProvider(): LlmProvider {
+  const { adapter, modelOptions } = createAdapter();
+  return {
+    // ponytail: opts.maxTokens is ignored — TanStack AI has no provider-agnostic
+    // token cap (per-provider modelOptions only) and the sole caller never sets
+    // it. Upgrade path: add a per-provider maxTokens mapping in createAdapter().
+    async callStructured(opts): Promise<unknown> {
+      return chat({
+        adapter,
+        systemPrompts: [
+          opts.system,
+          `Respond by producing the "${opts.tool.name}" object. ${opts.tool.description}`,
+        ],
+        messages: [{ role: 'user', content: opts.user }],
+        outputSchema: opts.tool.schema as unknown as JSONSchema,
+        modelOptions,
+      });
+    },
+  };
 }

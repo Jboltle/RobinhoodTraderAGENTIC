@@ -35,7 +35,7 @@ export function awaitAuthorizationCode(
   host: string,
   port: number,
   pathname: string,
-  timeoutMs: number = 5 * 60 * 1000
+  timeoutMs: number = 30 * 60 * 1000
 ): Promise<CallbackResult> {
   return new Promise((resolve, reject) => {
     let server: Server | undefined;

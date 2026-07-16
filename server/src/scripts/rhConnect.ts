@@ -12,7 +12,7 @@
 import { config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import { RobinhoodMcpClient } from '../trader/rh/mcpClient.js';
-import { RobinhoodTools, TOOL_NAMES, type ToolKind } from '../trader/rh/tools.js';
+import { RobinhoodTools, TOOL_NAMES } from '../trader/rh/tools.js';
 
 const log = createLogger('rh-connect');
 
@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   // ---- Verify our canonical mapping ----------------------------------
   const summary: Record<string, { canonical: string; advertised: boolean }> = {};
   let missing = 0;
-  for (const kind of Object.keys(TOOL_NAMES) as ToolKind[]) {
+  for (const kind of Object.keys(TOOL_NAMES) as (keyof typeof TOOL_NAMES)[]) {
     const canonical = TOOL_NAMES[kind];
     const present = advertised.includes(canonical);
     summary[kind] = { canonical, advertised: present };

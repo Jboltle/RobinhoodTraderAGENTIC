@@ -189,6 +189,28 @@ describe('parseCallout — BTO / entry signals', () => {
       option: { optionType: 'call', strike: 110, expiration: '2026-07-17' },
     });
   });
+  it('labeled entering option alert with no entry price parses as a market buy', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      "I'm Entering",
+      'Option: GOOGL 380 C 7/24',
+    ].join('\n'), '2026-07-01T14:35:00.000Z'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'GOOGL',
+      orderType: 'market',
+      limitPrice: null,
+      option: { optionType: 'call', strike: 380, expiration: '2026-07-24' },
+    });
+  });
   it('SPX 7500C - 4.8 - chase parses as a deterministic 0DTE buy', async () => {
     const mockProvider: LlmProvider = {
       callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
@@ -513,6 +535,93 @@ describe('parseCallout — pre-LLM chatter gate', () => {
     await parser.parse(makeEnvelope('might buy something soon idk'));
 
     expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('parseCallout — pre-LLM brag/P/L-update filter', () => {
+  const BRAG_MESSAGES = [
+    '**130%** 🔥aapl calls 3.38 to 7.70 now!!! 🚀',
+    '**100%** 🔥aapl calls 3.38 to 6.76 now!!! 🚀',
+    '**45%** 🔥aapl calls',
+    '**40%** 🔥aapl calls 4.53 now sniper!!! 🚀',
+  ];
+
+  it.each(BRAG_MESSAGES)('classifies "%s" as not_callout without the LLM', async (content) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope(content));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(false);
+    expect(result.rationale).toMatch(/pre-filter/);
+  });
+
+  it('does not filter a real BTO entry (parses deterministically)', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('BTO $MSFT 397.5c 07/15 @0.85', '2026-07-15T14:35:00.000Z'));
+
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      ticker: 'MSFT',
+      limitPrice: 0.85,
+      option: { optionType: 'call', strike: 397.5, expiration: '2026-07-15' },
+    });
+  });
+
+  it("does not filter Bishop's bold-labeled entering alert (reaches the LLM)", async () => {
+    const parser = parserWithMock({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'PANW',
+      orderType: 'limit',
+      limitPrice: 4.9,
+      sizeHint: null,
+      positionSize: null,
+      option: { optionType: 'call', strike: 365, expiration: '2026-07-17' },
+      confidence: 0.95,
+      rationale: 'PANW 365C 7/17 entry 4.80-4.90',
+    });
+
+    const result = await parser.parse(makeEnvelope(
+      "I'm Entering\n**Option:** PANW 365 C 7/17\n**Entry:** 4.80-4.90",
+      '2026-07-15T14:35:00.000Z'
+    ));
+
+    expect(result.isCallout).toBe(true);
+    expect(result.ticker).toBe('PANW');
+  });
+
+  it('does not filter a lotto callout with a code-blocked contract (reaches the LLM)', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: true,
+        assetType: 'option',
+        action: 'buy',
+        ticker: 'SPY',
+        orderType: 'limit',
+        limitPrice: 1.7,
+        sizeHint: null,
+        positionSize: 'small',
+        option: { optionType: 'call', strike: 745, expiration: '2026-06-15' },
+        confidence: 0.9,
+        rationale: 'lotto SPY 745C',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope('⚠️ Lotto — RISKY\n```\nSPY 745C 0DTE $1.7\n```'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+    expect(result.isCallout).toBe(true);
   });
 });
 

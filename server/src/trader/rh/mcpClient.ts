@@ -8,7 +8,7 @@ import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
 import { awaitAuthorizationCode } from './oauthCallback.js';
 import { FileOAuthProvider } from './oauthProvider.js';
-import { importCodexTokensIfNeeded, readTokenStatus } from './tokenBootstrap.js';
+import { readTokenStatus } from './tokenBootstrap.js';
 import type { CallToolResult } from './types.js';
 
 export type { CallToolResult } from './types.js';
@@ -41,27 +41,25 @@ export class RobinhoodMcpClient {
   private async connect(): Promise<void> {
     const redirectUrl = new URL(config.robinhoodOAuthRedirectUri);
 
-    // Detect the local auth state and, when the saved tokens can't carry us,
-    // try to import fresh ones from Codex before falling back to browser OAuth.
+    // Log the local auth state; the SDK transport handles refresh on 401 and
+    // we fall back to browser OAuth below only when that fails.
     const status = await readTokenStatus(config.rhTokensPath);
     log.info('Robinhood token status', {
       state: status.state,
       expiresInMin: status.expiresInSec !== null ? Math.round(status.expiresInSec / 60) : null,
       hasRefreshToken: status.hasRefreshToken,
     });
-    if (status.state === 'missing' || status.state === 'expired') {
-      await importCodexTokensIfNeeded({
-        path: config.rhTokensPath,
-        redirectUri: config.robinhoodOAuthRedirectUri,
-        clientName: config.robinhoodOAuthClientName,
-      });
-    }
 
     const provider = new FileOAuthProvider({
       path: config.rhTokensPath,
       clientName: config.robinhoodOAuthClientName,
       redirectUri: config.robinhoodOAuthRedirectUri,
       onAuthorizationUrl: (url) => {
+        // Robinhood's advertised authorization_endpoint (robinhood.com/oauth)
+        // loads a login shell that never redirects back for agent consent.
+        // The working consent SPA (captured from Codex CLI's flow) lives at
+        // robinhood.com/mcp/trading with identical query params.
+        if (url.pathname === '/oauth') url.pathname = '/mcp/trading';
         log.info('OAuth authorization required');
         process.stdout.write('\n========================================\n');
         process.stdout.write('Robinhood authorization required.\n');
@@ -83,27 +81,7 @@ export class RobinhoodMcpClient {
     } catch (err) {
       if (!(err instanceof UnauthorizedError)) throw err;
 
-      // Unauthorized despite the preflight — try a Codex import once more (the
-      // local tokens may have just expired), then reconnect before prompting.
-      if (await importCodexTokensIfNeeded({
-        path: config.rhTokensPath,
-        redirectUri: config.robinhoodOAuthRedirectUri,
-        clientName: config.robinhoodOAuthClientName,
-      })) {
-        transport = new StreamableHTTPClientTransport(new URL(config.robinhoodMcpUrl), {
-          authProvider: provider,
-        });
-        client = new Client(CLIENT_INFO);
-        try {
-          await client.connect(transport);
-          this.client = client;
-          await this.introspect(client);
-          return;
-        } catch (retryErr) {
-          if (!(retryErr instanceof UnauthorizedError)) throw retryErr;
-        }
-      }
-
+      // Tokens missing or refresh failed — fall back to browser OAuth.
       log.info('starting OAuth callback listener');
       const callbackPath = redirectUrl.pathname || '/oauth/callback';
       const port = config.robinhoodOAuthCallbackPort;
@@ -115,7 +93,10 @@ export class RobinhoodMcpClient {
         callbackPath,
         redirectUri: config.robinhoodOAuthRedirectUri,
       });
-      const { code } = await awaitAuthorizationCode(host, port, callbackPath);
+      const { code, state } = await awaitAuthorizationCode(host, port, callbackPath);
+      if (provider.expectedState !== undefined && state !== provider.expectedState) {
+        throw new Error('OAuth state mismatch on callback; aborting token exchange');
+      }
       log.info('received authorization code, exchanging for tokens');
       await transport.finishAuth(code);
 
@@ -154,7 +135,21 @@ export class RobinhoodMcpClient {
     if (!this.client) {
       throw new Error('MCP client not connected; call ensureConnected() first');
     }
-    const result = (await this.client.callTool({ name, arguments: args })) as CallToolResult;
+    let result: CallToolResult;
+    try {
+      result = (await this.client.callTool({ name, arguments: args })) as CallToolResult;
+    } catch (err) {
+      if (!(err instanceof UnauthorizedError)) throw err;
+
+      // Mid-session token expiry where the SDK's silent refresh failed: reset
+      // the connection and re-run connect() so its browser OAuth fallback can
+      // execute, then retry the tool call once.
+      log.info('unauthorized during tool call; reconnecting', { tool: name });
+      this.client = undefined;
+      this.connectPromise = undefined;
+      await this.ensureConnected();
+      result = (await this.client!.callTool({ name, arguments: args })) as CallToolResult;
+    }
     if (result.isError) {
       const text = (result.content ?? [])
         .filter((c) => c.type === 'text')

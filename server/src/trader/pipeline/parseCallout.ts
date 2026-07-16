@@ -76,6 +76,7 @@ const TOOL_SCHEMA: ToolJsonSchema = {
 const SYSTEM_PROMPT = `You extract structured trading callouts (US equities OR US-listed options) from Discord chat messages.
 
 A "callout" is an explicit, forward-looking directive to BUY or SELL.
+Entry language counts as BUY: "buying", "entering", "I'm entering", "I'm in", "adding", "grabbing", "starting a position". Exit language counts as SELL: "selling", "trimming", "closing", "taking profit".
 
 EQUITY EXAMPLES:
 - "Buying NVDA at open"           -> equity buy NVDA, market
@@ -133,6 +134,15 @@ REAL-WORLD CHANNEL FORMAT (with noise lines stripped):
    GOOGL 370C 2026-06-18
    2.7500  →  5.1   P/L: +85.45% ($235.00)"
   -> option sell GOOGL call, strike 370, exp 2026-06-18, positionSize full
+
+  "I'm Entering
+   Option: GOOGL 380 C 7/24"
+  -> option buy GOOGL call, strike 380, exp = nearest future 07-24, market order (no price given)
+
+  "Entering
+   Option: SPY 550 P 8/15
+   Entry: @1.20"
+  -> option buy SPY put, strike 550, exp = nearest future 08-15, limit 1.20 (per-contract premium)
 
 NON-CALLOUTS (set isCallout=false):
 - "Watching SOFI", "Bought MSFT" (past tense), "Long $META" (no buy/sell verb), generic chatter.
@@ -276,20 +286,22 @@ function parseLabeledEntryOption(content: string, timestamp: string): Callout | 
   const optionMatch = content.match(
     /^\s*Option\s*:\s*\$?([A-Z]{1,5})\s+(\d+(?:\.\d+)?)\s*([CP]|calls?|puts?)\s+(0DTE|TODAY|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})\s*$/im
   );
+  if (!optionMatch) return null;
+
+  // Entry price is optional: "Entry: @1.20" -> limit order; absent -> market
+  // order (execution sizes off the live mark price).
   const entryMatch = content.match(
     /^\s*Entry\s*:\s*(?:@|\$)?\s*(\d+(?:\.\d+)?)(?:\s*[-–—]\s*(?:@|\$)?\s*(\d+(?:\.\d+)?))?\s*$/im
   );
-  if (!optionMatch || !entryMatch) return null;
 
   const [, tickerRaw, strikeRaw, typeRaw, expirationRaw] = optionMatch;
-  const [, lowerLimitRaw, upperLimitRaw] = entryMatch;
-  const limitRaw = upperLimitRaw ?? lowerLimitRaw;
+  const limitRaw = entryMatch ? (entryMatch[2] ?? entryMatch[1]) : undefined;
   return buildDeterministicOptionCallout({
     tickerRaw: tickerRaw!,
     strikeRaw: strikeRaw!,
     typeRaw: typeRaw![0]!,
     expirationRaw: expirationRaw!,
-    limitRaw: limitRaw!,
+    limitRaw,
     timestamp,
     content,
     rationalePrefix: 'ENTRY',
@@ -301,7 +313,8 @@ function buildDeterministicOptionCallout(opts: {
   strikeRaw: string;
   typeRaw: string;
   expirationRaw: string;
-  limitRaw: string;
+  /** Explicit per-contract premium; omit for a market order. */
+  limitRaw?: string;
   timestamp: string;
   content: string;
   rationalePrefix: string;
@@ -309,13 +322,16 @@ function buildDeterministicOptionCallout(opts: {
   const expiration = resolveDeterministicExpiration(opts.expirationRaw, opts.timestamp);
   if (!expiration) return null;
 
+  const hasLimit = opts.limitRaw !== undefined && opts.limitRaw !== '';
+  const ticker = opts.tickerRaw.toUpperCase();
+  const contract = opts.strikeRaw + opts.typeRaw.toUpperCase();
   const candidate = {
     isCallout: true,
     assetType: 'option',
     action: 'buy',
-    ticker: opts.tickerRaw.toUpperCase(),
-    orderType: 'limit',
-    limitPrice: Number(opts.limitRaw),
+    ticker,
+    orderType: hasLimit ? 'limit' : 'market',
+    limitPrice: hasLimit ? Number(opts.limitRaw) : null,
     sizeHint: null,
     positionSize: /\b(risky|lotto|small|light|tiny|starter|scalp)\b/i.test(opts.content) ? 'small' : null,
     option: {
@@ -324,7 +340,13 @@ function buildDeterministicOptionCallout(opts: {
       expiration,
     },
     confidence: 0.99,
-    rationale: [opts.rationalePrefix, opts.tickerRaw.toUpperCase(), opts.strikeRaw + opts.typeRaw.toUpperCase(), opts.expirationRaw, 'at', '$' + opts.limitRaw].join(' '),
+    rationale: [
+      opts.rationalePrefix,
+      ticker,
+      contract,
+      opts.expirationRaw,
+      hasLimit ? 'at $' + opts.limitRaw : 'at market',
+    ].join(' '),
   };
 
   const parsed = CalloutSchema.safeParse(candidate);
@@ -375,6 +397,32 @@ const TRADE_VERB =
  */
 function messageHasTradeSignal(content: string): boolean {
   return TICKER_LIKE.test(content) || TRADE_VERB.test(content);
+}
+
+// P/L-brag openers like "**130%** 🔥aapl calls 3.38 to 7.70 now!!!" — a bold
+// percentage leads the message.
+const BOLD_PCT_START = /^\s*\*\*\s*\+?\d+(?:\.\d+)?\s*%\s*\*\*/;
+
+// "3.38 to 7.70 now" — entry-price-to-current-price update phrasing.
+const PRICE_TO_PRICE_NOW = /\b\d+(?:\.\d+)?\s+to\s+\d+(?:\.\d+)?\s+now\b/i;
+
+// Words that signal an actual directive. Narrower than TRADE_VERB on purpose:
+// brags say "calls"/"puts" without any of these, while real entries always
+// carry one. Presence of any directive word sends the message to the LLM.
+const DIRECTIVE_VERB =
+  /\b(?:bto|btc|sto|stc|buy|buying|sell|selling|enter|entering|entered|entry|add|adding|trim|trimming|close|closing|long|short|grab|grabbing|chase|chasing|load|loading|scale|scaling|take|taking)\b/i;
+
+/**
+ * Detect profit-brag / P/L-update messages ("**130%** 🔥aapl calls 3.38 to
+ * 7.70 now!!! 🚀") so they never reach the LLM, which has misread them as
+ * fresh entries. Conservative: only fires when the brag shape is present AND
+ * no directive verb appears anywhere in the message.
+ */
+function isProfitBrag(content: string): boolean {
+  return (
+    (BOLD_PCT_START.test(content) || PRICE_TO_PRICE_NOW.test(content)) &&
+    !DIRECTIVE_VERB.test(content)
+  );
 }
 
 function buildNonCallout(rationale: string): Callout {
@@ -446,6 +494,14 @@ export class LlmCalloutParser implements CalloutParser {
         limitPrice: deterministic.limitPrice,
       });
       return deterministic;
+    }
+
+    if (isProfitBrag(envelope.content)) {
+      log.debug('P/L brag/update pattern; skipping LLM', {
+        messageId: envelope.messageId,
+        content: envelope.content.slice(0, 200),
+      });
+      return buildNonCallout('P/L brag/update pattern (bold % gain or price-to-price-now); skipped LLM (pre-filter)');
     }
 
     if (!messageHasTradeSignal(envelope.content)) {

@@ -1,6 +1,11 @@
 import { config as loadDotenv } from 'dotenv';
+import { z } from 'zod';
 
-loadDotenv();
+// .env lives at the repo root (one level above server/). Resolve it relative
+// to this file, not cwd, so env loads no matter where the process starts.
+// In Docker the file doesn't exist (compose env_file injects vars) and dotenv
+// silently no-ops.
+loadDotenv({ path: new URL('../../../.env', import.meta.url) });
 
 const env = process.env;
 
@@ -20,7 +25,34 @@ const num = (s: string | undefined, fallback: number): number => {
 const bool = (s: string | undefined, fallback: boolean): boolean =>
   s === undefined ? fallback : s.toLowerCase() === 'true';
 
-const llmProvider = (env.LLM_PROVIDER ?? 'anthropic') as 'anthropic' | 'openai';
+/**
+ * Fail-fast enum parse: a missing or unknown value aborts startup instead of
+ * silently defaulting, which matters for anything that changes trading behavior.
+ */
+const requiredEnum = <const T extends readonly [string, ...Array<string>]>(
+  name: string,
+  values: T
+): T[number] => {
+  const parsed = z.enum(values).safeParse(env[name]);
+  if (!parsed.success) {
+    const got = env[name] === undefined ? 'unset' : `"${env[name]}"`;
+    throw new Error(
+      `${name} must be one of: ${values.join(' | ')} (got ${got}). ` +
+        `Set it in .env (see .env.example).`
+    );
+  }
+  return parsed.data;
+};
+
+const requiredString = (name: string): string => {
+  const value = env[name]?.trim();
+  if (!value) {
+    throw new Error(`${name} is required. Set it in .env (see .env.example).`);
+  }
+  return value;
+};
+
+const llmProvider = requiredEnum('LLM_PROVIDER', ['ollama', 'openai', 'anthropic']);
 
 // OAuth: the browser is redirected to `redirectUri`; the local listener binds
 // `callbackHost:callbackPort`. `redirectUri` defaults to the redirect host so
@@ -45,14 +77,30 @@ export const config = {
 
   // ---- LLM -------------------------------------------------------------------
   llmProvider,
+  llmModel: requiredString('LLM_MODEL'),
+  ollamaBaseUrl: env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
   anthropicApiKey: env.ANTHROPIC_API_KEY ?? '',
-  anthropicModel: env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-5',
   openaiApiKey: env.OPENAI_API_KEY ?? '',
-  openaiModel: env.OPENAI_MODEL ?? 'gpt-4o-2024-08-06',
 
   // ---- Robinhood MCP ---------------------------------------------------------
   robinhoodMcpUrl: env.ROBINHOOD_MCP_URL ?? 'https://agent.robinhood.com/mcp/trading',
-  robinhoodOAuthClientName: env.ROBINHOOD_OAUTH_CLIENT_NAME ?? 'rh-discord-trader',
+  // Constant, not env-driven: OAuth client display name for dynamic registration.
+  // Lives here (not at the consumer in trader/rh/) so it stays next to the other
+  // Robinhood OAuth settings.
+  //
+  // Robinhood's DCR endpoint maps this name to a pre-provisioned client_id whose
+  // redirect-URI allowlist is fixed server-side (the redirect_uris we submit are
+  // ignored). Only its blessed clients allowlist loopback (loose on port AND
+  // path, verified via Codex CLI's working flow). Unknown names (e.g.
+  // "rh-discord-trader") get a generic client whose consent flow never
+  // redirects back. "Claude Code" -> ...-claude is used here instead of
+  // "Codex CLI" -> ...-chatgpt because the consent page short-circuits (no
+  // redirect) when the account already has an active connection for that
+  // client, and this account is already connected via Codex.
+  // ponytail: piggybacking on a blessed client id is the only unauthenticated
+  // way to get loopback allowlisted. Ceiling: if Robinhood ever locks per-client
+  // redirect shapes or the user connects Claude, register a first-party client.
+  robinhoodOAuthClientName: 'Claude Code',
   robinhoodOAuthRedirectUri: oauthRedirectUri,
   robinhoodOAuthCallbackPort: oauthCallbackPort,
   robinhoodOAuthCallbackHost: env.ROBINHOOD_OAUTH_CALLBACK_HOST ?? '0.0.0.0',
@@ -62,9 +110,11 @@ export const config = {
    * immediate = submit orders as soon as a callout passes risk checks.
    * approval  = parse/risk-check/log callouts but do not submit orders.
    */
-  tradeExecutionMode: (env.TRADE_EXECUTION_MODE ?? 'immediate') as 'immediate' | 'approval',
+  tradeExecutionMode: requiredEnum('TRADE_EXECUTION_MODE', ['immediate', 'approval']),
 
   // ---- Risk controls (all sizing in % of available capital) ------------------
+  // These are the env-fallback DEFAULTS of the settings resolution chain:
+  // payload override → state/settings.json → these values (see trader/settings.ts).
 
   /**
    * Maximum equity notional per trade as a percentage of buying power.
@@ -100,6 +150,14 @@ export const config = {
 
   // ---- Inter-service ---------------------------------------------------------
   botTraderSecret: env.BOT_TRADER_SECRET ?? '',
+  /**
+   * Optional URL of the client dashboard's session-settings endpoint
+   * (GET, TradeSettings-shaped JSON). Unset = the pull layer is skipped.
+   */
+  clientSettingsUrl: env.CLIENT_SETTINGS_URL?.trim() || null,
+  // 127.0.0.1 by default: the dashboard API has no auth, so binding is the
+  // access control. Set 0.0.0.0 only when another container must reach it.
+  traderHost: env.TRADER_HOST ?? '127.0.0.1',
   traderPort: num(env.TRADER_PORT, 3000),
   traderWebhookUrl: env.TRADER_WEBHOOK_URL ?? 'http://localhost:3000/webhook/discord',
 
@@ -107,6 +165,7 @@ export const config = {
   decisionLogPath: env.DECISION_LOG_PATH ?? 'state/decisions.jsonl',
   riskStatePath: env.RISK_STATE_PATH ?? 'state/risk.json',
   rhTokensPath: env.RH_TOKENS_PATH ?? 'state/rh-tokens.json',
+  settingsPath: env.SETTINGS_PATH ?? 'state/settings.json',
 } as const;
 
 export const isAllowed = (v: string, allowlist: readonly string[]): boolean =>

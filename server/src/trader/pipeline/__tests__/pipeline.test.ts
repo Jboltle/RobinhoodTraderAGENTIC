@@ -11,6 +11,7 @@ import type {
   Decision,
   DiscordEnvelope,
   PostReceipt,
+  TradeSettings,
 } from '../../../shared/types.js';
 import type { RobinhoodTools } from '../../rh/tools.js';
 import { DecisionLog } from '../../decisionLog.js';
@@ -86,14 +87,15 @@ function makeParser(callout: Callout | Error): CalloutParser {
 async function runWith(
   envelope: DiscordEnvelope,
   callout: Callout | Error,
-  toolsOverrides: Partial<RobinhoodTools> = {}
+  toolsOverrides: Partial<RobinhoodTools> = {},
+  settingsOverride: TradeSettings = {}
 ): Promise<{ decision: Decision; postReceipt: PostReceipt; tools: RobinhoodTools }> {
   const parser = makeParser(callout);
   const tools = makeTools(toolsOverrides);
   const decisions = new DecisionLog('/tmp/test-decisions.jsonl');
   const postReceipt = vi.fn().mockResolvedValue(undefined);
 
-  const decision = await runPipeline(envelope, { parser, tools, decisions, postReceipt });
+  const decision = await runPipeline(envelope, { parser, tools, decisions, postReceipt }, settingsOverride);
 
   return { decision, postReceipt, tools };
 }
@@ -211,6 +213,78 @@ describe('runPipeline — TRIM exit', () => {
   });
 });
 
+describe('runPipeline — parse consistency guardrails', () => {
+  // Real incident (2026-07-15): profit brag parsed by the LLM as an equity
+  // buy with the current option premium as the limit price.
+  const INCIDENT_ENVELOPE: DiscordEnvelope = {
+    messageId: 'incident-aapl-brag',
+    channelId: 'test-channel',
+    guildId: 'test-guild',
+    authorId: 'test-author',
+    authorName: 'Natalie Options Alert',
+    content: '**130%** 🔥aapl calls 3.38 to 7.70 now!!! 🚀',
+    timestamp: '2026-07-15T15:36:00.000Z',
+  };
+
+  const BAD_EQUITY_PARSE: Callout = {
+    isCallout: true,
+    assetType: 'equity',
+    action: 'buy',
+    ticker: 'AAPL',
+    orderType: 'limit',
+    limitPrice: 7.7,
+    sizeHint: null,
+    positionSize: null,
+    option: null,
+    confidence: 0.95,
+    rationale: 'buy AAPL at 7.70',
+  };
+
+  it('rejects an equity parse of an options-language message (the AAPL incident)', async () => {
+    const { decision, tools, postReceipt } = await runWith(INCIDENT_ENVELOPE, BAD_EQUITY_PARSE);
+
+    expect(decision.kind).toBe('risk_rejected');
+    expect(decision.code).toBe('parse_inconsistent');
+    expect(decision.order).toBeNull();
+    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(postReceipt).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an equity limit buy wildly below the live quote', async () => {
+    const envelope: DiscordEnvelope = {
+      ...INCIDENT_ENVELOPE,
+      messageId: 'incident-cheap-limit',
+      content: 'grabbing some AAPL here 7.70', // no options language — passes the text check
+    };
+
+    const { decision, tools } = await runWith(
+      envelope,
+      BAD_EQUITY_PARSE,
+      { getQuote: vi.fn().mockResolvedValue({ price: 211 }) }
+    );
+
+    expect(decision.kind).toBe('risk_rejected');
+    expect(decision.code).toBe('parse_inconsistent');
+    expect(decision.reason).toMatch(/option premium misread/);
+    expect(tools.placeOrder).not.toHaveBeenCalled();
+  });
+
+  it('still submits a plausible equity limit buy', async () => {
+    const envelope: DiscordEnvelope = {
+      ...INCIDENT_ENVELOPE,
+      messageId: 'plausible-equity-buy',
+      content: 'grabbing some AAPL here, 145 limit',
+    };
+    const plausible: Callout = { ...BAD_EQUITY_PARSE, limitPrice: 145 };
+
+    const { decision, tools } = await runWith(envelope, plausible);
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order).toMatchObject({ symbol: 'AAPL', assetType: 'equity', limitPrice: 145 });
+    expect(tools.placeOrder).toHaveBeenCalledOnce();
+  });
+});
+
 describe('runPipeline — approval mode', () => {
   it('records pending_approval and does not submit when approval mode is enabled', async () => {
     const { config } = await import('../../../shared/config.js');
@@ -233,6 +307,27 @@ describe('runPipeline — approval mode', () => {
       (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
     }
   });
+
+  it("ignores an 'immediate' override when booted in approval mode (no live MCP)", async () => {
+    const { config } = await import('../../../shared/config.js');
+    const original = config.tradeExecutionMode;
+    (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = 'approval';
+
+    try {
+      const { decision, tools } = await runWith(
+        envelopeFromFixture(BTO_QQQ_PUT),
+        BTO_QQQ_PUT.expectedCallout,
+        {},
+        { executionMode: 'immediate' }
+      );
+
+      expect(decision.kind).toBe('pending_approval');
+      expect(decision.order).toBeNull();
+      expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    } finally {
+      (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
+    }
+  });
 });
 
 describe('runPipeline — error paths', () => {
@@ -243,6 +338,7 @@ describe('runPipeline — error paths', () => {
     );
 
     expect(decision.kind).toBe('parser_error');
+    expect(decision.code).toBe('parse_failed');
     expect(decision.callout).toBeNull();
   });
 
@@ -251,6 +347,7 @@ describe('runPipeline — error paths', () => {
     const { decision, tools } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), lowConf);
 
     expect(decision.kind).toBe('risk_rejected');
+    expect(decision.code).toBe('low_confidence');
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 
@@ -262,6 +359,7 @@ describe('runPipeline — error paths', () => {
     );
 
     expect(decision.kind).toBe('risk_rejected');
+    expect(decision.code).toBe('insufficient_capital');
     expect(decision.reason).toMatch(/zero/i);
   });
 
@@ -273,6 +371,7 @@ describe('runPipeline — error paths', () => {
     );
 
     expect(decision.kind).toBe('execution_failed');
+    expect(decision.code).toBe('execution_error');
     expect(postReceipt).toHaveBeenCalledOnce();
   });
 
@@ -288,7 +387,45 @@ describe('runPipeline — error paths', () => {
     );
 
     expect(decision.kind).toBe('risk_rejected');
+    expect(decision.code).toBe('insufficient_capital');
     expect(decision.reason).toMatch(/MAX_SINGLE_CONTRACT_PCT/);
+  });
+});
+
+describe('runPipeline — lifecycle stage events', () => {
+  it('emits parsing → risk_check → executing → done for a submitted trade', async () => {
+    const parser = makeParser(BTO_QQQ_PUT.expectedCallout);
+    const tools = makeTools();
+    const decisions = new DecisionLog('/tmp/test-decisions.jsonl');
+    const stages: string[] = [];
+    decisions.on('stage', (e: { stage: string }) => stages.push(e.stage));
+
+    const decision = await runPipeline(envelopeFromFixture(BTO_QQQ_PUT), {
+      parser,
+      tools,
+      decisions,
+      postReceipt: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.code).toBeNull();
+    expect(stages).toEqual(['parsing', 'risk_check', 'executing', 'done']);
+  });
+
+  it('skips executing and still emits done for a risk rejection', async () => {
+    const lowConf: Callout = { ...BTO_QQQ_PUT.expectedCallout, confidence: 0.3 };
+    const decisions = new DecisionLog('/tmp/test-decisions.jsonl');
+    const stages: string[] = [];
+    decisions.on('stage', (e: { stage: string }) => stages.push(e.stage));
+
+    await runPipeline(envelopeFromFixture(BTO_QQQ_PUT), {
+      parser: makeParser(lowConf),
+      tools: makeTools(),
+      decisions,
+      postReceipt: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(stages).toEqual(['parsing', 'risk_check', 'done']);
   });
 });
 

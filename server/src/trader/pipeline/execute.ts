@@ -1,10 +1,31 @@
-import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
-import type { Callout, OptionContract } from '../../shared/types.js';
-import type { OptionPosition } from '../rh/tools.js';
-import type { PipelineDeps, PlacedResult, RiskAllow } from './types.js';
+import type {
+  Callout,
+  CalloutParser,
+  OptionContract,
+  PostReceipt,
+  RiskCheck,
+} from '../../shared/types.js';
+import type { OptionPosition, RobinhoodTools } from '../rh/tools.js';
+import type { DecisionLog } from '../decisionLog.js';
 
 const log = createLogger('trader:pipeline');
+
+export interface PipelineDeps {
+  readonly parser: CalloutParser;
+  readonly tools: RobinhoodTools;
+  readonly decisions: DecisionLog;
+  readonly postReceipt: PostReceipt;
+}
+
+/** The allow=true branch of a risk check — the shape execution paths consume. */
+export type RiskAllow = Extract<RiskCheck, { allow: true }>;
+
+export interface PlacedResult {
+  readonly orderId: string | null;
+  readonly status: string | null;
+  readonly quantity: number;
+}
 
 /**
  * Thrown when the current account balance makes a trade unviable (e.g. even
@@ -17,6 +38,23 @@ export class CapitalConstraintError extends Error {
     this.name = 'CapitalConstraintError';
   }
 }
+
+/**
+ * Thrown when the parsed order contradicts market reality (e.g. an equity
+ * limit price that is a small fraction of the live quote — almost certainly
+ * an option premium misread as a share price). Surfaces as `risk_rejected`
+ * with code `parse_inconsistent` in the decision log.
+ */
+export class ParseInconsistencyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ParseInconsistencyError';
+  }
+}
+
+// Equity limit buys priced below this fraction of the live quote are treated
+// as misparses rather than aggressive orders.
+const EQUITY_LIMIT_MIN_QUOTE_FRACTION = 0.2;
 
 export async function executeEquity(
   symbol: string,
@@ -31,6 +69,20 @@ export async function executeEquity(
       ? risk.limitPrice
       : await deps.tools.getQuote(symbol).then((q) => q.price);
   if (price === null) throw new Error(`could not determine price for ${symbol}`);
+
+  // Sanity: an equity buy limit wildly below the live quote is a misparse
+  // (e.g. an option premium taken as a share price), not a bargain order.
+  // ponytail: only guards immediate-mode buys with a limit; approval-mode
+  // parses rely on the pipeline's options-language veto, and a stale/absent
+  // quote skips the check. Upgrade path: quote-check at risk-filter time.
+  if (side === 'buy' && risk.limitPrice !== null) {
+    const quote = await deps.tools.getQuote(symbol).then((q) => q.price);
+    if (quote !== null && risk.limitPrice < quote * EQUITY_LIMIT_MIN_QUOTE_FRACTION) {
+      throw new ParseInconsistencyError(
+        `equity limit $${risk.limitPrice.toFixed(2)} is <${EQUITY_LIMIT_MIN_QUOTE_FRACTION * 100}% of ${symbol} quote $${quote.toFixed(2)} — likely an option premium misread as a share price`
+      );
+    }
+  }
 
   let quantity: number;
 
@@ -92,11 +144,11 @@ export async function executeOptions(
   // positions (e.g. a $3 premium on a $5,000 account = 6% per contract).
   if (contractCost !== null) {
     const singleContractPct = (contractCost / buyingPower) * 100;
-    if (singleContractPct > config.maxSingleContractPct) {
+    if (singleContractPct > risk.maxSingleContractPct) {
       throw new CapitalConstraintError(
         `1 ${symbol} contract costs $${contractCost.toFixed(2)} ` +
         `(${singleContractPct.toFixed(1)}% of $${buyingPower.toFixed(0)} buying power), ` +
-        `exceeds MAX_SINGLE_CONTRACT_PCT (${config.maxSingleContractPct}%) — trade skipped`
+        `exceeds MAX_SINGLE_CONTRACT_PCT (${risk.maxSingleContractPct}%) — trade skipped`
       );
     }
   }
@@ -135,11 +187,11 @@ export async function executeOptions(
   // ---- Hard cap: never exceed maxOptionsNotionalPct -----------------------
   // Applies regardless of whether contracts came from a hint or budget math.
   if (contractCost !== null) {
-    const hardMax = Math.max(1, Math.floor(buyingPower * config.maxOptionsNotionalPct / 100 / contractCost));
+    const hardMax = Math.max(1, Math.floor(buyingPower * risk.maxOptionsNotionalPct / 100 / contractCost));
     if (contracts > hardMax) {
       log.warn('capping contracts to hard max', {
         symbol, requested: contracts, capped: hardMax,
-        hardMaxPct: `${config.maxOptionsNotionalPct}%`,
+        hardMaxPct: `${risk.maxOptionsNotionalPct}%`,
       });
       contracts = hardMax;
     }

@@ -13,8 +13,28 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { checkRisk, isRegularUsTradingHours } from '../riskFilter.js';
-import type { Callout } from '../../../shared/types.js';
+import { checkRisk as checkRiskWithSettings, isRegularUsTradingHours } from '../riskFilter.js';
+import type { Callout, ResolvedTradeSettings } from '../../../shared/types.js';
+
+// Resolved settings mirroring the config mock below — checkRisk takes these
+// as an argument now (resolution chain lives in trader/settings.ts).
+const SETTINGS: ResolvedTradeSettings = {
+  executionMode: 'immediate',
+  minConfidence: 0.7,
+  blockedTickers: ['GME'],
+  allowedTickers: [],          // empty = allow all
+  regularHoursOnly: false,     // disabled by default in tests
+  maxTradesPerDay: 3,
+  cooldownSeconds: 60,
+  maxNotionalPct: 5,           // equity cap = 5% of buying power
+  maxOptionsNotionalPct: 2,    // options cap = 2%
+  maxSingleContractPct: 5,
+  positionSmallPct: 25,        // small  = 25% of cap
+  positionMediumPct: 50,       // medium = 50% of cap
+};
+
+const checkRisk = (callout: Callout, now?: Date) =>
+  checkRiskWithSettings(callout, SETTINGS, now);
 
 // ---------------------------------------------------------------------------
 // Mock config so tests are independent of .env values
@@ -122,6 +142,99 @@ describe('riskFilter — guards', () => {
     });
     expect(result.allow).toBe(false);
     expect((result as { reason: string }).reason).toMatch(/not valid for equity/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rejection codes — every guard carries a machine-readable code
+// ---------------------------------------------------------------------------
+
+describe('riskFilter — rejection codes', () => {
+  const codeOf = async (callout: Callout, settings = SETTINGS, now?: Date) => {
+    const result = await checkRiskWithSettings(callout, settings, now);
+    expect(result.allow).toBe(false);
+    return (result as { code: string }).code;
+  };
+
+  it('not_callout when isCallout=false', async () => {
+    expect(await codeOf({ ...BASE_EQUITY, isCallout: false })).toBe('not_callout');
+  });
+
+  it('missing_contract for optionless option callout', async () => {
+    expect(await codeOf({ ...BASE_OPTION, option: null })).toBe('missing_contract');
+  });
+
+  it('invalid_sizing for equity with contracts hint', async () => {
+    expect(
+      await codeOf({ ...BASE_EQUITY, sizeHint: { kind: 'contracts', value: 5 } })
+    ).toBe('invalid_sizing');
+  });
+
+  it('low_confidence below threshold', async () => {
+    expect(await codeOf({ ...BASE_EQUITY, confidence: 0.5 })).toBe('low_confidence');
+  });
+
+  it('ticker_blocked for blocklisted ticker', async () => {
+    expect(await codeOf({ ...BASE_EQUITY, ticker: 'GME' })).toBe('ticker_blocked');
+  });
+
+  it('ticker_not_allowed when allowlist excludes the ticker', async () => {
+    expect(
+      await codeOf(BASE_EQUITY, { ...SETTINGS, allowedTickers: ['TSLA'] })
+    ).toBe('ticker_not_allowed');
+  });
+
+  it('outside_market_hours when the gate is on', async () => {
+    // Saturday noon UTC — never regular hours.
+    expect(
+      await codeOf(BASE_EQUITY, { ...SETTINGS, regularHoursOnly: true }, new Date('2026-07-11T12:00:00Z'))
+    ).toBe('outside_market_hours');
+  });
+
+  it('daily_cap_reached when maxTradesPerDay is 0', async () => {
+    expect(await codeOf(BASE_EQUITY, { ...SETTINGS, maxTradesPerDay: 0 })).toBe('daily_cap_reached');
+  });
+
+  it('cooldown_active right after a recorded trade', async () => {
+    const { checkRisk: freshCheck, recordTrade } = await import('../riskFilter.js');
+    await recordTrade('AAPL');
+    const result = await freshCheck(BASE_EQUITY, SETTINGS);
+    expect(result.allow).toBe(false);
+    expect((result as { code: string }).code).toBe('cooldown_active');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Settings override — the same callout flips outcome with different settings
+// ---------------------------------------------------------------------------
+
+describe('riskFilter — settings override', () => {
+  it('minConfidence from a settings override rejects a callout the baseline allows', async () => {
+    const baseline = await checkRiskWithSettings(BASE_EQUITY, SETTINGS);
+    expect(baseline.allow).toBe(true);
+
+    const strict = await checkRiskWithSettings(BASE_EQUITY, { ...SETTINGS, minConfidence: 0.95 });
+    expect(strict.allow).toBe(false);
+    expect((strict as { reason: string }).reason).toMatch(/confidence 0\.90 < threshold 0\.95/);
+  });
+
+  it('blockedTickers from a settings override rejects a normally-allowed ticker', async () => {
+    const result = await checkRiskWithSettings(BASE_EQUITY, {
+      ...SETTINGS,
+      blockedTickers: ['AAPL'],
+    });
+    expect(result.allow).toBe(false);
+    expect((result as { reason: string }).reason).toMatch(/AAPL is blocked/);
+  });
+
+  it('sizing caps come from the settings object, not env config', async () => {
+    const result = await checkRiskWithSettings(
+      { ...BASE_EQUITY, positionSize: 'full' },
+      { ...SETTINGS, maxNotionalPct: 8 }
+    );
+    expect(result.allow).toBe(true);
+    if (!result.allow) return;
+    expect(result.portfolioPct).toBeCloseTo(8);
   });
 });
 

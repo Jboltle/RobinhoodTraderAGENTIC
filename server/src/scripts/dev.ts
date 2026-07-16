@@ -5,7 +5,9 @@ import { createLogger } from '../shared/logger.js';
 import { readTokenStatus } from '../trader/rh/tokenBootstrap.js';
 
 const log = createLogger('dev');
-const HEALTH_TIMEOUT_MS = Number(process.env.DEV_TRADER_HEALTH_TIMEOUT_MS ?? 10 * 60 * 1000);
+// Generous fixed ceiling: first-time Robinhood OAuth can keep the trader
+// unhealthy for minutes while the operator completes the browser flow.
+const HEALTH_TIMEOUT_MS = 10 * 60 * 1000;
 const HEALTH_POLL_MS = 750;
 
 const children = new Map<string, ChildProcess>();
@@ -14,10 +16,10 @@ let shuttingDown = false;
 async function main(): Promise<void> {
   await logAuthPreflight();
 
-  const trader = start('trader', 'tsx', ['src/trader/index.ts']);
+  const trader = start('trader', 'bun', ['src/trader/index.ts']);
 
   await waitForTraderHealth(trader);
-  start('bot', 'tsx', ['src/bot/index.ts']);
+  start('bot', 'bun', ['src/bot/index.ts']);
 
   log.info('dev stack running', {
     traderHealth: `http://localhost:${config.traderPort}/health`,
@@ -43,7 +45,7 @@ async function logAuthPreflight(): Promise<void> {
     hasRefreshToken: status.hasRefreshToken,
     browserOAuthLikely,
     hint: browserOAuthLikely
-      ? 'trader will try a Codex token import, then print an OAuth URL if needed'
+      ? 'trader will print an OAuth URL to authorize in the browser'
       : 'trader should connect with saved tokens',
   });
 }

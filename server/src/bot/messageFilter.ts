@@ -8,9 +8,17 @@
 import type { Message } from 'discord.js';
 
 import { isAllowed } from '../shared/config.js';
-import type { MessageClassification, MessageFilterConfig } from './types.js';
 
-export type { MessageClassification, MessageFilterConfig } from './types.js';
+export interface MessageFilterConfig {
+  readonly discordAllowedChannelIds: readonly string[];
+  readonly discordAllowedAuthorIds: readonly string[];
+}
+
+export interface MessageClassification {
+  readonly forward: boolean;
+  /** 'allowed' when forwardable, otherwise the ignore reason code. */
+  readonly reason: string;
+}
 
 /**
  * Parent channel id of a message's channel (the containing channel when the
@@ -53,17 +61,21 @@ export function hasForwardableContent(content: string): boolean {
 }
 
 /**
- * Ordered filter chain: system -> webhook -> bot author -> channel allow-list
- * -> author allow-list. Content emptiness is checked separately by the caller
- * after the (async) content assembly step via {@link hasForwardableContent}.
+ * Ordered filter chain: system -> self -> channel allow-list -> author
+ * allow-list. Bot/webhook-authored messages are always allowed because most
+ * alert channels are bot-driven; the bot's own posts are still dropped (via
+ * `selfAuthorId`) so mirrored messages never loop back in. Content emptiness
+ * is checked separately by the caller via {@link hasForwardableContent}.
  */
 export function classifyMessage(
   message: Message,
-  cfg: MessageFilterConfig
+  cfg: MessageFilterConfig,
+  selfAuthorId?: string | null
 ): MessageClassification {
   if (message.system) return { forward: false, reason: 'system_message' };
-  if (message.webhookId) return { forward: false, reason: 'webhook_message' };
-  if (message.author.bot) return { forward: false, reason: 'bot_author' };
+  if (selfAuthorId && message.author.id === selfAuthorId) {
+    return { forward: false, reason: 'self_author' };
+  }
   if (!isAllowedDiscordChannel(message, cfg.discordAllowedChannelIds)) {
     return { forward: false, reason: 'channel_not_allowed' };
   }

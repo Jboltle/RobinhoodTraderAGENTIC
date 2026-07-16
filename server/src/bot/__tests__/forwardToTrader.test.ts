@@ -33,7 +33,7 @@ describe('buildForwardRequest', () => {
     expect(req.headers['content-type']).toBe('application/json');
     expect(req.headers[webhookAuthHeaders.signature]).toBeTruthy();
     expect(req.headers[webhookAuthHeaders.timestamp]).toBeTruthy();
-    expect(req.body).toBe(JSON.stringify(ENVELOPE));
+    expect(req.body).toBe(JSON.stringify({ envelope: ENVELOPE }));
   });
 });
 
@@ -47,7 +47,7 @@ describe('forwardToTrader', () => {
     const [url, init] = fetchImpl.mock.calls[0]!;
     expect(url).toBe(config.traderWebhookUrl);
     expect(init.method).toBe('POST');
-    expect(init.body).toBe(JSON.stringify(ENVELOPE));
+    expect(init.body).toBe(JSON.stringify({ envelope: ENVELOPE }));
     expect(init.headers[webhookAuthHeaders.signature]).toBeTruthy();
     expect(init.headers[webhookAuthHeaders.timestamp]).toBeTruthy();
   });
@@ -82,9 +82,36 @@ describe('forwardToTrader', () => {
     const auth = verifyWebhookBody(body, headers, config.botTraderSecret);
     expect(auth.ok).toBe(true);
 
-    const parsed = DiscordEnvelopeSchema.safeParse(JSON.parse(body));
+    const parsed = DiscordEnvelopeSchema.safeParse(JSON.parse(body).envelope);
     expect(parsed.success).toBe(true);
     expect(parsed.success && parsed.data).toEqual(ENVELOPE);
+  });
+
+  it('round-trips embeds: they survive the POST body and trader-side parse', async () => {
+    const envelope: DiscordEnvelope = {
+      ...ENVELOPE,
+      content: 'BTO $QQQ 710p 06/08 (from card)',
+      embeds: [
+        {
+          title: 'BTO $QQQ 710p 06/08',
+          description: 'Entry @ 0.97',
+          fields: [{ name: 'Size', value: 'RISKY' }],
+          footer: { text: 'Demon Alerts' },
+        },
+      ],
+    };
+
+    let capturedBody = '';
+    const fetchImpl = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      capturedBody = init.body as string;
+      return Promise.resolve(okResponse());
+    });
+
+    await forwardToTrader(envelope, fetchImpl as unknown as typeof fetch);
+
+    const parsed = DiscordEnvelopeSchema.safeParse(JSON.parse(capturedBody).envelope);
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.embeds).toEqual(envelope.embeds);
   });
 
   it('rejects a tampered body under the original signature', async () => {

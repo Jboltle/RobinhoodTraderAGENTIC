@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
@@ -24,11 +25,24 @@ const log = createLogger('trader:rh:oauth');
 export class FileOAuthProvider implements OAuthClientProvider {
   private cachedState: PersistedState | undefined;
   private loadPromise: Promise<PersistedState> | undefined;
+  private oauthState: string | undefined;
 
   constructor(private readonly opts: FileOAuthProviderOptions) {}
 
   get redirectUrl(): string {
     return this.opts.redirectUri;
+  }
+
+  // Robinhood's /mcp/trading consent page requires a `state` param (its
+  // working clients all send one); the SDK forwards this to the authorize URL.
+  state(): string {
+    this.oauthState ??= randomBytes(16).toString('base64url');
+    return this.oauthState;
+  }
+
+  /** The `state` value the authorize redirect must echo back; undefined before state() is first called. */
+  get expectedState(): string | undefined {
+    return this.oauthState;
   }
 
   get clientMetadata(): OAuthClientMetadata {

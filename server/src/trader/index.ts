@@ -1,16 +1,14 @@
 import { REST, Routes } from 'discord.js';
-import Fastify from 'fastify';
 
 import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
-import { DiscordEnvelopeSchema, PostReceipt } from '../shared/types.js';
-import { verifyWebhookBody } from '../shared/webhookAuth.js';
+import { PostReceipt } from '../shared/types.js';
+import { createCalloutHistory } from './callouts.js';
 import { DecisionLog } from './decisionLog.js';
-import { runPipeline } from './pipeline/index.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { RobinhoodMcpClient } from './rh/mcpClient.js';
-import { readTokenStatus } from './rh/tokenBootstrap.js';
 import { RobinhoodTools } from './rh/tools.js';
+import { buildServer } from './server.js';
 
 const log = createLogger('trader');
 
@@ -70,75 +68,31 @@ async function main(): Promise<void> {
     log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
     await mcp.ensureConnected();
     log.info('Robinhood MCP connected', { tools: mcp.getToolNames() });
+
+    // ponytail: fail-fast on purpose — immediate mode is useless if the account
+    // can't be read, and main().catch already exits 1. Also warms the
+    // accountNumber cache in RobinhoodTools for later order placement.
+    const account = await tools.getBuyingPower();
+    log.info('Robinhood account snapshot', {
+      accountNumber: account.accountNumber,
+      portfolioValueUsd: account.portfolioValueUsd,
+      buyingPowerUsd: account.amountUsd,
+    });
   } else {
     log.warn('Robinhood MCP disabled in approval mode; no orders will be submitted');
   }
 
-  // Serialize pipeline so we never have two trades in flight on the same session.
-  let chain: Promise<void> = Promise.resolve();
-
-  const fastify = Fastify({ logger: false });
-
-  fastify.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
-    try {
-      (request as { rawBody?: string }).rawBody = body as string;
-      done(null, JSON.parse(body as string));
-    } catch (err) {
-      done(err as Error);
-    }
+  const fastify = buildServer({
+    parser,
+    tools,
+    decisions,
+    postReceipt,
+    mcp,
+    callouts: createCalloutHistory(),
   });
 
-  fastify.post('/webhook/discord', async (request, reply) => {
-    const rawBody = (request as { rawBody?: string }).rawBody ?? JSON.stringify(request.body);
-    const auth = verifyWebhookBody(rawBody, request.headers, config.botTraderSecret);
-    if (!auth.ok) {
-      log.warn('webhook: rejected - unauthorized', { reason: auth.reason });
-      return reply.status(401).send({ error: 'unauthorized' });
-    }
-
-    const result = DiscordEnvelopeSchema.safeParse(request.body);
-    if (!result.success) {
-      log.warn('webhook: rejected — invalid envelope', {
-        error: result.error.message,
-      });
-      return reply.status(400).send({ error: 'invalid envelope' });
-    }
-
-    const envelope = result.data;
-    log.info('webhook: received callout candidate', {
-      messageId: envelope.messageId,
-      author: envelope.authorName,
-      channel: envelope.channelId,
-    });
-
-    // Acknowledge immediately; the pipeline runs async so the bot never times out.
-    chain = chain
-      .then(() => runPipeline(envelope, { parser, tools, decisions, postReceipt }))
-      .then(() => undefined)
-      .catch((err) =>
-        log.error('pipeline crashed', {
-          messageId: envelope.messageId,
-          error: (err as Error).message,
-        })
-      );
-
-    return reply.status(202).send({ ok: true });
-  });
-
-  fastify.get('/health', async (_request, reply) => {
-    const tokenStatus = mcp ? await readTokenStatus(config.rhTokensPath) : null;
-    return reply.send({
-      ok: true,
-      executionMode: config.tradeExecutionMode,
-      rhConnected: mcp?.isConnected() ?? false,
-      rhTokenState: tokenStatus?.state ?? null,
-      rhTokenExpiresInSec: tokenStatus?.expiresInSec ?? null,
-      rhTools: mcp?.getToolNames() ?? [],
-    });
-  });
-
-  await fastify.listen({ port: config.traderPort, host: '0.0.0.0' });
-  log.info('trader listening', { port: config.traderPort });
+  await fastify.listen({ port: config.traderPort, host: config.traderHost });
+  log.info('trader listening', { host: config.traderHost, port: config.traderPort });
 }
 
 main().catch((err) => {

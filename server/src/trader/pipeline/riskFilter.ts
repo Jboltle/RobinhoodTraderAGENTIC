@@ -3,9 +3,18 @@ import { dirname } from 'node:path';
 
 import { config, isAllowed } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
-import type { Callout, PositionSize, RiskCheck } from '../../shared/types.js';
+import type { Callout, ResolvedTradeSettings, RiskCheck } from '../../shared/types.js';
 
 const log = createLogger('trader:risk');
+
+/**
+ * Qualitative position-size keywords extracted from the message.
+ * - small / light / scalp  →  small
+ * - medium / half          →  medium
+ * - full / max / heavy     →  full
+ * null = no size qualifier present (sizing defaults per asset type below).
+ */
+type PositionSize = 'small' | 'medium' | 'full';
 
 // =============================================================================
 // Sizing — keyword → portfolio percentage
@@ -19,19 +28,22 @@ const log = createLogger('trader:risk');
 // The pipeline fetches buying power once and does the dollar conversion.
 // =============================================================================
 
-function sizeFraction(size: PositionSize): number {
+function sizeFraction(size: PositionSize, settings: ResolvedTradeSettings): number {
   switch (size) {
-    case 'small':  return config.positionSmallPct  / 100;
-    case 'medium': return config.positionMediumPct / 100;
+    case 'small':  return settings.positionSmallPct  / 100;
+    case 'medium': return settings.positionMediumPct / 100;
     case 'full':   return 1.0;
   }
 }
 
-function resolveSize(callout: Callout): { portfolioPct: number; quantityHint: number | null } {
+function resolveSize(
+  callout: Callout,
+  settings: ResolvedTradeSettings
+): { portfolioPct: number; quantityHint: number | null } {
   const capPct =
     callout.assetType === 'option'
-      ? config.maxOptionsNotionalPct
-      : config.maxNotionalPctPerTrade;
+      ? settings.maxOptionsNotionalPct
+      : settings.maxNotionalPct;
 
   // Explicit share / contract count bypasses percentage sizing entirely.
   if (callout.sizeHint?.kind === 'shares') {
@@ -50,7 +62,7 @@ function resolveSize(callout: Callout): { portfolioPct: number; quantityHint: nu
 
   // Keyword / default — pure percentage sizing.
   const size: PositionSize = callout.positionSize ?? (callout.assetType === 'option' ? 'small' : 'medium');
-  return { portfolioPct: capPct * sizeFraction(size), quantityHint: null };
+  return { portfolioPct: capPct * sizeFraction(size, settings), quantityHint: null };
 }
 
 // =============================================================================
@@ -114,57 +126,63 @@ async function persistState(): Promise<void> {
 // =============================================================================
 
 /**
- * Evaluate a callout against deterministic risk rules.
+ * Evaluate a callout against deterministic risk rules using pre-resolved
+ * settings (payload → settings file → env; see trader/settings.ts).
  * Supports both equity (notional-based sizing) and options (contract-count sizing).
  */
-export async function checkRisk(callout: Callout, now: Date = new Date()): Promise<RiskCheck> {
+export async function checkRisk(
+  callout: Callout,
+  settings: ResolvedTradeSettings,
+  now: Date = new Date()
+): Promise<RiskCheck> {
   await ensureStateLoaded();
 
   if (!callout.isCallout || !callout.action || !callout.ticker) {
-    return { allow: false, reason: 'not a callout' };
+    return { allow: false, code: 'not_callout', reason: 'not a callout' };
   }
   if (callout.assetType === 'option' && !callout.option) {
-    return { allow: false, reason: 'option callout missing contract details' };
+    return { allow: false, code: 'missing_contract', reason: 'option callout missing contract details' };
   }
   if (callout.assetType === 'equity' && callout.sizeHint?.kind === 'contracts') {
-    return { allow: false, reason: 'contracts sizing is not valid for equity orders' };
+    return { allow: false, code: 'invalid_sizing', reason: 'contracts sizing is not valid for equity orders' };
   }
-  if (callout.confidence < config.minConfidence) {
+  if (callout.confidence < settings.minConfidence) {
     return {
       allow: false,
-      reason: `confidence ${callout.confidence.toFixed(2)} < threshold ${config.minConfidence}`,
+      code: 'low_confidence',
+      reason: `confidence ${callout.confidence.toFixed(2)} < threshold ${settings.minConfidence}`,
     };
   }
 
   const ticker = callout.ticker.toUpperCase();
 
-  if (config.blockedTickers.includes(ticker)) {
-    return { allow: false, reason: `${ticker} is blocked` };
+  if (settings.blockedTickers.includes(ticker)) {
+    return { allow: false, code: 'ticker_blocked', reason: `${ticker} is blocked` };
   }
   if (
-    config.allowedTickers.length > 0 &&
-    !config.allowedTickers.includes('*') &&
-    !isAllowed(ticker, config.allowedTickers)
+    settings.allowedTickers.length > 0 &&
+    !settings.allowedTickers.includes('*') &&
+    !isAllowed(ticker, settings.allowedTickers)
   ) {
-    return { allow: false, reason: `${ticker} not in allowlist` };
+    return { allow: false, code: 'ticker_not_allowed', reason: `${ticker} not in allowlist` };
   }
-  if (config.regularHoursOnly && !isRegularUsTradingHours(now)) {
-    return { allow: false, reason: 'outside regular US trading hours' };
+  if (settings.regularHoursOnly && !isRegularUsTradingHours(now)) {
+    return { allow: false, code: 'outside_market_hours', reason: 'outside regular US trading hours' };
   }
-  if (state.trades >= config.maxTradesPerDay) {
-    return { allow: false, reason: `daily trade cap reached (${config.maxTradesPerDay})` };
+  if (state.trades >= settings.maxTradesPerDay) {
+    return { allow: false, code: 'daily_cap_reached', reason: `daily trade cap reached (${settings.maxTradesPerDay})` };
   }
 
   const lastTradeAt = state.lastTradeAtByTicker[ticker];
   if (typeof lastTradeAt === 'number') {
     const elapsed = now.getTime() - lastTradeAt;
-    if (elapsed < config.cooldownSecondsPerTicker * 1000) {
-      const secs = Math.ceil((config.cooldownSecondsPerTicker * 1000 - elapsed) / 1000);
-      return { allow: false, reason: `${ticker} cooldown active (${secs}s remaining)` };
+    if (elapsed < settings.cooldownSeconds * 1000) {
+      const secs = Math.ceil((settings.cooldownSeconds * 1000 - elapsed) / 1000);
+      return { allow: false, code: 'cooldown_active', reason: `${ticker} cooldown active (${secs}s remaining)` };
     }
   }
 
-  const { portfolioPct, quantityHint } = resolveSize(callout);
+  const { portfolioPct, quantityHint } = resolveSize(callout, settings);
   const limitPrice = callout.orderType === 'limit' ? callout.limitPrice : null;
 
   return {
@@ -174,6 +192,8 @@ export async function checkRisk(callout: Callout, now: Date = new Date()): Promi
     quantityHint,
     limitPrice,
     orderType: callout.orderType,
+    maxSingleContractPct: settings.maxSingleContractPct,
+    maxOptionsNotionalPct: settings.maxOptionsNotionalPct,
   };
 }
 
