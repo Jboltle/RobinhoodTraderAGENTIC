@@ -1,0 +1,17 @@
+# Trader: Fastify webhook server + LLM parser + Robinhood MCP client.
+# Runs from source with production node_modules -- bundled dist/ output is NOT
+# used because discord.js/fastify leave lazy require()s (ajv, ...) unresolved
+# in the bundle. See README "Deployment" for details.
+FROM oven/bun:1.2.18-slim
+WORKDIR /app
+
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+
+COPY --chown=bun:bun src ./src
+RUN mkdir -p state && chown bun:bun state
+USER bun
+
+# 3000 = webhook + /health, 8788 = Robinhood OAuth browser callback
+EXPOSE 3000 8788
+CMD ["bun", "src/trader/index.ts"]

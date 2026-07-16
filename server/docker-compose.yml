@@ -1,0 +1,96 @@
+name: rh-discord-trader
+
+services:
+  trader:
+    build:
+      context: .
+      dockerfile: Dockerfile.trader
+    env_file: ../.env
+    environment:
+      # Inside compose, "localhost" points at the container itself. Default to
+      # the ollama service DNS name; override in .env for host Ollama
+      # (http://host.docker.internal:11434) or a cloud provider.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      # Both listeners must bind all interfaces inside the container so the
+      # published ports and the bot's cross-container webhook POSTs work,
+      # regardless of the host-oriented (127.0.0.1) .env values.
+      TRADER_HOST: 0.0.0.0
+      ROBINHOOD_OAUTH_CALLBACK_HOST: 0.0.0.0
+      # Session-settings pull from the client dashboard. Host-oriented .env
+      # values (http://localhost:3001/...) don't resolve inside the container,
+      # so reach the client service by name. Uncomment to enable; the trader
+      # falls through to settings.json/env whenever the client is unreachable.
+      # CLIENT_SETTINGS_URL: http://client:3001/api/settings-state
+    # Identity mappings (host port == container port) keep the OAuth redirect
+    # URI derived from .env valid both inside the container and in the browser.
+    # Published on host loopback only: the settings API has no auth, so we
+    # mirror the non-Docker default of binding 127.0.0.1.
+    ports:
+      - "127.0.0.1:${TRADER_PORT:-3000}:${TRADER_PORT:-3000}"
+      # Robinhood OAuth browser callback -- must be reachable from the host
+      # browser during first-run auth.
+      - "127.0.0.1:${ROBINHOOD_OAUTH_CALLBACK_PORT:-8788}:${ROBINHOOD_OAUTH_CALLBACK_PORT:-8788}"
+    volumes:
+      - state:/app/state
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch(`http://localhost:$${process.env.TRADER_PORT||3000}/health`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      # In immediate mode the trader completes Robinhood OAuth BEFORE it starts
+      # listening; a generous retry window (~10 min) covers first-run auth.
+      retries: 40
+      start_period: 30s
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    env_file: ../.env
+    environment:
+      TRADER_WEBHOOK_URL: http://trader:${TRADER_PORT:-3000}/webhook/discord
+    volumes:
+      - state:/app/state
+    restart: unless-stopped
+    depends_on:
+      trader:
+        condition: service_healthy
+
+  client:
+    build:
+      # Repo root: Dockerfile.client COPYs client/... relative to the root.
+      context: ..
+      dockerfile: Dockerfile.client
+      args:
+        # Baked into the bundle at build time; the BROWSER calls this URL, so
+        # it must be host-reachable (the trader's published loopback port),
+        # NOT the compose-internal "http://trader:3000".
+        VITE_TRADER_URL: ${VITE_TRADER_URL:-http://localhost:${TRADER_PORT:-3000}}
+    ports:
+      - "127.0.0.1:3001:3001"
+    restart: unless-stopped
+    depends_on:
+      trader:
+        condition: service_healthy
+
+  # Optional local LLM. Opt in with: docker compose --profile ollama up
+  # Then pull a model once: docker compose exec ollama ollama pull qwen3:8b
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    # GPU acceleration (NVIDIA): requires nvidia-container-toolkit on the host.
+    # Uncomment to enable; without it Ollama falls back to CPU.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  state:
+  ollama-models:

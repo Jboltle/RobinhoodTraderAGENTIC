@@ -1,0 +1,20 @@
+# Client: TanStack Start dashboard, built with Vite and served by a small Bun
+# static+SSR server (client/server.ts). Same base image as the other services.
+FROM oven/bun:1.2.18-slim
+WORKDIR /app
+
+COPY client/package.json client/bun.lock ./
+# Dev deps included: vite runs the build inside the image.
+RUN bun install --frozen-lockfile
+
+COPY --chown=bun:bun client ./
+
+# Baked into the static bundle at build time. The BROWSER calls this URL, so
+# it must be reachable from the host (default: trader's published port).
+ARG VITE_TRADER_URL=http://localhost:3000
+ENV VITE_TRADER_URL=${VITE_TRADER_URL}
+RUN bun --bun run build
+
+USER bun
+EXPOSE 3001
+CMD ["bun", "server.ts"]

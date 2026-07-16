@@ -1,0 +1,14 @@
+# Bot: Discord Gateway client that forwards callouts to the trader.
+# Outbound network only -- no ports exposed. Runs from source with production
+# node_modules (same rationale as Dockerfile.trader; see README "Deployment").
+FROM oven/bun:1.2.18-slim
+WORKDIR /app
+
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+
+COPY --chown=bun:bun src ./src
+RUN mkdir -p state && chown bun:bun state
+USER bun
+
+CMD ["bun", "src/bot/index.ts"]

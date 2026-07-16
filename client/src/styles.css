@@ -1,0 +1,37 @@
+
+@import "tailwindcss";
+
+/* Design tokens from the "Stock Trading Software UI Kit" Figma file
+   (see .ua/intermediate/style-extract.json). Neutral scale is named ink-*. */
+@theme {
+  --font-sans: 'Golos Text', system-ui, -apple-system, sans-serif;
+
+  --color-ink-900: #050505; /* app background */
+  --color-ink-800: #0a0a0a; /* panel / card surface */
+  --color-ink-700: #191919; /* elevated surface, buttons, inputs */
+  --color-ink-600: #1f1f1f; /* borders / dividers */
+  --color-ink-500: #595959; /* muted text (dim) */
+  --color-ink-400: #999999; /* muted text */
+
+  --color-brand: #00bddd; /* Brand Blue */
+  --color-gain: #0fedbe; /* up / buy green */
+  --color-loss: #f63c6b; /* down / sell red */
+  --color-warn: #ffaa2b; /* warning yellow */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-ink-900);
+  color: #ffffff;
+  -webkit-font-smoothing: antialiased;
+}

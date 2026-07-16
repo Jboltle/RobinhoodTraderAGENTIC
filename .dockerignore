@@ -1,0 +1,20 @@
+# Root context is only used by Dockerfile.client; exclude the backend entirely.
+server/
+node_modules/
+dist/
+client/node_modules/
+client/dist/
+client/.tanstack/
+client/.env
+state/
+.env
+.env.*
+!.env.example
+.git/
+.cursor/
+.ua/
+*.log
+context.md
+Dockerfile.*
+docker-compose.yml
+test-docker-build.ps1
