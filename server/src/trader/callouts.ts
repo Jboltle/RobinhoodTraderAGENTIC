@@ -88,6 +88,42 @@ export function flattenRestMessage(msg: RestMessage): string {
   return body;
 }
 
+/** Header the bot prepends in buildMirrorPayload (bot/messageAssembly.ts). */
+const MIRROR_HEADER_RE =
+  /^From: (.+) \((\d+)\)\nSource channel: (\d+)\nMessage ID: (\d+)\n?\n?/;
+
+/**
+ * Parse a funnel-channel mirror post (buildMirrorPayload in
+ * bot/messageAssembly.ts) back into a CalloutMessage. Returns null for
+ * anything without the mirror header (humans chatting in the funnel,
+ * receipts, ...) — header-parse success is the display gate: the bot only
+ * mirrors already-allowlisted callouts, so no author filtering is needed.
+ */
+export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
+  const match = MIRROR_HEADER_RE.exec(msg.content ?? '');
+  if (!match) return null;
+
+  let content = msg.content.slice(match[0].length);
+  if (msg.embeds?.length) {
+    const embedText = msg.embeds.map(flattenEmbedText).filter(Boolean).join('\n---\n');
+    if (embedText) content = (content ? content + '\n' : '') + embedText;
+  }
+
+  return {
+    // The ORIGINAL message id from the header — the decision log joins on it,
+    // not the mirror post's own id.
+    messageId: match[4]!,
+    channelId: match[3]!,
+    channelName: null, // resolved by the caller via the cached channel-name lookup
+    authorName: match[1]!,
+    // The mirror post's own timestamp — the original's isn't in the header;
+    // close enough for feed ordering.
+    timestamp: msg.timestamp,
+    content,
+    embeds: msg.embeds ?? [],
+  };
+}
+
 /**
  * Mirror of the bot's classifyMessage for REST payloads: non-system message,
  * allowlisted author, non-empty flattened content. The channel gate is
@@ -172,7 +208,8 @@ async function discordGet(url: URL, fetchImpl: typeof fetch): Promise<unknown> {
 
 export interface CalloutHistory {
   /**
-   * Today's displayable callouts across all allowlisted channels, newest-first.
+   * Today's displayable callouts, newest-first — from the funnel channel when
+   * `discordForwardChannelId` is set, otherwise from every allowlisted channel.
    * Cached ~60s; on Discord failure serves the last successful result (stale)
    * and backs off for 30s. Throws only when no fetch has ever succeeded.
    */
@@ -215,20 +252,36 @@ export function createCalloutHistory(fetchImpl: typeof fetch = fetch): CalloutHi
       try {
         const since = localMidnight();
         const messages: CalloutMessage[] = [];
-        for (const channelId of config.discordAllowedChannelIds) {
-          const name = await channelName(channelId);
-          const raw = await fetchChannelMessagesSince(channelId, since, fetchImpl);
+        if (config.discordForwardChannelId) {
+          // Funnel path: the bot mirrors every allowed callout into one
+          // channel, so fetch just that — 1 history call instead of N
+          // (avoids 429s, and 404s from private channels in the allowlist).
+          const raw = await fetchChannelMessagesSince(
+            config.discordForwardChannelId,
+            since,
+            fetchImpl
+          );
           for (const msg of raw) {
-            if (!isDisplayableCallout(msg, config.discordAllowedAuthorIds)) continue;
-            messages.push({
-              messageId: msg.id,
-              channelId: msg.channel_id,
-              channelName: name,
-              authorName: msg.author.global_name ?? msg.author.username,
-              timestamp: msg.timestamp,
-              content: flattenRestMessage(msg),
-              embeds: msg.embeds ?? [],
-            });
+            const parsed = parseMirrorMessage(msg);
+            if (!parsed) continue;
+            messages.push({ ...parsed, channelName: await channelName(parsed.channelId) });
+          }
+        } else {
+          for (const channelId of config.discordAllowedChannelIds) {
+            const name = await channelName(channelId);
+            const raw = await fetchChannelMessagesSince(channelId, since, fetchImpl);
+            for (const msg of raw) {
+              if (!isDisplayableCallout(msg, config.discordAllowedAuthorIds)) continue;
+              messages.push({
+                messageId: msg.id,
+                channelId: msg.channel_id,
+                channelName: name,
+                authorName: msg.author.global_name ?? msg.author.username,
+                timestamp: msg.timestamp,
+                content: flattenRestMessage(msg),
+                embeds: msg.embeds ?? [],
+              });
+            }
           }
         }
         messages.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
