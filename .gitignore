@@ -3,11 +3,12 @@ dist/
 .env
 .env.*
 !.env.example
-bun.lock 
-
+.ua/
 state/
 *.log
 .DS_Store
 
 # Stray OAuth client dump written by some MCP clients at the repo root.
 rh-discord-trader.json
+
+.cursor/

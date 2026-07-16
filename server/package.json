@@ -1,0 +1,40 @@
+{
+  "name": "rh-discord-trader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Discord-driven Robinhood auto-trader: listens to a channel and executes equity orders via the Robinhood Trading MCP.",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "dev": "bun src/scripts/dev.ts",
+    "trader": "bun src/trader/index.ts",
+    "bot": "bun src/bot/index.ts",
+    "start:bot": "bun src/bot/index.ts",
+    "start:trader": "bun src/trader/index.ts",
+    "connect": "bun src/scripts/rhConnect.ts",
+    "auth:reset": "bun src/scripts/rhResetAuth.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "bun build src/bot/index.ts src/trader/index.ts --outdir dist --target bun",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tanstack/ai": "^0.40.0",
+    "@tanstack/ai-anthropic": "^0.16.1",
+    "@tanstack/ai-ollama": "^0.8.14",
+    "@tanstack/ai-openai": "^0.16.0",
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.8.5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.9"
+  }
+}
