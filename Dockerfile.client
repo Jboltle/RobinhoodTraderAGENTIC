@@ -11,8 +11,8 @@ COPY --chown=bun:bun client ./
 
 # Baked into the static bundle at build time. The BROWSER calls this URL, so
 # it must be reachable from the host (default: trader's published port).
-ARG VITE_TRADER_URL=http://localhost:3000
-ENV VITE_TRADER_URL=${VITE_TRADER_URL}
+ARG API_URL=http://localhost:3000
+ENV API_URL=${API_URL}
 RUN bun --bun run build
 
 USER bun

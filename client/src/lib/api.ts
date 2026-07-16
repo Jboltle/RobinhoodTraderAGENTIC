@@ -8,7 +8,7 @@
  */
 
 export const TRADER_URL: string =
-  import.meta.env.VITE_TRADER_URL ?? 'http://localhost:3000'
+  import.meta.env.API_URL ?? 'http://localhost:3000'
 
 export interface OptionContract {
   optionType: 'call' | 'put'

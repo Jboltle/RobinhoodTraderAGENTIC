@@ -157,8 +157,10 @@ export const config = {
   clientSettingsUrl: env.CLIENT_SETTINGS_URL?.trim() || null,
   // 127.0.0.1 by default: the dashboard API has no auth, so binding is the
   // access control. Set 0.0.0.0 only when another container must reach it.
-  traderHost: env.TRADER_HOST ?? '127.0.0.1',
-  traderPort: num(env.TRADER_PORT, 3000),
+  // ponytail: a set PORT env var (Render/PaaS convention) flips the default
+  // to 0.0.0.0 so the platform proxy can reach us; explicit TRADER_HOST wins.
+  traderHost: env.TRADER_HOST ?? (env.PORT ? '0.0.0.0' : '127.0.0.1'),
+  traderPort: num(env.PORT ?? env.TRADER_PORT, 3000),
   traderWebhookUrl: env.TRADER_WEBHOOK_URL ?? 'http://localhost:3000/webhook/discord',
 
   // ---- State paths -----------------------------------------------------------

@@ -65,7 +65,7 @@ services:
         # Baked into the bundle at build time; the BROWSER calls this URL, so
         # it must be host-reachable (the trader's published loopback port),
         # NOT the compose-internal "http://trader:3000".
-        VITE_TRADER_URL: ${VITE_TRADER_URL:-http://localhost:${TRADER_PORT:-3000}}
+        API_URL: ${API_URL:-http://localhost:${TRADER_PORT:-3000}}
     ports:
       - "127.0.0.1:3001:3001"
     restart: unless-stopped
