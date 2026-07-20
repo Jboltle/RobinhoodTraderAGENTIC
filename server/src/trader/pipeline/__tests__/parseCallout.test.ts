@@ -385,6 +385,66 @@ describe('parseCallout — Lotto / risky trades (positionSize)', () => {
 });
 
 describe('parseCallout — exit / management signals', () => {
+  it('"Trim some" Close-or-Trim alert parses deterministically without the LLM', async () => {
+    // Regression: this exact message surfaced as parser_error when the LLM
+    // call failed. Bot exit alerts must never depend on the LLM.
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      'Close or Trim & Set SL to BE',
+      '',
+      'Trim some',
+      '',
+      'SPY 743P 2026-07-20',
+      '0.9000  →  1.06   P/L: +17.78% ($16.00)',
+      '',
+      '@Namrood - LIVE DASHBOARD',
+      '',
+      '@Optionality | Monday - 07-20-2026 10:21 AM EST',
+    ].join('\n'), '2026-07-20T14:21:00.000Z'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'sell',
+      ticker: 'SPY',
+      orderType: 'market',
+      limitPrice: null,
+      positionSize: 'medium',
+      option: { optionType: 'put', strike: 743, expiration: '2026-07-20' },
+    });
+  });
+
+  it('header-only Close-or-Trim alert (no size line) parses with positionSize null', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      '@Pro',
+      'Close or Trim & Set SL to BE',
+      'SPY 755C 2026-06-15',
+      '0.7100  →  0.9   P/L: +26.76% ($19.00)',
+      '@Namrood - LIVE DASHBOARD',
+    ].join('\n')));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      action: 'sell',
+      ticker: 'SPY',
+      orderType: 'market',
+      limitPrice: null,
+      positionSize: null,
+      option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+    });
+  });
+
   it('Close or Trim & Set SL to BE → sell / action=sell', async () => {
     const parser = parserWithMock({
       isCallout: true,

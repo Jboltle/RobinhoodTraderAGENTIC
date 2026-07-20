@@ -58,10 +58,25 @@ describe('message fixtures — exit / management (TRIM / RUNNERS ONLY)', () => {
     const trimFirst = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'trim-qqq-707c-first')!);
     const trimDouble = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'trim-qqq-707c-double')!);
     const runners = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'runners-only-qqq-707c')!);
+    const trimSome = await parseFixture(EXIT_FIXTURES.find((f) => f.id === 'trim-spy-743p-some')!);
 
     expect(trimFirst.positionSize).toBe('medium');
     expect(trimDouble.positionSize).toBe('full');
     expect(runners.positionSize).toBe('full');
+    expect(trimSome.positionSize).toBe('medium');
+  });
+
+  it.each(EXIT_FIXTURES.map((f) => [f.id, f] as const))('%s parses deterministically without the LLM', async (_id, fixture) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(envelopeFromFixture(fixture));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(true);
+    expect(result.action).toBe('sell');
   });
 });
 
@@ -86,7 +101,9 @@ describe('message fixtures — full catalog schema acceptance', () => {
 
 describe('message fixtures — prompt includes message content', () => {
   it('passes envelope content and timestamp to the LLM provider', async () => {
-    const fixture = ALL_FIXTURES.find((f) => f.id === 'trim-qqq-707c-first')!;
+    // Uses the lotto fixture: trim exits now parse deterministically and
+    // never reach the LLM, so they cannot exercise the prompt wiring.
+    const fixture = ALL_FIXTURES.find((f) => f.id === 'lotto-spy-risky')!;
     const mockCall = vi.fn().mockResolvedValue(fixture.expectedCallout);
     const parser = new LlmCalloutParser({ callStructured: mockCall });
     const envelope = envelopeFromFixture(fixture);

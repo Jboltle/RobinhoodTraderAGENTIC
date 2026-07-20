@@ -212,6 +212,38 @@ export const RUNNERS_ONLY_QQQ: DiscordMessageFixture = {
   },
 };
 
+export const TRIM_SPY_SOME: DiscordMessageFixture = {
+  id: 'trim-spy-743p-some',
+  category: 'trim_exit',
+  description: '"Trim some" exit alert that previously hit the LLM and surfaced as parser_error',
+  content: [
+    'Close or Trim & Set SL to BE',
+    '',
+    'Trim some',
+    '',
+    'SPY 743P 2026-07-20',
+    '0.9000  →  1.06   P/L: +17.78% ($16.00)',
+    '',
+    '@Namrood - LIVE DASHBOARD',
+    '',
+    '@Optionality | Monday - 07-20-2026 10:21 AM EST',
+  ].join('\n'),
+  timestamp: '2026-07-20T14:21:00.000Z',
+  expectedCallout: {
+    isCallout: true,
+    assetType: 'option',
+    action: 'sell',
+    ticker: 'SPY',
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: 'medium',
+    option: { optionType: 'put', strike: 743, expiration: '2026-07-20' },
+    confidence: 0.99,
+    rationale: 'Trim some SPY 743P — partial exit, P/L line is status only',
+  },
+};
+
 export const TRIM_GOOGLE_MOST: DiscordMessageFixture = {
   id: 'trim-goog-most',
   category: 'trim_exit',
@@ -547,6 +579,7 @@ export const ALL_FIXTURES: readonly DiscordMessageFixture[] = [
   TRIM_QQQ_FIRST,
   TRIM_QQQ_DOUBLE,
   RUNNERS_ONLY_QQQ,
+  TRIM_SPY_SOME,
   TRIM_GOOGLE_MOST,
   LOTTO_SPY_RISKY,
   HYPE_BANG,
