@@ -198,19 +198,36 @@ OTHER:
 - confidence: 0.0 - 1.0.
 - rationale: <=200 char summary of the trade extracted (or why rejected).
 - Always call the report_callout tool exactly once.`;
+// Mention/header noise lines the bot channels prepend or append to alerts:
+// "@Pro", "@Namrood - LIVE DASHBOARD", "@Optionality | Monday - ...".
+// Deliberately narrow: a line that mixes a mention with real signal
+// ("@Pro BTO SPY ...") is kept.
+const NOISE_LINE = /^(?:@\S+|@.+\bLIVE DASHBOARD\b.*|@\S+\s*\|.+)$/i;
+
+// The buy directive, anchored to the start of its own line — alerts may carry
+// author names, role mentions, or headers above it.
+const BTO_DIRECTIVE_LINE = /^\s*(?:BTO|BUY\s+TO\s+OPEN)\b/i;
+
 function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null {
-  const ownContent = envelope.content
-    .split(/\r?\n/)
+  const contentLines = envelope.content
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    // Markdown emphasis ("**Buy To Open**") must not hide a directive.
+    .map((line) => line.replace(/\*\*|__|`/g, ''))
     .filter((line) => !line.trimStart().startsWith('>'))
-    .join('\n');
-  const normalized = ownContent
-    .replace(/\r/g, '\n')
-    .replace(/[\u2192\u21d2]/g, ' -> ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .filter((line) => !NOISE_LINE.test(line.trimStart()));
+
+  const ownContent = contentLines.join('\n');
+  const collapse = (text: string): string =>
+    text.replace(/[\u2192\u21d2]/g, ' -> ').replace(/\s+/g, ' ').trim();
+  const normalized = collapse(ownContent);
+
+  const btoLineIndex = contentLines.findIndex((line) => BTO_DIRECTIVE_LINE.test(line));
+  const btoContent =
+    btoLineIndex === -1 ? normalized : collapse(contentLines.slice(btoLineIndex).join('\n'));
 
   return (
-    parseBtoOption(normalized, envelope.timestamp) ??
+    parseBtoOption(btoContent, envelope.timestamp) ??
     parseChaseOption(normalized, envelope.timestamp) ??
     parseCompactOptionLine(ownContent, envelope.timestamp) ??
     parseLabeledEntryOption(ownContent, envelope.timestamp) ??

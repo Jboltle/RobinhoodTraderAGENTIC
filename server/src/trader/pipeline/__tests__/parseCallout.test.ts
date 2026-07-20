@@ -230,6 +230,85 @@ describe('parseCallout — BTO / entry signals', () => {
       option: { optionType: 'call', strike: 7500, expiration: '2026-06-15' },
     });
   });
+  it('Buy To Open with SMALL POSITION tag and trailing headers parses deterministically', async () => {
+    // Regression: this exact message surfaced as parser_error when the LLM
+    // call failed. Bot entry alerts must never depend on the LLM.
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      'Buy To Open',
+      '',
+      'SMALL POSITION',
+      '',
+      'SPY 743P 0DTE 0.9',
+      '',
+      '@Namrood - LIVE DASHBOARD',
+      '',
+      '@Optionality | Monday - 07-20-2026 10:20 AM EST',
+    ].join('\n'), '2026-07-20T14:20:00.000Z'));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'limit',
+      limitPrice: 0.9,
+      positionSize: 'small',
+      option: { optionType: 'put', strike: 743, expiration: '2026-07-20' },
+    });
+  });
+
+  it('Buy To Open below @Optionality header and @Pro mention parses deterministically', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope([
+      '@Optionality | Monday - 06-15-2026  09:35 AM EST',
+      '@Pro',
+      'Buy To Open',
+      'SPY 755C 0DTE $0.71',
+      '@Namrood - LIVE DASHBOARD',
+    ].join('\n')));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'limit',
+      limitPrice: 0.71,
+      option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+    });
+  });
+
+  it('bold **Buy To Open** directive parses deterministically', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope(
+      '**Buy To Open**\nSPY 743P 0DTE 0.9',
+      '2026-07-20T14:20:00.000Z'
+    ));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      action: 'buy',
+      ticker: 'SPY',
+      limitPrice: 0.9,
+      option: { optionType: 'put', strike: 743, expiration: '2026-07-20' },
+    });
+  });
+
   it('BTO $SPY 755C 0DTE $0.71 parses deterministically without the LLM', async () => {
     const mockProvider: LlmProvider = {
       callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
@@ -636,28 +715,21 @@ describe('parseCallout — pre-LLM brag/P/L-update filter', () => {
     });
   });
 
-  it("does not filter Bishop's bold-labeled entering alert (reaches the LLM)", async () => {
-    const parser = parserWithMock({
-      isCallout: true,
-      assetType: 'option',
-      action: 'buy',
-      ticker: 'PANW',
-      orderType: 'limit',
-      limitPrice: 4.9,
-      sizeHint: null,
-      positionSize: null,
-      option: { optionType: 'call', strike: 365, expiration: '2026-07-17' },
-      confidence: 0.95,
-      rationale: 'PANW 365C 7/17 entry 4.80-4.90',
-    });
+  it("parses Bishop's bold-labeled entering alert deterministically", async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
 
     const result = await parser.parse(makeEnvelope(
       "I'm Entering\n**Option:** PANW 365 C 7/17\n**Entry:** 4.80-4.90",
       '2026-07-15T14:35:00.000Z'
     ));
 
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
     expect(result.isCallout).toBe(true);
     expect(result.ticker).toBe('PANW');
+    expect(result.limitPrice).toBe(4.9);
   });
 
   it('does not filter a lotto callout with a code-blocked contract (reaches the LLM)', async () => {
