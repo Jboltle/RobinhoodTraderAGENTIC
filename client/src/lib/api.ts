@@ -125,7 +125,7 @@ export interface PortfolioSummary {
 }
 
 /**
- * Session overrides pushed to /api/settings-state. Mirrors TradeSettingsSchema:
+ * Settings saved via PUT /api/settings on the trader. Mirrors TradeSettingsSchema:
  * every field optional — an absent field falls through to the trader's
  * settings.json / env defaults.
  */

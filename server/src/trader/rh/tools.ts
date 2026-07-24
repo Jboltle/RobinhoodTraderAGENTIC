@@ -115,7 +115,9 @@ export class RobinhoodTools {
         symbol: args.symbol,
         side: args.side,
         type: args.orderType,
-        quantity: args.quantity,
+        // RH MCP's schema types quantity as a string (decimal, supports
+        // fractional shares); an integer fails validation with -32602.
+        quantity: String(args.quantity),
         time_in_force: args.timeInForce ?? 'day',
         ...(args.orderType === 'limit' && args.limitPrice !== undefined
           ? { limit_price: args.limitPrice, price: args.limitPrice }
@@ -137,7 +139,10 @@ export class RobinhoodTools {
         option_type: args.optionType,
         strike_price: args.strike,
         expiration_date: args.expiration,
-        quantity: args.contracts,
+        // RH MCP's schema types quantity as a string ("type: 5 has type
+        // integer, want string"); strike_price/price passed validation as
+        // numbers on the same calls, so only quantity is coerced.
+        quantity: String(args.contracts),
         side: args.side,
         type: args.orderType,
         time_in_force: args.timeInForce ?? 'day',

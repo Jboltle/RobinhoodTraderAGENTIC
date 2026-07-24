@@ -90,6 +90,50 @@ describe('RobinhoodTools account selection', () => {
   });
 });
 
+describe('RobinhoodTools order placement argument types', () => {
+  // RH MCP rejects integer quantity ("type: 5 has type integer, want string").
+  const ORDER_PAYLOAD = { data: { order: { id: 'order-1', state: 'queued' } } };
+
+  it('passes option order quantity as a string', async () => {
+    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.placeOptionsOrder], {
+      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+      [TOOL_NAMES.placeOptionsOrder]: ORDER_PAYLOAD,
+    });
+    await new RobinhoodTools(mcp).placeOptionsOrder({
+      symbol: 'RIVN',
+      optionType: 'call',
+      strike: 16,
+      expiration: '2026-07-24',
+      contracts: 5,
+      side: 'buy',
+      orderType: 'market',
+    });
+
+    expect(mcp.callTool).toHaveBeenCalledWith(
+      TOOL_NAMES.placeOptionsOrder,
+      expect.objectContaining({ quantity: '5', strike_price: 16 })
+    );
+  });
+
+  it('passes equity order quantity as a string', async () => {
+    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.placeOrder], {
+      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+      [TOOL_NAMES.placeOrder]: ORDER_PAYLOAD,
+    });
+    await new RobinhoodTools(mcp).placeOrder({
+      symbol: 'AMD',
+      side: 'buy',
+      quantity: 2,
+      orderType: 'market',
+    });
+
+    expect(mcp.callTool).toHaveBeenCalledWith(
+      TOOL_NAMES.placeOrder,
+      expect.objectContaining({ quantity: '2' })
+    );
+  });
+});
+
 describe('RobinhoodTools get_portfolio parsing', () => {
   it('parses string-valued buying power and total value', async () => {
     const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.portfolio], {

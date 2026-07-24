@@ -1,0 +1,14 @@
+{
+  "executionMode": "approval",
+  "maxNotionalPct": 5,
+  "maxOptionsNotionalPct": 10,
+  "maxSingleContractPct": 42,
+  "positionSmallPct": 25,
+  "positionMediumPct": 50,
+  "maxTradesPerDay": 10,
+  "cooldownSeconds": 300,
+  "allowedTickers": ["*"],
+  "blockedTickers": [],
+  "minConfidence": 0.7,
+  "regularHoursOnly": true
+}

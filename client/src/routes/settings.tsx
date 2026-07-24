@@ -3,7 +3,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { fetchSettings, type TradeSettings, type TradeSettingsInput } from '../lib/api'
-import { fetchSessionSettings, saveSettings } from '../lib/settingsSync'
+import { saveSettings } from '../lib/settingsSync'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
@@ -11,34 +11,28 @@ export const Route = createFileRoute('/settings')({
 })
 
 function SettingsPage() {
-  // Session overrides live on this app's own server — always reachable.
-  const session = useQuery({
-    queryKey: ['settings-state'],
-    queryFn: fetchSessionSettings,
-  })
-  // Resolved defaults from the trader, used only for placeholder text; the
-  // form must still work when the trader is offline.
-  const defaults = useQuery({
+  // The form initializes from the trader's resolved settings; saving needs
+  // the trader anyway, so an unreachable trader is a hard error here.
+  const settings = useQuery({
     queryKey: ['settings'],
     queryFn: fetchSettings,
-    retry: false,
   })
 
-  if (session.isPending) {
+  if (settings.isPending) {
     return (
       <div className="rounded-xl border border-ink-600 bg-ink-800 px-4 py-6 text-center text-sm text-ink-400">
         Loading settings…
       </div>
     )
   }
-  if (session.isError) {
+  if (settings.isError) {
     return (
       <div className="rounded-xl border border-ink-600 bg-ink-800 px-4 py-6 text-center text-sm text-loss">
-        Failed to load settings: {(session.error as Error).message}
+        Failed to load settings: {(settings.error as Error).message}
       </div>
     )
   }
-  return <SettingsForm initial={session.data} defaults={defaults.data} />
+  return <SettingsForm initial={settings.data} defaults={settings.data} />
 }
 
 function SettingsForm({
@@ -54,7 +48,7 @@ function SettingsForm({
   const mutation = useMutation({
     mutationFn: saveSettings,
     onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ['settings-state'] }),
+      queryClient.invalidateQueries({ queryKey: ['settings'] }),
   })
 
   const set = <K extends keyof TradeSettingsInput>(
@@ -81,9 +75,9 @@ function SettingsForm({
       <header>
         <h1 className="text-2xl font-semibold text-white">Trade Settings</h1>
         <p className="mt-2 text-sm text-ink-400">
-          These settings apply to trades while set here — they ride along with
-          each message and are not saved permanently. Blank fields are unset
-          and fall through to the trader's saved settings or env defaults.
+          Saved settings are written to the trader and applied to every new
+          trade; they persist across restarts. Blank fields are unset and fall
+          through to the trader's env defaults.
         </p>
       </header>
 

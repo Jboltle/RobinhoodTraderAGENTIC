@@ -181,6 +181,14 @@ export class RobinhoodMcpClient {
       tools: this.toolNames,
       serverInfo: client.getServerVersion(),
     });
+    // The server validates arguments against these schemas (e.g. quantity is
+    // string-typed); log them once so type mismatches are diagnosable from logs.
+    const orderTools = list.tools.filter((t) => t.name.startsWith('place_'));
+    if (orderTools.length > 0) {
+      log.info('order tool input schemas', {
+        schemas: Object.fromEntries(orderTools.map((t) => [t.name, t.inputSchema])),
+      });
+    }
   }
 
   getToolNames(): readonly string[] {
