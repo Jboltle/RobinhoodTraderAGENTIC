@@ -1,11 +1,10 @@
 /**
- * createCalloutHistory resilience: stale-cache fallback and failure cooldown.
- *   - failure after a prior success serves stale data, no refetch during cooldown
- *   - cold failure (no prior success) still throws
- *   - after cooldown expiry a new Discord fetch is attempted
+ * Discord history reading for catch-up: the funnel-channel path, the
+ * per-channel path, and the mirror-header round trip that ties this module to
+ * the bot's payload format.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../shared/config.js', () => ({
   config: {
@@ -21,12 +20,12 @@ vi.mock('../../shared/config.js', () => ({
 import { buildMirrorPayload } from '../../bot/messageAssembly.js';
 import { config } from '../../shared/config.js';
 import type { DiscordEnvelope } from '../../shared/types.js';
-import { createCalloutHistory, parseMirrorMessage, type RestMessage } from '../callouts.js';
+import { fetchTodaysCallouts, parseMirrorMessage, type RestMessage } from '../callouts.js';
 
 // The real config is `as const`; the mock above is a plain mutable object.
 const mutableConfig = config as { discordForwardChannelId: string | null };
 
-const NOW = new Date('2026-07-16T12:00:00');
+const SINCE = new Date('2026-07-16T00:00:00');
 
 const MESSAGE: RestMessage = {
   id: 'msg-1',
@@ -37,85 +36,17 @@ const MESSAGE: RestMessage = {
   author: { id: 'author-1', username: 'caller', global_name: 'Caller' },
 };
 
-const json = (body: unknown) =>
-  new Response(JSON.stringify(body), { status: 200 });
-// 500, not 429: discordGet retries 429 with a real setTimeout sleep.
-const serverError = () => new Response('{}', { status: 500 });
+const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
 
 /** fetchImpl serving the channel-name lookup and one message page. */
-const okFetch = () =>
+const fetchServing = (messages: RestMessage[], channelName = 'alerts') =>
   vi.fn(async (url: Parameters<typeof fetch>[0]) => {
     const path = url instanceof URL ? url.pathname : String(url);
-    return path.endsWith('/messages') ? json([MESSAGE]) : json({ name: 'alerts' });
+    return path.endsWith('/messages') ? json(messages) : json({ name: channelName });
   }) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
 
-const failFetch = () =>
-  vi.fn(async () => serverError()) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
-
-beforeEach(() => {
-  vi.useFakeTimers();
-  vi.setSystemTime(NOW);
-});
-
 afterEach(() => {
-  vi.useRealTimers();
   mutableConfig.discordForwardChannelId = null;
-});
-
-describe('createCalloutHistory failure handling', () => {
-  it('serves stale data on failure and skips fetch during cooldown', async () => {
-    const fetchMock = okFetch();
-    const history = createCalloutHistory(fetchMock);
-
-    const fresh = await history.getToday();
-    expect(fresh).toHaveLength(1);
-    const callsAfterSuccess = fetchMock.mock.calls.length;
-
-    // Past the 60s TTL, Discord now fails.
-    vi.setSystemTime(NOW.getTime() + 61_000);
-    fetchMock.mockImplementation(async () => serverError());
-
-    const stale = await history.getToday();
-    expect(stale).toEqual(fresh);
-    expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterSuccess);
-
-    // Within the 30s cooldown: stale again, no new Discord call.
-    const callsAfterFailure = fetchMock.mock.calls.length;
-    vi.setSystemTime(NOW.getTime() + 61_000 + 10_000);
-    expect(await history.getToday()).toEqual(fresh);
-    expect(fetchMock.mock.calls.length).toBe(callsAfterFailure);
-  });
-
-  it('throws on cold failure (no prior success), rethrowing during cooldown without refetching', async () => {
-    const fetchMock = failFetch();
-    const history = createCalloutHistory(fetchMock);
-
-    await expect(history.getToday()).rejects.toThrow('failed: 500');
-    const callsAfterFailure = fetchMock.mock.calls.length;
-
-    vi.setSystemTime(NOW.getTime() + 10_000);
-    await expect(history.getToday()).rejects.toThrow('failed: 500');
-    expect(fetchMock.mock.calls.length).toBe(callsAfterFailure);
-  });
-
-  it('attempts a new fetch after the cooldown expires', async () => {
-    const fetchMock = failFetch();
-    const history = createCalloutHistory(fetchMock);
-
-    await expect(history.getToday()).rejects.toThrow('failed: 500');
-    const callsAfterFailure = fetchMock.mock.calls.length;
-
-    vi.setSystemTime(NOW.getTime() + 31_000);
-    fetchMock.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
-      const path = url instanceof URL ? url.pathname : String(url);
-      return path.endsWith('/messages') ? json([MESSAGE]) : json({ name: 'alerts' });
-    });
-
-    const messages = await history.getToday();
-    expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterFailure);
-    expect(messages).toHaveLength(1);
-    expect(messages[0]!.messageId).toBe('msg-1');
-  });
 });
 
 const ENVELOPE: DiscordEnvelope = {
@@ -143,12 +74,12 @@ describe('parseMirrorMessage', () => {
   // Pins parseMirrorMessage to the bot's real header format: a change to
   // buildMirrorPayload must fail this round-trip loudly.
   it('round-trips buildMirrorPayload output back to the original callout', () => {
-    const payload = buildMirrorPayload(ENVELOPE);
-    const parsed = parseMirrorMessage(mirrorRestMessage(payload.content));
+    const parsed = parseMirrorMessage(mirrorRestMessage(buildMirrorPayload(ENVELOPE).content));
 
     expect(parsed).not.toBeNull();
     expect(parsed!.messageId).toBe(ENVELOPE.messageId);
     expect(parsed!.channelId).toBe(ENVELOPE.channelId);
+    expect(parsed!.authorId).toBe(ENVELOPE.authorId);
     expect(parsed!.authorName).toBe(ENVELOPE.authorName);
     expect(parsed!.content).toBe(ENVELOPE.content);
   });
@@ -158,17 +89,33 @@ describe('parseMirrorMessage', () => {
   });
 });
 
-describe('getToday funnel path', () => {
+describe('fetchTodaysCallouts', () => {
+  it('reads the allowlisted channels and resolves their names', async () => {
+    const messages = await fetchTodaysCallouts(fetchServing([MESSAGE]), SINCE);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      messageId: 'msg-1',
+      channelId: 'chan-1',
+      channelName: 'alerts',
+      authorId: 'author-1',
+      authorName: 'Caller',
+      content: 'BTO AAPL 220c',
+    });
+  });
+
+  it('skips system messages and messages from non-allowlisted authors', async () => {
+    const systemMessage: RestMessage = { ...MESSAGE, id: 'msg-system', type: 6 };
+    const messages = await fetchTodaysCallouts(fetchServing([systemMessage]), SINCE);
+    expect(messages).toEqual([]);
+  });
+
   it('fetches only the funnel channel and resolves source channel names', async () => {
     mutableConfig.discordForwardChannelId = 'funnel-1';
     const mirror = mirrorRestMessage(buildMirrorPayload(ENVELOPE).content);
+    const fetchMock = fetchServing([mirror], 'source-alerts');
 
-    const fetchMock = vi.fn(async (url: Parameters<typeof fetch>[0]) => {
-      const path = url instanceof URL ? url.pathname : String(url);
-      return path.endsWith('/messages') ? json([mirror]) : json({ name: 'source-alerts' });
-    }) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
-
-    const messages = await createCalloutHistory(fetchMock).getToday();
+    const messages = await fetchTodaysCallouts(fetchMock, SINCE);
 
     const messageFetchUrls = fetchMock.mock.calls
       .map((call: unknown[]) => String(call[0]))
@@ -180,5 +127,26 @@ describe('getToday funnel path', () => {
     expect(messages[0]!.messageId).toBe(ENVELOPE.messageId);
     expect(messages[0]!.channelId).toBe(ENVELOPE.channelId);
     expect(messages[0]!.channelName).toBe('source-alerts');
+  });
+
+  it('returns messages oldest-first so catch-up replays them in order', async () => {
+    const older: RestMessage = {
+      ...MESSAGE,
+      id: 'older',
+      timestamp: new Date('2026-07-16T09:00:00').toISOString(),
+    };
+    const newer: RestMessage = {
+      ...MESSAGE,
+      id: 'newer',
+      timestamp: new Date('2026-07-16T11:00:00').toISOString(),
+    };
+
+    const messages = await fetchTodaysCallouts(fetchServing([newer, older]), SINCE);
+    expect(messages.map((m) => m.messageId)).toEqual(['older', 'newer']);
+  });
+
+  it('propagates a Discord failure so startup can log it', async () => {
+    const failing = vi.fn(async () => new Response('{}', { status: 500 })) as unknown as typeof fetch;
+    await expect(fetchTodaysCallouts(failing, SINCE)).rejects.toThrow('failed: 500');
   });
 });

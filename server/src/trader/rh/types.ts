@@ -103,13 +103,18 @@ export interface PlaceOptionsOrderResult {
 
 // ---- OAuth persistence -------------------------------------------------------
 
-export interface FileOAuthProviderOptions {
-  readonly path: string;
+/** The subset of the data layer the OAuth provider needs. */
+export interface BrokerTokenStore {
+  getBrokerTokens(userId: string): Promise<PersistedState | null>;
+  saveBrokerTokens(userId: string, state: PersistedState): Promise<void>;
+}
+
+export interface SupabaseOAuthProviderOptions {
+  readonly userId: string;
+  readonly db: BrokerTokenStore;
   readonly clientName: string;
   readonly redirectUri: string;
   readonly onAuthorizationUrl: (url: URL) => void | Promise<void>;
-  /** Fire-and-forget hook invoked after each successful persist (e.g. vault backup). */
-  readonly onPersist?: () => void;
 }
 
 export interface PersistedState {
@@ -127,14 +132,4 @@ export interface TokenStatus {
   /** Seconds until the access token's `exp`; null when unknown/missing. */
   readonly expiresInSec: number | null;
   readonly hasRefreshToken: boolean;
-}
-
-/** Shape of the persisted token file, as read by the bootstrap. */
-export interface StoredTokens {
-  access_token?: string;
-  refresh_token?: string;
-}
-
-export interface StoredState {
-  tokens?: StoredTokens;
 }

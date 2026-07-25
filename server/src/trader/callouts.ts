@@ -1,29 +1,26 @@
 /**
- * Today's Discord callout history for the dashboard feed — "Discord acts as
- * the database". Fetches message history for every allowlisted channel via the
- * Discord REST API and mirrors the bot's filter/flatten semantics
- * (messageFilter.ts / messageAssembly.ts).
+ * Today's Discord callout history, read over the REST API.
  *
- * SAFETY: display-only read path. Nothing here builds envelopes or calls
- * parse/risk/execute — history must never enter the trade pipeline.
+ * This used to backfill the dashboard feed; the feed now reads the `callouts`
+ * table, and the only caller left is catch-up-on-wake (catchup.ts), which
+ * needs to know what was posted while the process was asleep. It mirrors the
+ * bot's filter/flatten semantics (messageFilter.ts / messageAssembly.ts) so a
+ * catch-up message is shaped exactly like a live one.
  *
  * ponytail: the trader calling Discord REST directly is a deliberate boundary
  * shortcut — message history needs no gateway connection, and a bot→trader
- * backfill hop just for display isn't worth it. Upgrade path: move history
- * into the bot service if it ever needs gateway state.
+ * hop for it isn't worth it. Upgrade path: move history into the bot service
+ * if it ever needs gateway state.
  */
 
 import { config, isAllowed } from '../shared/config.js';
 import { flattenEmbedText, type EmbedLike } from '../shared/embedText.js';
 import { createLogger } from '../shared/logger.js';
-import type { Decision, DecisionKind } from '../shared/types.js';
 
 const log = createLogger('trader:callouts');
 
 const DISCORD_API = 'https://discord.com/api/v10';
 const PAGE_SIZE = 100;
-const CACHE_TTL_MS = 60_000;
-const FAILURE_COOLDOWN_MS = 30_000;
 /** Discord message types the bot treats as non-system: DEFAULT and REPLY. */
 const USER_MESSAGE_TYPES = new Set([0, 19]);
 
@@ -40,21 +37,19 @@ export interface RestMessage {
   readonly sticker_items?: readonly { readonly name: string }[];
 }
 
-/** One feed item; `decision` is null when the message was never processed. */
-export interface CalloutItem {
+/** A Discord message worth putting through the pipeline. */
+export interface CalloutMessage {
   readonly messageId: string;
   readonly channelId: string;
   readonly channelName: string | null;
+  readonly authorId: string;
   readonly authorName: string;
   readonly timestamp: string;
   readonly content: string;
   readonly embeds: readonly Record<string, unknown>[];
-  readonly decision: { readonly kind: DecisionKind; readonly reason: string; readonly at: string } | null;
 }
 
-export type CalloutMessage = Omit<CalloutItem, 'decision'>;
-
-/** Local midnight (server timezone) — the feed's "today" boundary. */
+/** Local midnight (server timezone) — the history window's "today" boundary. */
 export function localMidnight(now: Date = new Date()): Date {
   const midnight = new Date(now);
   midnight.setHours(0, 0, 0, 0);
@@ -96,8 +91,8 @@ const MIRROR_HEADER_RE =
  * Parse a funnel-channel mirror post (buildMirrorPayload in
  * bot/messageAssembly.ts) back into a CalloutMessage. Returns null for
  * anything without the mirror header (humans chatting in the funnel,
- * receipts, ...) — header-parse success is the display gate: the bot only
- * mirrors already-allowlisted callouts, so no author filtering is needed.
+ * receipts, ...) — header-parse success is the gate: the bot only mirrors
+ * already-allowlisted callouts, so no author filtering is needed.
  */
 export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
   const match = MIRROR_HEADER_RE.exec(msg.content ?? '');
@@ -110,14 +105,15 @@ export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
   }
 
   return {
-    // The ORIGINAL message id from the header — the decision log joins on it,
-    // not the mirror post's own id.
+    // The ORIGINAL message id from the header — the callouts table is keyed on
+    // it, not on the mirror post's own id.
     messageId: match[4]!,
     channelId: match[3]!,
     channelName: null, // resolved by the caller via the cached channel-name lookup
+    authorId: match[2]!,
     authorName: match[1]!,
     // The mirror post's own timestamp — the original's isn't in the header;
-    // close enough for feed ordering.
+    // close enough for ordering and for the staleness window.
     timestamp: msg.timestamp,
     content,
     embeds: msg.embeds ?? [],
@@ -136,24 +132,6 @@ export function isDisplayableCallout(
   if (!USER_MESSAGE_TYPES.has(msg.type)) return false;
   if (!isAllowed(msg.author.id, authorAllowlist)) return false;
   return flattenRestMessage(msg).trim().length > 0;
-}
-
-/** Attach each message's pipeline outcome from the decision log, joined on Discord message id. */
-export function joinDecisions(
-  messages: readonly CalloutMessage[],
-  decisions: readonly Decision[]
-): CalloutItem[] {
-  const byMessageId = new Map<string, Decision>();
-  for (const decision of decisions) byMessageId.set(decision.envelope.messageId, decision);
-  return messages.map((message) => {
-    const decision = byMessageId.get(message.messageId);
-    return {
-      ...message,
-      decision: decision
-        ? { kind: decision.kind, reason: decision.reason, at: decision.at }
-        : null,
-    };
-  });
 }
 
 /**
@@ -206,22 +184,17 @@ async function discordGet(url: URL, fetchImpl: typeof fetch): Promise<unknown> {
   }
 }
 
-export interface CalloutHistory {
-  /**
-   * Today's displayable callouts, newest-first — from the funnel channel when
-   * `discordForwardChannelId` is set, otherwise from every allowlisted channel.
-   * Cached ~60s; on Discord failure serves the last successful result (stale)
-   * and backs off for 30s. Throws only when no fetch has ever succeeded.
-   */
-  getToday(): Promise<CalloutMessage[]>;
-}
-
-export function createCalloutHistory(fetchImpl: typeof fetch = fetch): CalloutHistory {
-  let cache: { at: number; messages: CalloutMessage[] } | null = null;
-  let lastFailure: { at: number; error: Error } | null = null;
-  // Channel names change rarely; cache them for the process lifetime.
+/**
+ * Today's callouts, oldest-first so catch-up replays them in the order they
+ * were posted. Reads the funnel channel when `discordForwardChannelId` is set
+ * — the bot mirrors every allowed callout there, so that is one history call
+ * instead of N (avoids 429s, and 404s from private channels in the allowlist).
+ */
+export async function fetchTodaysCallouts(
+  fetchImpl: typeof fetch = fetch,
+  since: Date = localMidnight()
+): Promise<CalloutMessage[]> {
   const channelNames = new Map<string, string | null>();
-
   const channelName = async (channelId: string): Promise<string | null> => {
     if (!channelNames.has(channelId)) {
       try {
@@ -238,67 +211,34 @@ export function createCalloutHistory(fetchImpl: typeof fetch = fetch): CalloutHi
     return channelNames.get(channelId) ?? null;
   };
 
-  return {
-    async getToday(): Promise<CalloutMessage[]> {
-      if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.messages;
+  const messages: CalloutMessage[] = [];
 
-      // ponytail: naive fixed cooldown after a failed fetch, not a bucket-aware
-      // limiter; upgrade path is honoring Discord rate-limit headers here.
-      if (lastFailure && Date.now() - lastFailure.at < FAILURE_COOLDOWN_MS) {
-        if (cache) return cache.messages;
-        throw lastFailure.error;
+  if (config.discordForwardChannelId) {
+    const raw = await fetchChannelMessagesSince(config.discordForwardChannelId, since, fetchImpl);
+    for (const msg of raw) {
+      const parsed = parseMirrorMessage(msg);
+      if (!parsed) continue;
+      messages.push({ ...parsed, channelName: await channelName(parsed.channelId) });
+    }
+  } else {
+    for (const channelId of config.discordAllowedChannelIds) {
+      const name = await channelName(channelId);
+      const raw = await fetchChannelMessagesSince(channelId, since, fetchImpl);
+      for (const msg of raw) {
+        if (!isDisplayableCallout(msg, config.discordAllowedAuthorIds)) continue;
+        messages.push({
+          messageId: msg.id,
+          channelId: msg.channel_id,
+          channelName: name,
+          authorId: msg.author.id,
+          authorName: msg.author.global_name ?? msg.author.username,
+          timestamp: msg.timestamp,
+          content: flattenRestMessage(msg),
+          embeds: msg.embeds ?? [],
+        });
       }
+    }
+  }
 
-      try {
-        const since = localMidnight();
-        const messages: CalloutMessage[] = [];
-        if (config.discordForwardChannelId) {
-          // Funnel path: the bot mirrors every allowed callout into one
-          // channel, so fetch just that — 1 history call instead of N
-          // (avoids 429s, and 404s from private channels in the allowlist).
-          const raw = await fetchChannelMessagesSince(
-            config.discordForwardChannelId,
-            since,
-            fetchImpl
-          );
-          for (const msg of raw) {
-            const parsed = parseMirrorMessage(msg);
-            if (!parsed) continue;
-            messages.push({ ...parsed, channelName: await channelName(parsed.channelId) });
-          }
-        } else {
-          for (const channelId of config.discordAllowedChannelIds) {
-            const name = await channelName(channelId);
-            const raw = await fetchChannelMessagesSince(channelId, since, fetchImpl);
-            for (const msg of raw) {
-              if (!isDisplayableCallout(msg, config.discordAllowedAuthorIds)) continue;
-              messages.push({
-                messageId: msg.id,
-                channelId: msg.channel_id,
-                channelName: name,
-                authorName: msg.author.global_name ?? msg.author.username,
-                timestamp: msg.timestamp,
-                content: flattenRestMessage(msg),
-                embeds: msg.embeds ?? [],
-              });
-            }
-          }
-        }
-        messages.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
-
-        cache = { at: Date.now(), messages };
-        lastFailure = null;
-        return messages;
-      } catch (err) {
-        lastFailure = { at: Date.now(), error: err as Error };
-        if (cache) {
-          log.warn('serving stale callouts; discord unavailable', {
-            error: (err as Error).message,
-          });
-          return cache.messages;
-        }
-        throw err;
-      }
-    },
-  };
+  return messages.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }

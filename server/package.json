@@ -8,7 +8,8 @@
     "node": ">=20.10"
   },
   "scripts": {
-    "dev": "bun src/scripts/dev.ts",
+    "dev": "bun src/index.ts",
+    "start": "bun src/index.ts",
     "trader": "bun src/trader/index.ts",
     "bot": "bun src/bot/index.ts",
     "start:bot": "bun src/bot/index.ts",
@@ -23,6 +24,7 @@
   "dependencies": {
     "@fastify/cors": "^11.3.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@supabase/supabase-js": "^2.110.8",
     "@tanstack/ai": "^0.40.0",
     "@tanstack/ai-anthropic": "^0.16.1",
     "@tanstack/ai-ollama": "^0.8.14",

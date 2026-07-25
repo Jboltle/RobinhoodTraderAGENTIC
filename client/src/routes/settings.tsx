@@ -11,8 +11,8 @@ export const Route = createFileRoute('/settings')({
 })
 
 function SettingsPage() {
-  // The form initializes from the trader's resolved settings; saving needs
-  // the trader anyway, so an unreachable trader is a hard error here.
+  // The form initializes from this user's saved settings; saving needs the
+  // trader anyway, so an unreachable trader is a hard error here.
   const settings = useQuery({
     queryKey: ['settings'],
     queryFn: fetchSettings,
@@ -56,11 +56,11 @@ function SettingsForm({
     value: TradeSettingsInput[K],
   ) => setForm((f) => ({ ...f, [key]: value }))
 
-  // Placeholder showing the trader's effective default, when reachable.
+  // Placeholder showing the value currently in effect for this account.
   const ph = (key: keyof TradeSettings): string =>
     defaults === undefined
       ? 'default (trader offline)'
-      : `default: ${Array.isArray(defaults[key]) ? (defaults[key] as string[]).join(',') : String(defaults[key])}`
+      : `current: ${Array.isArray(defaults[key]) ? (defaults[key] as string[]).join(',') : String(defaults[key])}`
 
   return (
     <form
@@ -75,9 +75,8 @@ function SettingsForm({
       <header>
         <h1 className="text-2xl font-semibold text-white">Trade Settings</h1>
         <p className="mt-2 text-sm text-ink-400">
-          Saved settings are written to the trader and applied to every new
-          trade; they persist across restarts. Blank fields are unset and fall
-          through to the trader's env defaults.
+          These apply to your account only, and to every callout from the next
+          one onwards. Blank fields fall back to the built-in default.
         </p>
       </header>
 

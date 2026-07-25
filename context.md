@@ -1,47 +1,72 @@
-# Session Context — rh-discord-trader refactor (resume file)
+# Session Context — rh-discord-trader multi-tenant refactor (resume file)
 
-Written 2026-07-14 ~8:40 PM. Caveman-compressed. Read with plan file:
-`/home/on/.cursor/plans/refactor_and_deploy_trader_f94c450c.plan.md` (compressed; verbose backup = same name `.original.md`).
+Rewritten 2026-07-24 ~7:30 PM, after the multi-tenant Supabase refactor landed. Caveman-compressed. Read with the plan file: `.cursor/plans/multi-tenant_supabase_auth_5493be1b.plan.md`.
 
 ## Project
 
-Discord→Robinhood auto-trader. Two services: `src/bot/` (Discord gateway, forwards signed envelopes) + `src/trader/` (Fastify webhook → LLM parse → risk filter → Robinhood MCP order). Shared code `src/shared/`. State files `state/`. Git repo, commits "test"/"working on it", many uncommitted changes.
+Discord→Robinhood auto-trader, now **invite-only multi-tenant**. One Discord channel fans out to each user's own Robinhood account, settings and limits.
+
+Three parts: `server/src/bot/` (Discord gateway, forwards HMAC-signed envelopes) + `server/src/trader/` (Fastify webhook → LLM parse ONCE → per-user fan-out → each user's Robinhood MCP) + `client/` (TanStack Start dashboard, Supabase Auth). Shared code `server/src/shared/`. All state in Supabase Postgres; `state/` files are gone. `server/src/index.ts` supervises trader+bot as one process tree.
 
 ## Locked decisions (user Q&A)
 
-- Bot + trader stay separate services. Keep HMAC webhookAuth (bot→trader trust boundary).
-- Self-hosted deployment, each user own instance + own Robinhood. Docker compose.
-- Runtime = Bun everywhere. Keep vitest for tests, tsc --noEmit typecheck.
-- LLM: ONE factory in `src/shared/llm.ts` via TanStack AI adapters (`@tanstack/ai` + ai-ollama/ai-openai/ai-anthropic). Default provider = ollama, model qwen3:8b. Stability gate: TanStack broken → swap factory internals to Vercel AI SDK v6, same `LlmProvider` interface. `LLM_PROVIDER` typed `z.enum(['ollama','openai','anthropic'])`, fail-fast boot.
-- MCP client: keep hand-rolled wrapper (shrink-only), NO @tanstack/ai-mcp in phase 1.
-- OAuth: delete Codex import path entirely; persist refresh_token; SDK auto-refresh; harness-agnostic for free.
-- Settings: `TradeSettingsSchema` zod, all optional. Webhook body `{ envelope, settings? }`. Resolution payload → state/settings.json → env default. Cooldown STATE stays trader-side (`state/risk.json`); payload = params only.
-- Phase 2: `client/` folder at root, TanStack Start. Settings in client state, ride as payload override. Wiring mechanism (push/pull/proxy) = ask user AFTER phase 1 review. Figma kit via /understand-figma; user has FIGMA_TOKEN PAT (ask user for it, never write to files).
-- Subagents: cavecrew-investigator locate → karpathy-ponytail implement → cavecrew-reviewer audit → cavecrew-builder ≤2-file fixes. Caveman-terse chat outside plans.
+- Bot + trader stay logically separate but run as one process tree (bot binds no port; one `/health` ping keeps the Gateway socket alive). Keep HMAC webhookAuth as the bot→trader trust boundary.
+- Invite-only multi-tenant, NOT self-hosted-per-person any more. Supabase Auth email/password; signup gated server-side against `allowed_emails`.
+- Runtime = Bun everywhere. vitest for tests, `tsc -p . --noEmit` typecheck.
+- LLM: ONE factory in `server/src/shared/llm.ts` via TanStack AI adapters. Default provider ollama. `LLM_PROVIDER`/`TRADE_EXECUTION_MODE` fail-fast `z.enum`, plus `requiredString('LLM_MODEL')`.
+- MCP client: hand-rolled wrapper, one instance **per user** in `rh/mcpRegistry.ts` (`Map`, ponytail-marked unbounded, LRU is the upgrade path).
+- Data access: `server/src/trader/db.ts` is the ONLY module that constructs a Supabase client. Service-role key (bypasses RLS). Every per-user method takes `userId` first so scoping can't be forgotten.
+- RLS on, default-deny (no policies + grants revoked) on all five tables. Mandatory, not defense in depth: anon key ships in the client bundle and PostgREST is public. Browser's anon key is auth-only.
+- Settings: one `jsonb` row per user in `settings`. Defaults live in `TradeSettingsSchema` `.default()` values — no env layer, no file layer, no `resolveSettings`.
+- Risk state DERIVED from `trades` (two count queries), not stored. Fixes `maxTradesPerDay` resetting on every restart.
+- Broker tokens per user in `broker_connections`, AES-256-GCM under `RH_TOKENS_VAULT_KEY`. DB holds ciphertext only.
+- Catch-up-on-wake staleness window = **2 minutes**. Older than that → recorded `missed`, never executed at a moved price.
+- Supabase local via `npx supabase@latest start` (CLI deliberately NOT installed globally). Schema versioned in `supabase/migrations/`, portable to hosted with `db push`.
+- Known accepted ceiling: users consent to an app calling itself "Claude Code" (borrowed blessed client id — the only way to get loopback allowlisted), and connecting burns that Robinhood account's Claude Code slot. Connect dialog warns about both. Hard blocker on ever opening this up.
 
 ## Environment facts
 
-- Bun 1.2.18. WSL2 Ubuntu on Windows.
-- GPU = RTX 3060 **12GB** (plan text says 3060 Ti 8GB — wrong, 12GB confirmed via nvidia-smi). Passthrough works.
-- Ollama installed in WSL. Server must be started manually (`ollama serve`, no systemd autostart). qwen3:8b pull was IN PROGRESS at write time — verify `ollama list`.
-- sudo needs password — can't install system packages non-interactively.
+- Bun 1.3.14, Node 22.22, Docker 29.5.2. **Windows / PowerShell**, repo at `C:\Users\Sheri\Sandbox\RobinhoodTraderAGENTIC` (no longer the WSL layout the old notes assumed).
+- `bunx` is NOT on PATH here; use `bun run vitest ...` / `bun x`.
+- Local Supabase ports shifted off CLI defaults (other Postgres already on 5432x): API **54331**, DB **54332**, Studio **54333**, Mailpit **54334**. Set in `supabase/config.toml`.
+- Local Supabase still uses the CLI's legacy `supabase-demo` JWT keys. `status` also prints newer `sb_publishable_` / `sb_secret_` keys; PostgREST accepts either and maps both to the `anon` role. `.env` holds the legacy JWT pair.
+- Ollama reachable at `localhost:11434`, but only `gemma3:4b` + `nomic-embed-text` are pulled — **`qwen3:8b` (the `.env.example` default) is not present**. Pull it or set `LLM_MODEL` to something local.
+- `.env` currently defines ONLY the four Supabase/vault vars. Discord, LLM and `TRADE_EXECUTION_MODE` are unset, so the trader will fail `assertConfigValid` on boot. Tests are unaffected — `server/vitest.config.ts` loads `.env` and then fills dummies for whatever is still missing.
 
-## Workstream status (updated 8:50 PM)
+## Workstream status
 
-1. **1a Bun migration: DONE + reviewed.** typecheck clean, `bun build src/bot/index.ts src/trader/index.ts --outdir dist --target bun` works (dist/bot/index.js + dist/trader/index.js). tsx removed, bun.lock regenerated (patch bumps).
-2. **1b LLM factory: DONE.** TanStack AI path worked, NO Vercel gate needed. llm.ts = 50-line factory (createOllamaChat/createOpenaiChat/createAnthropicChat + one `chat({ outputSchema })` call; outputSchema accepts raw ToolJsonSchema). config.ts: `requiredEnum` helper, LLM_PROVIDER + TRADE_EXECUTION_MODE fail-fast z.enum; `llmModel` (LLM_MODEL, default qwen3:8b) + `ollamaBaseUrl` replace per-provider models. New test src/shared/__tests__/llm.test.ts. Deps: +@tanstack/ai{,-ollama,-openai,-anthropic}, −@anthropic-ai/sdk −openai. **168 tests pass / 2 skipped** (new baseline). Live qwen3:8b smoke passed. ponytail note: maxTokens/temperature ride adapter defaults.
-3. **1b-ii Ollama: DONE.** Installed in WSL, qwen3:8b pulled (5.2GB), GPU-verified. First load hit CUDA OOM once (transient, other apps held VRAM) — retry worked. Server needs manual `ollama serve` (no systemd autostart in this WSL). Structured JSON via /api/chat `format` works great. **qwen3 thinking mode ON by default — burns tokens (60s+); `think:false` → 0.7s.** FIXED: llm.ts spreads `modelOptions:{think:false}` when provider === 'ollama' (llm.ts:41-46, typecheck + tests verified).
-4. **1c OAuth: USER-OWNED, HANDS OFF.** rh/ edits (importCodexTokens.ts deleted, tokenBootstrap gutted, mcpClient Codex sites removed) appeared mid-session — user editing concurrently; user ABORTED the dispatched OAuth worker. Do NOT reimplement. When user says ready: run verify only — `rg -i codex src/ package.json` empty, tests ≥168, typecheck, build, then live `bun run connect` (user does browser step) + restart-no-reprompt check + confirm refresh_token persisted in state/rh-tokens.json.
-5. **1d embeds: NOT STARTED.** Root cause known: `buildMessageContent` (src/bot/messageAssembly.ts) ignores `message.embeds`; embed-only msgs dropped by `hasForwardableContent`; mirror never re-sends embeds. NOTE: bot files (index.ts, messageFilter.ts, types.ts) + parseCallout.ts also show uncommitted user edits — RE-READ current file state before dispatching, don't trust plan line numbers.
-6. **1e type shrink / 1f REST API+settings: NOT STARTED.**
-7. **1h Docker/deploy: NOT STARTED.**
-- Phase 0 /understand knowledge graph: DONE. `.ua/knowledge-graph.json` saved (128 nodes, 283 edges, 8 layers, 14-step tour, 0 validation issues), analyzed at commit 2fb3374 — pre-refactor snapshot; run incremental update after phase 1 lands. Dashboard not launched (`/understand-dashboard` to view).
+The refactor is landed and the suite is green: **322 pass / 3 skipped across 20 files + 1 skipped**, typecheck clean. (Count drifts upward while the deploy agent is working — it gained a file mid-session.)
+
+1. **Schema + RLS: DONE.** `supabase/migrations/20260725012642_multi_tenant_schema.sql` — five tables, RLS on, zero policies, anon/authenticated grants revoked, service_role granted explicitly.
+2. **Auth gate: DONE.** `trader/auth.ts` `preHandler` verifies the Supabase JWT on every route. Public set = `/health`, `/webhook/discord`, `/api/auth/signup` only.
+3. **Data access: DONE.** `trader/db.ts` as above.
+4. **Broker tokens, per-user MCP, settings-in-DB, callouts/trades, risk-derive, pipeline fan-out, catch-up: DONE.** `tokenVault.ts`, `settings.ts`, `decisionLog.ts` and all `state/` files deleted.
+5. **Dashboard: DONE.** `AuthScreen` gates the app in `__root.tsx` (one component, sign-in/sign-up modes — not separate routes). SSE reads with `fetch`, not `EventSource`, so it carries a normal `Authorization` header instead of a token in the URL. "Backfill" concept gone; the feed reads the DB.
+6. **RLS test reconciled: DONE.** See below.
+7. **Docs: DONE.** `README.md` + this file.
+8. **Deploy: OWNED BY ANOTHER AGENT — HANDS OFF** `render.yaml`, `server/docker-compose.yml`, the Dockerfiles. Moving under us mid-session: `scripts/dev.ts` deleted, `Dockerfile.bot`/`Dockerfile.trader` replaced by `Dockerfile.server`, `src/__tests__/stack.test.ts` added.
+
+## RLS test — root cause, settled
+
+`server/src/shared/__tests__/supabaseRls.test.ts` was reported red with 6 assertions getting `PGRST301` where it expects `42501`. Root cause was a **stale/unverifiable anon JWT in `.env`**, not the key *format* and not RLS.
+
+Two error classes, and only one of them proves anything:
+
+- `42501` = key decoded, role resolved to `anon`, Postgres denied on grants/RLS. **Genuine denial.** This is what the test must assert.
+- `PGRST301` = PostgREST could not decode the bearer JWT (wrong signature, expired, malformed, empty). Denied at the auth layer, before any table. **Proves nothing.**
+
+The 6-vs-passing split is the fingerprint: PostgREST only verifies the **bearer** token, and the 6 failing cases were the ones that send the anon key as the bearer. The `authenticated` cases send a freshly minted user JWT and the `service_role` cases send the service key, so both got as far as the grant check and passed. GoTrue does not verify the `apikey` header at all, so the `beforeAll` seeding succeeded either way.
+
+Guard added so this can never be mistaken again: `assertAnonKeyReachesTheGrantCheck` hits `GET /rest/v1/` (needs a decodable key, no table privilege) before any expectation runs, and fails with "re-copy ANON_KEY from `npx supabase status`" if the key is rejected. Works for legacy JWT and `sb_publishable_` alike.
+
+The "newer non-JWT publishable key format" hypothesis is **falsified**: a publishable key returns `42501` too, so it could never have produced `PGRST301`.
 
 ## Other notes
 
-- `.env` fixed: LLM_PROVIDER=ollama, LLM_MODEL=qwen3:8b (was openai/gpt-4o-mini, would fail new fail-fast boot).
-- `state/rh-tokens.json` WIPED by accidental rhResetAuth run during 1a verify. Re-auth needed at 1c verify (`bun run connect`).
-- Baseline to preserve: ≥168 tests pass / 2 skipped.
-- .env.example: LLM section done (workstream 2); risk-controls section moves to settings.json in workstream 5 (env stays fallback defaults).
-- User pasted Figma PAT in old chat — advise rotation after phase 2; never commit it. Ask user to `export FIGMA_TOKEN=...` for /understand-figma.
-- User works in repo concurrently — ALWAYS `git status` + re-read touched files before dispatching a workstream; scope prompts to exact current file state.
+- Vacuity of the RLS test verified by hand: `grant select on public.trades to anon` → only `the anon key cannot read trades` fails; grant + permissive policy on `settings` to `authenticated` → only `a logged-in user cannot read settings` fails. Both reverted; grants/policies confirmed back to migration state.
+- Fan-out set = users with a `broker_connections` row (`listBrokerUserIds`). Nobody connected ⇒ callout is parsed and stored but produces no trades and no Discord receipt. Bites you when testing.
+- `server/src/scripts/dev.ts` is gone; the deploy agent folded it into `server/src/index.ts`, and `dev` and `start` are now the same command deliberately — a production path that differs from the one you develop against is a path nobody has tested.
+- `/health` body is now `{ ok, executionMode }` only. Per-user Robinhood state moved to `GET /api/broker/status`. `/api/auth/status` and `/api/auth/callback` were renamed to `/api/broker/*` because `/api/auth/*` now means user auth.
+- `allowed_emails` starts EMPTY, so nobody can sign up until a row is inserted. `[db.seed]` in `config.toml` is enabled and points at `supabase/seed.sql`, which does not exist yet — create it if you want the allowlist to survive `db reset`.
+- `.ua/knowledge-graph.json` from the old session is gone; the pre-refactor snapshot no longer applies.
+- User works in the repo concurrently — ALWAYS `git status` + re-read touched files before dispatching a workstream.

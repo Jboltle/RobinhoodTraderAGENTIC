@@ -7,10 +7,12 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { TanStackRouterDevtoolsPanel } from '@tanstack/react-router-devtools'
 import { TanStackDevtools } from '@tanstack/react-devtools'
-import { LayoutDashboard, Search, Settings } from 'lucide-react'
+import { LayoutDashboard, LogOut, Search, Settings } from 'lucide-react'
 
 import TanStackQueryDevtools from '../integrations/tanstack-query/devtools'
 
+import { AuthScreen } from '../components/AuthScreen'
+import { AuthProvider, signOut, useAuth } from '../lib/auth'
 import { useTraderStream } from '../lib/stream'
 
 import appCss from '../styles.css?url'
@@ -60,22 +62,15 @@ const navLinkClass =
   'flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-ink-400 transition-colors hover:bg-ink-700/60 hover:text-white [&.active]:bg-brand/8 [&.active]:text-brand'
 
 function RootDocument({ children }: { children: React.ReactNode }) {
-  useTraderStream()
   return (
     <html lang="en" className="dark">
       <head>
         <HeadContent />
       </head>
       <body className="min-h-screen bg-ink-900 font-sans text-white antialiased">
-        <div className="flex min-h-screen">
-          <SideNav />
-          <div className="flex min-w-0 flex-1 flex-col">
-            <TopHeader />
-            <main className="mx-auto w-full max-w-6xl flex-1 px-8 py-6">
-              {children}
-            </main>
-          </div>
-        </div>
+        <AuthProvider>
+          <AuthGate>{children}</AuthGate>
+        </AuthProvider>
         <TanStackDevtools
           config={{
             position: 'bottom-right',
@@ -91,6 +86,37 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <Scripts />
       </body>
     </html>
+  )
+}
+
+/**
+ * The route guard. `/` and `/settings` are only ever rendered inside this, so
+ * there is no signed-out path to them — and no window where the dashboard
+ * mounts and fires unauthenticated requests while a redirect is in flight.
+ */
+function AuthGate({ children }: { children: React.ReactNode }) {
+  const { session, isLoading } = useAuth()
+  // The stream is the only thing that opens a connection on its own, so it
+  // waits for a session rather than reconnecting in a loop against a 401.
+  useTraderStream(session !== null)
+
+  if (isLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center text-sm text-ink-400">
+        Loading…
+      </main>
+    )
+  }
+  if (!session) return <AuthScreen />
+
+  return (
+    <div className="flex min-h-screen">
+      <SideNav />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <TopHeader />
+        <main className="mx-auto w-full max-w-6xl flex-1 px-8 py-6">{children}</main>
+      </div>
+    </div>
   )
 }
 
@@ -158,6 +184,7 @@ function AccountSummaryCard() {
 }
 
 function TopHeader() {
+  const { email } = useAuth()
   return (
     <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-ink-600 bg-ink-900 px-8">
       <span className="text-sm font-medium text-ink-400 md:hidden">
@@ -179,6 +206,18 @@ function TopHeader() {
           className="w-full bg-transparent text-sm text-white placeholder:text-ink-400 focus:outline-none"
         />
       </label>
+      <div className="flex items-center gap-3">
+        <span className="truncate text-xs text-ink-400 max-sm:hidden">{email}</span>
+        <button
+          type="button"
+          onClick={() => void signOut()}
+          title="Sign out"
+          className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-ink-400 transition-colors hover:bg-ink-700/60 hover:text-white"
+        >
+          <LogOut className="size-4" />
+          <span className="max-sm:hidden">Sign out</span>
+        </button>
+      </div>
     </header>
   )
 }

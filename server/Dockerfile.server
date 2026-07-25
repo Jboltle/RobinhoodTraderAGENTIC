@@ -1,4 +1,8 @@
-# Trader: Fastify webhook server + LLM parser + Robinhood MCP client.
+# Server: the whole backend in one container -- src/index.ts supervises the
+# Fastify trader and the Discord Gateway bot as a single process tree, so one
+# keep-alive ping on /health keeps both awake. See src/index.ts for why they
+# are not separate services any more.
+#
 # Runs from source with production node_modules -- bundled dist/ output is NOT
 # used because discord.js/fastify leave lazy require()s (ajv, ...) unresolved
 # in the bundle. See README "Deployment" for details.
@@ -9,9 +13,8 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
 COPY --chown=bun:bun src ./src
-RUN mkdir -p state && chown bun:bun state
 USER bun
 
 # 3000 = webhook + /health, 8788 = Robinhood OAuth browser callback
 EXPOSE 3000 8788
-CMD ["bun", "src/trader/index.ts"]
+CMD ["bun", "src/index.ts"]

@@ -1,25 +1,39 @@
 /**
- * One-shot Robinhood MCP connect + introspect.
+ * One-shot Robinhood MCP connect + introspect for one user.
  *
- *   bun run connect
+ *   bun run connect <email or user id>
  *
  * On first run this triggers the OAuth flow: the script prints an
- * authorization URL, spins up a local listener at the configured
- * redirect, persists tokens to `state/rh-tokens.json`, then lists the
- * tools the server advertises and verifies our canonical TOOL_NAMES
+ * authorization URL, spins up a local listener at the configured redirect,
+ * persists the encrypted tokens to that user's `broker_connections` row, then
+ * lists the tools the server advertises and verifies our canonical TOOL_NAMES
  * line up with what the server actually exposes.
  */
 import { config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
+import { createTraderDb } from '../trader/db.js';
 import { RobinhoodMcpClient } from '../trader/rh/mcpClient.js';
 import { RobinhoodTools, TOOL_NAMES } from '../trader/rh/tools.js';
 
 const log = createLogger('rh-connect');
 
 async function main(): Promise<void> {
-  log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
+  const identifier = process.argv[2]?.trim();
+  if (!identifier) {
+    throw new Error('usage: bun run connect <email or user id>');
+  }
 
-  const mcp = new RobinhoodMcpClient();
+  const db = createTraderDb();
+  const userId = identifier.includes('@')
+    ? (await db.findUserByEmail(identifier))?.id
+    : identifier;
+  if (!userId) {
+    throw new Error(`no such user: ${identifier}`);
+  }
+
+  log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl, userId });
+
+  const mcp = new RobinhoodMcpClient({ userId, db });
   await mcp.ensureConnected();
 
   const advertised = mcp.getToolNames();

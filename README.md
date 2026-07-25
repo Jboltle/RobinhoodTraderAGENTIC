@@ -1,9 +1,12 @@
 # Discord-driven Robinhood Auto-Trader
 
-A two-process TypeScript system:
+An invite-only, multi-tenant TypeScript system. One Discord channel fans out to each signed-up user's own Robinhood account, settings and risk limits.
 
 - **`server/src/bot/`** — a Discord Gateway client (`discord.js`) that listens to `MESSAGE_CREATE` events on configured channels, filters by author allowlist, and forwards each candidate as an HMAC-signed JSON POST to the trader.
-- **`server/src/trader/`** — a Fastify HTTP service that verifies the HMAC signature, uses an LLM to extract a structured trade callout, applies deterministic risk filters, and executes equity or single-leg option orders via the [Robinhood Trading MCP](https://agent.robinhood.com/mcp/trading) (Streamable HTTP + OAuth).
+- **`server/src/trader/`** — a Fastify HTTP service that verifies the HMAC signature, uses an LLM to extract a structured trade callout **once**, then runs it per connected user: their settings, their risk state, their [Robinhood Trading MCP](https://agent.robinhood.com/mcp/trading) session (Streamable HTTP + OAuth).
+- **`client/`** — a TanStack Start dashboard. Users sign in with Supabase Auth, connect their own Robinhood account, edit their own limits, and watch their own feed.
+
+All state lives in Supabase (Postgres). Users, per-user trades, per-user settings and encrypted per-user broker tokens are rows, not files.
 
 ## Why a Gateway bot, not Discord webhook events
 
@@ -14,54 +17,137 @@ Discord's outgoing webhook-events transport only delivers `APPLICATION_*`, `ENTI
 ```
 Discord Gateway ──▶ bot (discord.js) ──HMAC POST──▶ trader (Fastify)
                                                          │
-                                                         ├─▶ LLM (Ollama, OpenAI, or Anthropic) – parse callout
-                                                         ├─▶ Risk filter – deterministic guards
-                                                         └─▶ Robinhood MCP – place equity order
+                                              LLM parse ONCE, cached in `callouts`
                                                          │
-                              ◀── "Bought 3 AAPL …" ──── posts receipt back to channel
+                                          ┌──────────────┴──────────────┐
+                                       user A                        user B
+                                   their settings                their settings
+                                   derived risk state            derived risk state
+                                   their Robinhood MCP           their Robinhood MCP
+                                          └──────────────┬──────────────┘
+                                                         │
+      ◀── "BUY QQQ 710P — 1 submitted, 1 risk_rejected across 2 accounts." ─┘
+
+browser (client/) ──Supabase JWT──▶ /api/* ──service_role──▶ Supabase Postgres
 ```
+
+One parse serves everyone, which is the cost saving that matters as users are added. Users then run concurrently — separate Robinhood sessions — while each user's own messages stay serialized so no account ever has two orders in flight. The Discord receipt counts outcomes rather than naming who traded what, because the source channel is shared.
+
+### Access model
+
+- Every route is behind a Fastify `preHandler` that verifies the Supabase JWT. The only public ones are `/health`, `/webhook/discord` (HMAC over the raw body) and `/api/auth/signup`.
+- Signup is gated server-side against the `allowed_emails` table, so the browser cannot skip the invite check.
+- [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that constructs a Supabase client. It uses the service-role key, and every per-user method takes `userId` as its first argument so a caller cannot forget to scope a query.
+- RLS is on with **default-deny** (no policies, grants revoked) for all five tables. This is mandatory, not defense in depth: the anon key ships in the JS bundle and PostgREST is publicly reachable, so without it `GET /rest/v1/trades?select=*` is a full data leak. The browser's anon key is used **only** for auth, never for data. [`supabaseRls.test.ts`](server/src/shared/__tests__/supabaseRls.test.ts) is the guard on that.
+
+### Schema (`supabase/migrations/`)
+
+| Table | Scope | Holds |
+| --- | --- | --- |
+| `callouts` | shared | Discord snapshot + the cached LLM parse. Also the idempotency ledger for catch-up. |
+| `trades` | per-user | One decision row per callout per user. Denormalized so it reads standalone. |
+| `settings` | per-user | One `jsonb` payload — the full resolved settings. Authoritative; no env or file layer behind it. |
+| `allowed_emails` | shared | The signup gate. |
+| `broker_connections` | per-user | Robinhood tokens, AES-256-GCM encrypted under `RH_TOKENS_VAULT_KEY`. The database only ever holds ciphertext. |
+
+Daily trade counts and per-ticker cooldowns are **derived** from `trades` with two count queries rather than stored, so a restart no longer resets the daily cap.
+
+On startup the trader replays Discord messages it slept through, skipping any that already have a `callouts` row. Anything older than the **2-minute** staleness window is recorded as *missed* rather than executed at a price that has since moved.
 
 ## Setup
 
-All backend code lives in `server/`; run bun/docker commands from there. `.env` stays at the repo root.
+Backend code lives in `server/`, the dashboard in `client/`; run bun commands from the matching folder. The server's `.env` stays at the repo root; the client has its own `client/.env`.
+
+### 1. Install deps
 
 ```bash
-# 1. Install deps
-cd server
-bun install
-
-# 2. Configure (from the repo root)
-cp .env.example .env
-# Fill in:
-#   DISCORD_BOT_TOKEN              -- from https://discord.com/developers/applications
-#   DISCORD_ALLOWED_CHANNEL_IDS    -- channel(s) to monitor
-#   DISCORD_ALLOWED_AUTHOR_IDS     -- whitelisted callout authors
-#   LLM_PROVIDER + LLM_MODEL       -- ollama | openai | anthropic (startup fails if unset)
-#   OPENAI_API_KEY / ANTHROPIC_API_KEY -- only for the matching cloud provider
-#   BOT_TRADER_SECRET              -- `openssl rand -hex 32`
+cd server && bun install
+cd ../client && bun install
 ```
+
+### 2. Start local Supabase
+
+From the **repo root**. The CLI is not installed globally on purpose — `npx` fetches it:
+
+```bash
+npx supabase start
+```
+
+First run pulls the Docker images and applies everything in `supabase/migrations/`, which takes a few minutes. Ports are shifted off the CLI defaults in `supabase/config.toml` so this stack can run beside another local Supabase: API `54331`, DB `54332`, Studio `54333`, Mailpit `54334`.
+
+`npx supabase status` prints the keys you need. Re-run it any time — if `SUPABASE_ANON_KEY` in `.env` ever drifts from what it reports, PostgREST rejects the key before it reaches a table and the RLS test fails with `PGRST301` instead of the `42501` it asserts.
+
+### 3. Configure
+
+```bash
+# from the repo root
+cp .env.example .env
+```
+
+Fill in:
+
+| Var | Value |
+| --- | --- |
+| `DISCORD_BOT_TOKEN` | from https://discord.com/developers/applications |
+| `DISCORD_ALLOWED_CHANNEL_IDS` | channel(s) to monitor |
+| `DISCORD_ALLOWED_AUTHOR_IDS` | whitelisted callout authors |
+| `LLM_PROVIDER` + `LLM_MODEL` | `ollama` \| `openai` \| `anthropic` (startup fails if unset) |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | only for the matching cloud provider |
+| `BOT_TRADER_SECRET` | `openssl rand -hex 32` |
+| `SUPABASE_URL` | `API_URL` from `npx supabase status` |
+| `SUPABASE_ANON_KEY` | `ANON_KEY` from the same output |
+| `SUPABASE_SERVICE_ROLE_KEY` | `SERVICE_ROLE_KEY` — bypasses RLS, server-side only, never in the client bundle |
+| `RH_TOKENS_VAULT_KEY` | `openssl rand -hex 32`. Encrypts Robinhood tokens at rest; losing it means everyone reconnects. |
+
+The trader refuses to boot without the four Supabase/vault values.
+
+Then the dashboard's own build-time config:
+
+```bash
+cp client/.env.example client/.env
+```
+
+`API_URL` points at the trader (`http://localhost:3000` by default); `SUPABASE_URL` and `SUPABASE_ANON_KEY` are the same two values as above. Never put the service-role key here — this file is baked into a public bundle.
+
+### 4. Invite yourself
+
+**Signup is allowlist-gated, and the allowlist starts empty — until you add a row, nobody can create an account and the sign-up form just returns "this email is not invited".**
+
+Open Studio at http://127.0.0.1:54333, go to the SQL editor, and run:
+
+```sql
+insert into public.allowed_emails (email) values ('you@example.com');
+```
+
+The email must be lowercase (there is a check constraint) and the address only has to be one you can type — local Supabase does not send or confirm mail, and any confirmation it did send would land in Mailpit at http://127.0.0.1:54334 rather than a real inbox.
+
+To have the allowlist survive a `npx supabase db reset`, put the same statement in `supabase/seed.sql`; `[db.seed]` in `config.toml` is already enabled and pointed at that path.
 
 The Discord bot needs the **Message Content** privileged intent enabled in the developer portal (Bot → Privileged Gateway Intents).
 
 ## Run
 
-Start the full stack with one command (from `server/`):
+Local Supabase needs to be up first (`npx supabase start`). Then the backend, from `server/`:
 
 ```bash
 cd server
 bun run dev
 ```
 
-`dev` starts the trader first, waits for `GET /health` (up to 10 minutes, to leave room for first-time OAuth), then starts the Discord bot.
+`dev` starts the trader first, waits for `GET /health`, then starts the Discord bot. Both processes read the same root `.env`. The bot only forwards messages whose `channelId` is in `DISCORD_ALLOWED_CHANNEL_IDS`; `DISCORD_ALLOWED_AUTHOR_IDS` remains an optional author allowlist.
 
-On startup in immediate mode the trader detects its Robinhood auth state automatically:
+And the dashboard, from `client/`:
 
-1. It inspects `state/rh-tokens.json` (decoding the access token's expiry) and logs whether the saved tokens are valid, refreshable, or missing.
-2. If the tokens can't carry the session, it prints a Robinhood OAuth URL — open it in your browser to authorize; tokens are then stored at `state/rh-tokens.json` and refreshed automatically, so no re-auth is needed.
+```bash
+cd client
+bun run dev      # http://localhost:3001
+```
 
-`GET /health` reports `rhConnected`, `rhTokenState`, and `rhTokenExpiresInSec` so you can observe the auth state. `bun run dev` also logs an auth preflight summary before the trader starts.
+Sign up with the address you added to `allowed_emails`, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per user. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
 
-Both processes read the same `.env`. The bot will only forward messages whose `channelId` is in `DISCORD_ALLOWED_CHANNEL_IDS`; `DISCORD_ALLOWED_AUTHOR_IDS` remains a global optional author allowlist.
+On restart the trader reconnects every user who already had stored tokens, so their MCP session is warm before the first callout rather than during it.
+
+`GET /health` is public and returns `{ ok, executionMode }` — it is a liveness signal, not an auth report. Per-user Robinhood state is at `GET /api/broker/status`.
 
 You can still run components separately when debugging:
 
@@ -69,10 +155,6 @@ You can still run components separately when debugging:
 bun run trader
 bun run bot
 ```
-
-## Run with Docker Compose
-
-See [Deployment (Docker)](#deployment-docker) below.
 
 ## Ollama in WSL (local LLM)
 
@@ -95,8 +177,18 @@ With `LLM_PROVIDER=ollama` and `LLM_MODEL=qwen3:8b` in `.env`, the trader uses i
 
 ```bash
 cd server
-bunx vitest run     # unit tests
-bunx tsc --noEmit   # typecheck
+bun run test        # unit tests
+bun run typecheck   # tsc -p . --noEmit
+```
+
+Most of the suite is hermetic. [`supabaseRls.test.ts`](server/src/shared/__tests__/supabaseRls.test.ts) is the exception: it talks to the live local stack and proves every table is unreadable both by the anon key and by a real logged-in user's JWT, while `service_role` still works. It skips itself when the `SUPABASE_*` vars are unset, and fails with an explicit message if the anon key is stale — a denial caused by an unusable key would prove nothing about RLS.
+
+The dashboard has its own suite:
+
+```bash
+cd client
+bun run test
+bun run typecheck
 ```
 
 
@@ -139,14 +231,14 @@ ROBINHOOD_OAUTH_CALLBACK_HOST=0.0.0.0
 
 Restart `bun run dev` after changing the redirect URI and use the newly printed Robinhood auth URL.
 
-If Robinhood says the agent is already connected but this app never continues, your local `state/rh-tokens.json` may contain only partial OAuth state and no tokens. Reset local OAuth state and start again:
+If Robinhood says the agent is already connected but this app never continues, that user's `broker_connections` row may hold only partial OAuth state and no usable tokens. Drop it and start again:
 
 ```bash
-bun run auth:reset
+bun run auth:reset you@example.com   # email or user id
 bun run dev
 ```
 
-This does not disconnect anything inside Robinhood; it only removes the local cached OAuth client/verifier/token file so a new authorization flow can produce usable local tokens.
+This does not disconnect anything inside Robinhood; it only removes the stored OAuth client/verifier/tokens for that one user so a new authorization flow can produce usable ones. `bun run connect <email or user id>` runs the same flow from the CLI instead of the dashboard, and additionally checks our canonical tool names against what the MCP server actually advertises.
 
 ## Test With Your Discord Channel
 
@@ -156,8 +248,9 @@ For safe end-to-end Discord testing, run in approval mode first:
 DISCORD_ALLOWED_CHANNEL_IDS=your_test_channel_id
 DISCORD_ALLOWED_AUTHOR_IDS=your_discord_user_id
 TRADE_EXECUTION_MODE=approval
-REGULAR_HOURS_ONLY=false
 ```
+
+`TRADE_EXECUTION_MODE` is the global kill-switch and it wins: in `approval` it holds every user, whatever their own `executionMode` says. Turn off `regularHoursOnly` on the Settings page if you want to test outside market hours.
 
 Then start everything:
 
@@ -184,93 +277,60 @@ QQQ 707C 2026-06-11
 1.5900 -> 1.75 P/L: +10.06% ($16.00)
 ```
 
-In `approval` mode the bot should post an approval-required receipt back to the same Discord channel, and no Robinhood MCP connection or order submission is attempted. Switch to `TRADE_EXECUTION_MODE=immediate` only when you want passed callouts to submit live orders.
+In `approval` mode every user gets an approval-required outcome and no order is submitted. Switch to `TRADE_EXECUTION_MODE=immediate` only when you want passed callouts to submit live orders.
 
-## Deployment (Docker)
+One thing that surprises people: the pipeline fans out to users who have a `broker_connections` row, so if nobody has connected Robinhood yet, a callout is parsed and stored but produces no per-user outcomes and no receipt. Connect at least one account before wondering where the feed went.
 
-Each user runs their own stack — the containers hold your Discord token and your Robinhood login, so this is self-hosted per person, not a shared service.
+## Deployment
 
-```bash
-cp .env.example .env   # at the repo root; fill in tokens/secrets — read at runtime, never baked into images
-cd server
-docker compose up -d --build
-```
-
-Topology: `bot` and `trader` containers (one per service, built from `Dockerfile.bot` / `Dockerfile.trader`), a shared named volume mounted at `/app/state` in both, and `depends_on` so the bot starts only after the trader reports healthy. The bot needs outbound network only; the trader publishes `TRADER_PORT` (default 3000) and the OAuth callback port (default 8788).
-
-### Why the images run from source (not `dist/` bundles)
-
-`bun build` does not produce standalone bundles for this dependency tree: discord.js and fastify use lazy CommonJS `require()` calls that survive bundling as-is (`ws`, `undici`, `ajv`, ...). `ws` and `undici` happen to be Bun built-ins, and Bun's auto-install can silently fetch the rest at runtime — which masks the gap locally but is exactly the kind of network-dependent surprise you don't want in a container. So the images copy `src/` and install production dependencies with `bun install --frozen-lockfile --production`, and run `bun src/<service>/index.ts` directly (same as `bun run start:bot` / `start:trader`). `bun run build` still emits `dist/` bundles, but they are not the deployable artifact.
-
-### First-run Robinhood OAuth inside Docker
-
-In `immediate` mode the trader must complete Robinhood OAuth before it starts listening:
-
-1. `docker compose up` and watch the trader logs (`docker compose logs -f trader`) — it prints a Robinhood auth URL.
-2. Open the URL in your host browser and authorize.
-3. Robinhood redirects to `http://127.0.0.1:8788/oauth/callback`. That port is published by compose on host loopback, so the redirect reaches the container's callback listener. Keep `ROBINHOOD_OAUTH_REDIRECT_HOST` unset (or `127.0.0.1`) when running under compose — the WSL-IP value from "Robinhood OAuth On WSL" applies only to the non-Docker WSL flow, since compose publishes 8788 on `127.0.0.1` only.
-4. Tokens are saved to the `state` volume (`state/rh-tokens.json`) and refreshed automatically — later restarts skip this flow.
-
-The trader's healthcheck allows ~10 minutes for this before compose marks it unhealthy; the bot waits for a healthy trader.
-
-### State persistence
-
-`state/` (decision log, risk counters, OAuth tokens, settings) lives in the named `state` volume shared by both containers. `docker compose down` keeps it; `docker compose down -v` deletes it, which erases your Robinhood tokens and trade history.
-
-### Ollama in compose
-
-The `ollama` service is profile-gated (opt-in):
-
-```bash
-docker compose --profile ollama up -d
-docker compose exec ollama ollama pull qwen3:8b   # once
-```
-
-Inside the compose network the trader reaches it at `http://ollama:11434` (the compose default for `OLLAMA_BASE_URL`) — **not** the host default `http://localhost:11434` from `.env.example`, because `localhost` inside a container is the container itself. To use an Ollama already running on your host instead, skip the profile and set `OLLAMA_BASE_URL=http://host.docker.internal:11434` in `.env`. For NVIDIA GPU acceleration, install [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and uncomment the `deploy.resources` block in `docker-compose.yml`.
+Owned separately — see `render.yaml` and `server/docker-compose.yml`. In outline: the trader and bot run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a static site, and Supabase moves from the local CLI stack to a hosted project with `npx supabase db push`. Nothing in `supabase/migrations/` is local-only.
 
 ## Risk controls
 
-All configured via `.env` (see `.env.example`):
+Per user, not per environment. Each user owns one row in `settings`, edited from the dashboard's Settings page; the defaults below live in `TradeSettingsSchema` ([`server/src/shared/types.ts`](server/src/shared/types.ts)) and are the only source. There is no env or file layer behind them.
 
-| Var | Purpose |
-| --- | --- |
-| `MAX_NOTIONAL_PCT_PER_TRADE` | Max equity notional per order, as % of buying power |
-| `MAX_OPTIONS_NOTIONAL_PCT` | Max options premium per order, as % of buying power |
-| `MAX_SINGLE_CONTRACT_PCT` | Skip options trades where even 1 contract exceeds this % of buying power |
-| `POSITION_SMALL_PCT` / `POSITION_MEDIUM_PCT` | Fraction of the per-trade cap used for small/medium size keywords |
-| `MAX_TRADES_PER_DAY` | Total daily trades across all tickers |
-| `COOLDOWN_SECONDS_PER_TICKER` | Minimum gap between two trades on the same ticker |
-| `ALLOWED_TICKERS` / `BLOCKED_TICKERS` | Symbol allow/block lists |
-| `REGULAR_HOURS_ONLY` | Reject orders outside US/Eastern 09:30–16:00 weekdays |
-| `MIN_CONFIDENCE` | Drop callouts the LLM rates below this confidence |
-| `TRADE_EXECUTION_MODE` | `immediate` submits after risk checks; `approval` logs/notifies without submitting |
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `maxNotionalPct` | 5 | Max equity notional per order, as % of buying power |
+| `maxOptionsNotionalPct` | 2 | Max options premium per order, as % of buying power |
+| `maxSingleContractPct` | 5 | Skip options trades where even 1 contract exceeds this % of buying power |
+| `positionSmallPct` / `positionMediumPct` | 25 / 50 | % of the per-trade cap used for the small/medium size keywords |
+| `maxTradesPerDay` | 10 | Total daily submitted trades across all tickers |
+| `cooldownSeconds` | 300 | Minimum gap between two trades on the same ticker |
+| `allowedTickers` / `blockedTickers` | `[]` / `[]` | Symbol allow/block lists; empty allowlist means allow everything |
+| `minConfidence` | 0.7 | Drop callouts the LLM rates below this confidence |
+| `regularHoursOnly` | `true` | Reject orders outside US/Eastern 09:30–16:00 weekdays |
+| `executionMode` | `immediate` | This user's own switch: `immediate` submits after risk checks, `approval` records without submitting |
 
-State files live under `state/` and are git-ignored:
+`maxTradesPerDay` and `cooldownSeconds` are enforced against the `trades` table rather than an in-process counter, so they hold across restarts.
 
-- `state/decisions.jsonl` — append-only record of every callout decision and its outcome
-- `state/risk.json` — daily counters, per-ticker last-trade timestamps
-- `state/rh-tokens.json` — Robinhood OAuth tokens (chmod 0600)
+The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch. It can only tighten: a trader booted in `approval` mode holds every user regardless of their own `executionMode`, because the MCP sessions it would need to submit with are never wired up.
 
 ## Project layout
 
 ```
 server/
 ├── src/
+│   ├── index.ts       supervises trader + bot as one process tree
 │   ├── shared/        config + validation, types, HMAC signing, logger, LLM providers
 │   ├── bot/           discord.js Gateway client (filter, assemble, forward)
+│   ├── scripts/       one-shot operator CLIs (connect, auth:reset)
 │   └── trader/
-│       ├── index.ts   process entrypoint (wires deps, starts the server)
+│       ├── index.ts   process entrypoint (wires deps, starts the server, catch-up)
 │       ├── server.ts  Fastify routes: POST /webhook/discord, GET /health, /api/*
-│       ├── pipeline/  runPipeline orchestrator, parseCallout, riskFilter, execute, summarize
-│       ├── rh/        MCP client + OAuth + token bootstrap + typed tool wrappers
-│       └── decisionLog.ts  append-only JSONL writer
-├── state/             runtime state files (git-ignored)
-└── docker-compose.yml
+│       ├── auth.ts    Supabase JWT preHandler; the public-route list lives here
+│       ├── db.ts      the only Supabase client; every per-user method takes userId first
+│       ├── catchup.ts replays messages missed while asleep, with the staleness window
+│       ├── pipeline/  parse-once + per-user fan-out, riskFilter, execute, summarize
+│       └── rh/        per-user MCP registry, MCP client, OAuth, token crypto, tool wrappers
+supabase/
+├── config.toml        local stack config (ports shifted off the CLI defaults)
+└── migrations/        the schema; portable to a hosted project with `db push`
 client/                web dashboard (TanStack Start)
 ```
 
 ## Out of scope (v1)
 
 - Multi-leg options, crypto, and advanced order management beyond simple equity and single-leg option buy/sell
-- Persistent DB (state is JSON files)
-- Replaying historical callouts
+- Self-service signup — the allowlist is managed by hand, and connecting burns a Robinhood account's Claude Code slot, which is the hard blocker on opening this up
+- Replaying historical callouts beyond catch-up-on-wake

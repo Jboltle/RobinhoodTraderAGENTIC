@@ -1,25 +1,41 @@
 /**
- * Reset local Robinhood OAuth state.
+ * Drop one user's stored Robinhood OAuth state.
  *
- * Use this when Robinhood shows the agent as connected but this local app never
- * received/stored tokens. It removes local client registration, PKCE verifier,
- * and token state so the next `bun run connect` or `bun run dev` starts a fresh
- * OAuth flow.
+ *   bun run auth:reset <email or user id>
+ *
+ * Use this when Robinhood shows the agent as connected but the app can no
+ * longer trade with the tokens it holds. Removing the row means the user's
+ * next visit to the dashboard starts a fresh OAuth flow.
  */
-import { rm } from 'node:fs/promises';
-
-import { config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
+import { createTraderDb } from '../trader/db.js';
 
 const log = createLogger('rh-reset-auth');
 
 async function main(): Promise<void> {
+  const identifier = process.argv[2]?.trim();
+  if (!identifier) {
+    log.error('usage: bun run auth:reset <email or user id>');
+    process.exitCode = 1;
+    return;
+  }
+
+  const db = createTraderDb();
+  const userId = identifier.includes('@')
+    ? (await db.findUserByEmail(identifier))?.id
+    : identifier;
+  if (!userId) {
+    log.error('no such user', { identifier });
+    process.exitCode = 1;
+    return;
+  }
+
   try {
-    await rm(config.rhTokensPath, { force: true });
-    log.info('removed local Robinhood OAuth state', { path: config.rhTokensPath });
+    await db.deleteBrokerTokens(userId);
+    log.info('removed stored Robinhood OAuth state', { userId });
   } catch (err) {
-    log.error('failed to remove local Robinhood OAuth state', {
-      path: config.rhTokensPath,
+    log.error('failed to remove stored Robinhood OAuth state', {
+      userId,
       error: (err as Error).message,
     });
     process.exitCode = 1;

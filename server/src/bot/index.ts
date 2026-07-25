@@ -231,6 +231,16 @@ async function main(): Promise<void> {
 
   client.on(Events.Error, (err) => log.error('discord error', { error: err.message }));
 
+  // discord.js reconnects on its own for every recoverable drop; `invalidated`
+  // is the one case where it gives up and leaves the process running with a
+  // dead Gateway. Exiting hands that to the supervisor, which takes the whole
+  // service down so /health stops answering, rather than staying "up" while
+  // silently receiving nothing.
+  client.on(Events.Invalidated, () => {
+    log.error('discord session invalidated; exiting so the stack restarts');
+    process.exit(1);
+  });
+
   await client.login(config.discordBotToken);
 }
 

@@ -1,21 +1,12 @@
 import { createLogger } from '../../shared/logger.js';
-import type {
-  Callout,
-  CalloutParser,
-  OptionContract,
-  PostReceipt,
-  RiskCheck,
-} from '../../shared/types.js';
+import type { Callout, OptionContract, RiskCheck } from '../../shared/types.js';
 import type { OptionPosition, RobinhoodTools } from '../rh/tools.js';
-import type { DecisionLog } from '../decisionLog.js';
 
 const log = createLogger('trader:pipeline');
 
-export interface PipelineDeps {
-  readonly parser: CalloutParser;
+/** Everything the order-placement paths need: one user's broker session. */
+export interface ExecutionContext {
   readonly tools: RobinhoodTools;
-  readonly decisions: DecisionLog;
-  readonly postReceipt: PostReceipt;
 }
 
 /** The allow=true branch of a risk check — the shape execution paths consume. */
@@ -62,7 +53,7 @@ export async function executeEquity(
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  deps: PipelineDeps
+  deps: ExecutionContext
 ): Promise<PlacedResult> {
   const price =
     risk.limitPrice !== null
@@ -118,7 +109,7 @@ export async function executeOptions(
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  deps: PipelineDeps
+  deps: ExecutionContext
 ): Promise<PlacedResult> {
   const option = callout.option!;
 
@@ -221,7 +212,7 @@ async function executeOptionExit(
   symbol: string,
   risk: RiskAllow,
   callout: Callout,
-  deps: PipelineDeps
+  deps: ExecutionContext
 ): Promise<PlacedResult> {
   const option = callout.option!;
   const position = await findOpenOptionPosition(deps, symbol, option);
@@ -267,7 +258,7 @@ async function executeOptionExit(
 }
 
 async function findOpenOptionPosition(
-  deps: PipelineDeps,
+  deps: ExecutionContext,
   symbol: string,
   option: OptionContract
 ): Promise<OptionPosition | null> {
