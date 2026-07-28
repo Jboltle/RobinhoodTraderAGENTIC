@@ -97,7 +97,7 @@ Fill in:
 | `SUPABASE_URL` | `API_URL` from `npx supabase status` |
 | `SUPABASE_ANON_KEY` | `ANON_KEY` from the same output |
 | `SUPABASE_SERVICE_ROLE_KEY` | `SERVICE_ROLE_KEY` — bypasses RLS, server-side only, never in the client bundle |
-| `RH_TOKENS_VAULT_KEY` | `openssl rand -hex 32`. Encrypts Robinhood tokens at rest; losing it means everyone reconnects. |
+| `RH_TOKENS_VAULT_KEY` | any long random string (e.g. from a password manager, or `openssl rand -hex 32`). Encrypts Robinhood tokens at rest; losing it means everyone reconnects. On Render it is generated automatically. |
 
 The trader refuses to boot without the four Supabase/vault values.
 

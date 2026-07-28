@@ -121,11 +121,13 @@ services:
       # site's build environment.
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      # Decrypts every stored Robinhood token. Losing or changing it forces
-      # every user to reconnect, which is why it is entered by hand rather than
-      # generated -- keep a copy somewhere you trust.
+      # Decrypts every stored Robinhood token. Render generates it on first
+      # apply and keeps it across deploys; it only regenerates if this service
+      # is deleted and recreated, which forces every user to reconnect their
+      # Robinhood account. Copy the generated value somewhere you trust so a
+      # recreated service can be given the old key instead.
       - key: RH_TOKENS_VAULT_KEY
-        sync: false
+        generateValue: true
 
   - type: web
     name: rh-trader-dashboard
