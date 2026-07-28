@@ -115,10 +115,12 @@ export class RobinhoodTools {
         symbol: args.symbol,
         side: args.side,
         type: args.orderType,
-        quantity: args.quantity,
+        // RH MCP schema declares quantity as a string, mirroring its
+        // string-encoded numerics elsewhere ("100.0000").
+        quantity: String(args.quantity),
         time_in_force: args.timeInForce ?? 'day',
         ...(args.orderType === 'limit' && args.limitPrice !== undefined
-          ? { limit_price: args.limitPrice, price: args.limitPrice }
+          ? { limit_price: String(args.limitPrice), price: String(args.limitPrice) }
           : {}),
       },
       parsePlaceOrder
@@ -137,12 +139,13 @@ export class RobinhoodTools {
         option_type: args.optionType,
         strike_price: args.strike,
         expiration_date: args.expiration,
-        quantity: args.contracts,
+        quantity: String(args.contracts),
         side: args.side,
         type: args.orderType,
         time_in_force: args.timeInForce ?? 'day',
+        // RH MCP schema declares price as a string (same convention as quantity).
         ...(args.orderType === 'limit' && args.limitPremium !== undefined
-          ? { price: args.limitPremium }
+          ? { price: String(args.limitPremium) }
           : {}),
       },
       parsePlaceOrder
