@@ -1,41 +1,24 @@
 /**
- * Sign in / sign up, shown in place of the dashboard when there is no session.
+ * Sign in, shown in place of the dashboard when there is no session.
  *
- * Signing up posts to the trader rather than to Supabase directly: the invite
- * allowlist lives server-side, so the browser has no way to create an account
- * for an address that was never invited.
+ * Passwordless: the user asks for a one-time sign-in link by email. The
+ * request goes to the trader rather than to Supabase directly, because the
+ * invite allowlist lives server-side — an address that was never invited gets
+ * a 403 and no email, and there is no self-serve signup path at all.
  */
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 
-import { signUp } from '../lib/api'
-import { signIn } from '../lib/auth'
-
-const MIN_PASSWORD_LENGTH = 8
-
-type Mode = 'signin' | 'signup'
+import { requestMagicLink } from '../lib/api'
 
 export function AuthScreen() {
-  const [mode, setMode] = useState<Mode>('signin')
   const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
 
   const submit = useMutation({
-    mutationFn: async () => {
-      if (mode === 'signin') return signIn(email, password)
-      await signUp(email, password)
-      // Sign the new account straight in so they land on the dashboard.
-      return signIn(email, password)
-    },
+    mutationFn: () => requestMagicLink(email),
   })
 
-  const canSubmit =
-    email.trim().length > 0 && password.length >= MIN_PASSWORD_LENGTH && !submit.isPending
-
-  const switchMode = (next: Mode) => {
-    setMode(next)
-    submit.reset()
-  }
+  const canSubmit = email.trim().length > 0 && !submit.isPending
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-ink-900 px-6">
@@ -49,86 +32,62 @@ export function AuthScreen() {
           </span>
         </div>
 
-        <h1 className="text-2xl font-semibold text-white">
-          {mode === 'signin' ? 'Sign in' : 'Create your account'}
-        </h1>
-        <p className="mt-2 text-sm text-ink-400">
-          {mode === 'signin'
-            ? 'This dashboard is invite-only.'
-            : 'Your email must already be on the invite list.'}
-        </p>
+        {submit.isSuccess ? (
+          <>
+            <h1 className="text-2xl font-semibold text-white">Check your email</h1>
+            <p className="mt-2 text-sm text-ink-400">
+              We sent a sign-in link to <span className="text-white">{email}</span>.
+              Open it on this device to land on the dashboard.
+            </p>
+            <button
+              type="button"
+              onClick={() => submit.reset()}
+              className="mt-6 text-sm text-brand hover:underline"
+            >
+              Use a different email
+            </button>
+          </>
+        ) : (
+          <>
+            <h1 className="text-2xl font-semibold text-white">Sign in</h1>
+            <p className="mt-2 text-sm text-ink-400">
+              This dashboard is invite-only. Enter your invited email and we&apos;ll
+              send you a sign-in link.
+            </p>
 
-        <form
-          className="mt-6 flex flex-col gap-4"
-          onSubmit={(e) => {
-            e.preventDefault()
-            if (canSubmit) submit.mutate()
-          }}
-        >
-          <Field label="Email">
-            <input
-              type="email"
-              autoComplete="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className={inputClass}
-              required
-            />
-          </Field>
-          <Field label={`Password (min ${MIN_PASSWORD_LENGTH} characters)`}>
-            <input
-              type="password"
-              autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className={inputClass}
-              minLength={MIN_PASSWORD_LENGTH}
-              required
-            />
-          </Field>
+            <form
+              className="mt-6 flex flex-col gap-4"
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (canSubmit) submit.mutate()
+              }}
+            >
+              <label className="flex flex-col gap-1.5 text-xs text-ink-400">
+                Email
+                <input
+                  type="email"
+                  autoComplete="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className={inputClass}
+                  required
+                />
+              </label>
 
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="mt-2 rounded-lg bg-brand px-4 py-2.5 text-sm font-medium text-ink-900 transition-opacity hover:bg-brand/80 disabled:opacity-50"
-          >
-            {submit.isPending
-              ? 'Working…'
-              : mode === 'signin'
-                ? 'Sign in'
-                : 'Create account'}
-          </button>
-
-          {submit.isError && (
-            <p className="text-sm text-loss">{(submit.error as Error).message}</p>
-          )}
-        </form>
-
-        <p className="mt-6 text-sm text-ink-400">
-          {mode === 'signin' ? (
-            <>
-              Invited but no account yet?{' '}
               <button
-                type="button"
-                onClick={() => switchMode('signup')}
-                className="text-brand hover:underline"
+                type="submit"
+                disabled={!canSubmit}
+                className="mt-2 rounded-lg bg-brand px-4 py-2.5 text-sm font-medium text-ink-900 transition-opacity hover:bg-brand/80 disabled:opacity-50"
               >
-                Create one
+                {submit.isPending ? 'Sending…' : 'Email me a sign-in link'}
               </button>
-            </>
-          ) : (
-            <>
-              Already have an account?{' '}
-              <button
-                type="button"
-                onClick={() => switchMode('signin')}
-                className="text-brand hover:underline"
-              >
-                Sign in
-              </button>
-            </>
-          )}
-        </p>
+
+              {submit.isError && (
+                <p className="text-sm text-loss">{(submit.error as Error).message}</p>
+              )}
+            </form>
+          </>
+        )}
       </div>
     </main>
   )
@@ -136,18 +95,3 @@ export function AuthScreen() {
 
 const inputClass =
   'w-full rounded-lg border border-ink-600 bg-ink-700 px-3 py-2 text-sm text-white transition-colors focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25'
-
-function Field({
-  label,
-  children,
-}: {
-  label: string
-  children: React.ReactNode
-}) {
-  return (
-    <label className="flex flex-col gap-1.5 text-xs text-ink-400">
-      {label}
-      {children}
-    </label>
-  )
-}

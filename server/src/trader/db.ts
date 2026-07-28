@@ -87,7 +87,10 @@ export interface TraderDb {
   // ---- Auth ------------------------------------------------------------------
 
   isEmailAllowed(email: string): Promise<boolean>;
-  createUser(email: string, password: string): Promise<AuthUser>;
+  /** Create the passwordless auth user if it does not exist yet. */
+  ensureUser(email: string): Promise<void>;
+  /** Email a one-time sign-in link. The user must already exist. */
+  sendMagicLink(email: string): Promise<void>;
   findUserByEmail(email: string): Promise<AuthUser | null>;
   /** Resolve a bearer token to its user; null when absent, expired or forged. */
   verifyAccessToken(token: string): Promise<AuthUser | null>;
@@ -284,16 +287,26 @@ class SupabaseTraderDb implements TraderDb {
     return data !== null;
   }
 
-  async createUser(email: string, password: string): Promise<AuthUser> {
-    const { data, error } = await this.supabase.auth.admin.createUser({
+  async ensureUser(email: string): Promise<void> {
+    // Passwordless: the only way in is the emailed link. The admin API works
+    // even with self-serve signups disabled on the Supabase project.
+    const { error } = await this.supabase.auth.admin.createUser({
       email: email.trim().toLowerCase(),
-      password,
       email_confirm: true,
     });
-    if (error || !data.user) {
-      throw new Error(`could not create user: ${error?.message ?? 'no user returned'}`);
+    if (error && error.code !== 'email_exists') {
+      throw new Error(`could not create user: ${error.message}`);
     }
-    return { id: data.user.id, email: data.user.email ?? null };
+  }
+
+  async sendMagicLink(email: string): Promise<void> {
+    // shouldCreateUser false keeps this a pure sign-in: account creation only
+    // ever happens through ensureUser, behind the allowlist check.
+    const { error } = await this.supabase.auth.signInWithOtp({
+      email: email.trim().toLowerCase(),
+      options: { shouldCreateUser: false },
+    });
+    if (error) throw new Error(`could not send sign-in link: ${error.message}`);
   }
 
   async findUserByEmail(email: string): Promise<AuthUser | null> {

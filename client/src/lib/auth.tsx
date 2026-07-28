@@ -59,11 +59,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 export const useAuth = (): AuthState => useContext(AuthContext)
 
-export const signIn = async (email: string, password: string): Promise<void> => {
-  const { error } = await supabase.auth.signInWithPassword({ email, password })
-  if (error) throw new Error(error.message)
-}
-
 export const signOut = async (): Promise<void> => {
   await supabase.auth.signOut()
 }

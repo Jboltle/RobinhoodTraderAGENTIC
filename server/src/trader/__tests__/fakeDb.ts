@@ -28,6 +28,8 @@ export const fakeTokens = (accessToken: string, refreshToken?: string): Persiste
 export interface FakeDb extends TraderDb {
   /** Every per-user query this db has served, in order. */
   readonly calls: ScopedCall[];
+  /** Emails a magic link was "sent" to, in order. */
+  readonly magicLinksSent: string[];
   /** Register a bearer token that resolves to a user. */
   addUser(user: AuthUser, accessToken: string): void;
   seedSettings(userId: string, settings: TradeSettings): void;
@@ -39,6 +41,7 @@ export interface FakeDb extends TraderDb {
 
 export function createFakeDb(): FakeDb {
   const calls: ScopedCall[] = [];
+  const magicLinksSent: string[] = [];
   const settings = new Map<string, ResolvedTradeSettings>();
   const trades: Array<{ userId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
@@ -56,6 +59,7 @@ export function createFakeDb(): FakeDb {
 
   return {
     calls,
+    magicLinksSent,
 
     addUser(user, accessToken) {
       usersByToken.set(accessToken, user);
@@ -149,12 +153,16 @@ export function createFakeDb(): FakeDb {
     async isEmailAllowed(email) {
       return allowedEmails.has(email.trim().toLowerCase());
     },
-    async createUser(email, _password) {
+    async ensureUser(email) {
       const normalized = email.trim().toLowerCase();
-      if (usersByEmail.has(normalized)) throw new Error('user already exists');
+      if (usersByEmail.has(normalized)) return;
       const user: AuthUser = { id: `user-${usersByEmail.size + 1}`, email: normalized };
       usersByEmail.set(normalized, user);
-      return user;
+    },
+    async sendMagicLink(email) {
+      const normalized = email.trim().toLowerCase();
+      if (!usersByEmail.has(normalized)) throw new Error('no user to send a link to');
+      magicLinksSent.push(normalized);
     },
     async findUserByEmail(email) {
       return usersByEmail.get(email.trim().toLowerCase()) ?? null;

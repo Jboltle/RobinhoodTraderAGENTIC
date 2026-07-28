@@ -218,17 +218,18 @@ export const submitBrokerRedirect = (redirectUrl: string): Promise<void> =>
   postJson<{ ok: true }>('/api/broker/callback', { redirectUrl }).then(() => undefined)
 
 /**
- * Create an account. Unauthenticated on purpose — this is where the token
- * comes from — and gated server-side against the invite allowlist.
+ * Ask the server to email a one-time sign-in link. Unauthenticated on purpose —
+ * this is where the session comes from — and gated server-side against the
+ * invite allowlist.
  */
-export async function signUp(email: string, password: string): Promise<void> {
-  const res = await fetch(`${TRADER_URL}/api/auth/signup`, {
+export async function requestMagicLink(email: string): Promise<void> {
+  const res = await fetch(`${TRADER_URL}/api/auth/magic-link`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ email }),
   })
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
-    throw new Error(body?.error ?? `sign up failed: ${res.status}`)
+    throw new Error(body?.error ?? `sign in failed: ${res.status}`)
   }
 }

@@ -35,8 +35,8 @@ One parse serves everyone, which is the cost saving that matters as users are ad
 
 ### Access model
 
-- Every route is behind a Fastify `preHandler` that verifies the Supabase JWT. The only public ones are `/health`, `/webhook/discord` (HMAC over the raw body) and `/api/auth/signup`.
-- Signup is gated server-side against the `allowed_emails` table, so the browser cannot skip the invite check.
+- Every route is behind a Fastify `preHandler` that verifies the Supabase JWT. The only public ones are `/health`, `/webhook/discord` (HMAC over the raw body) and `/api/auth/magic-link`.
+- Sign-in is passwordless: `/api/auth/magic-link` checks the email against the `allowed_emails` table server-side, creates the account if needed (admin API), and has Supabase email a one-time sign-in link. Self-serve Supabase signups are disabled, so the anon key in the browser bundle cannot create accounts around the invite gate.
 - [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that constructs a Supabase client. It uses the service-role key, and every per-user method takes `userId` as its first argument so a caller cannot forget to scope a query.
 - RLS is on with **default-deny** (no policies, grants revoked) for all five tables. This is mandatory, not defense in depth: the anon key ships in the JS bundle and PostgREST is publicly reachable, so without it `GET /rest/v1/trades?select=*` is a full data leak. The browser's anon key is used **only** for auth, never for data. [`supabaseRls.test.ts`](server/src/shared/__tests__/supabaseRls.test.ts) is the guard on that.
 
@@ -119,7 +119,7 @@ Open Studio at http://127.0.0.1:54333, go to the SQL editor, and run:
 insert into public.allowed_emails (email) values ('you@example.com');
 ```
 
-The email must be lowercase (there is a check constraint) and the address only has to be one you can type — local Supabase does not send or confirm mail, and any confirmation it did send would land in Mailpit at http://127.0.0.1:54334 rather than a real inbox.
+The email must be lowercase (there is a check constraint). Sign-in links from the local stack are not actually delivered — they land in Mailpit at http://127.0.0.1:54334, so open that inbox and click the link there.
 
 To have the allowlist survive a `npx supabase db reset`, put the same statement in `supabase/seed.sql`; `[db.seed]` in `config.toml` is already enabled and pointed at that path.
 
@@ -143,7 +143,7 @@ cd client
 bun run dev      # http://localhost:3001
 ```
 
-Sign up with the address you added to `allowed_emails`, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per user. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
+On the sign-in screen, enter the address you added to `allowed_emails` — a sign-in link is emailed to you (locally it lands in Mailpit at http://127.0.0.1:54334). Click it, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per user. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
 
 On restart the trader reconnects every user who already had stored tokens, so their MCP session is warm before the first callout rather than during it.
 
@@ -284,6 +284,12 @@ One thing that surprises people: the pipeline fans out to users who have a `brok
 ## Deployment
 
 Owned separately — see `render.yaml` and `server/docker-compose.yml`. In outline: the trader and bot run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a static site, and Supabase moves from the local CLI stack to a hosted project with `npx supabase db push`. Nothing in `supabase/migrations/` is local-only.
+
+Magic-link sign-in needs three things configured on the hosted Supabase project (dashboard, not code):
+
+1. **Auth → URL Configuration → Site URL** = the deployed dashboard URL, so the emailed link redirects there instead of localhost.
+2. **Auth → Sign In / Up → "Allow new users to sign up" = off.** Accounts are created only by the trader after the allowlist check; leaving this on lets anyone with the (public) anon key create an account directly.
+3. **Auth → SMTP**: the built-in email service is rate-limited to a few emails per hour and only reliably delivers to your own project team's addresses. Before inviting anyone else, plug in a custom SMTP provider (Resend, Postmark, SES — free tiers are fine at this scale).
 
 ## Risk controls
 

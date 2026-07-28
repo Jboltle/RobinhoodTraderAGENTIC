@@ -111,34 +111,47 @@ describe('routes that must stay open', () => {
   });
 });
 
-describe('POST /api/auth/signup', () => {
-  it('is open, but only to an allowlisted email', async () => {
-    const signup = (email: string) =>
-      harness.app.inject({
-        method: 'POST',
-        url: '/api/auth/signup',
-        headers: { 'content-type': 'application/json' },
-        payload: JSON.stringify({ email, password: 'a-long-enough-password' }),
-      });
+describe('POST /api/auth/magic-link', () => {
+  const requestLink = (email: string) =>
+    harness.app.inject({
+      method: 'POST',
+      url: '/api/auth/magic-link',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ email }),
+    });
 
-    const uninvited = await signup('stranger@example.com');
+  it('is open, but only emails a link to an allowlisted address', async () => {
+    const uninvited = await requestLink('stranger@example.com');
     expect(uninvited.statusCode).toBe(403);
     expect(await harness.db.findUserByEmail('stranger@example.com')).toBeNull();
+    expect(harness.db.magicLinksSent).toHaveLength(0);
 
     harness.db.allowEmail('invited@example.com');
-    const invited = await signup('invited@example.com');
-    expect(invited.statusCode).toBe(201);
+    const invited = await requestLink('invited@example.com');
+    expect(invited.statusCode).toBe(200);
     expect(await harness.db.findUserByEmail('invited@example.com')).not.toBeNull();
+    expect(harness.db.magicLinksSent).toEqual(['invited@example.com']);
   });
 
-  it('rejects a password below the minimum length', async () => {
+  it('sends to an existing account without creating a duplicate', async () => {
     harness.db.allowEmail('invited@example.com');
+    await requestLink('invited@example.com');
+    const again = await requestLink('invited@example.com');
+    expect(again.statusCode).toBe(200);
+    expect(harness.db.magicLinksSent).toEqual([
+      'invited@example.com',
+      'invited@example.com',
+    ]);
+  });
+
+  it('rejects a body without a valid email', async () => {
     const response = await harness.app.inject({
       method: 'POST',
-      url: '/api/auth/signup',
+      url: '/api/auth/magic-link',
       headers: { 'content-type': 'application/json' },
-      payload: JSON.stringify({ email: 'invited@example.com', password: 'short' }),
+      payload: JSON.stringify({ email: 'not-an-email' }),
     });
     expect(response.statusCode).toBe(400);
+    expect(harness.db.magicLinksSent).toHaveLength(0);
   });
 });

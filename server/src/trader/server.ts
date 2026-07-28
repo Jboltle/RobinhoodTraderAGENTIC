@@ -55,10 +55,7 @@ const WebhookBodySchema = z.object({ envelope: DiscordEnvelopeSchema });
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
 const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 
-const SignupBodySchema = z.object({
-  email: z.email(),
-  password: z.string().min(8),
-});
+const MagicLinkBodySchema = z.object({ email: z.email() });
 
 export interface ServerDeps {
   readonly db: TraderDb;
@@ -132,27 +129,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.send({ ok: true, executionMode: config.tradeExecutionMode });
   });
 
-  // Signup is gated here rather than in the browser: the allowlist decides who
-  // gets an account, so the check has to live somewhere the client can't skip.
-  fastify.post('/api/auth/signup', async (request, reply) => {
-    const parsed = SignupBodySchema.safeParse(request.body);
+  // Sign-in is an emailed magic link; there are no passwords. The allowlist is
+  // checked here rather than in the browser so the client can't skip it, and
+  // accounts are only ever created here (via the admin API) — self-serve
+  // Supabase signups stay disabled.
+  fastify.post('/api/auth/magic-link', async (request, reply) => {
+    const parsed = MagicLinkBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: 'body must be { email: string, password: string (min 8) }' });
+      return reply.status(400).send({ error: 'body must be { email: string }' });
     }
-    const { email, password } = parsed.data;
+    const { email } = parsed.data;
     if (!(await deps.db.isEmailAllowed(email))) {
-      log.warn('signup rejected: email not on the allowlist', { email });
+      log.warn('magic link rejected: email not on the allowlist', { email });
       return reply.status(403).send({ error: 'this email is not invited' });
     }
-    try {
-      const user = await deps.db.createUser(email, password);
-      log.info('created user', { userId: user.id });
-      return reply.status(201).send({ user });
-    } catch (err) {
-      return reply.status(409).send({ error: (err as Error).message });
-    }
+    await deps.db.ensureUser(email);
+    await deps.db.sendMagicLink(email);
+    log.info('sent sign-in link', { email });
+    return reply.send({ ok: true });
   });
 
   // ---- Robinhood connection (per user) ----------------------------------------
