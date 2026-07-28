@@ -67,37 +67,42 @@ export type Callout = z.infer<typeof CalloutSchema>;
 // =============================================================================
 // Trade settings — runtime-tunable risk parameters
 //
-// Every field is optional: a settings payload/file only carries overrides.
-// Resolution order (see src/trader/settings.ts): payload override →
-// state/settings.json → env defaults from config.ts.
+// This schema is the single source of truth for defaults. Each user owns one
+// settings row holding the full payload; parsing `{}` yields the defaults
+// below, so there is no env or file layer behind it.
 // =============================================================================
 
 const pct = z.number().positive().max(100);
 const tickerList = z.array(z.string().transform((t) => t.toUpperCase()));
 
 export const TradeSettingsSchema = z.object({
-  executionMode: z.enum(['immediate', 'approval']).optional(),
+  executionMode: z.enum(['immediate', 'approval']).default('immediate'),
   /** Max equity notional per trade as % of buying power. */
-  maxNotionalPct: pct.optional(),
+  maxNotionalPct: pct.default(5),
   /** Max options premium spend per trade as % of buying power. */
-  maxOptionsNotionalPct: pct.optional(),
+  maxOptionsNotionalPct: pct.default(2),
   /** Skip options trades where even 1 contract exceeds this % of buying power. */
-  maxSingleContractPct: pct.optional(),
+  maxSingleContractPct: pct.default(5),
   /** % of the per-trade cap used for the "small" / "medium" size keywords. */
-  positionSmallPct: pct.optional(),
-  positionMediumPct: pct.optional(),
-  maxTradesPerDay: z.number().int().nonnegative().optional(),
-  cooldownSeconds: z.number().nonnegative().optional(),
-  allowedTickers: tickerList.optional(),
-  blockedTickers: tickerList.optional(),
-  minConfidence: z.number().min(0).max(1).optional(),
-  regularHoursOnly: z.boolean().optional(),
+  positionSmallPct: pct.default(25),
+  positionMediumPct: pct.default(50),
+  maxTradesPerDay: z.number().int().nonnegative().default(10),
+  cooldownSeconds: z.number().nonnegative().default(300),
+  /** Empty = allow every ticker. */
+  allowedTickers: tickerList.default([]),
+  blockedTickers: tickerList.default([]),
+  minConfidence: z.number().min(0).max(1).default(0.7),
+  regularHoursOnly: z.boolean().default(true),
 });
 
-export type TradeSettings = z.infer<typeof TradeSettingsSchema>;
+/** What a client may send: every field optional, defaults fill the rest. */
+export type TradeSettings = z.input<typeof TradeSettingsSchema>;
 
-/** Fully-resolved settings: every field populated after the resolution chain. */
-export type ResolvedTradeSettings = Required<TradeSettings>;
+/** Fully-resolved settings: every field populated by the schema defaults. */
+export type ResolvedTradeSettings = z.output<typeof TradeSettingsSchema>;
+
+/** The defaults, as a fresh object. */
+export const defaultSettings = (): ResolvedTradeSettings => TradeSettingsSchema.parse({});
 
 // =============================================================================
 // LLM provider abstraction (implementations live in src/shared/llm.ts)
@@ -190,7 +195,9 @@ export type DecisionKind =
   | 'risk_rejected'
   | 'pending_approval'
   | 'submitted'
-  | 'execution_failed';
+  | 'execution_failed'
+  /** Seen on catch-up but too old to execute at a price that still makes sense. */
+  | 'missed';
 
 export interface SubmittedOrder {
   readonly symbol: string;
@@ -208,15 +215,21 @@ export interface SubmittedOrder {
   readonly status: string | null;
 }
 
+/**
+ * One user's outcome for one Discord callout — a row in `trades`. Ticker and
+ * action are denormalized off the callout so a decision reads standalone
+ * without joining the shared `callouts` table.
+ */
 export interface Decision {
   readonly at: string;
-  readonly envelope: DiscordEnvelope;
-  readonly callout: Callout | null;
+  readonly messageId: string;
   readonly kind: DecisionKind;
   /** Machine-readable rejection code; null for successful/informational kinds. */
   readonly code: RejectionCode | null;
   /** Human-readable: rejection reason or success summary. Always populated. */
   readonly reason: string;
+  readonly ticker: string | null;
+  readonly action: 'buy' | 'sell' | null;
   /** Set when we attempted to submit (kind: 'submitted' or 'execution_failed'). */
   readonly order: SubmittedOrder | null;
 }

@@ -1,6 +1,4 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
-import { dirname } from 'node:path';
 
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type {
@@ -11,23 +9,24 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import { createLogger } from '../../shared/logger.js';
-import type { FileOAuthProviderOptions, PersistedState } from './types.js';
+import type { SupabaseOAuthProviderOptions, PersistedState } from './types.js';
 
-export type { FileOAuthProviderOptions } from './types.js';
+export type { SupabaseOAuthProviderOptions } from './types.js';
 
 const log = createLogger('trader:rh:oauth');
 
 /**
- * OAuthClientProvider that persists DCR client info, PKCE verifier, and tokens
- * to a single JSON file (chmod 0600). Suitable for a single-user, single-process
- * agentic-trading setup.
+ * OAuthClientProvider that keeps one user's DCR client info, PKCE verifier and
+ * tokens in `broker_connections`, encrypted at rest. Postgres rather than a
+ * local file because the deployed filesystem is ephemeral: tokens written to
+ * disk vanish on every spin-down, which is what forced re-auth every 30 minutes.
  */
-export class FileOAuthProvider implements OAuthClientProvider {
+export class SupabaseOAuthProvider implements OAuthClientProvider {
   private cachedState: PersistedState | undefined;
   private loadPromise: Promise<PersistedState> | undefined;
   private oauthState: string | undefined;
 
-  constructor(private readonly opts: FileOAuthProviderOptions) {}
+  constructor(private readonly opts: SupabaseOAuthProviderOptions) {}
 
   get redirectUrl(): string {
     return this.opts.redirectUri;
@@ -56,8 +55,7 @@ export class FileOAuthProvider implements OAuthClientProvider {
   }
 
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
-    const state = await this.load();
-    return state.client;
+    return (await this.load()).client;
   }
 
   async saveClientInformation(info: OAuthClientInformationMixed): Promise<void> {
@@ -67,15 +65,14 @@ export class FileOAuthProvider implements OAuthClientProvider {
   }
 
   async tokens(): Promise<OAuthTokens | undefined> {
-    const state = await this.load();
-    return state.tokens;
+    return (await this.load()).tokens;
   }
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     const state = await this.load();
     state.tokens = tokens;
     await this.persist();
-    log.info('saved Robinhood OAuth tokens');
+    log.info('saved Robinhood OAuth tokens', { userId: this.opts.userId });
   }
 
   async redirectToAuthorization(url: URL): Promise<void> {
@@ -96,45 +93,35 @@ export class FileOAuthProvider implements OAuthClientProvider {
     return state.codeVerifier;
   }
 
-  async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery'): Promise<void> {
+  async invalidateCredentials(
+    scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery'
+  ): Promise<void> {
     const state = await this.load();
     if (scope === 'all' || scope === 'client') state.client = undefined;
     if (scope === 'all' || scope === 'tokens') state.tokens = undefined;
     if (scope === 'all' || scope === 'verifier') state.codeVerifier = undefined;
     await this.persist();
-    log.warn('invalidated credentials', { scope });
+    log.warn('invalidated credentials', { scope, userId: this.opts.userId });
   }
 
   private async load(): Promise<PersistedState> {
     if (this.cachedState) return this.cachedState;
-    if (!this.loadPromise) {
-      this.loadPromise = (async () => {
-        try {
-          const raw = await readFile(this.opts.path, 'utf8');
-          const parsed = JSON.parse(raw) as PersistedState;
-          return parsed ?? {};
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
-          log.warn('could not read tokens file, starting fresh', {
-            error: (err as Error).message,
-          });
-          return {};
-        }
-      })();
-    }
+    this.loadPromise ??= this.opts.db
+      .getBrokerTokens(this.opts.userId)
+      .then((state) => state ?? {})
+      .catch((err: unknown) => {
+        log.warn('could not read broker connection, starting fresh', {
+          userId: this.opts.userId,
+          error: (err as Error).message,
+        });
+        return {} as PersistedState;
+      });
     this.cachedState = await this.loadPromise;
     return this.cachedState;
   }
 
   private async persist(): Promise<void> {
     if (!this.cachedState) return;
-    await mkdir(dirname(this.opts.path), { recursive: true });
-    await writeFile(this.opts.path, JSON.stringify(this.cachedState, null, 2), 'utf8');
-    try {
-      await chmod(this.opts.path, 0o600);
-    } catch (err) {
-      log.warn('failed to chmod tokens file', { error: (err as Error).message });
-    }
-    this.opts.onPersist?.();
+    await this.opts.db.saveBrokerTokens(this.opts.userId, this.cachedState);
   }
 }

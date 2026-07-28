@@ -1,11 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-
-import { config, isAllowed } from '../../shared/config.js';
-import { createLogger } from '../../shared/logger.js';
+import { isAllowed } from '../../shared/config.js';
 import type { Callout, ResolvedTradeSettings, RiskCheck } from '../../shared/types.js';
-
-const log = createLogger('trader:risk');
 
 /**
  * Qualitative position-size keywords extracted from the message.
@@ -66,77 +60,68 @@ function resolveSize(
 }
 
 // =============================================================================
-// Persisted daily state
+// Daily state, derived from the trades table
+//
+// Nothing is cached in the process: the counters ARE the trade rows, so the
+// daily cap and cooldowns survive a restart. They previously lived in a
+// module-level object backed by state/risk.json, which meant every deploy
+// silently reset the daily cap to zero.
 // =============================================================================
 
-interface RiskState {
-  date: string;
-  trades: number;
-  lastTradeAtByTicker: Record<string, number>;
+/** One user's trading history, reduced to what the guards below need. */
+export interface DerivedRiskState {
+  /** Orders this user has submitted since the start of the local day. */
+  readonly submittedToday: number;
+  /** When this user last submitted an order for the callout's ticker. */
+  readonly lastSubmittedForTicker: Date | null;
 }
 
-const todayKey = (now: Date = new Date()): string => now.toISOString().slice(0, 10);
-const emptyState = (): RiskState => ({ date: todayKey(), trades: 0, lastTradeAtByTicker: {} });
+export const NO_TRADES_YET: DerivedRiskState = {
+  submittedToday: 0,
+  lastSubmittedForTicker: null,
+};
 
-let state: RiskState = emptyState();
-let stateLoaded = false;
-
-async function ensureStateLoaded(): Promise<void> {
-  if (stateLoaded) {
-    resetStateIfNewDay();
-    return;
-  }
-  try {
-    const raw = await readFile(config.riskStatePath, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<RiskState>;
-    state = {
-      date: typeof parsed.date === 'string' ? parsed.date : todayKey(),
-      trades: typeof parsed.trades === 'number' ? parsed.trades : 0,
-      lastTradeAtByTicker:
-        parsed.lastTradeAtByTicker && typeof parsed.lastTradeAtByTicker === 'object'
-          ? parsed.lastTradeAtByTicker
-          : {},
-    };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('failed to read risk state, starting fresh', { error: (err as Error).message });
-    }
-    state = emptyState();
-  }
-  resetStateIfNewDay();
-  stateLoaded = true;
+/** Source of the two count queries behind DerivedRiskState. */
+export interface RiskHistory {
+  countSubmittedSince(userId: string, since: Date): Promise<number>;
+  lastSubmittedAt(userId: string, ticker: string): Promise<Date | null>;
 }
 
-function resetStateIfNewDay(now: Date = new Date()): void {
-  const date = todayKey(now);
-  if (state.date !== date) {
-    state = { date, trades: 0, lastTradeAtByTicker: {} };
-  }
+/** Local midnight — the daily cap resets with the trading day, not with UTC. */
+export function startOfDay(now: Date = new Date()): Date {
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  return midnight;
 }
 
-async function persistState(): Promise<void> {
-  await mkdir(dirname(config.riskStatePath), { recursive: true });
-  await writeFile(config.riskStatePath, JSON.stringify(state, null, 2), 'utf8');
+export async function deriveRiskState(
+  history: RiskHistory,
+  userId: string,
+  ticker: string | null,
+  now: Date = new Date()
+): Promise<DerivedRiskState> {
+  const [submittedToday, lastSubmittedForTicker] = await Promise.all([
+    history.countSubmittedSince(userId, startOfDay(now)),
+    ticker ? history.lastSubmittedAt(userId, ticker) : Promise.resolve(null),
+  ]);
+  return { submittedToday, lastSubmittedForTicker };
 }
-
-
 
 // =============================================================================
 // Public API
 // =============================================================================
 
 /**
- * Evaluate a callout against deterministic risk rules using pre-resolved
- * settings (payload → settings file → env; see trader/settings.ts).
- * Supports both equity (notional-based sizing) and options (contract-count sizing).
+ * Evaluate a callout against deterministic risk rules using the acting user's
+ * settings and their trade history. Supports both equity (notional-based
+ * sizing) and options (contract-count sizing).
  */
-export async function checkRisk(
+export function checkRisk(
   callout: Callout,
   settings: ResolvedTradeSettings,
+  state: DerivedRiskState = NO_TRADES_YET,
   now: Date = new Date()
-): Promise<RiskCheck> {
-  await ensureStateLoaded();
-
+): RiskCheck {
   if (!callout.isCallout || !callout.action || !callout.ticker) {
     return { allow: false, code: 'not_callout', reason: 'not a callout' };
   }
@@ -169,13 +154,12 @@ export async function checkRisk(
   if (settings.regularHoursOnly && !isRegularUsTradingHours(now)) {
     return { allow: false, code: 'outside_market_hours', reason: 'outside regular US trading hours' };
   }
-  if (state.trades >= settings.maxTradesPerDay) {
+  if (state.submittedToday >= settings.maxTradesPerDay) {
     return { allow: false, code: 'daily_cap_reached', reason: `daily trade cap reached (${settings.maxTradesPerDay})` };
   }
 
-  const lastTradeAt = state.lastTradeAtByTicker[ticker];
-  if (typeof lastTradeAt === 'number') {
-    const elapsed = now.getTime() - lastTradeAt;
+  if (state.lastSubmittedForTicker !== null) {
+    const elapsed = now.getTime() - state.lastSubmittedForTicker.getTime();
     if (elapsed < settings.cooldownSeconds * 1000) {
       const secs = Math.ceil((settings.cooldownSeconds * 1000 - elapsed) / 1000);
       return { allow: false, code: 'cooldown_active', reason: `${ticker} cooldown active (${secs}s remaining)` };
@@ -195,14 +179,6 @@ export async function checkRisk(
     maxSingleContractPct: settings.maxSingleContractPct,
     maxOptionsNotionalPct: settings.maxOptionsNotionalPct,
   };
-}
-
-/** Increment daily counter and stamp per-ticker cooldown after a successful order. */
-export async function recordTrade(ticker: string, now: Date = new Date()): Promise<void> {
-  await ensureStateLoaded();
-  state.trades += 1;
-  state.lastTradeAtByTicker[ticker.toUpperCase()] = now.getTime();
-  await persistState();
 }
 
 // =============================================================================

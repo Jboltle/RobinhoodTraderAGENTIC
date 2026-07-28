@@ -12,13 +12,19 @@
  *   - Options-specific guards
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { checkRisk as checkRiskWithSettings, isRegularUsTradingHours } from '../riskFilter.js';
+import { describe, expect, it } from 'vitest';
+import {
+  NO_TRADES_YET,
+  checkRisk as checkRiskWithSettings,
+  isRegularUsTradingHours,
+  type DerivedRiskState,
+} from '../riskFilter.js';
+import { TradeSettingsSchema } from '../../../shared/types.js';
 import type { Callout, ResolvedTradeSettings } from '../../../shared/types.js';
 
-// Resolved settings mirroring the config mock below — checkRisk takes these
-// as an argument now (resolution chain lives in trader/settings.ts).
-const SETTINGS: ResolvedTradeSettings = {
+// Settings come from the schema, so these tests fail if a default drifts away
+// from what they assume.
+const SETTINGS: ResolvedTradeSettings = TradeSettingsSchema.parse({
   executionMode: 'immediate',
   minConfidence: 0.7,
   blockedTickers: ['GME'],
@@ -31,38 +37,10 @@ const SETTINGS: ResolvedTradeSettings = {
   maxSingleContractPct: 5,
   positionSmallPct: 25,        // small  = 25% of cap
   positionMediumPct: 50,       // medium = 50% of cap
-};
+});
 
 const checkRisk = (callout: Callout, now?: Date) =>
-  checkRiskWithSettings(callout, SETTINGS, now);
-
-// ---------------------------------------------------------------------------
-// Mock config so tests are independent of .env values
-// ---------------------------------------------------------------------------
-
-vi.mock('../../../shared/config.js', () => ({
-  config: {
-    minConfidence: 0.7,
-    blockedTickers: ['GME'],
-    allowedTickers: [],          // empty = allow all
-    regularHoursOnly: false,     // disabled by default in tests
-    maxTradesPerDay: 3,
-    cooldownSecondsPerTicker: 60,
-    maxNotionalPctPerTrade: 5,   // equity cap = 5% of buying power
-    maxOptionsNotionalPct: 2,    // options cap = 2%
-    positionSmallPct: 25,        // small  = 25% of cap
-    positionMediumPct: 50,       // medium = 50% of cap
-    riskStatePath: '/tmp/test-risk-state.json',
-  },
-  isAllowed: (v: string, list: string[]) => list.length === 0 || list.includes(v),
-}));
-
-// Mock fs so state reads/writes don't touch disk
-vi.mock('node:fs/promises', () => ({
-  readFile: vi.fn().mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' })),
-  writeFile: vi.fn().mockResolvedValue(undefined),
-  mkdir: vi.fn().mockResolvedValue(undefined),
-}));
+  checkRiskWithSettings(callout, SETTINGS, NO_TRADES_YET, now);
 
 // ---------------------------------------------------------------------------
 // Base callout fixtures
@@ -95,11 +73,6 @@ const BASE_OPTION: Callout = {
   confidence: 0.95,
   rationale: 'BTO SPY 755C',
 };
-
-// Reset module-level state between tests by forcing a fresh state load
-beforeEach(() => {
-  vi.resetModules();
-});
 
 // ---------------------------------------------------------------------------
 // Guard rails
@@ -150,8 +123,13 @@ describe('riskFilter — guards', () => {
 // ---------------------------------------------------------------------------
 
 describe('riskFilter — rejection codes', () => {
-  const codeOf = async (callout: Callout, settings = SETTINGS, now?: Date) => {
-    const result = await checkRiskWithSettings(callout, settings, now);
+  const codeOf = async (
+    callout: Callout,
+    settings = SETTINGS,
+    now?: Date,
+    state: DerivedRiskState = NO_TRADES_YET
+  ) => {
+    const result = checkRiskWithSettings(callout, settings, state, now);
     expect(result.allow).toBe(false);
     return (result as { code: string }).code;
   };
@@ -195,12 +173,14 @@ describe('riskFilter — rejection codes', () => {
     expect(await codeOf(BASE_EQUITY, { ...SETTINGS, maxTradesPerDay: 0 })).toBe('daily_cap_reached');
   });
 
-  it('cooldown_active right after a recorded trade', async () => {
-    const { checkRisk: freshCheck, recordTrade } = await import('../riskFilter.js');
-    await recordTrade('AAPL');
-    const result = await freshCheck(BASE_EQUITY, SETTINGS);
-    expect(result.allow).toBe(false);
-    expect((result as { code: string }).code).toBe('cooldown_active');
+  it('cooldown_active right after a submitted order for the same ticker', async () => {
+    const now = new Date('2026-06-15T14:00:00Z');
+    expect(
+      await codeOf(BASE_EQUITY, SETTINGS, now, {
+        submittedToday: 1,
+        lastSubmittedForTicker: new Date(now.getTime() - 30_000),
+      })
+    ).toBe('cooldown_active');
   });
 });
 
@@ -208,18 +188,18 @@ describe('riskFilter — rejection codes', () => {
 // Settings override — the same callout flips outcome with different settings
 // ---------------------------------------------------------------------------
 
-describe('riskFilter — settings override', () => {
-  it('minConfidence from a settings override rejects a callout the baseline allows', async () => {
-    const baseline = await checkRiskWithSettings(BASE_EQUITY, SETTINGS);
+describe('riskFilter — per-user settings', () => {
+  it("a stricter minConfidence rejects a callout the baseline user's settings allow", async () => {
+    const baseline = checkRiskWithSettings(BASE_EQUITY, SETTINGS);
     expect(baseline.allow).toBe(true);
 
-    const strict = await checkRiskWithSettings(BASE_EQUITY, { ...SETTINGS, minConfidence: 0.95 });
+    const strict = checkRiskWithSettings(BASE_EQUITY, { ...SETTINGS, minConfidence: 0.95 });
     expect(strict.allow).toBe(false);
     expect((strict as { reason: string }).reason).toMatch(/confidence 0\.90 < threshold 0\.95/);
   });
 
-  it('blockedTickers from a settings override rejects a normally-allowed ticker', async () => {
-    const result = await checkRiskWithSettings(BASE_EQUITY, {
+  it("one user's blocklist rejects a ticker another user can trade", async () => {
+    const result = checkRiskWithSettings(BASE_EQUITY, {
       ...SETTINGS,
       blockedTickers: ['AAPL'],
     });
@@ -227,8 +207,8 @@ describe('riskFilter — settings override', () => {
     expect((result as { reason: string }).reason).toMatch(/AAPL is blocked/);
   });
 
-  it('sizing caps come from the settings object, not env config', async () => {
-    const result = await checkRiskWithSettings(
+  it('sizing caps come from the settings object', async () => {
+    const result = checkRiskWithSettings(
       { ...BASE_EQUITY, positionSize: 'full' },
       { ...SETTINGS, maxNotionalPct: 8 }
     );

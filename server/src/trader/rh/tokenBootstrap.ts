@@ -1,43 +1,27 @@
 /**
- * Runtime Robinhood auth bootstrap.
+ * Robinhood auth state reporting.
  *
- * `readTokenStatus` inspects the local token file and reports whether the
- * saved access token is still usable, refreshable, or gone — decoded from the
- * JWT `exp` claim (the file has no absolute timestamp, but the token itself
- * does).
+ * `readTokenStatus` decides whether a stored access token is still usable,
+ * refreshable, or gone — read from the JWT `exp` claim, since the stored
+ * record has no absolute timestamp but the token itself does.
  */
-import { readFile } from 'node:fs/promises';
+import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 
-import type { StoredState, TokenStatus } from './types.js';
+import type { TokenStatus } from './types.js';
 
 export type { TokenState, TokenStatus } from './types.js';
 
 /** Treat tokens expiring within this window as needing refresh/re-auth. */
 const EXPIRY_BUFFER_SEC = 120;
 
-/**
- * Inspect the local token file. Never throws — a missing or malformed file is
- * reported as `missing` so callers can decide how to recover.
- */
-export async function readTokenStatus(path: string): Promise<TokenStatus> {
-  let raw: string;
-  try {
-    raw = await readFile(path, 'utf8');
-  } catch {
-    return { state: 'missing', expiresInSec: null, hasRefreshToken: false };
-  }
+const MISSING: TokenStatus = { state: 'missing', expiresInSec: null, hasRefreshToken: false };
 
-  let parsed: StoredState;
-  try {
-    parsed = JSON.parse(raw) as StoredState;
-  } catch {
-    return { state: 'missing', expiresInSec: null, hasRefreshToken: false };
-  }
-
-  const accessToken = parsed.tokens?.access_token;
-  const hasRefreshToken = Boolean(parsed.tokens?.refresh_token);
+/** Never throws — absent or malformed token material is reported as `missing`. */
+export function readTokenStatus(tokens: OAuthTokens | undefined): TokenStatus {
+  const accessToken = tokens?.access_token;
+  const hasRefreshToken = Boolean(tokens?.refresh_token);
   if (!accessToken) {
-    return { state: 'missing', expiresInSec: null, hasRefreshToken };
+    return { ...MISSING, hasRefreshToken };
   }
 
   const expiresInSec = jwtSecondsUntilExpiry(accessToken);

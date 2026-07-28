@@ -3,21 +3,17 @@ import { REST, Routes } from 'discord.js';
 import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import { PostReceipt } from '../shared/types.js';
-import { createCalloutHistory } from './callouts.js';
-import { DecisionLog } from './decisionLog.js';
+import { catchUpOnWake } from './catchup.js';
+import { createTraderDb } from './db.js';
+import { TraderEvents } from './events.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
-import { RobinhoodMcpClient } from './rh/mcpClient.js';
-import { backupTokens, restoreTokens } from './rh/tokenVault.js';
-import { RobinhoodTools } from './rh/tools.js';
+import { createMessageProcessor } from './pipeline/index.js';
+import { createMcpRegistry } from './rh/mcpRegistry.js';
 import { buildServer } from './server.js';
 
 const log = createLogger('trader');
 
 const RECEIPT_MAX_LENGTH = 1900;
-
-function buildDiscordRestClient(): REST {
-  return new REST({ version: '10' }).setToken(config.discordBotToken);
-}
 
 function buildPostReceipt(rest: REST): PostReceipt {
   return async (channelId: string, content: string) => {
@@ -38,91 +34,51 @@ function buildPostReceipt(rest: REST): PostReceipt {
   };
 }
 
-function buildDisabledRobinhoodTools(): RobinhoodTools {
-  const disabled = async (): Promise<never> => {
-    throw new Error('Robinhood tools are disabled while TRADE_EXECUTION_MODE=approval');
-  };
-
-  return {
-    getBuyingPower: disabled,
-    getQuote: disabled,
-    getOptionsMarkPrice: disabled,
-    placeOrder: disabled,
-    placeOptionsOrder: disabled,
-    getPositions: disabled,
-    getOptionPositions: disabled,
-  } as unknown as RobinhoodTools;
-}
-
 async function main(): Promise<void> {
   assertConfigValid('trader');
 
-  const parser = new LlmCalloutParser();
-  const decisions = new DecisionLog(config.decisionLogPath);
-  const discordRest = buildDiscordRestClient();
-  const postReceipt = buildPostReceipt(discordRest);
+  const db = createTraderDb();
+  const events = new TraderEvents();
+  const brokers = createMcpRegistry(db);
+  const discordRest = new REST({ version: '10' }).setToken(config.discordBotToken);
 
-  // Token vault: serialized backups (chained like server.ts's pipeline chain
-  // so concurrent persists never interleave). Null channel = vault disabled.
-  const vaultChannelId = config.rhTokensVaultChannelId;
-  let backupChain: Promise<void> = Promise.resolve();
-  const onTokensPersisted = vaultChannelId
-    ? () => {
-        backupChain = backupChain.then(() =>
-          backupTokens(discordRest, vaultChannelId, config.rhTokensPath)
-        );
-      }
-    : undefined;
-
-  const mcp =
-    config.tradeExecutionMode === 'immediate'
-      ? new RobinhoodMcpClient({ onTokensPersisted })
-      : null;
-  const tools = mcp ? new RobinhoodTools(mcp) : buildDisabledRobinhoodTools();
-
-  if (!mcp) {
-    log.warn('Robinhood MCP disabled in approval mode; no orders will be submitted');
-  }
-
-  const fastify = buildServer({
-    parser,
-    tools,
-    decisions,
-    postReceipt,
-    mcp,
-    callouts: createCalloutHistory(),
+  const processor = createMessageProcessor({
+    parser: new LlmCalloutParser(),
+    db,
+    events,
+    brokers,
+    postReceipt: buildPostReceipt(discordRest),
   });
 
-  // Listen before connecting: on Render the OAuth flow can only complete via
-  // the dashboard hitting /api/auth/*, so the port must be open while auth is
-  // pending. No fail-fast on auth errors — a deployed server must stay up.
+  if (config.tradeExecutionMode === 'approval') {
+    log.warn('booted in approval mode; no orders will be submitted for any user');
+  }
+
+  const fastify = buildServer({ db, events, brokers, processor });
+
+  // Listen before anything else: on a deployed box the OAuth flow can only
+  // complete via the dashboard hitting /api/broker/*, so the port must be open
+  // while auth is pending. No fail-fast — a deployed server must stay up.
   await fastify.listen({ port: config.traderPort, host: config.traderHost });
   log.info('trader listening', { host: config.traderHost, port: config.traderPort });
 
-  if (mcp) {
-    if (vaultChannelId) {
-      await restoreTokens(discordRest, vaultChannelId, config.rhTokensPath);
-    }
-    log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl });
-    void mcp
-      .ensureConnected()
-      .then(async () => {
-        log.info('Robinhood MCP connected', { tools: mcp.getToolNames() });
-        // Also warms the accountNumber cache in RobinhoodTools for later orders.
-        const account = await tools.getBuyingPower();
-        log.info('Robinhood account snapshot', {
-          accountNumber: account.accountNumber,
-          portfolioValueUsd: account.portfolioValueUsd,
-          buyingPowerUsd: account.amountUsd,
-        });
-      })
-      .catch((err) => {
-        log.error('Robinhood MCP connection failed', {
-          error: (err as Error).message,
-          stack: (err as Error).stack,
-        });
-      });
+  // Reconnect everyone who was connected before the restart, so their stored
+  // tokens are refreshed and their MCP session is warm before the first
+  // callout arrives rather than during it.
+  const userIds = await db.listBrokerUserIds();
+  log.info('restoring broker sessions', { users: userIds.length });
+  for (const userId of userIds) {
+    void brokers
+      .for(userId)
+      .mcp.ensureConnected()
+      .catch((err: unknown) =>
+        log.warn('could not restore Robinhood session', { userId, error: (err as Error).message })
+      );
   }
+
+  void catchUpOnWake({ db, processor }).catch((err: unknown) =>
+    log.error('catch-up failed', { error: (err as Error).message })
+  );
 }
 
 main().catch((err) => {

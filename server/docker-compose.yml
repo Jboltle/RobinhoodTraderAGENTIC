@@ -1,10 +1,21 @@
 name: rh-discord-trader
 
+# Bring the stack up with:
+#
+#   docker compose --env-file ../.env up --build
+#
+# The flag is not optional. env_file below only injects variables into running
+# containers; the client's Supabase keys are Docker BUILD args, and those come
+# from compose's own interpolation, which does not read ../.env on its own.
+
 services:
-  trader:
+  # Trader + Discord bot in one container, same as production (see
+  # Dockerfile.server and ../render.yaml). All state lives in Supabase, so
+  # nothing is mounted -- the container is disposable.
+  server:
     build:
       context: .
-      dockerfile: Dockerfile.trader
+      dockerfile: Dockerfile.server
     env_file: ../.env
     environment:
       # Inside compose, "localhost" points at the container itself. Default to
@@ -12,49 +23,38 @@ services:
       # (http://host.docker.internal:11434) or a cloud provider.
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       # Both listeners must bind all interfaces inside the container so the
-      # published ports and the bot's cross-container webhook POSTs work,
-      # regardless of the host-oriented (127.0.0.1) .env values.
+      # published ports work regardless of the host-oriented (127.0.0.1) .env
+      # values.
       TRADER_HOST: 0.0.0.0
       ROBINHOOD_OAUTH_CALLBACK_HOST: 0.0.0.0
-      # Session-settings pull from the client dashboard. Host-oriented .env
-      # values (http://localhost:3001/...) don't resolve inside the container,
-      # so reach the client service by name. Uncomment to enable; the trader
-      # falls through to settings.json/env whenever the client is unreachable.
-      # CLIENT_SETTINGS_URL: http://client:3001/api/settings-state
+      # The bot now shares the container with the trader, so the webhook never
+      # leaves loopback. Pinned here because .env is host-oriented.
+      TRADER_WEBHOOK_URL: http://127.0.0.1:${TRADER_PORT:-3000}/webhook/discord
+    # SUPABASE_URL is deliberately NOT overridden here -- listing it would
+    # clobber the env_file value. With a HOSTED project nothing is needed. With
+    # a local Supabase (`npx supabase start`, listening on the host) set
+    # SUPABASE_URL=http://host.docker.internal:54331 in ../.env before bringing
+    # compose up; the browser still needs 127.0.0.1, which is why the client's
+    # build arg below keeps its own value.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Identity mappings (host port == container port) keep the OAuth redirect
     # URI derived from .env valid both inside the container and in the browser.
-    # Published on host loopback only: the settings API has no auth, so we
-    # mirror the non-Docker default of binding 127.0.0.1.
+    # Published on host loopback only: mirrors the non-Docker default.
     ports:
       - "127.0.0.1:${TRADER_PORT:-3000}:${TRADER_PORT:-3000}"
       # Robinhood OAuth browser callback -- must be reachable from the host
       # browser during first-run auth.
       - "127.0.0.1:${ROBINHOOD_OAUTH_CALLBACK_PORT:-8788}:${ROBINHOOD_OAUTH_CALLBACK_PORT:-8788}"
-    volumes:
-      - state:/app/state
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch(`http://localhost:$${process.env.TRADER_PORT||3000}/health`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
-      # In immediate mode the trader completes Robinhood OAuth BEFORE it starts
-      # listening; a generous retry window (~10 min) covers first-run auth.
-      retries: 40
+      # The trader binds its port before doing any Robinhood work, so this no
+      # longer has to wait out a first-run OAuth flow.
+      retries: 6
       start_period: 30s
-
-  bot:
-    build:
-      context: .
-      dockerfile: Dockerfile.bot
-    env_file: ../.env
-    environment:
-      TRADER_WEBHOOK_URL: http://trader:${TRADER_PORT:-3000}/webhook/discord
-    volumes:
-      - state:/app/state
-    restart: unless-stopped
-    depends_on:
-      trader:
-        condition: service_healthy
 
   client:
     build:
@@ -62,15 +62,17 @@ services:
       context: ..
       dockerfile: Dockerfile.client
       args:
-        # Baked into the bundle at build time; the BROWSER calls this URL, so
-        # it must be host-reachable (the trader's published loopback port),
-        # NOT the compose-internal "http://trader:3000".
+        # Baked into the bundle at build time; the BROWSER calls these, so they
+        # must be host-reachable (the server's published loopback port), NOT
+        # the compose-internal "http://server:3000".
         API_URL: ${API_URL:-http://localhost:${TRADER_PORT:-3000}}
+        SUPABASE_URL: ${SUPABASE_URL:-http://127.0.0.1:54331}
+        SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
     ports:
       - "127.0.0.1:3001:3001"
     restart: unless-stopped
     depends_on:
-      trader:
+      server:
         condition: service_healthy
 
   # Optional local LLM. Opt in with: docker compose --profile ollama up
@@ -92,5 +94,4 @@ services:
     #           capabilities: [gpu]
 
 volumes:
-  state:
   ollama-models:

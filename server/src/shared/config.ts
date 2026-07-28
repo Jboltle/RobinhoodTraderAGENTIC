@@ -112,68 +112,24 @@ export const config = {
    */
   tradeExecutionMode: requiredEnum('TRADE_EXECUTION_MODE', ['immediate', 'approval']),
 
-  // ---- Risk controls (all sizing in % of available capital) ------------------
-  // These are the env-fallback DEFAULTS of the settings resolution chain:
-  // payload override → state/settings.json → these values (see trader/settings.ts).
-
-  /**
-   * Maximum equity notional per trade as a percentage of buying power.
-   * e.g. 5 = "spend at most 5% of available cash on any single equity order".
-   */
-  maxNotionalPctPerTrade: num(env.MAX_NOTIONAL_PCT_PER_TRADE, 5),
-
-  /**
-   * Maximum options premium spend per trade as a percentage of buying power.
-   * Options premium = contracts × mark_price × 100.
-   */
-  maxOptionsNotionalPct: num(env.MAX_OPTIONS_NOTIONAL_PCT, 2),
-
-  /**
-   * Hard floor: if a single options contract would cost MORE than this
-   * percentage of buying power, skip the trade entirely.
-   */
-  maxSingleContractPct: num(env.MAX_SINGLE_CONTRACT_PCT, 5),
-
-  /**
-   * How much of the per-trade cap to use for each position-size keyword.
-   * "full" always = 100% of cap.
-   */
-  positionSmallPct: num(env.POSITION_SMALL_PCT, 25),
-  positionMediumPct: num(env.POSITION_MEDIUM_PCT, 50),
-
-  maxTradesPerDay: num(env.MAX_TRADES_PER_DAY, 10),
-  cooldownSecondsPerTicker: num(env.COOLDOWN_SECONDS_PER_TICKER, 300),
-  allowedTickers: list(env.ALLOWED_TICKERS, (s) => s.toUpperCase()),
-  blockedTickers: list(env.BLOCKED_TICKERS, (s) => s.toUpperCase()),
-  regularHoursOnly: bool(env.REGULAR_HOURS_ONLY, true),
-  minConfidence: num(env.MIN_CONFIDENCE, 0.7),
-
   // ---- Inter-service ---------------------------------------------------------
   botTraderSecret: env.BOT_TRADER_SECRET ?? '',
-  /**
-   * Optional URL of the client dashboard's session-settings endpoint
-   * (GET, TradeSettings-shaped JSON). Unset = the pull layer is skipped.
-   */
-  clientSettingsUrl: env.CLIENT_SETTINGS_URL?.trim() || null,
-  // 127.0.0.1 by default: the dashboard API has no auth, so binding is the
-  // access control. Set 0.0.0.0 only when another container must reach it.
+  // 127.0.0.1 by default; every /api route verifies a Supabase JWT, but a
+  // loopback bind keeps a misconfigured box off the local network anyway.
   // ponytail: a set PORT env var (Render/PaaS convention) flips the default
   // to 0.0.0.0 so the platform proxy can reach us; explicit TRADER_HOST wins.
   traderHost: env.TRADER_HOST ?? (env.PORT ? '0.0.0.0' : '127.0.0.1'),
   traderPort: num(env.PORT ?? env.TRADER_PORT, 3000),
   traderWebhookUrl: env.TRADER_WEBHOOK_URL ?? 'http://localhost:3000/webhook/discord',
 
-  // ---- State paths -----------------------------------------------------------
-  decisionLogPath: env.DECISION_LOG_PATH ?? 'state/decisions.jsonl',
-  riskStatePath: env.RISK_STATE_PATH ?? 'state/risk.json',
-  rhTokensPath: env.RH_TOKENS_PATH ?? 'state/rh-tokens.json',
-  /**
-   * Private Discord channel ID for the encrypted Robinhood token backup
-   * (survives free-tier deploys with no persistent disk). Unset = vault
-   * disabled entirely.
-   */
-  rhTokensVaultChannelId: env.RH_TOKENS_VAULT_CHANNEL_ID?.trim() || null,
-  settingsPath: env.SETTINGS_PATH ?? 'state/settings.json',
+  // ---- Supabase ---------------------------------------------------------------
+  supabaseUrl: env.SUPABASE_URL?.trim() ?? '',
+  /** Browser-safe key; the server uses it only to verify user JWTs. */
+  supabaseAnonKey: env.SUPABASE_ANON_KEY?.trim() ?? '',
+  /** Bypasses RLS. Server-only, never sent to a browser. */
+  supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? '',
+  /** AES-256-GCM key material for broker tokens at rest. */
+  rhTokensVaultKey: env.RH_TOKENS_VAULT_KEY?.trim() ?? '',
 } as const;
 
 export const isAllowed = (v: string, allowlist: readonly string[]): boolean =>
@@ -183,8 +139,8 @@ export const isAllowed = (v: string, allowlist: readonly string[]): boolean =>
  * Fail fast at process startup with a single message listing every missing
  * required variable, instead of surfacing cryptic runtime errors later.
  *
- * Both processes need Discord + the shared HMAC secret. Only the trader parses
- * callouts, so only it requires the LLM key for the selected provider.
+ * Both processes need Discord + the shared HMAC secret. Only the trader talks
+ * to Supabase and parses callouts, so only it requires those keys.
  */
 export function assertConfigValid(scope: 'trader' | 'bot'): void {
   const missing: string[] = [];
@@ -193,6 +149,10 @@ export function assertConfigValid(scope: 'trader' | 'bot'): void {
   if (scope === 'trader') {
     if (config.llmProvider === 'openai' && !config.openaiApiKey) missing.push('OPENAI_API_KEY');
     if (config.llmProvider === 'anthropic' && !config.anthropicApiKey) missing.push('ANTHROPIC_API_KEY');
+    if (!config.supabaseUrl) missing.push('SUPABASE_URL');
+    if (!config.supabaseAnonKey) missing.push('SUPABASE_ANON_KEY');
+    if (!config.supabaseServiceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
+    if (!config.rhTokensVaultKey) missing.push('RH_TOKENS_VAULT_KEY');
   }
 
   if (missing.length > 0) {

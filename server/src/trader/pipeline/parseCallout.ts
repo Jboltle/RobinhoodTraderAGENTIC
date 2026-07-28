@@ -198,23 +198,112 @@ OTHER:
 - confidence: 0.0 - 1.0.
 - rationale: <=200 char summary of the trade extracted (or why rejected).
 - Always call the report_callout tool exactly once.`;
+// Mention/header noise lines the bot channels prepend or append to alerts:
+// "@Pro", "@Namrood - LIVE DASHBOARD", "@Optionality | Monday - ...".
+// Deliberately narrow: a line that mixes a mention with real signal
+// ("@Pro BTO SPY ...") is kept.
+const NOISE_LINE = /^(?:@\S+|@.+\bLIVE DASHBOARD\b.*|@\S+\s*\|.+)$/i;
+
+// The buy directive, anchored to the start of its own line — alerts may carry
+// author names, role mentions, or headers above it.
+const BTO_DIRECTIVE_LINE = /^\s*(?:BTO|BUY\s+TO\s+OPEN)\b/i;
+
 function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null {
-  const ownContent = envelope.content
-    .split(/\r?\n/)
+  const contentLines = envelope.content
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    // Markdown emphasis ("**Buy To Open**") must not hide a directive.
+    .map((line) => line.replace(/\*\*|__|`/g, ''))
     .filter((line) => !line.trimStart().startsWith('>'))
-    .join('\n');
-  const normalized = ownContent
-    .replace(/\r/g, '\n')
-    .replace(/[\u2192\u21d2]/g, ' -> ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .filter((line) => !NOISE_LINE.test(line.trimStart()));
+
+  const ownContent = contentLines.join('\n');
+  const collapse = (text: string): string =>
+    text.replace(/[\u2192\u21d2]/g, ' -> ').replace(/\s+/g, ' ').trim();
+  const normalized = collapse(ownContent);
+
+  const btoLineIndex = contentLines.findIndex((line) => BTO_DIRECTIVE_LINE.test(line));
+  const btoContent =
+    btoLineIndex === -1 ? normalized : collapse(contentLines.slice(btoLineIndex).join('\n'));
 
   return (
-    parseBtoOption(normalized, envelope.timestamp) ??
+    parseBtoOption(btoContent, envelope.timestamp) ??
     parseChaseOption(normalized, envelope.timestamp) ??
     parseCompactOptionLine(ownContent, envelope.timestamp) ??
-    parseLabeledEntryOption(ownContent, envelope.timestamp)
+    parseLabeledEntryOption(ownContent, envelope.timestamp) ??
+    parseTrimExitOption(ownContent, envelope.timestamp)
   );
+}
+
+// Bot-generated exit alerts always carry this fixed header line.
+const TRIM_EXIT_HEADER = /^\s*Close\s+or\s+Trim\b/im;
+
+// Contract line inside an exit alert: "SPY 743P 2026-07-20" / "QQQ 707C 06/11".
+const TRIM_EXIT_CONTRACT_LINE =
+  /^\$?([A-Z]{1,6})\s+(\d+(?:\.\d+)?)([CP])\b\s+(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s*$/;
+
+// Heavy-exit language: sell most of the position, keep at most a runner.
+const TRIM_EXIT_FULL =
+  /\btrim\s+trim\b|\btrim(?:ming)?\s+most\b|\brunners?\s+only\b|\bclos(?:e|ing)\s+(?:all|full|it\s+all|everything)\b/i;
+
+// Any other trim wording ("TRIM", "Trim some") is a partial exit.
+const TRIM_EXIT_PARTIAL = /\btrim/i;
+
+function resolveTrimExitSize(directiveText: string): 'medium' | 'full' | null {
+  if (TRIM_EXIT_FULL.test(directiveText)) return 'full';
+  if (TRIM_EXIT_PARTIAL.test(directiveText)) return 'medium';
+  return null;
+}
+
+/**
+ * Deterministic parser for the bot's "Close or Trim & Set SL to BE" exit
+ * alerts. These are machine-generated with a fixed shape, so relying on the
+ * LLM for them is pure downside: a provider outage turns a routine trim into
+ * a parser_error and the exit is missed. The P/L arrow line ("0.90 → 1.06")
+ * is status only and must never become a limit price — exits go out as
+ * market orders.
+ */
+function parseTrimExitOption(content: string, timestamp: string): Callout | null {
+  if (!TRIM_EXIT_HEADER.test(content)) return null;
+
+  const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const contractMatch = lines
+    .map((line) => line.match(TRIM_EXIT_CONTRACT_LINE))
+    .find((match) => match !== null);
+  if (!contractMatch) return null;
+
+  const [, tickerRaw, strikeRaw, typeRaw, expirationRaw] = contractMatch;
+  const expiration = resolveDeterministicExpiration(expirationRaw!, timestamp);
+  if (!expiration) return null;
+
+  // Size keywords live on their own directive line ("TRIM TRIM", "Trim some",
+  // "RUNNERS ONLY"). The header itself contains "Trim", so exclude it — a
+  // header-only alert has no size qualifier.
+  const directiveText = lines
+    .filter((line) => !TRIM_EXIT_HEADER.test(line) && !TRIM_EXIT_CONTRACT_LINE.test(line))
+    .join('\n');
+
+  const ticker = tickerRaw!.toUpperCase();
+  const candidate = {
+    isCallout: true,
+    assetType: 'option',
+    action: 'sell',
+    ticker,
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: resolveTrimExitSize(directiveText),
+    option: {
+      optionType: typeRaw!.toUpperCase() === 'C' ? 'call' : 'put',
+      strike: Number(strikeRaw),
+      expiration,
+    },
+    confidence: 0.99,
+    rationale: `TRIM ${ticker} ${strikeRaw}${typeRaw!.toUpperCase()} ${expirationRaw} — Close or Trim exit, P/L line is status only`,
+  };
+
+  const parsed = CalloutSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
 }
 
 function parseBtoOption(content: string, timestamp: string): Callout | null {

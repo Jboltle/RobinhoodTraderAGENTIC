@@ -77,6 +77,7 @@ export const BTO_SPY_0DTE: DiscordMessageFixture = {
     'SPY 755C 0DTE $0.71',
     '@Namrood - LIVE DASHBOARD',
   ].join('\n'),
+  timestamp: '2026-06-15T13:35:00.000Z',
   expectedCallout: {
     isCallout: true,
     assetType: 'option',
@@ -89,6 +90,37 @@ export const BTO_SPY_0DTE: DiscordMessageFixture = {
     option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
     confidence: 0.96,
     rationale: 'BTO SPY 755C 0DTE $0.71',
+  },
+};
+
+export const BTO_SPY_SMALL_POSITION: DiscordMessageFixture = {
+  id: 'bto-spy-743p-small',
+  category: 'bto_entry',
+  description: 'Buy To Open with SMALL POSITION tag and trailing header — previously surfaced as parser_error',
+  content: [
+    'Buy To Open',
+    '',
+    'SMALL POSITION',
+    '',
+    'SPY 743P 0DTE 0.9',
+    '',
+    '@Namrood - LIVE DASHBOARD',
+    '',
+    '@Optionality | Monday - 07-20-2026 10:20 AM EST',
+  ].join('\n'),
+  timestamp: '2026-07-20T14:20:00.000Z',
+  expectedCallout: {
+    isCallout: true,
+    assetType: 'option',
+    action: 'buy',
+    ticker: 'SPY',
+    orderType: 'limit',
+    limitPrice: 0.9,
+    sizeHint: null,
+    positionSize: 'small',
+    option: { optionType: 'put', strike: 743, expiration: '2026-07-20' },
+    confidence: 0.99,
+    rationale: 'BTO SPY 743P 0DTE at $0.9, SMALL POSITION → small',
   },
 };
 
@@ -209,6 +241,38 @@ export const RUNNERS_ONLY_QQQ: DiscordMessageFixture = {
     option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
     confidence: 0.87,
     rationale: 'RUNNERS ONLY — sell most, keep runners; P/L line is status',
+  },
+};
+
+export const TRIM_SPY_SOME: DiscordMessageFixture = {
+  id: 'trim-spy-743p-some',
+  category: 'trim_exit',
+  description: '"Trim some" exit alert that previously hit the LLM and surfaced as parser_error',
+  content: [
+    'Close or Trim & Set SL to BE',
+    '',
+    'Trim some',
+    '',
+    'SPY 743P 2026-07-20',
+    '0.9000  →  1.06   P/L: +17.78% ($16.00)',
+    '',
+    '@Namrood - LIVE DASHBOARD',
+    '',
+    '@Optionality | Monday - 07-20-2026 10:21 AM EST',
+  ].join('\n'),
+  timestamp: '2026-07-20T14:21:00.000Z',
+  expectedCallout: {
+    isCallout: true,
+    assetType: 'option',
+    action: 'sell',
+    ticker: 'SPY',
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: 'medium',
+    option: { optionType: 'put', strike: 743, expiration: '2026-07-20' },
+    confidence: 0.99,
+    rationale: 'Trim some SPY 743P — partial exit, P/L line is status only',
   },
 };
 
@@ -543,10 +607,12 @@ export const MESSAGE_WITH_ATTACHMENT_URL: DiscordMessageFixture = {
 export const ALL_FIXTURES: readonly DiscordMessageFixture[] = [
   BTO_QQQ_PUT,
   BTO_SPY_0DTE,
+  BTO_SPY_SMALL_POSITION,
   BTO_SBUX_CALL,
   TRIM_QQQ_FIRST,
   TRIM_QQQ_DOUBLE,
   RUNNERS_ONLY_QQQ,
+  TRIM_SPY_SOME,
   TRIM_GOOGLE_MOST,
   LOTTO_SPY_RISKY,
   HYPE_BANG,

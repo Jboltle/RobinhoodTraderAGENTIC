@@ -1,9 +1,11 @@
 /**
- * Trader HTTP server: signed Discord webhook + REST API (decisions feed,
- * position performance, runtime trade settings).
+ * Trader HTTP server: signed Discord webhook + per-user REST API (feed,
+ * position performance, trade settings, Robinhood connection).
  *
- * Kept separate from index.ts (which auto-runs main() on import) so routes can
- * be tested with fastify.inject and mocked deps.
+ * Every /api route runs behind the Supabase JWT hook in auth.ts and reads or
+ * writes only the acting user's rows. Kept separate from index.ts (which
+ * auto-runs main() on import) so routes can be tested with fastify.inject and
+ * mocked deps.
  */
 import fastifyCors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -17,43 +19,55 @@ import {
   type Decision,
 } from '../shared/types.js';
 import { verifyWebhookBody } from '../shared/webhookAuth.js';
-import { joinDecisions, type CalloutHistory } from './callouts.js';
-import { runPipeline, type PipelineDeps } from './pipeline/index.js';
-import type { RobinhoodMcpClient } from './rh/mcpClient.js';
-import { readTokenStatus } from './rh/tokenBootstrap.js';
-import { resolveSettings, writeSettingsFile } from './settings.js';
+import { registerAuth, requireUser } from './auth.js';
+import type { StoredCallout, TraderDb } from './db.js';
+import type { TraderEvents } from './events.js';
+import type { MessageProcessor } from './pipeline/index.js';
+import type { McpRegistry, UserBroker } from './rh/mcpRegistry.js';
+import type { RobinhoodTools } from './rh/tools.js';
 
 const log = createLogger('trader:server');
 
 const DEFAULT_DECISIONS_LIMIT = 50;
+const DEFAULT_CALLOUTS_LIMIT = 100;
+/**
+ * How far back the performance view looks for the order that opened a
+ * position. Deeper than the feed page: a position held for weeks still needs
+ * its entry price, and the feed's 50 rows would lose it.
+ */
+const PERFORMANCE_HISTORY_LIMIT = 500;
 // ponytail: fixed cadences — matches the old client poll rate; make these
 // settings if anyone ever needs to tune them.
 const SSE_PERFORMANCE_INTERVAL_MS = 5000;
 const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
+/** How long POST /api/broker/connect waits for Robinhood to hand us a URL. */
+const AUTH_URL_TIMEOUT_MS = 15_000;
+const AUTH_URL_POLL_MS = 100;
 
 /**
- * Webhook body = `{ envelope, settings? }`. The bot signs and sends the whole
- * wrapper; `settings` is an optional per-message override (absent = env/file
- * defaults). HMAC verification is over the raw body string, so both sides
- * changed shape together (see src/bot/forwarder.ts).
+ * Webhook body = `{ envelope }`. The bot signs and sends the whole wrapper and
+ * HMAC verification is over the raw body string, so both sides change shape
+ * together (see src/bot/forwarder.ts). Trade settings are per user and live in
+ * the database, so no settings ride along with a message any more.
  */
-const WebhookBodySchema = z.object({
-  envelope: DiscordEnvelopeSchema,
-  settings: TradeSettingsSchema.optional(),
-});
+const WebhookBodySchema = z.object({ envelope: DiscordEnvelopeSchema });
 
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
-const AuthCallbackBodySchema = z.object({ redirectUrl: z.string() });
+const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 
-export interface ServerDeps extends PipelineDeps {
-  readonly mcp: RobinhoodMcpClient | null;
-  readonly callouts: CalloutHistory;
+const SignupBodySchema = z.object({
+  email: z.email(),
+  password: z.string().min(8),
+});
+
+export interface ServerDeps {
+  readonly db: TraderDb;
+  readonly events: TraderEvents;
+  readonly brokers: McpRegistry;
+  readonly processor: MessageProcessor;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
-  // Serialize pipeline so we never have two trades in flight on the same session.
-  let chain: Promise<void> = Promise.resolve();
-
   const fastify = Fastify({ logger: false });
 
   // Browser dashboard (client/) calls /api/* cross-origin.
@@ -71,6 +85,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  registerAuth(fastify, deps.db);
+
+  // ---- Public -----------------------------------------------------------------
+
   fastify.post('/webhook/discord', async (request, reply) => {
     const rawBody = (request as { rawBody?: string }).rawBody ?? JSON.stringify(request.body);
     const auth = verifyWebhookBody(rawBody, request.headers, config.botTraderSecret);
@@ -81,62 +99,106 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     const result = WebhookBodySchema.safeParse(request.body);
     if (!result.success) {
-      log.warn('webhook: rejected — invalid envelope', {
-        error: result.error.message,
-      });
+      log.warn('webhook: rejected — invalid envelope', { error: result.error.message });
       return reply.status(400).send({ error: 'invalid envelope' });
     }
 
-    const { envelope, settings } = result.data;
+    const { envelope } = result.data;
     log.info('webhook: received callout candidate', {
       messageId: envelope.messageId,
       author: envelope.authorName,
       channel: envelope.channelId,
-      hasSettingsOverride: settings !== undefined,
     });
 
-    deps.decisions.emitStage({ messageId: envelope.messageId, ticker: null, stage: 'received' });
-
-    // Acknowledge immediately; the pipeline runs async so the bot never times out.
-    chain = chain
-      .then(() => runPipeline(envelope, deps, settings))
-      .then(() => undefined)
-      .catch((err) =>
-        log.error('pipeline crashed', {
-          messageId: envelope.messageId,
-          error: (err as Error).message,
-        })
-      );
+    // Acknowledge immediately; the fan-out runs async so the bot never times
+    // out. Per-user ordering is preserved inside the processor.
+    void deps.processor.process(envelope).catch((err: unknown) =>
+      log.error('fan-out crashed', {
+        messageId: envelope.messageId,
+        error: (err as Error).message,
+      })
+    );
 
     return reply.status(202).send({ ok: true });
   });
 
+  // Keep-alive target for the external cron (see render.yaml) and the platform
+  // health check. Its liveness signal is whether it answers at all, not what it
+  // says: src/index.ts runs the bot in the same process tree and tears the tree
+  // down if the bot dies, so a dead Gateway means this stops responding. The
+  // body is diagnostics only — the execution kill-switch is the one piece of
+  // process-wide state worth reading without an account.
   fastify.get('/health', async (_request, reply) => {
-    const tokenStatus = deps.mcp ? await readTokenStatus(config.rhTokensPath) : null;
+    return reply.send({ ok: true, executionMode: config.tradeExecutionMode });
+  });
+
+  // Signup is gated here rather than in the browser: the allowlist decides who
+  // gets an account, so the check has to live somewhere the client can't skip.
+  fastify.post('/api/auth/signup', async (request, reply) => {
+    const parsed = SignupBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: 'body must be { email: string, password: string (min 8) }' });
+    }
+    const { email, password } = parsed.data;
+    if (!(await deps.db.isEmailAllowed(email))) {
+      log.warn('signup rejected: email not on the allowlist', { email });
+      return reply.status(403).send({ error: 'this email is not invited' });
+    }
+    try {
+      const user = await deps.db.createUser(email, password);
+      log.info('created user', { userId: user.id });
+      return reply.status(201).send({ user });
+    } catch (err) {
+      return reply.status(409).send({ error: (err as Error).message });
+    }
+  });
+
+  // ---- Robinhood connection (per user) ----------------------------------------
+
+  fastify.get('/api/broker/status', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    const broker = deps.brokers.existing(userId);
+    const tokens = broker ? await broker.mcp.getTokenStatus() : null;
     return reply.send({
-      ok: true,
+      connected: broker?.mcp.isConnected() ?? false,
+      authUrl: broker?.mcp.getPendingAuthUrl() ?? null,
+      tokenState: tokens?.state ?? null,
       executionMode: config.tradeExecutionMode,
-      rhConnected: deps.mcp?.isConnected() ?? false,
-      rhTokenState: tokenStatus?.state ?? null,
-      rhTokenExpiresInSec: tokenStatus?.expiresInSec ?? null,
-      rhTools: deps.mcp?.getToolNames() ?? [],
     });
   });
 
-  // OAuth-over-dashboard: Robinhood only allows loopback redirect URIs, so on
-  // a deployed server the post-consent redirect dead-ends on the user's own
-  // 127.0.0.1. The dashboard shows the auth URL from here, the user approves,
-  // then pastes the dead-end redirect URL into POST /api/auth/callback.
-  fastify.get('/api/auth/status', async (_request, reply) => {
-    return reply.send({
-      connected: deps.mcp?.isConnected() ?? false,
-      authUrl: deps.mcp?.getPendingAuthUrl() ?? null,
-      executionMode: config.tradeExecutionMode,
-    });
+  // Robinhood only allows loopback redirect URIs, so on a deployed server the
+  // post-consent redirect dead-ends on the user's own 127.0.0.1. The dashboard
+  // opens the URL returned here, the user approves, then pastes the dead-end
+  // redirect URL into POST /api/broker/callback.
+  fastify.post('/api/broker/connect', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    const broker = deps.brokers.for(userId);
+    if (broker.mcp.isConnected()) {
+      return reply.send({ connected: true, authUrl: null });
+    }
+
+    // ensureConnected only resolves once the whole OAuth dance finishes, which
+    // needs the paste this endpoint's caller hasn't made yet — so kick it off
+    // and wait only for the authorization URL it produces on the way.
+    void broker.mcp.ensureConnected().catch((err: unknown) =>
+      log.warn('Robinhood connect failed', { userId, error: (err as Error).message })
+    );
+
+    const authUrl = await waitForAuthUrl(broker);
+    if (!authUrl) {
+      return reply
+        .status(504)
+        .send({ error: 'Robinhood did not return an authorization URL in time' });
+    }
+    return reply.send({ connected: false, authUrl });
   });
 
-  fastify.post('/api/auth/callback', async (request, reply) => {
-    const parsed = AuthCallbackBodySchema.safeParse(request.body);
+  fastify.post('/api/broker/callback', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    const parsed = BrokerCallbackBodySchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: 'body must be { redirectUrl: string }' });
     }
@@ -150,69 +212,73 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!code) {
       return reply.status(400).send({ error: 'redirectUrl has no code parameter' });
     }
-    if (!deps.mcp || !deps.mcp.isAuthPending()) {
+    const broker = deps.brokers.existing(userId);
+    if (!broker || !broker.mcp.isAuthPending()) {
       return reply.status(409).send({ error: 'no OAuth authorization is pending' });
     }
-    deps.mcp.submitAuthCode(code, url.searchParams.get('state'));
+    broker.mcp.submitAuthCode(code, url.searchParams.get('state'));
     // Token exchange happens asynchronously inside the pending connect();
-    // the client polls /api/auth/status until `connected` flips.
+    // the client polls /api/broker/status until `connected` flips.
     return reply.send({ ok: true });
   });
 
-  // Returns decisions newest-first (dashboard shows the latest activity on top).
+  fastify.post('/api/broker/disconnect', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    await deps.db.deleteBrokerTokens(userId);
+    deps.brokers.drop(userId);
+    return reply.send({ ok: true });
+  });
+
+  // ---- Feed --------------------------------------------------------------------
+
+  // This user's trade outcomes, newest-first.
   fastify.get('/api/decisions', async (request, reply) => {
+    const { id: userId } = requireUser(request);
     const limitRaw = (request.query as { limit?: string }).limit;
     const limit = limitRaw === undefined ? DEFAULT_DECISIONS_LIMIT : Number(limitRaw);
     if (!Number.isInteger(limit) || limit < 1) {
       return reply.status(400).send({ error: 'limit must be a positive integer' });
     }
-    const all = await deps.decisions.readAll();
-    return reply.send({ decisions: all.reverse().slice(0, limit) });
+    return reply.send({ decisions: await deps.db.listDecisions(userId, limit) });
   });
 
-  // Today's Discord message history joined with pipeline outcomes. Backfills
-  // the dashboard feed with callouts that never reached the webhook (e.g.
-  // trader downtime); display-only, never enters the trade pipeline.
-  fastify.get('/api/callouts', async (_request, reply) => {
-    try {
-      const [messages, decisions] = await Promise.all([
-        deps.callouts.getToday(),
-        deps.decisions.readAll(),
-      ]);
-      return reply.send({ callouts: joinDecisions(messages, decisions) });
-    } catch (err) {
-      return reply
-        .status(503)
-        .send({ error: 'discord unavailable', detail: (err as Error).message });
-    }
+  // Every callout the pipeline has seen, each carrying THIS user's outcome.
+  // The callouts themselves are shared; the decision attached to them is not.
+  fastify.get('/api/callouts', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    return reply.send({ callouts: await loadFeed(deps, userId) });
   });
 
-  // Resolved persistent settings: state/settings.json merged over env defaults
-  // (per-message payload overrides are not persistent and don't appear here).
-  fastify.get('/api/settings', async (_request, reply) => {
-    return reply.send({ settings: await resolveSettings() });
+  // ---- Settings -----------------------------------------------------------------
+
+  fastify.get('/api/settings', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    return reply.send({ settings: await deps.db.getSettings(userId) });
   });
 
   fastify.put('/api/settings', async (request, reply) => {
+    const { id: userId } = requireUser(request);
     // strict(): a typo'd key ("maxTradesperDay") must 400, not be silently
-    // stripped. The webhook settings override stays non-strict for forward compat.
+    // stripped and leave the user thinking they raised a limit they didn't.
     const parsed = TradeSettingsSchema.strict().safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: 'invalid settings', detail: parsed.error.message });
     }
-    // Hot-apply for free: each message re-reads the file during resolution.
-    await writeSettingsFile(parsed.data);
-    return reply.send({ settings: parsed.data });
+    return reply.send({ settings: await deps.db.saveSettings(userId, parsed.data) });
   });
+
+  // ---- Portfolio ------------------------------------------------------------------
 
   // Account snapshot for the dashboard header: total portfolio value plus a
   // count of open (quantity > 0) equity + option positions.
-  fastify.get('/api/portfolio', async (_request, reply) => {
+  fastify.get('/api/portfolio', async (request, reply) => {
+    const { id: userId } = requireUser(request);
     try {
+      const tools = deps.brokers.for(userId).tools;
       const [buyingPower, equity, options] = await Promise.all([
-        deps.tools.getBuyingPower(),
-        deps.tools.getPositions(),
-        deps.tools.getOptionPositions(),
+        tools.getBuyingPower(),
+        tools.getPositions(),
+        tools.getOptionPositions(),
       ]);
       const openPositions =
         equity.positions.filter((p) => p.quantity > 0).length +
@@ -228,9 +294,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
-  fastify.get('/api/trades/performance', async (_request, reply) => {
+  fastify.get('/api/trades/performance', async (request, reply) => {
+    const { id: userId } = requireUser(request);
     try {
-      return reply.send({ positions: await collectPerformance(deps) });
+      return reply.send({ positions: await collectPerformance(deps, userId) });
     } catch (err) {
       return reply
         .status(503)
@@ -238,14 +305,21 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  // ---- Live stream ------------------------------------------------------------------
+
   // SSE stream for the dashboard: replaces client-side polling of
   // /api/decisions and /api/trades/performance (both kept for curl/fallback).
   // Events: `decisions` (snapshot on connect + on every append, newest-first),
   // `performance` ({ positions, error } every 5s while connected), and `stage`
   // (live trade lifecycle: received → parsing → risk_check → executing → done).
+  //
+  // Read with fetch, not EventSource, so it carries the same Authorization
+  // header as every other route (see client/src/lib/stream.ts).
   fastify.get('/api/stream', (request, reply) => {
+    const { id: userId } = requireUser(request);
+
     // Raw SSE writing bypasses Fastify's send path, so @fastify/cors headers
-    // are lost — reflect the origin manually (simple GET, no preflight).
+    // are lost — reflect the origin manually.
     reply.hijack();
     reply.raw.writeHead(200, {
       'content-type': 'text/event-stream',
@@ -259,30 +333,33 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     };
 
     const pushDecisions = (): void => {
-      void deps.decisions
-        .readAll()
-        .then((all) => send('decisions', all.reverse().slice(0, DEFAULT_DECISIONS_LIMIT)));
+      void deps.db
+        .listDecisions(userId, DEFAULT_DECISIONS_LIMIT)
+        .then((decisions) => send('decisions', decisions))
+        .catch((err: unknown) =>
+          log.warn('could not push decisions frame', { error: (err as Error).message })
+        );
     };
 
     const pushPerformance = async (): Promise<void> => {
       try {
-        send('performance', { positions: await collectPerformance(deps), error: null });
+        send('performance', { positions: await collectPerformance(deps, userId), error: null });
       } catch (err) {
         // Robinhood MCP down/unauthed: keep the stream alive with an error shape.
         send('performance', { positions: null, error: (err as Error).message });
       }
     };
 
-    // Live trade lifecycle (received → parsing → risk_check → executing → done).
-    const pushStage = (event: unknown): void => send('stage', event);
-
     pushDecisions();
     void pushPerformance();
-    deps.decisions.on('decision', pushDecisions);
-    deps.decisions.on('stage', pushStage);
+    const unsubscribe = deps.events.subscribe(userId, {
+      onDecision: pushDecisions,
+      onStage: (event) => send('stage', event),
+    });
+
     // ponytail: per-connection timers — N clients means N× Robinhood quote
-    // traffic. Fine for a single-user dashboard; upgrade path is one shared
-    // broadcast loop gated on client count. Zero clients = zero timers either way.
+    // traffic. Fine at invite-only scale; upgrade path is one shared broadcast
+    // loop per user gated on client count. Zero clients = zero timers either way.
     const performanceTimer = setInterval(() => void pushPerformance(), SSE_PERFORMANCE_INTERVAL_MS);
     const heartbeatTimer = setInterval(
       () => reply.raw.write(': heartbeat\n\n'),
@@ -292,13 +369,45 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     request.raw.on('close', () => {
       clearInterval(performanceTimer);
       clearInterval(heartbeatTimer);
-      deps.decisions.off('decision', pushDecisions);
-      deps.decisions.off('stage', pushStage);
+      unsubscribe();
       reply.raw.end();
     });
   });
 
   return fastify;
+}
+
+// =============================================================================
+// Feed
+// =============================================================================
+
+/** A shared callout plus the acting user's outcome for it (null = not acted on). */
+export interface CalloutFeedItem extends StoredCallout {
+  readonly decision: Decision | null;
+}
+
+async function loadFeed(deps: ServerDeps, userId: string): Promise<CalloutFeedItem[]> {
+  const callouts = await deps.db.listCallouts(DEFAULT_CALLOUTS_LIMIT);
+  const decisions = await deps.db.decisionsByMessageId(
+    userId,
+    callouts.map((c) => c.messageId)
+  );
+  return callouts.map((callout) => ({
+    ...callout,
+    decision: decisions.get(callout.messageId) ?? null,
+  }));
+}
+
+async function waitForAuthUrl(broker: UserBroker): Promise<string | null> {
+  const deadline = Date.now() + AUTH_URL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const authUrl = broker.mcp.getPendingAuthUrl();
+    if (authUrl) return authUrl;
+    // Already-valid stored tokens finish the connect with no consent step.
+    if (broker.mcp.isConnected()) return null;
+    await new Promise((resolve) => setTimeout(resolve, AUTH_URL_POLL_MS));
+  }
+  return null;
 }
 
 // =============================================================================
@@ -313,31 +422,32 @@ interface PerformanceRow {
   readonly strike?: number;
   readonly expiration?: string;
   /**
-   * Entry from the decision log's most recent submitted order for the position.
+   * Entry from the user's most recent submitted order for the position.
    * ponytail: uses the order's limitPrice, so market fills report null — the
-   * decision log doesn't capture fill prices. Upgrade path: poll the broker's
-   * order status after submit and log the executed price.
+   * trades table doesn't capture fill prices. Upgrade path: poll the broker's
+   * order status after submit and record the executed price.
    */
   readonly entryPrice: number | null;
   readonly currentPrice: number | null;
   readonly pctChange: number | null;
 }
 
-async function collectPerformance(deps: ServerDeps): Promise<PerformanceRow[]> {
-  const [equity, options, allDecisions] = await Promise.all([
-    deps.tools.getPositions(),
-    deps.tools.getOptionPositions(),
-    deps.decisions.readAll(),
+async function collectPerformance(deps: ServerDeps, userId: string): Promise<PerformanceRow[]> {
+  const tools: RobinhoodTools = deps.brokers.for(userId).tools;
+  const [equity, options, decisions] = await Promise.all([
+    tools.getPositions(),
+    tools.getOptionPositions(),
+    deps.db.listDecisions(userId, PERFORMANCE_HISTORY_LIMIT),
   ]);
-  // Newest first, so find() picks the most recent entry for a position.
-  const submitted = allDecisions.filter((d) => d.kind === 'submitted' && d.order).reverse();
+  // Already newest-first, so find() picks the most recent entry for a position.
+  const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);
 
   const rows: PerformanceRow[] = [];
 
   for (const position of equity.positions) {
     if (position.quantity <= 0) continue;
     const entryPrice = findEquityEntry(submitted, position.symbol);
-    const currentPrice = await deps.tools.getQuote(position.symbol).then((q) => q.price);
+    const currentPrice = await tools.getQuote(position.symbol).then((q) => q.price);
     rows.push({
       assetType: 'equity',
       symbol: position.symbol,
@@ -351,7 +461,7 @@ async function collectPerformance(deps: ServerDeps): Promise<PerformanceRow[]> {
   for (const position of options.positions) {
     if (position.quantity <= 0) continue;
     const entryPrice = findOptionEntry(submitted, position);
-    const quote = await deps.tools.getOptionsMarkPrice(
+    const quote = await tools.getOptionsMarkPrice(
       position.symbol,
       position.optionType,
       position.strike,

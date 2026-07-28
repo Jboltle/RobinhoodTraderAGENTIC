@@ -14,6 +14,8 @@ import type {
 
 export const Route = createFileRoute('/')({ component: Dashboard, ssr: false })
 
+const FEED_POLL_MS = 60_000
+
 function Dashboard() {
   // No queryFn/polling: both caches are hydrated and kept live by the SSE
   // stream (lib/stream.ts) — snapshot on connect, pushes thereafter.
@@ -25,13 +27,13 @@ function Dashboard() {
     queryKey: ['performance'],
     enabled: false,
   })
-  // Discord history backfill: today's callouts that never reached the trader
-  // webhook (decision === null). Polled — the server caches Discord for ~60s
-  // and the SSE stream doesn't carry history.
+  // Every callout the pipeline has recorded, each carrying this user's own
+  // outcome. Polled: the SSE stream carries decisions, not the callouts
+  // themselves, so a message that produced no decision arrives on this query.
   const callouts = useQuery<CalloutItem[]>({
     queryKey: ['callouts'],
     queryFn: fetchCallouts,
-    refetchInterval: 60_000,
+    refetchInterval: FEED_POLL_MS,
     retry: false,
   })
 
@@ -55,16 +57,13 @@ function Dashboard() {
 
       <section>
         <SectionTitle>Callout feed</SectionTitle>
-        {decisions.isError && (
+        {callouts.isError && (
           <EmptyState>
-            Callout feed unavailable ({(decisions.error as Error).message})
+            Callout feed unavailable ({(callouts.error as Error).message})
           </EmptyState>
         )}
-        {decisions.isPending && <EmptyState>Loading…</EmptyState>}
-        <FeedList
-          decisions={decisions.data ?? []}
-          callouts={callouts.data ?? []}
-        />
+        {callouts.isPending && <EmptyState>Loading…</EmptyState>}
+        {callouts.isSuccess && <FeedList callouts={callouts.data} />}
       </section>
     </div>
   )
@@ -226,7 +225,7 @@ function TradesTable({
         <tbody>
           {trades.map((d) => (
             <TradeRow
-              key={`${d.envelope.messageId}-${d.at}`}
+              key={`${d.messageId}-${d.at}`}
               decision={d}
               position={matchPosition(d, positions)}
             />
@@ -241,9 +240,9 @@ function matchPosition(
   decision: Decision,
   positions: PerformanceRow[],
 ): PerformanceRow | undefined {
-  const symbol = decision.order?.symbol ?? decision.callout?.ticker
+  const symbol = decision.order?.symbol ?? decision.ticker
   if (!symbol) return undefined
-  const option = decision.order?.option ?? decision.callout?.option ?? null
+  const option = decision.order?.option ?? null
   return positions.find((p) => {
     if (p.symbol !== symbol) return false
     if (option === null) return p.assetType === 'equity'
@@ -263,12 +262,12 @@ function TradeRow({
   decision: Decision
   position: PerformanceRow | undefined
 }) {
-  const { callout, order } = decision
-  const ticker = order?.symbol ?? callout?.ticker ?? '—'
-  const side = order?.side ?? callout?.action ?? '—'
-  const option = order?.option ?? callout?.option ?? null
+  const { order } = decision
+  const ticker = order?.symbol ?? decision.ticker ?? '—'
+  const side = order?.side ?? decision.action ?? '—'
+  const option = order?.option ?? null
   const qty = order?.quantity
-  const entry = order?.limitPrice ?? callout?.limitPrice ?? null
+  const entry = order?.limitPrice ?? null
   const pct = position?.pctChange ?? null
 
   return (
@@ -345,6 +344,15 @@ function Outcome({ decision }: { decision: Decision }) {
           failed{code}: {decision.reason}
         </span>
       )
+    case 'missed':
+      return (
+        <span
+          className={`${chipClass} bg-ink-700 text-ink-400`}
+          title={decision.reason}
+        >
+          missed: too old to trade when the trader woke up
+        </span>
+      )
     default:
       return (
         <span className={`${chipClass} bg-ink-700 text-ink-400`}>
@@ -367,53 +375,25 @@ const Td = ({
 }) => <td className={`px-4 py-3 ${className}`}>{children}</td>
 
 // =============================================================================
-// Callout / decision feed
+// Callout feed
 // =============================================================================
 
-type FeedItem =
-  | { kind: 'decision'; at: string; decision: Decision }
-  | { kind: 'backfill'; at: string; callout: CalloutItem }
-
-/**
- * Processed decisions merged with backfilled Discord history (callouts that
- * never reached the trader, e.g. downtime), newest-first. Callouts the
- * pipeline did process are dropped here — their DecisionCard already covers them.
- */
-function FeedList({
-  decisions,
-  callouts,
-}: {
-  decisions: Decision[]
-  callouts: CalloutItem[]
-}) {
-  const items: FeedItem[] = [
-    ...decisions.map(
-      (d): FeedItem => ({ kind: 'decision', at: d.at, decision: d }),
-    ),
-    ...callouts
-      .filter((c) => c.decision === null)
-      .map((c): FeedItem => ({ kind: 'backfill', at: c.timestamp, callout: c })),
-  ].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
-
+/** Every callout the pipeline saw, newest-first, with this user's outcome. */
+function FeedList({ callouts }: { callouts: CalloutItem[] }) {
+  if (callouts.length === 0) {
+    return <EmptyState>No callouts yet.</EmptyState>
+  }
   return (
     <div className="flex flex-col gap-3">
-      {items.map((item) =>
-        item.kind === 'decision' ? (
-          <DecisionCard
-            key={`${item.decision.envelope.messageId}-${item.at}`}
-            decision={item.decision}
-          />
-        ) : (
-          <BackfillCard key={item.callout.messageId} callout={item.callout} />
-        ),
-      )}
-      {items.length === 0 && <EmptyState>No decisions logged yet.</EmptyState>}
+      {callouts.map((callout) => (
+        <CalloutFeedCard key={callout.messageId} callout={callout} />
+      ))}
     </div>
   )
 }
 
-/** A Discord message the trader never processed (fetched via history backfill). */
-function BackfillCard({ callout }: { callout: CalloutItem }) {
+function CalloutFeedCard({ callout }: { callout: CalloutItem }) {
+  const { decision } = callout
   return (
     <CalloutCard
       authorName={callout.authorName}
@@ -421,32 +401,37 @@ function BackfillCard({ callout }: { callout: CalloutItem }) {
       timestamp={callout.timestamp}
       content={callout.content}
       embeds={callout.embeds}
-      dashed
+      dashed={decision === null}
       footer={
-        <span className={`${chipClass} bg-ink-700 text-ink-400`}>
-          backfill: not processed
-        </span>
+        decision ? (
+          <>
+            <Outcome decision={decision} />
+            {decision.kind === 'submitted' && (
+              <span className="text-ink-400">{decision.reason}</span>
+            )}
+          </>
+        ) : (
+          <SharedOutcome parseStatus={callout.parseStatus} />
+        )
       }
     />
   )
 }
 
-function DecisionCard({ decision }: { decision: Decision }) {
-  const { envelope } = decision
-  return (
-    <CalloutCard
-      authorName={envelope.authorName}
-      timestamp={decision.at}
-      content={envelope.content}
-      embeds={envelope.embeds}
-      footer={
-        <>
-          <Outcome decision={decision} />
-          {decision.kind === 'submitted' && (
-            <span className="text-ink-400">{decision.reason}</span>
-          )}
-        </>
-      }
-    />
-  )
+/**
+ * What the feed shows when this account has no decision for a callout. The
+ * pipeline records nothing per user for channel chatter or a failed parse,
+ * because the outcome is the same for everyone and already on the shared row.
+ */
+function SharedOutcome({ parseStatus }: { parseStatus: CalloutItem['parseStatus'] }) {
+  switch (parseStatus) {
+    case 'not_callout':
+      return <span className={`${chipClass} bg-ink-700 text-ink-400`}>not a callout</span>
+    case 'failed':
+      return <span className={`${chipClass} bg-loss/10 text-loss`}>parse failed</span>
+    default:
+      // 'parsed' with no decision, or 'skipped': the callout predates this
+      // account's connection, so nothing was ever run for it.
+      return <span className={`${chipClass} bg-ink-700 text-ink-500`}>not traded</span>
+  }
 }

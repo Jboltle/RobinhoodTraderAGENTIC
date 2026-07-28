@@ -1,0 +1,160 @@
+# Render blueprint.
+#
+# Two services:
+#   rh-trader            free web service, the whole backend in one container
+#                        (Fastify trader + Discord Gateway bot, supervised by
+#                        server/src/index.ts)
+#   rh-trader-dashboard  free static site, the prerendered SPA from client/
+#
+# The backend is one service on purpose. The bot holds a Discord Gateway
+# websocket and binds no port, so nothing can ping it awake; a free service
+# that spins down stops receiving callouts and places no orders, silently.
+# Sharing the trader's port means one keep-alive ping keeps the socket alive.
+# If either half dies the supervisor takes the tree down, so /health stops
+# answering rather than lying about a dead Gateway.
+#
+# ---------------------------------------------------------------------------
+# Keep-alive cron (set this up outside Render -- Render's own cron jobs are not
+# on the free tier)
+# ---------------------------------------------------------------------------
+# Ping https://<rh-trader>.onrender.com/health every 10 minutes, weekdays only.
+# A free service sleeps after 15 minutes idle, so 10 keeps a margin.
+#
+#   */10 * * * 1-5      timezone: UTC
+#
+# Timezone matters here and UTC is the deliberate choice: Monday 00:00 UTC
+# through Friday 23:59 UTC covers Sunday ~19:00 ET to Friday 19:00 ET under EST
+# (20:00 ET under EDT). That spans every pre-market open (04:00 ET) and, on
+# EDT, runs to the 20:00 ET after-hours close exactly. Under EST it clips the
+# final hour of Friday after-hours; if that hour matters, add a second job
+# `*/10 0-1 * * 6` (Saturday 00:00-01:59 UTC = Friday 19:00-20:59 EST), which
+# costs about 8 extra hours a month. Do NOT translate this to a local-time
+# schedule without handling DST -- an hour of drift twice a year lands right on
+# the open.
+#
+# Cost, corrected from the plan's "~528 of 750": free instance hours are 750
+# per month, shared across every free web service in the workspace. 24h x
+# weekdays gives 480-552 hours depending on the month (20-23 weekdays; 528 is
+# the 22-weekday case, so the plan's figure is a fair average but not a
+# ceiling). Worst case 552 leaves ~200 hours of headroom, which is why 24/5
+# beats a market-hours-only window: the narrower schedule saves hours there is
+# no use for, and every gap is a cold start plus a Gateway reconnect. The
+# catch-up routine's staleness window is 2 minutes, so a callout that arrives
+# while the service is asleep is recorded as missed, not traded -- coverage
+# gaps cost trades directly. Keeping the dashboard a static site rather than a
+# second free web service is what makes this budget work; static sites do not
+# consume instance hours.
+#
+# ---------------------------------------------------------------------------
+# Delete these old services before or after applying this blueprint
+# ---------------------------------------------------------------------------
+# The previous topology ran the bot on its own. Look in the Render dashboard
+# for a Background Worker built from `server/Dockerfile.bot` or starting with
+# `bun src/bot/index.ts` -- likely named something like `rh-discord-bot`,
+# `rh-trader-bot` or `discord-bot`. It is redundant now and should be deleted:
+# leaving it running means two Gateway connections consuming the same channel,
+# so every callout is forwarded and traded twice. Render has no free plan for
+# background workers, so this one is also on a paid instance type (Starter,
+# ~$7/month at time of writing) -- check Billing, not just the service list.
+#
+# Also delete any free web service that was serving the dashboard with
+# `bun server.ts` on port 3001 (likely `rh-trader-client` or similar). The
+# static site replaces it, and while it existed it was drawing from the same
+# 750 free instance hours the backend now needs.
+#
+# Both Dockerfiles those services referenced are gone from this repo, so their
+# next deploy would fail anyway.
+
+services:
+  - type: web
+    name: rh-trader
+    runtime: docker
+    plan: free
+    dockerContext: ./server
+    dockerfilePath: ./server/Dockerfile.server
+    healthCheckPath: /health
+    envVars:
+      # Set explicitly because two things key off it: Fastify binds this port,
+      # and server/src/shared/config.ts flips TRADER_HOST to 0.0.0.0 when PORT
+      # is present, which is what lets Render's proxy reach us.
+      - key: PORT
+        value: 10000
+      # The bot and the trader share this container, so the webhook never
+      # leaves loopback. Must track PORT above.
+      - key: TRADER_WEBHOOK_URL
+        value: http://127.0.0.1:10000/webhook/discord
+      # Regenerating this is harmless -- both ends read the same value from the
+      # same environment, so they can never disagree.
+      - key: BOT_TRADER_SECRET
+        generateValue: true
+
+      # ollama is not reachable from here; pick anthropic or openai, and set
+      # the matching API key below.
+      - key: LLM_PROVIDER
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # The global execution kill-switch. sync: false so that re-applying this
+      # blueprint can never silently flip a paused account back to immediate.
+      - key: TRADE_EXECUTION_MODE
+        sync: false
+
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_ALLOWED_CHANNEL_IDS
+        sync: false
+      - key: DISCORD_ALLOWED_AUTHOR_IDS
+        sync: false
+      - key: DISCORD_FORWARD_CHANNEL_ID
+        sync: false
+
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      # Bypasses RLS. Server-only: it is set here and nowhere near the static
+      # site's build environment.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Decrypts every stored Robinhood token. Losing or changing it forces
+      # every user to reconnect, which is why it is entered by hand rather than
+      # generated -- keep a copy somewhere you trust.
+      - key: RH_TOKENS_VAULT_KEY
+        sync: false
+
+  - type: web
+    name: rh-trader-dashboard
+    runtime: static
+    # No rootDir: staticPublishPath is repo-root-relative, so keeping every
+    # path in one frame of reference avoids guessing which ones rootDir shifts.
+    buildCommand: cd client && bun install --frozen-lockfile && API_URL="https://$TRADER_HOSTNAME" bun --bun run build
+    staticPublishPath: ./client/dist/client
+    routes:
+      # The dashboard is a client-rendered SPA with one prerendered shell, so
+      # every path has to resolve to it or a refresh on /settings 404s.
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # Bun is only on PATH if the service root has a lockfile or this is set;
+      # the lockfile lives in client/, which is not the service root here.
+      - key: BUN_VERSION
+        value: 1.3.14
+      # Render exposes no way to build "https://" + a service reference, so the
+      # hostname comes across on its own and the build command prefixes it.
+      - key: TRADER_HOSTNAME
+        fromService:
+          name: rh-trader
+          type: web
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+      # Baked into the bundle, so both are public. That is fine: the anon key
+      # is only used for auth, and every table is default-deny under RLS.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false

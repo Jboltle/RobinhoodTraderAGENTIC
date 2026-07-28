@@ -7,9 +7,9 @@ import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
 import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
 import { awaitAuthorizationCode } from './oauthCallback.js';
-import { FileOAuthProvider } from './oauthProvider.js';
+import { SupabaseOAuthProvider } from './oauthProvider.js';
 import { readTokenStatus } from './tokenBootstrap.js';
-import type { CallToolResult } from './types.js';
+import type { BrokerTokenStore, CallToolResult, TokenStatus } from './types.js';
 
 export type { CallToolResult } from './types.js';
 
@@ -23,12 +23,18 @@ interface AuthCodeSubmission {
 }
 
 export interface RobinhoodMcpClientOptions {
-  /** Fire-and-forget hook invoked after each successful token persist (e.g. vault backup). */
-  readonly onTokensPersisted?: () => void;
+  /** Whose Robinhood account this client trades. One client per user. */
+  readonly userId: string;
+  readonly db: BrokerTokenStore;
 }
 
+/**
+ * One user's connection to the Robinhood MCP server. Pending-auth state lives
+ * on the instance, so several users can sit in the OAuth flow at once — see
+ * McpRegistry, which owns one instance per user.
+ */
 export class RobinhoodMcpClient {
-  constructor(private readonly options: RobinhoodMcpClientOptions = {}) {}
+  constructor(private readonly options: RobinhoodMcpClientOptions) {}
 
   private client: Client | undefined;
   private toolNames: string[] = [];
@@ -54,20 +60,28 @@ export class RobinhoodMcpClient {
     await this.connectPromise;
   }
 
+  /** Stored-token state for this user, for /api/broker/status and logging. */
+  async getTokenStatus(): Promise<TokenStatus> {
+    const state = await this.options.db.getBrokerTokens(this.options.userId);
+    return readTokenStatus(state?.tokens);
+  }
+
   private async connect(): Promise<void> {
     const redirectUrl = new URL(config.robinhoodOAuthRedirectUri);
 
-    // Log the local auth state; the SDK transport handles refresh on 401 and
+    // Log the stored auth state; the SDK transport handles refresh on 401 and
     // we fall back to browser OAuth below only when that fails.
-    const status = await readTokenStatus(config.rhTokensPath);
+    const status = await this.getTokenStatus();
     log.info('Robinhood token status', {
+      userId: this.options.userId,
       state: status.state,
       expiresInMin: status.expiresInSec !== null ? Math.round(status.expiresInSec / 60) : null,
       hasRefreshToken: status.hasRefreshToken,
     });
 
-    const provider = new FileOAuthProvider({
-      path: config.rhTokensPath,
+    const provider = new SupabaseOAuthProvider({
+      userId: this.options.userId,
+      db: this.options.db,
       clientName: config.robinhoodOAuthClientName,
       redirectUri: config.robinhoodOAuthRedirectUri,
       onAuthorizationUrl: (url) => {
@@ -77,7 +91,7 @@ export class RobinhoodMcpClient {
         // robinhood.com/mcp/trading with identical query params.
         if (url.pathname === '/oauth') url.pathname = '/mcp/trading';
         this.pendingAuthUrl = url.toString();
-        log.info('OAuth authorization required');
+        log.info('OAuth authorization required', { userId: this.options.userId });
         process.stdout.write('\n========================================\n');
         process.stdout.write('Robinhood authorization required.\n');
         process.stdout.write('Open this URL in your browser to authorize:\n\n');
@@ -86,7 +100,6 @@ export class RobinhoodMcpClient {
         process.stdout.write(`${redirectUrl.origin}${redirectUrl.pathname} ...\n`);
         process.stdout.write('========================================\n\n');
       },
-      onPersist: this.options.onTokensPersisted,
     });
 
     let transport = new StreamableHTTPClientTransport(new URL(config.robinhoodMcpUrl), {
@@ -112,11 +125,12 @@ export class RobinhoodMcpClient {
         redirectUri: config.robinhoodOAuthRedirectUri,
       });
       // Race the loopback listener (local dev) against a manually pasted
-      // redirect URL (deployed dashboard, POST /api/auth/callback).
-      // ponytail: a listener failure (port in use, 30-min timeout) must not
-      // kill the race while the manual path is viable, so it collapses into a
-      // never-resolving promise. The manual path has no timeout — a single-user
-      // service just waits for a paste that may never come.
+      // redirect URL (deployed dashboard, POST /api/broker/callback).
+      // ponytail: a listener failure (port in use — including a second user
+      // authorizing concurrently — or the 30-min timeout) must not kill the
+      // race while the manual path is viable, so it collapses into a
+      // never-resolving promise. The manual path has no timeout: the server
+      // just waits for a paste that may never come.
       const manualSubmission = new Promise<AuthCodeSubmission>((resolve) => {
         this.manualAuthResolve = resolve;
       });
@@ -181,6 +195,14 @@ export class RobinhoodMcpClient {
       tools: this.toolNames,
       serverInfo: client.getServerVersion(),
     });
+    // The server validates arguments against these schemas (e.g. quantity is
+    // string-typed); log them once so type mismatches are diagnosable from logs.
+    const orderTools = list.tools.filter((t) => t.name.startsWith('place_'));
+    if (orderTools.length > 0) {
+      log.info('order tool input schemas', {
+        schemas: Object.fromEntries(orderTools.map((t) => [t.name, t.inputSchema])),
+      });
+    }
   }
 
   getToolNames(): readonly string[] {

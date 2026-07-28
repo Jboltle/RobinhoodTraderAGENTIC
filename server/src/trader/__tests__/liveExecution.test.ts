@@ -6,10 +6,10 @@
  * Everything here is SKIPPED by default so `npm test` never touches Robinhood.
  * Two independent opt-in switches gate the two levels of risk:
  *
- *   RUN_LIVE_TRADE_TEST=1
- *     Connects to the real Robinhood MCP (OAuth tokens must already exist at
- *     RH_TOKENS_PATH — run `bun run connect` first) and performs a READ-ONLY
- *     buying-power check. No orders are placed.
+ *   RUN_LIVE_TRADE_TEST=1 LIVE_TRADE_USER_ID=<uuid>
+ *     Connects to the real Robinhood MCP as that user (their broker_connections
+ *     row must already hold tokens — run `bun run connect <email>` first) and
+ *     performs a READ-ONLY buying-power check. No orders are placed.
  *
  *   RUN_LIVE_TRADE_TEST=1 LIVE_TRADE_PLACE_ORDER=1
  *     Additionally places ONE minimal real order and logs the returned order id
@@ -26,12 +26,14 @@
 import { describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../shared/logger.js';
+import { createTraderDb } from '../db.js';
 import { RobinhoodMcpClient } from '../rh/mcpClient.js';
 import { RobinhoodTools } from '../rh/tools.js';
 
 const log = createLogger('test:live-execution');
 
-const RUN_LIVE = process.env.RUN_LIVE_TRADE_TEST === '1';
+const LIVE_USER_ID = process.env.LIVE_TRADE_USER_ID ?? '';
+const RUN_LIVE = process.env.RUN_LIVE_TRADE_TEST === '1' && LIVE_USER_ID !== '';
 const PLACE_ORDER = process.env.LIVE_TRADE_PLACE_ORDER === '1';
 
 const LIVE_ORDER = {
@@ -43,7 +45,7 @@ const LIVE_ORDER = {
 const CONNECT_TIMEOUT_MS = 120_000;
 
 async function connectTools(): Promise<{ mcp: RobinhoodMcpClient; tools: RobinhoodTools }> {
-  const mcp = new RobinhoodMcpClient();
+  const mcp = new RobinhoodMcpClient({ userId: LIVE_USER_ID, db: createTraderDb() });
   await mcp.ensureConnected();
   log.info('connected to Robinhood MCP', { tools: mcp.getToolNames() });
   return { mcp, tools: new RobinhoodTools(mcp) };

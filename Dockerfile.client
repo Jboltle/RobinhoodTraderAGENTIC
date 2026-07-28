@@ -9,10 +9,16 @@ RUN bun install --frozen-lockfile
 
 COPY --chown=bun:bun client ./
 
-# Baked into the static bundle at build time. The BROWSER calls this URL, so
-# it must be reachable from the host (default: trader's published port).
+# Baked into the static bundle at build time, so the BROWSER must be able to
+# reach both (default: the server's published port, and a host-local Supabase).
+# The anon key is public by design; the service-role key must never be passed
+# here -- vite.config.ts only exposes SUPABASE_URL and SUPABASE_ANON_KEY.
 ARG API_URL=http://localhost:3000
+ARG SUPABASE_URL
+ARG SUPABASE_ANON_KEY
 ENV API_URL=${API_URL}
+ENV SUPABASE_URL=${SUPABASE_URL}
+ENV SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
 RUN bun --bun run build
 
 USER bun

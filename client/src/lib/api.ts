@@ -2,6 +2,9 @@
  * Trader REST API client. Response shapes mirror src/trader/server.ts and
  * src/shared/types.ts in the parent repo.
  *
+ * Every request carries the caller's Supabase access token; the server derives
+ * the acting user from it, so no request ever names a user.
+ *
  * ponytail: types are hand-copied, not imported from ../src (the client is a
  * standalone package with its own tsconfig). Upgrade path: extract a shared
  * types package or generate from the zod schemas.
@@ -9,6 +12,21 @@
 
 export const TRADER_URL: string =
   import.meta.env.API_URL ?? 'http://localhost:3000'
+
+// Set once by AuthProvider (lib/auth.tsx). A getter rather than a value so a
+// refreshed token is picked up without re-wiring anything.
+let accessToken: () => string | null = () => null
+
+export function setAccessTokenSource(source: () => string | null): void {
+  accessToken = source
+}
+
+/** Authorization header for the current session; throws when signed out. */
+export function authHeaders(): Record<string, string> {
+  const token = accessToken()
+  if (!token) throw new Error('not signed in')
+  return { authorization: `Bearer ${token}` }
+}
 
 export interface OptionContract {
   optionType: 'call' | 'put'
@@ -35,6 +53,7 @@ export type DecisionKind =
   | 'pending_approval'
   | 'submitted'
   | 'execution_failed'
+  | 'missed'
 
 /** Machine-readable rejection code; mirrors RejectionCode in server/src/shared/types.ts. */
 export type RejectionCode =
@@ -66,33 +85,22 @@ export interface DiscordEmbed {
   [key: string]: unknown
 }
 
+/** One row of the caller's `trades` table: their outcome for one callout. */
 export interface Decision {
   at: string
-  envelope: {
-    messageId: string
-    authorName: string
-    content: string
-    timestamp: string
-    embeds?: DiscordEmbed[]
-  }
-  callout: {
-    ticker: string | null
-    action: 'buy' | 'sell' | null
-    assetType: 'equity' | 'option'
-    limitPrice: number | null
-    option: OptionContract | null
-  } | null
+  messageId: string
   kind: DecisionKind
-  /** Null for successful/informational decisions; older log entries predate the field. */
-  code?: RejectionCode | null
+  code: RejectionCode | null
   reason: string
+  ticker: string | null
+  action: 'buy' | 'sell' | null
   order: SubmittedOrder | null
 }
 
 /**
- * One item from GET /api/callouts: today's Discord channel history joined
- * with pipeline outcomes. `decision` is null when the message never reached
- * the trader webhook (e.g. trader downtime) — the backfill case.
+ * One item from GET /api/callouts: a Discord message the pipeline has seen,
+ * carrying the caller's own outcome. `decision` is null when nothing was
+ * recorded for this user — the message arrived before they connected.
  */
 export interface CalloutItem {
   messageId: string
@@ -102,7 +110,8 @@ export interface CalloutItem {
   timestamp: string
   content: string
   embeds: DiscordEmbed[]
-  decision: { kind: DecisionKind; reason: string; at: string } | null
+  parseStatus: 'parsed' | 'not_callout' | 'failed' | 'skipped'
+  decision: Decision | null
 }
 
 export interface PerformanceRow {
@@ -125,9 +134,8 @@ export interface PortfolioSummary {
 }
 
 /**
- * Session overrides pushed to /api/settings-state. Mirrors TradeSettingsSchema:
- * every field optional — an absent field falls through to the trader's
- * settings.json / env defaults.
+ * Settings saved via PUT /api/settings. Mirrors TradeSettingsSchema's input:
+ * every field optional, and an absent field takes the schema default.
  */
 export type TradeSettingsInput = Partial<TradeSettings>
 
@@ -147,49 +155,80 @@ export interface TradeSettings {
   regularHoursOnly: boolean
 }
 
-/** GET /api/auth/status: Robinhood OAuth state for the connect banner. */
-export interface AuthStatus {
+/** GET /api/broker/status: the caller's Robinhood connection state. */
+export interface BrokerStatus {
   connected: boolean
-  /** Authorization URL to open when auth is pending; null once connected (or before the server triggers OAuth). */
+  /** Authorization URL awaiting consent; null when none is pending. */
   authUrl: string | null
+  tokenState: 'missing' | 'valid' | 'refreshable' | 'expired' | null
   executionMode: 'immediate' | 'approval'
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${TRADER_URL}${path}`)
-  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`)
+/** POST /api/broker/connect: the URL to open, or `connected` when already live. */
+export interface BrokerConnectResult {
+  connected: boolean
+  authUrl: string | null
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${TRADER_URL}${path}`, {
+    ...init,
+    headers: { ...authHeaders(), ...init.headers },
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `${init.method ?? 'GET'} ${path} failed: ${res.status}`)
+  }
   return res.json() as Promise<T>
 }
 
+const postJson = <T>(path: string, body: unknown): Promise<T> =>
+  request<T>(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+
 export const fetchDecisions = (): Promise<Decision[]> =>
-  getJson<{ decisions: Decision[] }>('/api/decisions').then((r) => r.decisions)
+  request<{ decisions: Decision[] }>('/api/decisions').then((r) => r.decisions)
 
 export const fetchPerformance = (): Promise<PerformanceRow[]> =>
-  getJson<{ positions: PerformanceRow[] }>('/api/trades/performance').then(
+  request<{ positions: PerformanceRow[] }>('/api/trades/performance').then(
     (r) => r.positions,
   )
 
 export const fetchSettings = (): Promise<TradeSettings> =>
-  getJson<{ settings: TradeSettings }>('/api/settings').then((r) => r.settings)
+  request<{ settings: TradeSettings }>('/api/settings').then((r) => r.settings)
 
 export const fetchCallouts = (): Promise<CalloutItem[]> =>
-  getJson<{ callouts: CalloutItem[] }>('/api/callouts').then((r) => r.callouts)
+  request<{ callouts: CalloutItem[] }>('/api/callouts').then((r) => r.callouts)
 
 export const fetchPortfolio = (): Promise<PortfolioSummary> =>
-  getJson<PortfolioSummary>('/api/portfolio')
+  request<PortfolioSummary>('/api/portfolio')
 
-export const fetchAuthStatus = (): Promise<AuthStatus> =>
-  getJson<AuthStatus>('/api/auth/status')
+export const fetchBrokerStatus = (): Promise<BrokerStatus> =>
+  request<BrokerStatus>('/api/broker/status')
 
-/** POST the dead-end 127.0.0.1 redirect URL the user pasted after approving in Robinhood. */
-export async function submitAuthRedirect(redirectUrl: string): Promise<void> {
-  const res = await fetch(`${TRADER_URL}/api/auth/callback`, {
+/** Start the Robinhood OAuth flow and get the URL the user must approve. */
+export const connectBroker = (): Promise<BrokerConnectResult> =>
+  postJson<BrokerConnectResult>('/api/broker/connect', {})
+
+/** POST the dead-end 127.0.0.1 redirect URL the user pasted after approving. */
+export const submitBrokerRedirect = (redirectUrl: string): Promise<void> =>
+  postJson<{ ok: true }>('/api/broker/callback', { redirectUrl }).then(() => undefined)
+
+/**
+ * Create an account. Unauthenticated on purpose — this is where the token
+ * comes from — and gated server-side against the invite allowlist.
+ */
+export async function signUp(email: string, password: string): Promise<void> {
+  const res = await fetch(`${TRADER_URL}/api/auth/signup`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ redirectUrl }),
+    body: JSON.stringify({ email, password }),
   })
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
-    throw new Error(body?.error ?? `POST /api/auth/callback failed: ${res.status}`)
+    throw new Error(body?.error ?? `sign up failed: ${res.status}`)
   }
 }
