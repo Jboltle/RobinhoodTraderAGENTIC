@@ -3,13 +3,14 @@ import { useQuery } from '@tanstack/react-query'
 
 import { CalloutCard } from '../components/CalloutCard'
 import { ConnectBanner } from '../components/ConnectBanner'
-import { fetchCallouts, fetchPortfolio } from '../lib/api'
+import { fetchCallouts, fetchPortfolio, fetchSettings } from '../lib/api'
 import type {
   CalloutItem,
   Decision,
   PerformanceRow,
   PortfolioSummary,
   StageEvent,
+  TradeSettings,
 } from '../lib/api'
 
 export const Route = createFileRoute('/')({ component: Dashboard, ssr: false })
@@ -36,6 +37,22 @@ function Dashboard() {
     refetchInterval: FEED_POLL_MS,
     retry: false,
   })
+  // Following drives what the feed DISPLAYS; the trade gate is server-side.
+  const settings = useQuery<TradeSettings>({
+    queryKey: ['settings'],
+    queryFn: fetchSettings,
+    retry: false,
+  })
+
+  // null (or settings still loading) = show everyone. Callouts stored before
+  // author identity was kept (authorId null) stay visible.
+  const followedCallerIds = settings.data?.followedCallerIds ?? null
+  const visibleCallouts = (callouts.data ?? []).filter(
+    (c) =>
+      followedCallerIds === null ||
+      c.authorId == null ||
+      followedCallerIds.includes(c.authorId),
+  )
 
   return (
     <div className="flex flex-col gap-8">
@@ -63,7 +80,7 @@ function Dashboard() {
           </EmptyState>
         )}
         {callouts.isPending && <EmptyState>Loading…</EmptyState>}
-        {callouts.isSuccess && <FeedList callouts={callouts.data} />}
+        {callouts.isSuccess && <FeedList callouts={visibleCallouts} />}
       </section>
     </div>
   )

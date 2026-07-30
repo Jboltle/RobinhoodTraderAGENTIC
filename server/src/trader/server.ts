@@ -244,6 +244,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.send({ callouts: await loadFeed(deps, userId) });
   });
 
+  // The Caller roster for the settings Following picker. Shared rows, same
+  // for every user; auth is still required like every other /api route.
+  fastify.get('/api/callers', async (request, reply) => {
+    requireUser(request);
+    return reply.send({ callers: await deps.db.listCallers() });
+  });
+
   // ---- Settings -----------------------------------------------------------------
 
   fastify.get('/api/settings', async (request, reply) => {

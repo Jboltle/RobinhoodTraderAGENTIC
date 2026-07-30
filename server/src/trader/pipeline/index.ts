@@ -70,7 +70,10 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
   // process lifetime. Upgrade path is dropping the entry once its chain idles.
   const chains = new Map<string, Promise<unknown>>();
 
-  const queueForUser = (userId: string, run: () => Promise<Decision>): Promise<Decision> => {
+  const queueForUser = (
+    userId: string,
+    run: () => Promise<Decision | null>
+  ): Promise<Decision | null> => {
     const chain = (chains.get(userId) ?? Promise.resolve()).then(run, run);
     chains.set(userId, chain);
     return chain;
@@ -86,6 +89,19 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
           stage: 'received',
         });
       }
+
+      // Roster upsert at ingest, once globally: the Caller's identity rides
+      // every envelope, so the picker stays current without maintenance.
+      await deps.db
+        .upsertCaller({
+          authorId: envelope.authorId,
+          displayName: envelope.authorName,
+          avatarUrl: envelope.authorAvatarUrl,
+          lastSeenAt: envelope.timestamp,
+        })
+        .catch((err: unknown) =>
+          log.warn('could not upsert caller', { authorId: envelope.authorId, error: errMsg(err) })
+        );
 
       const parsed = await resolveCallout(envelope, deps, options);
 
@@ -112,7 +128,8 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
       const outcomes: Decision[] = [];
       for (const [index, result] of settled.entries()) {
         if (result.status === 'fulfilled') {
-          outcomes.push(result.value);
+          // null = the user does not follow this Caller (silent skip).
+          if (result.value) outcomes.push(result.value);
         } else {
           log.error('user pipeline crashed', {
             userId: userIds[index],
@@ -150,6 +167,7 @@ async function resolveCallout(
     messageId: envelope.messageId,
     channelId: envelope.channelId,
     channelName: options.channelName ?? null,
+    authorId: envelope.authorId,
     authorName: envelope.authorName,
     content: envelope.content,
     timestamp: envelope.timestamp,
@@ -206,6 +224,8 @@ async function save(deps: PipelineDeps, callout: StoredCallout): Promise<void> {
 
 /**
  * One user's run against an already-parsed callout:
+ *  0. Following gate → a Caller this user does not follow produces nothing
+ *     for them: no trade, no per-user record (silent skip, returns null)
  *  1. Risk check → deterministic guards + portfolio-percentage sizing, against
  *     this user's settings and their trade history
  *  2. Fetch buying power (always — needed for capital validation even when qty is explicit)
@@ -216,10 +236,26 @@ export async function runForUser(
   envelope: DiscordEnvelope,
   parsed: ParsedCallout,
   deps: PipelineDeps
-): Promise<Decision> {
+): Promise<Decision | null> {
   const at = new Date().toISOString();
   const base = { at, messageId: envelope.messageId, order: null };
   const { callout } = parsed;
+
+  // ponytail: a settings DB failure here also drops missed/parser_error records
+  // (they write to the same DB, so a fallback rarely helps); upgrade path is to
+  // catch it and fall back to record-only default paths — never trade on defaults.
+  const settings = await loadSettings(userId, deps);
+
+  // ---- 0. Following gate ---------------------------------------------------
+  // null = follow everyone (default); otherwise the list is exhaustive.
+  if (settings.followedCallerIds !== null && !settings.followedCallerIds.includes(envelope.authorId)) {
+    deps.events.emitStage(userId, {
+      messageId: envelope.messageId,
+      ticker: null,
+      stage: 'done',
+    });
+    return null;
+  }
 
   if (parsed.status === 'missed') {
     return finalize(userId, deps, {
@@ -258,8 +294,6 @@ export async function runForUser(
         'message mentions options (calls/puts/strike notation) but parse says equity — refusing to trade on an inconsistent parse',
     });
   }
-
-  const settings = await loadSettings(userId, deps);
 
   // ---- 1. Risk check ------------------------------------------------------
   deps.events.emitStage(userId, {

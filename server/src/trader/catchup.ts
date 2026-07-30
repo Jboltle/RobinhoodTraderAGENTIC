@@ -73,6 +73,7 @@ const toEnvelope = (message: CalloutMessage): DiscordEnvelope => ({
   guildId: null,
   authorId: message.authorId,
   authorName: message.authorName,
+  authorAvatarUrl: message.authorAvatarUrl,
   content: message.content,
   timestamp: message.timestamp,
   embeds: [...message.embeds],

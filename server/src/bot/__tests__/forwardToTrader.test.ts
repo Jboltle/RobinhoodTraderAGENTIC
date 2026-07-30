@@ -17,6 +17,7 @@ const ENVELOPE: DiscordEnvelope = {
   guildId: 'guild-001',
   authorId: 'user-42',
   authorName: 'Demon Alerts',
+  authorAvatarUrl: null,
   content: 'BTO $QQQ 710p 06/08 0.97',
   timestamp: '2026-06-09T14:27:00.000Z',
 };

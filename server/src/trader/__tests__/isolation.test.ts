@@ -47,6 +47,7 @@ const SHARED_CALLOUT: StoredCallout = {
   messageId: 'msg-shared',
   channelId: 'chan-1',
   channelName: 'alerts',
+  authorId: 'author-1',
   authorName: 'Demon Alerts',
   content: 'BUY $NVDA',
   timestamp: '2026-07-20T14:30:00.000Z',

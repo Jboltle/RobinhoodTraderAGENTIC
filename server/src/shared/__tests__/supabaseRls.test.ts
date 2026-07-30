@@ -26,7 +26,14 @@ const anonKey = process.env.SUPABASE_ANON_KEY?.trim();
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 const CONFIGURED = Boolean(supabaseUrl && anonKey && serviceRoleKey);
 
-const TABLES = ['callouts', 'trades', 'settings', 'allowed_emails', 'broker_connections'] as const;
+const TABLES = [
+  'callouts',
+  'trades',
+  'settings',
+  'allowed_emails',
+  'broker_connections',
+  'callers',
+] as const;
 
 // Unique per run so reruns never collide with leftovers from a failed teardown.
 const runId = Date.now();
@@ -127,6 +134,11 @@ async function seedOneRowPerTable(): Promise<void> {
     user_id: probeUserId,
     encrypted_tokens: 'cHJvYmUtY2lwaGVydGV4dA==',
   });
+  await insertAsServiceRole('callers', {
+    author_id: probeMessageId,
+    display_name: 'rls-probe',
+    last_seen_at: new Date(runId).toISOString(),
+  });
 }
 
 async function deleteProbeFixtures(): Promise<void> {
@@ -139,6 +151,10 @@ async function deleteProbeFixtures(): Promise<void> {
     method: 'DELETE',
   });
   await request(`/rest/v1/allowed_emails?email=eq.${probeEmail}`, {
+    apiKey: serviceRoleKey!,
+    method: 'DELETE',
+  });
+  await request(`/rest/v1/callers?author_id=eq.${probeMessageId}`, {
     apiKey: serviceRoleKey!,
     method: 'DELETE',
   });

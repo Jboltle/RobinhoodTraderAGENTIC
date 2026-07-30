@@ -26,6 +26,7 @@ function makeEnvelope(content: string, timestamp = '2026-06-15T14:35:00.000Z'): 
     guildId: 'test-guild',
     authorId: 'test-author',
     authorName: 'Namrood',
+    authorAvatarUrl: null,
     content,
     timestamp,
   };

@@ -51,7 +51,12 @@ function mockMessage(channelId: string): Message {
     createdTimestamp: Date.parse('2026-06-09T14:27:00.000Z'),
     system: false,
     webhookId: null,
-    author: { id: 'author-001', username: 'Demon Alerts', bot: false },
+    author: {
+      id: 'author-001',
+      username: 'Demon Alerts',
+      bot: false,
+      displayAvatarURL: () => 'https://cdn.discordapp.com/avatars/author-001/abc.png',
+    },
     member: { displayName: 'Demon Alerts' },
     channel: { parentId: null },
   } as unknown as Message;

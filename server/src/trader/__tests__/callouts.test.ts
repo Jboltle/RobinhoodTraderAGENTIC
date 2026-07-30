@@ -55,6 +55,7 @@ const ENVELOPE: DiscordEnvelope = {
   guildId: null,
   authorId: '777888999',
   authorName: 'Caller',
+  authorAvatarUrl: null,
   content: 'BTO AAPL 220c\nsmall size',
   timestamp: new Date('2026-07-16T10:00:00').toISOString(),
   embeds: [],

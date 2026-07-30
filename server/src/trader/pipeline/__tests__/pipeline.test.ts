@@ -256,6 +256,7 @@ describe('fan-out — parse consistency guardrails', () => {
     guildId: 'test-guild',
     authorId: 'test-author',
     authorName: 'Natalie Options Alert',
+    authorAvatarUrl: null,
     content: '**130%** 🔥aapl calls 3.38 to 7.70 now!!! 🚀',
     timestamp: '2026-07-15T15:36:00.000Z',
   };
@@ -472,6 +473,108 @@ describe('fan-out — several users', () => {
 
     expect(deps.parser.parse).toHaveBeenCalledOnce();
     expect(await db.listDecisions(USER, 10)).toHaveLength(2);
+  });
+});
+
+describe('fan-out — Following', () => {
+  // envelopeFromFixture always posts as authorId 'test-author'.
+
+  it('null Following (the default) trades on every Caller', async () => {
+    const { decision } = await runWith(
+      envelopeFromFixture(BTO_QQQ_PUT),
+      BTO_QQQ_PUT.expectedCallout
+    );
+    expect(decision.kind).toBe('submitted');
+  });
+
+  it('an explicit list including the author trades normally', async () => {
+    const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout);
+    db.seedSettings(USER, {
+      regularHoursOnly: false, maxOptionsNotionalPct: 10, maxSingleContractPct: 10,
+      followedCallerIds: ['test-author'],
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('submitted');
+  });
+
+  it('an explicit list excluding the author skips silently — no trade, no record', async () => {
+    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    db.seedSettings(USER, { regularHoursOnly: false, followedCallerIds: ['someone-else'] });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(await db.listDecisions(USER, 10)).toEqual([]);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it('an empty list follows no one', async () => {
+    const { db, deps, tools, postReceipt } = setup(BTO_QQQ_PUT.expectedCallout);
+    db.seedSettings(USER, { regularHoursOnly: false, followedCallerIds: [] });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(await db.listDecisions(USER, 10)).toEqual([]);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    // Every account skipped: nothing worth a Discord receipt either.
+    expect(postReceipt).not.toHaveBeenCalled();
+  });
+
+  it('Following is per user: one user skips while the other trades', async () => {
+    const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout, {}, [USER, OTHER_USER]);
+    db.seedSettings(OTHER_USER, { regularHoursOnly: false, followedCallerIds: [] });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('submitted');
+    expect(await db.listDecisions(OTHER_USER, 10)).toEqual([]);
+  });
+
+  it('ingest upserts the callers row: insert on first sight, update on the next', async () => {
+    const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout);
+    const processor = createMessageProcessor(deps);
+    const envelope = {
+      ...envelopeFromFixture(BTO_QQQ_PUT),
+      authorAvatarUrl: 'https://cdn.discordapp.com/avatars/test-author/a1.png',
+    };
+
+    await processor.process(envelope);
+    expect(await db.listCallers()).toEqual([
+      {
+        authorId: 'test-author',
+        displayName: 'Demon Alerts',
+        avatarUrl: 'https://cdn.discordapp.com/avatars/test-author/a1.png',
+        lastSeenAt: envelope.timestamp,
+      },
+    ]);
+
+    await processor.process({
+      ...envelope,
+      messageId: 'fixture-bto-qqq-710p-later',
+      authorName: 'Demon Renamed',
+      authorAvatarUrl: 'https://cdn.discordapp.com/avatars/test-author/a2.png',
+      timestamp: '2026-06-09T15:00:00.000Z',
+    });
+    expect(await db.listCallers()).toEqual([
+      {
+        authorId: 'test-author',
+        displayName: 'Demon Renamed',
+        avatarUrl: 'https://cdn.discordapp.com/avatars/test-author/a2.png',
+        lastSeenAt: '2026-06-09T15:00:00.000Z',
+      },
+    ]);
+
+    // Old-bot envelopes carry no avatar; that must not clobber the stored one.
+    await processor.process({
+      ...envelope,
+      messageId: 'fixture-bto-qqq-710p-latest',
+      authorAvatarUrl: null,
+      timestamp: '2026-06-09T16:00:00.000Z',
+    });
+    expect((await db.listCallers())[0]!.avatarUrl).toBe(
+      'https://cdn.discordapp.com/avatars/test-author/a2.png'
+    );
   });
 });
 

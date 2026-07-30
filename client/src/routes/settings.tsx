@@ -1,8 +1,16 @@
 import { useState } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Check } from 'lucide-react'
 
-import { fetchSettings, type TradeSettings, type TradeSettingsInput } from '../lib/api'
+import {
+  fetchCallers,
+  fetchSettings,
+  type Caller,
+  type TradeSettings,
+  type TradeSettingsInput,
+} from '../lib/api'
+import { toggleCaller } from '../lib/following'
 import { saveSettings } from '../lib/settingsSync'
 
 export const Route = createFileRoute('/settings')({
@@ -80,6 +88,11 @@ function SettingsForm({
         </p>
       </header>
 
+      <CallersSection
+        followed={form.followedCallerIds ?? null}
+        onChange={(v) => set('followedCallerIds', v)}
+      />
+
       <FormSection title="Execution">
         <SelectField
           label="Execution mode"
@@ -137,6 +150,119 @@ function SettingsForm({
         )}
       </div>
     </form>
+  )
+}
+
+/** Discord derives which of its 6 default avatars a user gets from their ID. */
+const fallbackAvatarUrl = (authorId: string): string => {
+  // A non-numeric id (malformed input) gets index 0 instead of a BigInt throw.
+  const index = /^\d+$/.test(authorId) ? (BigInt(authorId) >> 22n) % 6n : 0n
+  return `https://cdn.discordapp.com/embed/avatars/${index}.png`
+}
+
+/** Who to copy-trade: the roster of Callers, toggled by clicking their avatar. */
+function CallersSection({
+  followed,
+  onChange,
+}: {
+  followed: string[] | null
+  onChange: (value: string[] | null) => void
+}) {
+  const callers = useQuery({ queryKey: ['callers'], queryFn: fetchCallers })
+  const roster = callers.data ?? []
+  const isFollowed = (authorId: string): boolean =>
+    followed === null || followed.includes(authorId)
+  const followedCount = roster.filter((c) => isFollowed(c.authorId)).length
+
+  return (
+    <FormSection title="Callers">
+      <div className="flex flex-wrap items-center gap-3 text-xs">
+        <span className="text-ink-400">
+          {followed === null
+            ? 'Following everyone — including Callers added later'
+            : `Following ${followedCount} of ${roster.length} Callers`}
+        </span>
+        <button
+          type="button"
+          className="text-brand hover:underline"
+          onClick={() => onChange(null)}
+        >
+          Select all
+        </button>
+        <button
+          type="button"
+          className="text-ink-400 hover:underline"
+          onClick={() => onChange([])}
+        >
+          Clear all
+        </button>
+      </div>
+      {callers.isPending && (
+        <p className="text-sm text-ink-400">Loading Callers…</p>
+      )}
+      {callers.isError && (
+        <p className="text-sm text-loss">
+          Failed to load Callers: {(callers.error as Error).message}
+        </p>
+      )}
+      {callers.isSuccess && (
+        <div className="flex flex-wrap gap-4">
+          {roster.map((caller) => (
+            <CallerTile
+              key={caller.authorId}
+              caller={caller}
+              followed={isFollowed(caller.authorId)}
+              onToggle={() =>
+                onChange(
+                  toggleCaller(
+                    followed,
+                    roster.map((c) => c.authorId),
+                    caller.authorId,
+                  ),
+                )
+              }
+            />
+          ))}
+        </div>
+      )}
+    </FormSection>
+  )
+}
+
+function CallerTile({
+  caller,
+  followed,
+  onToggle,
+}: {
+  caller: Caller
+  followed: boolean
+  onToggle: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={followed ? `Unfollow ${caller.displayName}` : `Follow ${caller.displayName}`}
+      className="flex w-16 flex-col items-center gap-1.5"
+    >
+      <span className="relative">
+        <img
+          src={caller.avatarUrl ?? fallbackAvatarUrl(caller.authorId)}
+          alt=""
+          className={`h-14 w-14 rounded-full ${followed ? 'ring-2 ring-brand' : 'grayscale opacity-40'}`}
+        />
+        {followed && (
+          <span className="absolute -right-0.5 -bottom-0.5 flex size-4 items-center justify-center rounded-full bg-brand text-ink-900">
+            <Check className="size-3" />
+          </span>
+        )}
+      </span>
+      <span
+        className={`w-full truncate text-center text-xs ${followed ? 'text-white' : 'text-ink-400'}`}
+      >
+        {caller.displayName}
+      </span>
+    </button>
   )
 }
 

@@ -106,6 +106,8 @@ export interface CalloutItem {
   messageId: string
   channelId: string
   channelName: string | null
+  /** The Caller's Discord author ID; null on rows stored before author identity was kept. */
+  authorId: string | null
   authorName: string
   timestamp: string
   content: string
@@ -153,6 +155,16 @@ export interface TradeSettings {
   blockedTickers: string[]
   minConfidence: number
   regularHoursOnly: boolean
+  /** null = follow every Caller including future ones; [] = follow no one. */
+  followedCallerIds: string[] | null
+}
+
+/** One row from GET /api/callers: a Caller known to the roster. */
+export interface Caller {
+  authorId: string
+  displayName: string
+  avatarUrl: string | null
+  lastSeenAt: string
 }
 
 /** GET /api/broker/status: the caller's Robinhood connection state. */
@@ -202,6 +214,9 @@ export const fetchSettings = (): Promise<TradeSettings> =>
 
 export const fetchCallouts = (): Promise<CalloutItem[]> =>
   request<{ callouts: CalloutItem[] }>('/api/callouts').then((r) => r.callouts)
+
+export const fetchCallers = (): Promise<Caller[]> =>
+  request<{ callers: Caller[] }>('/api/callers').then((r) => r.callers)
 
 export const fetchPortfolio = (): Promise<PortfolioSummary> =>
   request<PortfolioSummary>('/api/portfolio')

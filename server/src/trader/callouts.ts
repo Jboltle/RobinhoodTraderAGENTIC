@@ -31,7 +31,12 @@ export interface RestMessage {
   readonly type: number;
   readonly content: string;
   readonly timestamp: string;
-  readonly author: { readonly id: string; readonly username: string; readonly global_name?: string | null };
+  readonly author: {
+    readonly id: string;
+    readonly username: string;
+    readonly global_name?: string | null;
+    readonly avatar?: string | null;
+  };
   readonly attachments?: readonly { readonly url: string }[];
   readonly embeds?: readonly (EmbedLike & Record<string, unknown>)[];
   readonly sticker_items?: readonly { readonly name: string }[];
@@ -44,9 +49,22 @@ export interface CalloutMessage {
   readonly channelName: string | null;
   readonly authorId: string;
   readonly authorName: string;
+  readonly authorAvatarUrl: string;
   readonly timestamp: string;
   readonly content: string;
   readonly embeds: readonly Record<string, unknown>[];
+}
+
+/**
+ * Public CDN avatar URL for a Discord user: custom avatar when a hash is
+ * known, otherwise Discord's id-derived default avatar (every user has one).
+ */
+export function discordAvatarUrl(userId: string, avatarHash?: string | null): string {
+  if (avatarHash) return `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png`;
+  // The default-avatar index derives from the numeric snowflake; a
+  // non-numeric id (malformed input) just gets index 0 instead of a throw.
+  const index = /^\d+$/.test(userId) ? (BigInt(userId) >> 22n) % 6n : 0n;
+  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
 }
 
 /** Local midnight (server timezone) — the history window's "today" boundary. */
@@ -112,6 +130,9 @@ export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
     channelName: null, // resolved by the caller via the cached channel-name lookup
     authorId: match[2]!,
     authorName: match[1]!,
+    // The mirror header carries no avatar hash; the id-derived default is the
+    // best available. The next live message's upsert restores a custom one.
+    authorAvatarUrl: discordAvatarUrl(match[2]!),
     // The mirror post's own timestamp — the original's isn't in the header;
     // close enough for ordering and for the staleness window.
     timestamp: msg.timestamp,
@@ -232,6 +253,7 @@ export async function fetchTodaysCallouts(
           channelName: name,
           authorId: msg.author.id,
           authorName: msg.author.global_name ?? msg.author.username,
+          authorAvatarUrl: discordAvatarUrl(msg.author.id, msg.author.avatar),
           timestamp: msg.timestamp,
           content: flattenRestMessage(msg),
           embeds: msg.embeds ?? [],

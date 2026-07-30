@@ -16,6 +16,7 @@
     "start:trader": "bun src/trader/index.ts",
     "connect": "bun src/scripts/rhConnect.ts",
     "auth:reset": "bun src/scripts/rhResetAuth.ts",
+    "seed:callers": "bun src/scripts/seedCallers.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "bun build src/bot/index.ts src/trader/index.ts --outdir dist --target bun",

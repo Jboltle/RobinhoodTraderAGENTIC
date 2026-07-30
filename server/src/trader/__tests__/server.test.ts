@@ -56,6 +56,7 @@ const calloutFixture = (messageId: string, timestamp: string): StoredCallout => 
   messageId,
   channelId: 'chan-001',
   channelName: 'alerts',
+  authorId: 'author-001',
   authorName: 'Demon Alerts',
   content: `callout ${messageId}`,
   timestamp,
@@ -194,6 +195,35 @@ describe('GET /api/callouts', () => {
     // Nothing acted on it for this user, and there is no "backfill" concept:
     // the callout is simply in the feed with no decision.
     expect(callouts[1]!.decision).toBeNull();
+  });
+});
+
+describe('GET /api/callers', () => {
+  it('returns the shared Caller roster', async () => {
+    await harness.db.upsertCaller({
+      authorId: 'author-001',
+      displayName: 'Demon Alerts',
+      avatarUrl: 'https://cdn.discordapp.com/avatars/author-001/abc.png',
+      lastSeenAt: '2026-07-15T14:30:00.000Z',
+    });
+
+    const response = await get('/api/callers');
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      callers: [
+        {
+          authorId: 'author-001',
+          displayName: 'Demon Alerts',
+          avatarUrl: 'https://cdn.discordapp.com/avatars/author-001/abc.png',
+          lastSeenAt: '2026-07-15T14:30:00.000Z',
+        },
+      ],
+    });
+  });
+
+  it('is rejected without a bearer token like every other private route', async () => {
+    const response = await harness.app.inject({ method: 'GET', url: '/api/callers' });
+    expect(response.statusCode).toBe(401);
   });
 });
 

@@ -35,6 +35,7 @@ export function envelopeFromFixture(f: DiscordMessageFixture): DiscordEnvelope {
     guildId: 'test-guild',
     authorId: 'test-author',
     authorName: f.authorName ?? 'Namrood',
+    authorAvatarUrl: null,
     content: f.content,
     timestamp: f.timestamp ?? DEFAULT_TS,
   };

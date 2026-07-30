@@ -8,7 +8,7 @@
  * endpoint may query a user id other than the caller's.
  */
 import { TradeSettingsSchema, type Decision, type ResolvedTradeSettings, type TradeSettings } from '../../shared/types.js';
-import type { AuthUser, StoredCallout, TraderDb } from '../db.js';
+import type { AuthUser, Caller, StoredCallout, TraderDb } from '../db.js';
 import type { PersistedState } from '../rh/types.js';
 
 export interface ScopedCall {
@@ -46,6 +46,7 @@ export function createFakeDb(): FakeDb {
   const trades: Array<{ userId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
   const callouts = new Map<string, StoredCallout>();
+  const callers = new Map<string, Caller>();
   const allowedEmails = new Set<string>();
   const usersByToken = new Map<string, AuthUser>();
   const usersByEmail = new Map<string, AuthUser>();
@@ -146,6 +147,14 @@ export function createFakeDb(): FakeDb {
       return [...callouts.values()]
         .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
         .slice(0, limit);
+    },
+    async upsertCaller(caller) {
+      // Mirrors the real upsert: a null avatar never overwrites a stored one.
+      const avatarUrl = caller.avatarUrl ?? callers.get(caller.authorId)?.avatarUrl ?? null;
+      callers.set(caller.authorId, { ...caller, avatarUrl });
+    },
+    async listCallers() {
+      return [...callers.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
     },
 
     // ---- Auth ----------------------------------------------------------------

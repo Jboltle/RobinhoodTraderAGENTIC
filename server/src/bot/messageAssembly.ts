@@ -77,6 +77,8 @@ export function buildEnvelope(message: Message, content: string): DiscordEnvelop
     guildId: message.guildId ?? null,
     authorId: message.author.id,
     authorName: message.member?.displayName ?? message.author.username,
+    // Resolves custom vs default-avatar CDN URLs, incl. webhook per-message avatars.
+    authorAvatarUrl: message.author.displayAvatarURL(),
     content,
     timestamp: new Date(message.createdTimestamp).toISOString(),
     embeds: (message.embeds ?? []).slice(0, MAX_EMBEDS).map((e) => e.toJSON()),

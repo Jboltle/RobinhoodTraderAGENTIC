@@ -10,6 +10,8 @@ export const DiscordEnvelopeSchema = z.object({
   guildId: z.string().nullable(),
   authorId: z.string().min(1),
   authorName: z.string(),
+  /** Resolved CDN avatar URL (custom or Discord default). Defaulted so envelopes from an older bot still parse. */
+  authorAvatarUrl: z.string().nullable().default(null),
   content: z.string(),
   timestamp: z.string(),
   /** Raw Discord embed JSON, passed through permissively (the bot flattens it into `content` for the LLM). */
@@ -93,6 +95,11 @@ export const TradeSettingsSchema = z.object({
   blockedTickers: tickerList.default([]),
   minConfidence: z.number().min(0).max(1).default(0.7),
   regularHoursOnly: z.boolean().default(true),
+  /**
+   * Following: null = follow every Caller including future ones (default),
+   * [] = follow no one, non-empty = follow exactly those Discord author ids.
+   */
+  followedCallerIds: z.array(z.string()).nullable().default(null),
 });
 
 /** What a client may send: every field optional, defaults fill the rest. */

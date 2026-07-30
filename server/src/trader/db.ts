@@ -11,8 +11,11 @@
  *
  * Expected schema (owned by supabase/migrations/, reconcile there):
  *   callouts            message_id text pk, channel_id text, channel_name text,
- *                       author_name text, content text, timestamp timestamptz,
- *                       embeds jsonb, parse jsonb, parse_status text
+ *                       author_id text, author_name text, content text,
+ *                       timestamp timestamptz, embeds jsonb, parse jsonb,
+ *                       parse_status text
+ *   callers             author_id text pk, display_name text, avatar_url text,
+ *                       last_seen_at timestamptz
  *   trades              id uuid pk, user_id uuid -> auth.users, message_id text,
  *                       kind text, code text, reason text, ticker text, action text,
  *                       order_payload jsonb, timestamp timestamptz
@@ -41,12 +44,22 @@ export interface StoredCallout {
   readonly messageId: string;
   readonly channelId: string;
   readonly channelName: string | null;
+  /** Null only on rows written before Caller Following existed. */
+  readonly authorId: string | null;
   readonly authorName: string;
   readonly content: string;
   readonly timestamp: string;
   readonly embeds: readonly Record<string, unknown>[];
   readonly parse: Callout | null;
   readonly parseStatus: CalloutParseStatus;
+}
+
+/** A row in the shared `callers` table: one Caller (Discord author) in the roster. */
+export interface Caller {
+  readonly authorId: string;
+  readonly displayName: string;
+  readonly avatarUrl: string | null;
+  readonly lastSeenAt: string;
 }
 
 /** A user identified by a verified Supabase access token. */
@@ -84,6 +97,10 @@ export interface TraderDb {
   saveCallout(callout: StoredCallout): Promise<void>;
   listCallouts(limit: number): Promise<StoredCallout[]>;
 
+  /** Insert a Caller or refresh their display name/avatar/last-seen. */
+  upsertCaller(caller: Caller): Promise<void>;
+  listCallers(): Promise<Caller[]>;
+
   // ---- Auth ------------------------------------------------------------------
 
   isEmailAllowed(email: string): Promise<boolean>;
@@ -109,7 +126,7 @@ export function createTraderDb(): TraderDb {
 
 const DECISION_COLUMNS = 'message_id, kind, code, reason, ticker, action, order_payload, timestamp';
 const CALLOUT_COLUMNS =
-  'message_id, channel_id, channel_name, author_name, content, timestamp, embeds, parse, parse_status';
+  'message_id, channel_id, channel_name, author_id, author_name, content, timestamp, embeds, parse, parse_status';
 
 class SupabaseTraderDb implements TraderDb {
   constructor(private readonly supabase: SupabaseClient) {}
@@ -255,6 +272,7 @@ class SupabaseTraderDb implements TraderDb {
         message_id: callout.messageId,
         channel_id: callout.channelId,
         channel_name: callout.channelName,
+        author_id: callout.authorId,
         author_name: callout.authorName,
         content: callout.content,
         timestamp: callout.timestamp,
@@ -275,6 +293,35 @@ class SupabaseTraderDb implements TraderDb {
       .limit(limit);
     if (error) throw queryError('list callouts', error);
     return (data ?? []).map(toStoredCallout);
+  }
+
+  async upsertCaller(caller: Caller): Promise<void> {
+    const { error } = await this.supabase.from('callers').upsert(
+      {
+        author_id: caller.authorId,
+        display_name: caller.displayName,
+        // Null avatar (old-bot envelopes) must not clobber a stored one:
+        // omitting the column leaves the existing value untouched on conflict.
+        ...(caller.avatarUrl !== null && { avatar_url: caller.avatarUrl }),
+        last_seen_at: caller.lastSeenAt,
+      },
+      { onConflict: 'author_id' }
+    );
+    if (error) throw queryError('upsert caller', error);
+  }
+
+  async listCallers(): Promise<Caller[]> {
+    const { data, error } = await this.supabase
+      .from('callers')
+      .select('author_id, display_name, avatar_url, last_seen_at')
+      .order('display_name', { ascending: true });
+    if (error) throw queryError('list callers', error);
+    return (data ?? []).map((row) => ({
+      authorId: String(row.author_id),
+      displayName: String(row.display_name),
+      avatarUrl: (row.avatar_url as string | null) ?? null,
+      lastSeenAt: String(row.last_seen_at),
+    }));
   }
 
   async isEmailAllowed(email: string): Promise<boolean> {
@@ -352,6 +399,7 @@ function toStoredCallout(row: Record<string, unknown>): StoredCallout {
     messageId: String(row.message_id),
     channelId: String(row.channel_id ?? ''),
     channelName: (row.channel_name as string | null) ?? null,
+    authorId: (row.author_id as string | null) ?? null,
     authorName: String(row.author_name ?? ''),
     content: String(row.content ?? ''),
     timestamp: String(row.timestamp),
