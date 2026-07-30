@@ -7,10 +7,14 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { config } from '../../shared/config.js';
 import { signWebhookBody } from '../../shared/webhookAuth.js';
 import { makeHarness, type Harness } from './harness.js';
 
-const SECRET = 'test-dummy-secret';
+// Sign with whatever secret the server verifies against: the vitest dummy is
+// only injected when .env doesn't already define BOT_TRADER_SECRET, so a
+// hardcoded 'test-dummy-secret' 401s on machines with a populated .env.
+const SECRET = config.botTraderSecret;
 const USER = { id: 'user-1', email: 'user@example.com' };
 const TOKEN = 'a-valid-token';
 
