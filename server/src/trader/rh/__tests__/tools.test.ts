@@ -90,15 +90,46 @@ describe('RobinhoodTools account selection', () => {
   });
 });
 
-describe('RobinhoodTools order placement argument types', () => {
-  // RH MCP rejects integer quantity ("type: 5 has type integer, want string").
+// Live schema (dumped 2026-07-29): place_option_order takes legs referencing
+// an option instrument UUID; flat symbol/strike/expiry args are rejected with
+// "unexpected additional properties".
+const INSTRUMENTS_PAYLOAD = {
+  data: {
+    instruments: [
+      {
+        id: 'opt-uuid-1',
+        chain_symbol: 'RIVN',
+        type: 'call',
+        strike_price: '16.0000',
+        expiration_date: '2026-07-24',
+        state: 'active',
+        tradability: 'tradable',
+      },
+    ],
+  },
+};
+
+describe('RobinhoodTools order placement argument shapes', () => {
   const ORDER_PAYLOAD = { data: { order: { id: 'order-1', state: 'queued' } } };
 
-  it('passes option order quantity as a string', async () => {
-    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.placeOptionsOrder], {
-      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
-      [TOOL_NAMES.placeOptionsOrder]: ORDER_PAYLOAD,
-    });
+  function orderMcp(): RobinhoodMcpClient {
+    return makeMcp(
+      [TOOL_NAMES.accounts, TOOL_NAMES.optionInstruments, TOOL_NAMES.placeOptionsOrder],
+      {
+        [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+        [TOOL_NAMES.optionInstruments]: INSTRUMENTS_PAYLOAD,
+        [TOOL_NAMES.placeOptionsOrder]: ORDER_PAYLOAD,
+      }
+    );
+  }
+
+  function lastCallArgs(mcp: RobinhoodMcpClient, tool: string): Record<string, unknown> {
+    const calls = (mcp.callTool as ReturnType<typeof vi.fn>).mock.calls;
+    return calls.filter(([name]) => name === tool).at(-1)![1];
+  }
+
+  it('resolves the option_id and places a legs-based market buy (no price, gfd)', async () => {
+    const mcp = orderMcp();
     await new RobinhoodTools(mcp).placeOptionsOrder({
       symbol: 'RIVN',
       optionType: 'call',
@@ -110,12 +141,51 @@ describe('RobinhoodTools order placement argument types', () => {
     });
 
     expect(mcp.callTool).toHaveBeenCalledWith(
-      TOOL_NAMES.placeOptionsOrder,
-      expect.objectContaining({ quantity: '5', strike_price: 16 })
+      TOOL_NAMES.optionInstruments,
+      expect.objectContaining({
+        chain_symbol: 'RIVN',
+        expiration_dates: '2026-07-24',
+        strike_price: '16.0000',
+        type: 'call',
+      })
     );
+    const args = lastCallArgs(mcp, TOOL_NAMES.placeOptionsOrder);
+    expect(args).toMatchObject({
+      legs: [{ option_id: 'opt-uuid-1', side: 'buy', position_effect: 'open', ratio_quantity: 1 }],
+      type: 'market',
+      quantity: '5',
+      time_in_force: 'gfd',
+    });
+    expect(args.ref_id).toEqual(expect.any(String));
+    // Rejected by the live schema (additionalProperties: false / market order).
+    for (const banned of ['price', 'symbol', 'strike_price', 'expiration_date', 'option_type', 'side']) {
+      expect(args).not.toHaveProperty(banned);
+    }
   });
 
-  it('passes equity order quantity as a string', async () => {
+  it('places a limit sell as a closing leg with a string price', async () => {
+    const mcp = orderMcp();
+    await new RobinhoodTools(mcp).placeOptionsOrder({
+      symbol: 'RIVN',
+      optionType: 'call',
+      strike: 16,
+      expiration: '2026-07-24',
+      contracts: 1,
+      side: 'sell',
+      orderType: 'limit',
+      limitPremium: 0.5,
+    });
+
+    const args = lastCallArgs(mcp, TOOL_NAMES.placeOptionsOrder);
+    expect(args).toMatchObject({
+      legs: [{ option_id: 'opt-uuid-1', side: 'sell', position_effect: 'close', ratio_quantity: 1 }],
+      type: 'limit',
+      price: '0.5',
+      quantity: '1',
+    });
+  });
+
+  it('passes equity order quantity as a string with gfd time in force', async () => {
     const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.placeOrder], {
       [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
       [TOOL_NAMES.placeOrder]: ORDER_PAYLOAD,
@@ -129,7 +199,62 @@ describe('RobinhoodTools order placement argument types', () => {
 
     expect(mcp.callTool).toHaveBeenCalledWith(
       TOOL_NAMES.placeOrder,
-      expect.objectContaining({ quantity: '2' })
+      expect.objectContaining({ quantity: '2', time_in_force: 'gfd' })
+    );
+  });
+
+  it('sends limit_price but never the unsupported price field on equity limit orders', async () => {
+    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.placeOrder], {
+      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+      [TOOL_NAMES.placeOrder]: ORDER_PAYLOAD,
+    });
+    await new RobinhoodTools(mcp).placeOrder({
+      symbol: 'AMD',
+      side: 'buy',
+      quantity: 2,
+      orderType: 'limit',
+      limitPrice: 100,
+    });
+
+    const args = lastCallArgs(mcp, TOOL_NAMES.placeOrder);
+    expect(args.limit_price).toBe('100');
+    expect(args).not.toHaveProperty('price');
+  });
+});
+
+describe('RobinhoodTools option position enrichment', () => {
+  it('resolves strike/type for rows that only carry an option_id', async () => {
+    // Live shape: no strike_price, no call/put, type = long/short direction.
+    const positionsPayload = {
+      data: {
+        results: [
+          { option_id: 'opt-uuid-1', chain_symbol: 'RIVN', type: 'long', quantity: '2.0000', expiration_date: '2026-07-24' },
+          { option_id: 'opt-uuid-1', chain_symbol: 'RIVN', type: 'short', quantity: '0.0000', expiration_date: '2026-07-24' },
+        ],
+      },
+    };
+    const mcp = makeMcp(
+      [TOOL_NAMES.accounts, TOOL_NAMES.optionPositions, TOOL_NAMES.optionInstruments],
+      {
+        [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+        [TOOL_NAMES.optionPositions]: positionsPayload,
+        [TOOL_NAMES.optionInstruments]: INSTRUMENTS_PAYLOAD,
+      }
+    );
+    const { positions } = await new RobinhoodTools(mcp).getOptionPositions();
+
+    expect(positions).toEqual([
+      expect.objectContaining({
+        symbol: 'RIVN',
+        optionType: 'call',
+        strike: 16,
+        expiration: '2026-07-24',
+        quantity: 2,
+      }),
+    ]);
+    expect(mcp.callTool).toHaveBeenCalledWith(
+      TOOL_NAMES.optionInstruments,
+      expect.objectContaining({ ids: 'opt-uuid-1' })
     );
   });
 });

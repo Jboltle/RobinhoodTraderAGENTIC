@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { createLogger } from '../../shared/logger.js';
 import type { RobinhoodMcpClient } from './mcpClient.js';
 import type {
@@ -13,6 +15,7 @@ import type {
   Position,
   PositionsResult,
   QuoteResult,
+  TimeInForce,
 } from './types.js';
 
 export type * from './types.js';
@@ -29,6 +32,7 @@ export const TOOL_NAMES = {
   portfolio: 'get_portfolio',
   positions: 'get_equity_positions',
   optionPositions: 'get_option_positions',
+  optionInstruments: 'get_option_instruments',
   placeOrder: 'place_equity_order',
   placeOptionsOrder: 'place_option_order',
 } as const;
@@ -39,6 +43,8 @@ export const TOOL_NAMES = {
 
 export class RobinhoodTools {
   private accountNumber: string | undefined;
+  /** Contract key → option instrument UUID. Instrument ids never change. */
+  private readonly optionIdCache = new Map<string, string>();
 
   constructor(private readonly mcp: RobinhoodMcpClient) {}
 
@@ -49,7 +55,7 @@ export class RobinhoodTools {
   /**
    * Fetch the mark price for a single-leg option contract.
    * Used for market-order options sizing (premium × 100 × contracts = notional).
-   * Returns null if the MCP server doesn't advertise the tool, so callers can
+   * Returns null if the MCP server doesn't advertise the tools, so callers can
    * fall back gracefully rather than throwing.
    */
   async getOptionsMarkPrice(
@@ -58,16 +64,18 @@ export class RobinhoodTools {
     strike: number,
     expiration: string
   ): Promise<OptionsQuoteResult | null> {
-    if (!this.mcp.getToolNames().includes(TOOL_NAMES.optionsQuote)) return null;
+    const advertised = this.mcp.getToolNames();
+    if (
+      !advertised.includes(TOOL_NAMES.optionsQuote) ||
+      !advertised.includes(TOOL_NAMES.optionInstruments)
+    ) {
+      return null;
+    }
     try {
+      const optionId = await this.resolveOptionId(symbol, optionType, strike, expiration);
       return await this.callTool(
         TOOL_NAMES.optionsQuote,
-        {
-          symbol,
-          option_type: optionType,
-          strike_price: strike,
-          expiration_date: expiration,
-        },
+        { instrument_ids: [optionId] },
         parseOptionsQuote
       );
     } catch {
@@ -97,11 +105,37 @@ export class RobinhoodTools {
   }
 
   async getOptionPositions(): Promise<OptionPositionsResult> {
-    return this.callTool(
+    const result = await this.callTool(
       TOOL_NAMES.optionPositions,
       { account_number: await this.getDefaultAccountNumber() },
       parseOptionPositions
     );
+    if (result.incomplete.length === 0) {
+      return { positions: result.positions, raw: result.raw };
+    }
+
+    // Current RH MCP position rows carry only an option_id — no strike and no
+    // call/put — so resolve those contracts in one batched instruments call.
+    const ids = [...new Set(result.incomplete.map((row) => row.optionId))];
+    const instruments = await this.callTool(
+      TOOL_NAMES.optionInstruments,
+      { ids: ids.join(',') },
+      parseOptionInstruments
+    );
+    const positions = [...result.positions];
+    for (const row of result.incomplete) {
+      const contract = instruments.get(row.optionId);
+      if (!contract) continue;
+      positions.push({
+        symbol: (row.symbol ?? contract.symbol).toUpperCase(),
+        optionType: contract.optionType,
+        strike: contract.strike,
+        expiration: contract.expiration,
+        quantity: row.quantity,
+        raw: row.raw,
+      });
+    }
+    return { positions, raw: result.raw };
   }
 
   async placeOrder(args: PlaceOrderArgs): Promise<PlaceOrderResult> {
@@ -115,13 +149,16 @@ export class RobinhoodTools {
         symbol: args.symbol,
         side: args.side,
         type: args.orderType,
-        // RH MCP's schema types quantity and price as strings, mirroring its
+        // RH MCP's schema types quantity and prices as strings, mirroring its
         // string-encoded numerics elsewhere ("100.0000"); raw numbers fail
         // validation with -32602.
         quantity: String(args.quantity),
-        time_in_force: args.timeInForce ?? 'day',
+        time_in_force: toRhTimeInForce(args.timeInForce),
+        // Constant across withRetry attempts, so a retry after a lost
+        // response can't fill the same order twice.
+        ref_id: randomUUID(),
         ...(args.orderType === 'limit' && args.limitPrice !== undefined
-          ? { limit_price: String(args.limitPrice), price: String(args.limitPrice) }
+          ? { limit_price: String(args.limitPrice) }
           : {}),
       },
       parsePlaceOrder
@@ -132,26 +169,67 @@ export class RobinhoodTools {
     if (args.orderType === 'limit' && typeof args.limitPremium !== 'number') {
       throw new Error('limitPremium (per-contract price) required for limit options orders');
     }
+    const optionId = await this.resolveOptionId(
+      args.symbol,
+      args.optionType,
+      args.strike,
+      args.expiration
+    );
     return this.callTool(
       TOOL_NAMES.placeOptionsOrder,
       {
         account_number: await this.getDefaultAccountNumber(),
-        symbol: args.symbol,
-        option_type: args.optionType,
-        strike_price: args.strike,
-        expiration_date: args.expiration,
-        // RH MCP's schema types quantity and price as strings ("type: 0.85
-        // has type number, want string"); strike_price is fine as a number.
-        quantity: String(args.contracts),
-        side: args.side,
+        legs: [
+          {
+            option_id: optionId,
+            side: args.side,
+            // ponytail: single-leg long-only mapping — buys open, sells close.
+            // Opening a short (sell/open) needs a new PlaceOptionsOrderArgs
+            // field if ever required; the pipeline only sells held positions.
+            position_effect: args.side === 'buy' ? 'open' : 'close',
+            ratio_quantity: 1,
+          },
+        ],
         type: args.orderType,
-        time_in_force: args.timeInForce ?? 'day',
+        quantity: String(args.contracts),
+        time_in_force: toRhTimeInForce(args.timeInForce),
+        ref_id: randomUUID(),
+        // price is required for limit and must be OMITTED for market orders.
         ...(args.orderType === 'limit' && args.limitPremium !== undefined
           ? { price: String(args.limitPremium) }
           : {}),
       },
       parsePlaceOrder
     );
+  }
+
+  /**
+   * Resolve a (symbol, type, strike, expiration) contract to the option
+   * instrument UUID that order/quote tools require, via get_option_instruments.
+   */
+  private async resolveOptionId(
+    symbol: string,
+    optionType: 'call' | 'put',
+    strike: number,
+    expiration: string
+  ): Promise<string> {
+    const key = `${symbol}|${optionType}|${strike}|${expiration}`;
+    const cached = this.optionIdCache.get(key);
+    if (cached) return cached;
+    const optionId = await this.callTool(
+      TOOL_NAMES.optionInstruments,
+      {
+        chain_symbol: symbol,
+        expiration_dates: expiration,
+        // The schema wants the exact strike string, RH-formatted ("150.0000").
+        strike_price: strike.toFixed(4),
+        type: optionType,
+        state: 'active',
+      },
+      parseOptionInstrumentId
+    );
+    this.optionIdCache.set(key, optionId);
+    return optionId;
   }
 
   /**
@@ -313,11 +391,28 @@ function parsePositions(result: CallToolResult): PositionsResult {
   return { positions, raw: data ?? result };
 }
 
-function parseOptionPositions(result: CallToolResult): OptionPositionsResult {
+/** A position row that only references its contract by option_id. */
+interface IncompleteOptionPosition {
+  readonly optionId: string;
+  readonly symbol: string | null;
+  readonly quantity: number;
+  readonly raw: unknown;
+}
+
+interface ParsedOptionPositions extends OptionPositionsResult {
+  readonly incomplete: readonly IncompleteOptionPosition[];
+}
+
+function parseOptionPositions(result: CallToolResult): ParsedOptionPositions {
   const data = structuredOrJson(result);
   const positions: OptionPosition[] = [];
+  const incomplete: IncompleteOptionPosition[] = [];
 
-  for (const item of extractList(data)) {
+  // The live server nests rows under data.results; older shapes were flat.
+  const rows =
+    deepFind(data, ['results', 'positions'], (v): v is unknown[] => Array.isArray(v)) ??
+    extractList(data);
+  for (const item of rows) {
     const symbol = deepFindString(item, ['symbol', 'chain_symbol', 'underlying_symbol', 'ticker']);
     const optionType = normalizeOptionType(deepFindString(item, ['option_type', 'type', 'optionType']));
     const strike = deepFindNumber(item, ['strike_price', 'strike']);
@@ -333,10 +428,61 @@ function parseOptionPositions(result: CallToolResult): OptionPositionsResult {
         quantity,
         raw: item,
       });
+      continue;
+    }
+
+    // Current RH MCP rows: `type` is direction (long/short), the contract is
+    // only identified by option_id. Short rows are hedges/zero-quantity
+    // mirrors, never positions this bot can sell to close.
+    const optionId = deepFindString(item, ['option_id', 'instrument_id']);
+    const direction = deepFindString(item, ['type'])?.toLowerCase();
+    if (optionId && quantity > 0 && direction !== 'short') {
+      incomplete.push({ optionId, symbol, quantity, raw: item });
     }
   }
 
-  return { positions, raw: data ?? result };
+  return { positions, incomplete, raw: data ?? result };
+}
+
+interface OptionInstrument {
+  readonly symbol: string;
+  readonly optionType: 'call' | 'put';
+  readonly strike: number;
+  readonly expiration: string;
+}
+
+/** Rows of get_option_instruments keyed by instrument UUID. */
+function parseOptionInstruments(result: CallToolResult): Map<string, OptionInstrument> {
+  const data = structuredOrJson(result);
+  const list =
+    deepFind(data, ['instruments', 'results'], (v): v is unknown[] => Array.isArray(v)) ?? [];
+  const byId = new Map<string, OptionInstrument>();
+  for (const item of list) {
+    const rec = asRecord(item);
+    if (!rec) continue;
+    const id = typeof rec.id === 'string' ? rec.id : null;
+    const symbol = deepFindString(rec, ['chain_symbol', 'symbol']);
+    const optionType = normalizeOptionType(deepFindString(rec, ['type', 'option_type']));
+    const strike = deepFindNumber(rec, ['strike_price', 'strike']);
+    const expiration = deepFindString(rec, ['expiration_date', 'expiration']);
+    if (id && symbol && optionType && strike !== null && expiration) {
+      byId.set(id, { symbol, optionType, strike, expiration: expiration.slice(0, 10) });
+    }
+  }
+  return byId;
+}
+
+function parseOptionInstrumentId(result: CallToolResult): string {
+  const data = structuredOrJson(result);
+  const list =
+    deepFind(data, ['instruments', 'results'], (v): v is unknown[] => Array.isArray(v)) ?? [];
+  for (const item of list) {
+    const id = asRecord(item)?.id;
+    if (typeof id === 'string' && id.length > 0) return id;
+  }
+  throw new Error(
+    `no option instrument matched the contract: ${extractText(result).slice(0, 200)}`
+  );
 }
 
 function parsePlaceOrder(result: CallToolResult): PlaceOrderResult {
@@ -352,6 +498,11 @@ function parsePlaceOrder(result: CallToolResult): PlaceOrderResult {
 
 const RETRY_ATTEMPTS = 3;
 const RETRY_INITIAL_DELAY_MS = 250;
+
+/** RH MCP spells day orders 'gfd'; callers use the conventional 'day'. */
+function toRhTimeInForce(tif: TimeInForce | undefined): 'gfd' | 'gtc' {
+  return tif === 'gtc' ? 'gtc' : 'gfd';
+}
 
 async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
   let lastErr: unknown;
