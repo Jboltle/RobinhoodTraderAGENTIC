@@ -25,6 +25,8 @@ const log = createLogger('stack');
 
 const HEALTH_TIMEOUT_MS = 60_000;
 const HEALTH_POLL_MS = 750;
+/** Render's free tier sleeps a service after 15 idle minutes; 10 keeps margin. */
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000;
 /** Time a child gets to exit on its own before it is killed outright. Render
  *  allows 30s after SIGTERM, so this leaves plenty of room. */
 const SHUTDOWN_GRACE_MS = 5_000;
@@ -40,11 +42,36 @@ async function main(): Promise<void> {
   // would drop whatever arrives before the trader is listening.
   await waitForTraderHealth(trader);
   start('bot', 'src/bot/index.ts');
+  startKeepAlive();
 
   log.info('stack running', {
     health: `http://localhost:${config.traderPort}/health`,
     webhook: config.traderWebhookUrl,
   });
+}
+
+/**
+ * Self-ping so Render's free tier never idles us out. Render suspends a free
+ * web service after 15 minutes without inbound HTTP traffic; requests to the
+ * service's own public URL go through Render's proxy and count as inbound, so
+ * pinging /health every 10 minutes keeps the whole tree (Gateway socket
+ * included) awake without an external cron. RENDER_EXTERNAL_URL is injected by
+ * Render, so locally this is a no-op. If the process ever does die, Render's
+ * restart brings the ping loop back with it.
+ */
+function startKeepAlive(): void {
+  const externalUrl = process.env.RENDER_EXTERNAL_URL;
+  if (!externalUrl) return;
+
+  const url = `${externalUrl}/health`;
+  log.info('keep-alive self-ping enabled', { url, intervalMs: KEEP_ALIVE_INTERVAL_MS });
+  setInterval(() => {
+    // A failed ping is worth a log line but not a shutdown: the platform
+    // health check is the real liveness signal.
+    fetch(url).catch((err: unknown) =>
+      log.warn('keep-alive ping failed', { error: (err as Error).message })
+    );
+  }, KEEP_ALIVE_INTERVAL_MS);
 }
 
 function start(name: string, entrypoint: string): ChildProcess {

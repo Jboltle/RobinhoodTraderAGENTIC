@@ -119,10 +119,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.status(202).send({ ok: true });
   });
 
-  // Keep-alive target for the external cron (see render.yaml) and the platform
-  // health check. Its liveness signal is whether it answers at all, not what it
-  // says: src/index.ts runs the bot in the same process tree and tears the tree
-  // down if the bot dies, so a dead Gateway means this stops responding. The
+  // Keep-alive target for the supervisor's self-ping (src/index.ts) and the
+  // platform health check. Its liveness signal is whether it answers at all,
+  // not what it says: src/index.ts runs the bot in the same process tree and
+  // tears the tree down if the bot dies, so a dead Gateway means this stops
+  // responding. The
   // body is diagnostics only — the execution kill-switch is the one piece of
   // process-wide state worth reading without an account.
   fastify.get('/health', async (_request, reply) => {
