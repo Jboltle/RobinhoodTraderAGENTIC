@@ -3,6 +3,7 @@ import { REST, Routes } from 'discord.js';
 import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import { PostReceipt } from '../shared/types.js';
+import { backfillCalloutAuthors, seedMissingCallers } from './callerBootstrap.js';
 import { catchUpOnWake } from './catchup.js';
 import { createTraderDb } from './db.js';
 import { TraderEvents } from './events.js';
@@ -78,6 +79,16 @@ async function main(): Promise<void> {
 
   void catchUpOnWake({ db, processor }).catch((err: unknown) =>
     log.error('catch-up failed', { error: (err as Error).message })
+  );
+
+  // Self-healing Caller data: production has no shell for one-time scripts,
+  // so the roster seed and the legacy author_id backfill run at every boot.
+  // Both are idempotent and neither may block or crash the trading path.
+  void seedMissingCallers(db).catch((err: unknown) =>
+    log.warn('caller seed failed', { error: (err as Error).message })
+  );
+  void backfillCalloutAuthors(db).catch((err: unknown) =>
+    log.warn('callout author backfill failed', { error: (err as Error).message })
   );
 }
 

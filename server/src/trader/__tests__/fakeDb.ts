@@ -156,6 +156,15 @@ export function createFakeDb(): FakeDb {
     async listCallers() {
       return [...callers.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
     },
+    async listCalloutsMissingAuthor() {
+      return [...callouts.values()]
+        .filter((c) => c.authorId === null)
+        .map((c) => ({ messageId: c.messageId, timestamp: c.timestamp }));
+    },
+    async setCalloutAuthor(messageId, authorId) {
+      const existing = callouts.get(messageId);
+      if (existing) callouts.set(messageId, { ...existing, authorId });
+    },
 
     // ---- Auth ----------------------------------------------------------------
 

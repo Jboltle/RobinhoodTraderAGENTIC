@@ -101,6 +101,10 @@ export interface TraderDb {
   upsertCaller(caller: Caller): Promise<void>;
   listCallers(): Promise<Caller[]>;
 
+  /** Rows written before author capture existed (author_id is null). */
+  listCalloutsMissingAuthor(): Promise<{ messageId: string; timestamp: string }[]>;
+  setCalloutAuthor(messageId: string, authorId: string): Promise<void>;
+
   // ---- Auth ------------------------------------------------------------------
 
   isEmailAllowed(email: string): Promise<boolean>;
@@ -322,6 +326,26 @@ class SupabaseTraderDb implements TraderDb {
       avatarUrl: (row.avatar_url as string | null) ?? null,
       lastSeenAt: String(row.last_seen_at),
     }));
+  }
+
+  async listCalloutsMissingAuthor(): Promise<{ messageId: string; timestamp: string }[]> {
+    const { data, error } = await this.supabase
+      .from('callouts')
+      .select('message_id, timestamp')
+      .is('author_id', null);
+    if (error) throw queryError('list callouts missing author', error);
+    return (data ?? []).map((row) => ({
+      messageId: String(row.message_id),
+      timestamp: String(row.timestamp),
+    }));
+  }
+
+  async setCalloutAuthor(messageId: string, authorId: string): Promise<void> {
+    const { error } = await this.supabase
+      .from('callouts')
+      .update({ author_id: authorId })
+      .eq('message_id', messageId);
+    if (error) throw queryError('backfill callout author', error);
   }
 
   async isEmailAllowed(email: string): Promise<boolean> {
