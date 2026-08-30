@@ -7,7 +7,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { TanStackRouterDevtoolsPanel } from '@tanstack/react-router-devtools'
 import { TanStackDevtools } from '@tanstack/react-devtools'
-import { LayoutDashboard, LogOut, Search, Settings } from 'lucide-react'
+import { ChartColumn, LayoutDashboard, LogOut, Search, Settings } from 'lucide-react'
 
 import TanStackQueryDevtools from '../integrations/tanstack-query/devtools'
 
@@ -135,6 +135,10 @@ function SideNav() {
           <LayoutDashboard className="size-4" />
           Dashboard
         </Link>
+        <Link to="/performance" className={navLinkClass}>
+          <ChartColumn className="size-4" />
+          Performance &amp; Metrix
+        </Link>
         <Link to="/settings" className={navLinkClass}>
           <Settings className="size-4" />
           Settings
@@ -193,6 +197,9 @@ function TopHeader() {
       <nav className="flex gap-1 md:hidden">
         <Link to="/" className={navLinkClass}>
           Dashboard
+        </Link>
+        <Link to="/performance" className={navLinkClass}>
+          Performance
         </Link>
         <Link to="/settings" className={navLinkClass}>
           Settings

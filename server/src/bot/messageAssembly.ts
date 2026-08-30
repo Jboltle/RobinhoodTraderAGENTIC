@@ -1,7 +1,11 @@
 import type { Message } from 'discord.js';
 
 import { flattenEmbedText } from '../shared/embedText.js';
-import { DiscordEnvelopeSchema, type DiscordEnvelope } from '../shared/types.js';
+import {
+  DiscordEnvelopeSchema,
+  type DiscordEnvelope,
+  type EnvelopeKind,
+} from '../shared/types.js';
 
 /** Message payload mirrored to the forward channel (text header + original embeds). */
 export interface MirrorPayload {
@@ -70,7 +74,11 @@ export async function buildMessageContent(message: Message): Promise<string> {
 }
 
 /** Validate and normalise a Discord message into a DiscordEnvelope. */
-export function buildEnvelope(message: Message, content: string): DiscordEnvelope {
+export function buildEnvelope(
+  message: Message,
+  content: string,
+  kind: EnvelopeKind = 'callout'
+): DiscordEnvelope {
   return DiscordEnvelopeSchema.parse({
     messageId: message.id,
     channelId: message.channelId,
@@ -82,6 +90,7 @@ export function buildEnvelope(message: Message, content: string): DiscordEnvelop
     content,
     timestamp: new Date(message.createdTimestamp).toISOString(),
     embeds: (message.embeds ?? []).slice(0, MAX_EMBEDS).map((e) => e.toJSON()),
+    kind,
   });
 }
 

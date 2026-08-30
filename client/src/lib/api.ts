@@ -167,6 +167,107 @@ export interface Caller {
   lastSeenAt: string
 }
 
+/** One options trade parsed out of a daily recap post. */
+export interface RecapTrade {
+  /** Recap section name ("Demon"), not a Discord identity. */
+  caller: string
+  ticker: string
+  /** Raw expiration token as posted ("8/19", "0DTE"). */
+  expiration: string | null
+  strike: number | null
+  optionType: 'call' | 'put' | null
+  entryPrice: number | null
+  exitPrice: number | null
+  pctGain: number
+  isWin: boolean
+  /** Hedged by the recap itself ("if held") — excluded from all stats. */
+  isSoft: boolean
+  note: string | null
+  lineRaw: string
+  recapDate: string
+}
+
+/** One leaderboard row from GET /api/recaps/performance. */
+export interface RecapCallerStats {
+  caller: string
+  trades: number
+  wins: number
+  losses: number
+  winRatePct: number
+  avgPct: number
+  medianPct: number
+  totalPct: number
+  bestPct: number
+  worstPct: number
+  stdDevPct: number
+  /** Meets the award floor (trades >= minTradesForAwards). */
+  qualifies: boolean
+}
+
+/** One chart row: { date: '2026-08-19', Demon: 1029.2, Waxui: 105, ... }. */
+export type RecapSeriesPoint = Record<string, number | string>
+
+export interface RecapPerformanceData {
+  windowDays: number
+  minTradesForAwards: number
+  fromDate: string | null
+  toDate: string | null
+  recapCount: number
+  tradeCount: number
+  softExcluded: number
+  trades: RecapTrade[]
+  totals: {
+    wins: number
+    losses: number
+    winRatePct: number
+    avgPct: number
+    totalPct: number
+  }
+  leaderboard: RecapCallerStats[]
+  awards: {
+    bestPerformer: RecapCallerStats | null
+    worstPerformer: RecapCallerStats | null
+    mostWins: RecapCallerStats | null
+    highestWinRate: RecapCallerStats | null
+    mostConsistent: RecapCallerStats | null
+    bestTrade: RecapTrade | null
+  }
+  topTrades: RecapTrade[]
+  series: RecapSeriesPoint[]
+  parseHealth: {
+    parsed: number
+    partial: number
+    failed: number
+    lastPostedAt: string | null
+  }
+}
+
+/** Cached AI narration for one window; null until the first sweep generates it. */
+export interface RecapInsight {
+  windowDays: number
+  generatedAt: string
+  content: string
+}
+
+export interface RecapPerformanceResponse {
+  performance: RecapPerformanceData
+  insight: RecapInsight | null
+}
+
+/** Window filter choices; must match RECAP_WINDOW_DAYS_CHOICES server-side. */
+export const RECAP_WINDOWS = [
+  { days: 7, label: '7D' },
+  { days: 30, label: '30D' },
+  { days: 90, label: '90D' },
+  { days: 180, label: '6M' },
+  { days: 365, label: '1Y' },
+] as const
+
+export const fetchRecapPerformance = (
+  days: number,
+): Promise<RecapPerformanceResponse> =>
+  request<RecapPerformanceResponse>(`/api/recaps/performance?days=${days}`)
+
 /** GET /api/broker/status: the caller's Robinhood connection state. */
 export interface BrokerStatus {
   connected: boolean

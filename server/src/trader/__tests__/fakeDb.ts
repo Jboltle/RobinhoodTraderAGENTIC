@@ -8,7 +8,14 @@
  * endpoint may query a user id other than the caller's.
  */
 import { TradeSettingsSchema, type Decision, type ResolvedTradeSettings, type TradeSettings } from '../../shared/types.js';
-import type { AuthUser, Caller, StoredCallout, TraderDb } from '../db.js';
+import type {
+  AuthUser,
+  Caller,
+  StoredCallout,
+  StoredRecap,
+  StoredRecapInsight,
+  TraderDb,
+} from '../db.js';
 import type { PersistedState } from '../rh/types.js';
 
 export interface ScopedCall {
@@ -47,6 +54,8 @@ export function createFakeDb(): FakeDb {
   const brokerTokens = new Map<string, PersistedState>();
   const callouts = new Map<string, StoredCallout>();
   const callers = new Map<string, Caller>();
+  const recaps = new Map<string, StoredRecap>();
+  const recapInsights = new Map<number, StoredRecapInsight>();
   const allowedEmails = new Set<string>();
   const usersByToken = new Map<string, AuthUser>();
   const usersByEmail = new Map<string, AuthUser>();
@@ -164,6 +173,41 @@ export function createFakeDb(): FakeDb {
     async setCalloutAuthor(messageId, authorId) {
       const existing = callouts.get(messageId);
       if (existing) callouts.set(messageId, { ...existing, authorId });
+    },
+    async saveRecap(recap) {
+      recaps.set(recap.messageId, recap);
+    },
+    async listRecapMetas(messageIds) {
+      const metas = new Map<string, { messageId: string; contentHash: string; parserVersion: number }>();
+      for (const id of messageIds) {
+        const row = recaps.get(id);
+        if (row) {
+          metas.set(id, {
+            messageId: row.messageId,
+            contentHash: row.contentHash,
+            parserVersion: row.parserVersion,
+          });
+        }
+      }
+      return metas;
+    },
+    async listRecapsSince(sinceDate) {
+      return [...recaps.values()]
+        .filter((r) => r.recapDate !== null && r.recapDate >= sinceDate)
+        .sort((a, b) => a.recapDate!.localeCompare(b.recapDate!));
+    },
+    async latestRecapPostedAt() {
+      const times = [...recaps.values()].map((r) => r.postedAt);
+      return times.length ? times.sort().at(-1)! : null;
+    },
+    async listRecapsWithStaleParse(version) {
+      return [...recaps.values()].filter((r) => r.parserVersion < version);
+    },
+    async getRecapInsight(windowDays) {
+      return recapInsights.get(windowDays) ?? null;
+    },
+    async saveRecapInsight(insight) {
+      recapInsights.set(insight.windowDays, insight);
     },
 
     // ---- Auth ----------------------------------------------------------------

@@ -72,6 +72,11 @@ export const config = {
    */
   discordAllowedChannelIds: list(env.DISCORD_ALLOWED_CHANNEL_IDS),
   discordAllowedAuthorIds: list(env.DISCORD_ALLOWED_AUTHOR_IDS),
+  /**
+   * Channels carrying daily trade-recap posts. Stored + parsed for the
+   * Performance & Metrix dashboard; structurally isolated from trading.
+   */
+  discordRecapChannelIds: list(env.DISCORD_RECAP_CHANNEL_IDS),
   discordForwardChannelId: env.DISCORD_FORWARD_CHANNEL_ID?.trim() || null,
   discordLogIgnoredMessages: bool(env.DISCORD_LOG_IGNORED_MESSAGES, false),
 
