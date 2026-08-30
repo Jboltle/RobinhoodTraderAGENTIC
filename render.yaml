@@ -96,6 +96,9 @@ services:
         sync: false
       - key: DISCORD_FORWARD_CHANNEL_ID
         sync: false
+      # Daily trade-recap channel(s) for Performance & Metrix. Never traded.
+      - key: DISCORD_RECAP_CHANNEL_IDS
+        sync: false
 
       - key: SUPABASE_URL
         sync: false
