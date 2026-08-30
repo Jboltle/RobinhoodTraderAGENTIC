@@ -41,6 +41,7 @@ const USER = 'user-1';
 const FILTER_CFG: MessageFilterConfig = {
   discordAllowedChannelIds: [ALLOWED_CHANNEL_ID],
   discordAllowedAuthorIds: [],
+  discordRecapChannelIds: [],
 };
 
 function mockMessage(channelId: string): Message {

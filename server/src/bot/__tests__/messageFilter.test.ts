@@ -42,6 +42,7 @@ function mockMessage(opts: MockMessageOpts = {}): Message {
 const ALLOW: MessageFilterConfig = {
   discordAllowedChannelIds: ['111', '222', '333'],
   discordAllowedAuthorIds: [],
+  discordRecapChannelIds: ['recap-1'],
 };
 
 // ---------------------------------------------------------------------------
@@ -74,7 +75,7 @@ describe('isAllowedDiscordChannel', () => {
 describe('classifyMessage', () => {
   it('forwards a normal message posted in an allow-listed channel', () => {
     const result = classifyMessage(mockMessage({ channelId: '111' }), ALLOW);
-    expect(result).toEqual({ forward: true, reason: 'allowed' });
+    expect(result).toEqual({ forward: true, reason: 'allowed', kind: 'callout' });
   });
 
   it('forwards a message from a thread under an allow-listed parent', () => {
@@ -91,6 +92,7 @@ describe('classifyMessage', () => {
     const emptyCfg: MessageFilterConfig = {
       discordAllowedChannelIds: [],
       discordAllowedAuthorIds: [],
+      discordRecapChannelIds: [],
     };
     const result = classifyMessage(mockMessage({ channelId: '111' }), emptyCfg);
     expect(result).toEqual({ forward: false, reason: 'channel_not_allowed' });
@@ -103,10 +105,10 @@ describe('classifyMessage', () => {
 
   it('forwards bot- and webhook-authored alert messages', () => {
     const bot = classifyMessage(mockMessage({ channelId: '111', author: { id: 'alertbot', bot: true } }), ALLOW);
-    expect(bot).toEqual({ forward: true, reason: 'allowed' });
+    expect(bot).toEqual({ forward: true, reason: 'allowed', kind: 'callout' });
 
     const webhook = classifyMessage(mockMessage({ channelId: '111', webhookId: 'wh-1' }), ALLOW);
-    expect(webhook).toEqual({ forward: true, reason: 'allowed' });
+    expect(webhook).toEqual({ forward: true, reason: 'allowed', kind: 'callout' });
   });
 
   it('always ignores the bot’s own messages', () => {
@@ -127,12 +129,36 @@ describe('classifyMessage', () => {
     const cfg: MessageFilterConfig = {
       discordAllowedChannelIds: ['111'],
       discordAllowedAuthorIds: ['trusted-user'],
+      discordRecapChannelIds: [],
     };
     const blocked = classifyMessage(mockMessage({ channelId: '111', author: { id: 'stranger' } }), cfg);
     expect(blocked).toEqual({ forward: false, reason: 'author_not_allowed' });
 
     const allowed = classifyMessage(mockMessage({ channelId: '111', author: { id: 'trusted-user' } }), cfg);
     expect(allowed.forward).toBe(true);
+  });
+
+  it('classifies recap-channel messages as recap, skipping the author gate', () => {
+    const cfg: MessageFilterConfig = {
+      discordAllowedChannelIds: ['111'],
+      discordAllowedAuthorIds: ['trusted-user'],
+      discordRecapChannelIds: ['recap-1'],
+    };
+    const result = classifyMessage(
+      mockMessage({ channelId: 'recap-1', author: { id: 'recap-bot', bot: true } }),
+      cfg
+    );
+    expect(result).toEqual({ forward: true, reason: 'allowed', kind: 'recap' });
+  });
+
+  it('recap classification wins when a channel is on both lists', () => {
+    const cfg: MessageFilterConfig = {
+      discordAllowedChannelIds: ['both'],
+      discordAllowedAuthorIds: [],
+      discordRecapChannelIds: ['both'],
+    };
+    const result = classifyMessage(mockMessage({ channelId: 'both' }), cfg);
+    expect(result).toEqual({ forward: true, reason: 'allowed', kind: 'recap' });
   });
 });
 
@@ -191,10 +217,12 @@ describe('configured DISCORD_ALLOWED_CHANNEL_IDS', () => {
         const result = classifyMessage(mockMessage({ channelId, author: { id: allowedAuthorId } }), {
           discordAllowedChannelIds: configured,
           discordAllowedAuthorIds: config.discordAllowedAuthorIds,
+          discordRecapChannelIds: [],
         });
         expect(result, `channel ${channelId} should be forwarded`).toEqual({
           forward: true,
           reason: 'allowed',
+          kind: 'callout',
         });
       }
     }

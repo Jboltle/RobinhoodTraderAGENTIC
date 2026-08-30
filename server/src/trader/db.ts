@@ -19,6 +19,10 @@
  *   trades              id uuid pk, user_id uuid -> auth.users, message_id text,
  *                       kind text, code text, reason text, ticker text, action text,
  *                       order_payload jsonb, timestamp timestamptz
+ *   recaps              message_id text pk, channel_id text, posted_at timestamptz,
+ *                       recap_date date, content text, content_hash text,
+ *                       parse jsonb, parse_status text, parser_version int
+ *   recap_insights      window_days int pk, generated_at timestamptz, content text
  *   settings            user_id uuid pk -> auth.users, payload jsonb
  *   allowed_emails      email text pk
  *   broker_connections  user_id uuid pk -> auth.users, encrypted_tokens text
@@ -34,6 +38,7 @@ import {
   type TradeSettings,
 } from '../shared/types.js';
 import { decryptTokens, encryptTokens } from './rh/tokenCrypto.js';
+import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
 import type { PersistedState } from './rh/types.js';
 
 /** How far the LLM got on a callout. Staleness is per-user, not recorded here. */
@@ -60,6 +65,33 @@ export interface Caller {
   readonly displayName: string;
   readonly avatarUrl: string | null;
   readonly lastSeenAt: string;
+}
+
+/** A row in the shared `recaps` table: raw daily-recap post plus the cached parse. */
+export interface StoredRecap {
+  readonly messageId: string;
+  readonly channelId: string;
+  readonly postedAt: string;
+  /** ISO trading day from the recap header; null for non-recap channel posts. */
+  readonly recapDate: string | null;
+  readonly content: string;
+  readonly contentHash: string;
+  readonly parse: RecapParse | null;
+  readonly parseStatus: RecapParseStatus;
+  readonly parserVersion: number;
+}
+
+/** Enough of a recaps row to decide whether a fetched message needs a re-save. */
+export interface StoredRecapMeta {
+  readonly messageId: string;
+  readonly contentHash: string;
+  readonly parserVersion: number;
+}
+
+export interface StoredRecapInsight {
+  readonly windowDays: number;
+  readonly generatedAt: string;
+  readonly content: string;
 }
 
 /** A user identified by a verified Supabase access token. */
@@ -105,6 +137,18 @@ export interface TraderDb {
   listCalloutsMissingAuthor(): Promise<{ messageId: string; timestamp: string }[]>;
   setCalloutAuthor(messageId: string, authorId: string): Promise<void>;
 
+  saveRecap(recap: StoredRecap): Promise<void>;
+  /** Hash + parser version for the given message ids, for sweep upsert decisions. */
+  listRecapMetas(messageIds: readonly string[]): Promise<Map<string, StoredRecapMeta>>;
+  /** Daily recaps (rows with a recap_date) on or after `sinceDate` (ISO date). */
+  listRecapsSince(sinceDate: string): Promise<StoredRecap[]>;
+  latestRecapPostedAt(): Promise<string | null>;
+  /** Rows whose cached parse predates `version` — re-parsed from raw at sweep. */
+  listRecapsWithStaleParse(version: number): Promise<StoredRecap[]>;
+
+  getRecapInsight(windowDays: number): Promise<StoredRecapInsight | null>;
+  saveRecapInsight(insight: StoredRecapInsight): Promise<void>;
+
   // ---- Auth ------------------------------------------------------------------
 
   isEmailAllowed(email: string): Promise<boolean>;
@@ -131,6 +175,9 @@ export function createTraderDb(): TraderDb {
 const DECISION_COLUMNS = 'message_id, kind, code, reason, ticker, action, order_payload, timestamp';
 const CALLOUT_COLUMNS =
   'message_id, channel_id, channel_name, author_id, author_name, content, timestamp, embeds, parse, parse_status';
+const RECAP_COLUMNS =
+  'message_id, channel_id, posted_at, recap_date, content, content_hash, parse, parse_status, parser_version';
+const RECAP_META_CHUNK = 100;
 
 class SupabaseTraderDb implements TraderDb {
   constructor(private readonly supabase: SupabaseClient) {}
@@ -348,6 +395,103 @@ class SupabaseTraderDb implements TraderDb {
     if (error) throw queryError('backfill callout author', error);
   }
 
+  async saveRecap(recap: StoredRecap): Promise<void> {
+    const { error } = await this.supabase.from('recaps').upsert(
+      {
+        message_id: recap.messageId,
+        channel_id: recap.channelId,
+        posted_at: recap.postedAt,
+        recap_date: recap.recapDate,
+        content: recap.content,
+        content_hash: recap.contentHash,
+        parse: recap.parse,
+        parse_status: recap.parseStatus,
+        parser_version: recap.parserVersion,
+      },
+      { onConflict: 'message_id' }
+    );
+    if (error) throw queryError('save recap', error);
+  }
+
+  async listRecapMetas(messageIds: readonly string[]): Promise<Map<string, StoredRecapMeta>> {
+    const metas = new Map<string, StoredRecapMeta>();
+    // Chunked: a year-deep sweep can carry hundreds of ids, and PostgREST
+    // `in` filters ride in the query string.
+    for (let start = 0; start < messageIds.length; start += RECAP_META_CHUNK) {
+      const chunk = messageIds.slice(start, start + RECAP_META_CHUNK);
+      const { data, error } = await this.supabase
+        .from('recaps')
+        .select('message_id, content_hash, parser_version')
+        .in('message_id', [...chunk]);
+      if (error) throw queryError('load recap metas', error);
+      for (const row of data ?? []) {
+        metas.set(String(row.message_id), {
+          messageId: String(row.message_id),
+          contentHash: String(row.content_hash),
+          parserVersion: Number(row.parser_version),
+        });
+      }
+    }
+    return metas;
+  }
+
+  async listRecapsSince(sinceDate: string): Promise<StoredRecap[]> {
+    const { data, error } = await this.supabase
+      .from('recaps')
+      .select(RECAP_COLUMNS)
+      .gte('recap_date', sinceDate)
+      .order('recap_date', { ascending: true });
+    if (error) throw queryError('list recaps', error);
+    return (data ?? []).map(toStoredRecap);
+  }
+
+  async latestRecapPostedAt(): Promise<string | null> {
+    const { data, error } = await this.supabase
+      .from('recaps')
+      .select('posted_at')
+      .order('posted_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw queryError('load latest recap time', error);
+    return data?.posted_at ? String(data.posted_at) : null;
+  }
+
+  async listRecapsWithStaleParse(version: number): Promise<StoredRecap[]> {
+    const { data, error } = await this.supabase
+      .from('recaps')
+      .select(RECAP_COLUMNS)
+      .lt('parser_version', version);
+    if (error) throw queryError('list stale recap parses', error);
+    return (data ?? []).map(toStoredRecap);
+  }
+
+  async getRecapInsight(windowDays: number): Promise<StoredRecapInsight | null> {
+    const { data, error } = await this.supabase
+      .from('recap_insights')
+      .select('window_days, generated_at, content')
+      .eq('window_days', windowDays)
+      .maybeSingle();
+    if (error) throw queryError('load recap insight', error);
+    if (!data) return null;
+    return {
+      windowDays: Number(data.window_days),
+      generatedAt: String(data.generated_at),
+      content: String(data.content),
+    };
+  }
+
+  async saveRecapInsight(insight: StoredRecapInsight): Promise<void> {
+    const { error } = await this.supabase.from('recap_insights').upsert(
+      {
+        window_days: insight.windowDays,
+        generated_at: insight.generatedAt,
+        content: insight.content,
+      },
+      { onConflict: 'window_days' }
+    );
+    if (error) throw queryError('save recap insight', error);
+  }
+
   async isEmailAllowed(email: string): Promise<boolean> {
     const { data, error } = await this.supabase
       .from('allowed_emails')
@@ -415,6 +559,20 @@ function toDecision(row: Record<string, unknown>): Decision {
     ticker: (row.ticker as string | null) ?? null,
     action: (row.action as Decision['action']) ?? null,
     order: (row.order_payload as Decision['order']) ?? null,
+  };
+}
+
+function toStoredRecap(row: Record<string, unknown>): StoredRecap {
+  return {
+    messageId: String(row.message_id),
+    channelId: String(row.channel_id ?? ''),
+    postedAt: String(row.posted_at),
+    recapDate: (row.recap_date as string | null) ?? null,
+    content: String(row.content ?? ''),
+    contentHash: String(row.content_hash ?? ''),
+    parse: (row.parse as RecapParse | null) ?? null,
+    parseStatus: (row.parse_status as RecapParseStatus) ?? 'failed',
+    parserVersion: Number(row.parser_version ?? 0),
   };
 }
 

@@ -61,13 +61,14 @@ function logIgnoredMessage(message: Message, reason: string): void {
 }
 
 async function validateConfiguredChannels(client: Client<true>): Promise<void> {
-  if (config.discordAllowedChannelIds.length === 0) {
+  const listenChannelIds = [...config.discordAllowedChannelIds, ...config.discordRecapChannelIds];
+  if (listenChannelIds.length === 0) {
     log.warn('no Discord channel allowlist configured; bot will ignore all Discord messages');
     return;
   }
 
   await Promise.all(
-    config.discordAllowedChannelIds.map(async (channelId) => {
+    listenChannelIds.map(async (channelId) => {
       try {
         const channel = await client.channels.fetch(channelId);
         if (!channel) {
@@ -175,6 +176,7 @@ async function main(): Promise<void> {
     log.info('discord forwarder ready', {
       tag: ready.user.tag,
       listeningChannels: config.discordAllowedChannelIds.length ? config.discordAllowedChannelIds : 'none',
+      recapChannels: config.discordRecapChannelIds.length ? config.discordRecapChannelIds : 'none',
       allowedAuthors: config.discordAllowedAuthorIds.length || 'all',
       logIgnoredMessages: config.discordLogIgnoredMessages,
       forwardChannel: config.discordForwardChannelId ?? 'disabled',
@@ -205,21 +207,27 @@ async function main(): Promise<void> {
         return;
       }
 
-      const envelope = buildEnvelope(message, content);
+      const envelope = buildEnvelope(message, content, classification.kind);
 
       log.info('forwarding message', {
         messageId: envelope.messageId,
         author: envelope.authorName,
         channel: envelope.channelId,
+        kind: envelope.kind ?? 'callout',
       });
 
-      await mirrorToDiscordChannel(client, message, envelope).catch((err) => {
-        log.warn('failed to mirror Discord message', {
-          messageId: envelope.messageId,
-          forwardChannel: config.discordForwardChannelId,
-          error: (err as Error).message,
+      // Recaps never mirror: the funnel channel is the callout catch-up
+      // source (parseMirrorMessage) and a mirrored recap would re-enter the
+      // trade path on the next wake.
+      if (envelope.kind !== 'recap') {
+        await mirrorToDiscordChannel(client, message, envelope).catch((err) => {
+          log.warn('failed to mirror Discord message', {
+            messageId: envelope.messageId,
+            forwardChannel: config.discordForwardChannelId,
+            error: (err as Error).message,
+          });
         });
-      });
+      }
       await forwardToTrader(envelope);
     } catch (err) {
       log.error('failed to forward message', {

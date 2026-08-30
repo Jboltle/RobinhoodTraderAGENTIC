@@ -16,9 +16,16 @@ export const DiscordEnvelopeSchema = z.object({
   timestamp: z.string(),
   /** Raw Discord embed JSON, passed through permissively (the bot flattens it into `content` for the LLM). */
   embeds: z.array(z.record(z.string(), z.unknown())).optional(),
+  /**
+   * Trader routing: 'recap' messages are stored for performance analytics and
+   * never enter the trade pipeline. Absent (older bot) means 'callout'.
+   */
+  kind: z.enum(['callout', 'recap']).optional(),
 });
 
 export type DiscordEnvelope = z.infer<typeof DiscordEnvelopeSchema>;
+
+export type EnvelopeKind = NonNullable<DiscordEnvelope['kind']>;
 
 // =============================================================================
 // Callout — the structured trade signal extracted from a Discord message

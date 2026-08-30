@@ -23,6 +23,14 @@ import { registerAuth, requireUser } from './auth.js';
 import type { StoredCallout, TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import type { MessageProcessor } from './pipeline/index.js';
+import {
+  DEFAULT_RECAP_WINDOW_DAYS,
+  RECAP_WINDOW_DAYS_CHOICES,
+  computeRecapPerformance,
+  isoDateDaysAgo,
+} from './recaps/analytics.js';
+import { refreshRecapInsights } from './recaps/insights.js';
+import { ingestRecapEnvelope } from './recaps/sweep.js';
 import type { McpRegistry, UserBroker } from './rh/mcpRegistry.js';
 import type { RobinhoodTools } from './rh/tools.js';
 
@@ -101,6 +109,26 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
 
     const { envelope } = result.data;
+
+    // Recaps are analytics data, never trades: they route to the recaps table
+    // and refresh the cached narration. Structurally unreachable by the
+    // trade pipeline below.
+    if (envelope.kind === 'recap') {
+      log.info('webhook: received recap', {
+        messageId: envelope.messageId,
+        channel: envelope.channelId,
+      });
+      void ingestRecapEnvelope(deps.db, envelope)
+        .then((changed) => (changed ? refreshRecapInsights(deps.db) : undefined))
+        .catch((err: unknown) =>
+          log.error('recap ingest crashed', {
+            messageId: envelope.messageId,
+            error: (err as Error).message,
+          })
+        );
+      return reply.status(202).send({ ok: true });
+    }
+
     log.info('webhook: received callout candidate', {
       messageId: envelope.messageId,
       author: envelope.authorName,
@@ -249,6 +277,26 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   fastify.get('/api/callers', async (request, reply) => {
     requireUser(request);
     return reply.send({ callers: await deps.db.listCallers() });
+  });
+
+  // Performance & Metrix: caller stats computed from parsed daily recaps.
+  // Shared data (same for every user), auth still required. Stats are
+  // recomputed per request — a year of recaps is a few thousand trades — and
+  // the AI narration is read from its cache, never generated inline.
+  fastify.get('/api/recaps/performance', async (request, reply) => {
+    requireUser(request);
+    const daysRaw = (request.query as { days?: string }).days;
+    const days = daysRaw === undefined ? DEFAULT_RECAP_WINDOW_DAYS : Number(daysRaw);
+    if (!RECAP_WINDOW_DAYS_CHOICES.includes(days)) {
+      return reply
+        .status(400)
+        .send({ error: `days must be one of ${RECAP_WINDOW_DAYS_CHOICES.join(', ')}` });
+    }
+    const recaps = await deps.db.listRecapsSince(isoDateDaysAgo(days));
+    return reply.send({
+      performance: computeRecapPerformance(recaps, days),
+      insight: await deps.db.getRecapInsight(days),
+    });
   });
 
   // ---- Settings -----------------------------------------------------------------

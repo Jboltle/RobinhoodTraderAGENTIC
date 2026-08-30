@@ -22,7 +22,7 @@ const log = createLogger('trader:callouts');
 const DISCORD_API = 'https://discord.com/api/v10';
 const PAGE_SIZE = 100;
 /** Discord message types the bot treats as non-system: DEFAULT and REPLY. */
-const USER_MESSAGE_TYPES = new Set([0, 19]);
+export const USER_MESSAGE_TYPES = new Set([0, 19]);
 
 /** Subset of Discord's REST message object we consume. */
 export interface RestMessage {

@@ -228,7 +228,13 @@ describe('buildEnvelope', () => {
       content: 'BTO $QQQ 710p 06/08 0.97',
       timestamp: '2026-06-09T14:27:00.000Z',
       embeds: [],
+      kind: 'callout',
     });
+  });
+
+  it('stamps recap kind when asked', () => {
+    const envelope = buildEnvelope(mockMessage({}), 'OPTIONALITY PRO DAILY RECAP | ...', 'recap');
+    expect(envelope.kind).toBe('recap');
   });
 
   it('uses username when member displayName is unavailable', () => {

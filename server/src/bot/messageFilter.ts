@@ -8,16 +8,20 @@
 import type { Message } from 'discord.js';
 
 import { isAllowed } from '../shared/config.js';
+import type { EnvelopeKind } from '../shared/types.js';
 
 export interface MessageFilterConfig {
   readonly discordAllowedChannelIds: readonly string[];
   readonly discordAllowedAuthorIds: readonly string[];
+  readonly discordRecapChannelIds: readonly string[];
 }
 
 export interface MessageClassification {
   readonly forward: boolean;
   /** 'allowed' when forwardable, otherwise the ignore reason code. */
   readonly reason: string;
+  /** Which trader path the message belongs to. Set only when forward=true. */
+  readonly kind?: EnvelopeKind;
 }
 
 /**
@@ -61,11 +65,16 @@ export function hasForwardableContent(content: string): boolean {
 }
 
 /**
- * Ordered filter chain: system -> self -> channel allow-list -> author
- * allow-list. Bot/webhook-authored messages are always allowed because most
- * alert channels are bot-driven; the bot's own posts are still dropped (via
- * `selfAuthorId`) so mirrored messages never loop back in. Content emptiness
- * is checked separately by the caller via {@link hasForwardableContent}.
+ * Ordered filter chain: system -> self -> recap channel -> channel allow-list
+ * -> author allow-list. Bot/webhook-authored messages are always allowed
+ * because most alert channels are bot-driven; the bot's own posts are still
+ * dropped (via `selfAuthorId`) so mirrored messages never loop back in.
+ * Content emptiness is checked separately by the caller via
+ * {@link hasForwardableContent}.
+ *
+ * Recap channels win over the callout allow-list when a channel is on both,
+ * and skip the author gate: recaps are posted by the service's own bot, not
+ * the callout authors.
  */
 export function classifyMessage(
   message: Message,
@@ -76,11 +85,14 @@ export function classifyMessage(
   if (selfAuthorId && message.author.id === selfAuthorId) {
     return { forward: false, reason: 'self_author' };
   }
+  if (isAllowedDiscordChannel(message, cfg.discordRecapChannelIds)) {
+    return { forward: true, reason: 'allowed', kind: 'recap' };
+  }
   if (!isAllowedDiscordChannel(message, cfg.discordAllowedChannelIds)) {
     return { forward: false, reason: 'channel_not_allowed' };
   }
   if (!isAllowed(message.author.id, cfg.discordAllowedAuthorIds)) {
     return { forward: false, reason: 'author_not_allowed' };
   }
-  return { forward: true, reason: 'allowed' };
+  return { forward: true, reason: 'allowed', kind: 'callout' };
 }
