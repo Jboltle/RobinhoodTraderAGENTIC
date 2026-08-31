@@ -216,17 +216,20 @@ export class RobinhoodTools {
     const key = `${symbol}|${optionType}|${strike}|${expiration}`;
     const cached = this.optionIdCache.get(key);
     if (cached) return cached;
+    // Live guide on an empty match: chain_symbol, expiration_date (singular),
+    // type, strike_price. expiration_dates was the July 2026 name and is
+    // ignored now, so the lookup ran with no expiry and returned [].
     const optionId = await this.callTool(
       TOOL_NAMES.optionInstruments,
       {
         chain_symbol: symbol,
-        expiration_dates: expiration,
+        expiration_date: expiration,
         // The schema wants the exact strike string, RH-formatted ("150.0000").
         strike_price: strike.toFixed(4),
         type: optionType,
         state: 'active',
       },
-      parseOptionInstrumentId
+      (raw) => parseOptionInstrumentId(raw, `${symbol} ${strike.toFixed(4)} ${optionType} ${expiration}`)
     );
     this.optionIdCache.set(key, optionId);
     return optionId;
@@ -472,7 +475,7 @@ function parseOptionInstruments(result: CallToolResult): Map<string, OptionInstr
   return byId;
 }
 
-function parseOptionInstrumentId(result: CallToolResult): string {
+function parseOptionInstrumentId(result: CallToolResult, contract: string): string {
   const data = structuredOrJson(result);
   const list =
     deepFind(data, ['instruments', 'results'], (v): v is unknown[] => Array.isArray(v)) ?? [];
@@ -481,7 +484,7 @@ function parseOptionInstrumentId(result: CallToolResult): string {
     if (typeof id === 'string' && id.length > 0) return id;
   }
   throw new Error(
-    `no option instrument matched the contract: ${extractText(result).slice(0, 200)}`
+    `no option instrument matched ${contract}: ${extractText(result).slice(0, 200)}`
   );
 }
 

@@ -144,7 +144,7 @@ describe('RobinhoodTools order placement argument shapes', () => {
       TOOL_NAMES.optionInstruments,
       expect.objectContaining({
         chain_symbol: 'RIVN',
-        expiration_dates: '2026-07-24',
+        expiration_date: '2026-07-24',
         strike_price: '16.0000',
         type: 'call',
       })
@@ -161,6 +161,27 @@ describe('RobinhoodTools order placement argument shapes', () => {
     for (const banned of ['price', 'symbol', 'strike_price', 'expiration_date', 'option_type', 'side']) {
       expect(args).not.toHaveProperty(banned);
     }
+  });
+
+  it('names the contract when get_option_instruments returns no rows', async () => {
+    const mcp = makeMcp(
+      [TOOL_NAMES.accounts, TOOL_NAMES.optionInstruments, TOOL_NAMES.placeOptionsOrder],
+      {
+        [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+        [TOOL_NAMES.optionInstruments]: { data: { instruments: [] } },
+      }
+    );
+    await expect(
+      new RobinhoodTools(mcp).placeOptionsOrder({
+        symbol: 'RIVN',
+        optionType: 'call',
+        strike: 16,
+        expiration: '2026-07-24',
+        contracts: 1,
+        side: 'buy',
+        orderType: 'market',
+      })
+    ).rejects.toThrow(/RIVN 16\.0000 call 2026-07-24/);
   });
 
   it('places a limit sell as a closing leg with a string price', async () => {

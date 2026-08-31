@@ -121,7 +121,10 @@ services:
     runtime: static
     # No rootDir: staticPublishPath is repo-root-relative, so keeping every
     # path in one frame of reference avoids guessing which ones rootDir shifts.
-    buildCommand: cd client && bun install --frozen-lockfile && API_URL="https://$TRADER_HOSTNAME" bun --bun run build
+    # API_URL wins if set on the service (needed when the trader is not named
+    # rh-trader). Otherwise derive it from TRADER_HOSTNAME. Empty = fail the
+    # build instead of shipping a bundle that fetches localhost:3000.
+    buildCommand: cd client && bun install --frozen-lockfile && API_URL="${API_URL:-https://$TRADER_HOSTNAME}" && test -n "${API_URL#https://}" && bun --bun run build
     staticPublishPath: ./client/dist/client
     routes:
       # The dashboard is a client-rendered SPA with one prerendered shell, so
@@ -141,6 +144,11 @@ services:
           name: rh-trader
           type: web
           envVarKey: RENDER_EXTERNAL_HOSTNAME
+      # Set this when the live trader is not the blueprint name `rh-trader`
+      # (e.g. https://robinhoodtraderagentic.onrender.com). Beats an empty
+      # TRADER_HOSTNAME from a mismatched fromService.
+      - key: API_URL
+        sync: false
       # Baked into the bundle, so both are public. That is fine: the anon key
       # is only used for auth, and every table is default-deny under RLS.
       - key: SUPABASE_URL
