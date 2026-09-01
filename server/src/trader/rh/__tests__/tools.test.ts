@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { RobinhoodMcpClient } from '../mcpClient.js';
 import type { CallToolResult } from '../types.js';
-import { RobinhoodTools, TOOL_NAMES } from '../tools.js';
+import type { ToolInputSchema } from '../types.js';
+import {
+  optionInstrumentIdArgs,
+  optionInstrumentLookupArgs,
+  RobinhoodTools,
+  TOOL_NAMES,
+} from '../tools.js';
 
 // Live-verified payload shapes from the real Robinhood MCP server.
 const ACCOUNTS_PAYLOAD = {
@@ -48,11 +54,13 @@ function textResult(payload: unknown): CallToolResult {
 
 function makeMcp(
   toolNames: string[],
-  responses: Record<string, unknown>
+  responses: Record<string, unknown>,
+  schemas: Record<string, ToolInputSchema> = {}
 ): RobinhoodMcpClient {
   return {
     isConnected: vi.fn().mockReturnValue(true),
     getToolNames: vi.fn().mockReturnValue(toolNames),
+    getToolInputSchema: vi.fn((name: string) => schemas[name]),
     callTool: vi.fn(async (name: string) => textResult(responses[name])),
   } as unknown as RobinhoodMcpClient;
 }
@@ -144,11 +152,12 @@ describe('RobinhoodTools order placement argument shapes', () => {
       TOOL_NAMES.optionInstruments,
       expect.objectContaining({
         chain_symbol: 'RIVN',
-        expiration_date: '2026-07-24',
+        expiration_dates: '2026-07-24',
         strike_price: '16.0000',
         type: 'call',
       })
     );
+    expect(lastCallArgs(mcp, TOOL_NAMES.optionInstruments)).not.toHaveProperty('expiration_date');
     const args = lastCallArgs(mcp, TOOL_NAMES.placeOptionsOrder);
     expect(args).toMatchObject({
       legs: [{ option_id: 'opt-uuid-1', side: 'buy', position_effect: 'open', ratio_quantity: 1 }],
@@ -302,5 +311,113 @@ describe('RobinhoodTools get_portfolio parsing', () => {
     expect(bp.amountUsd).toBe(0);
     expect(bp.portfolioValueUsd).toBeNull();
     expect(mcp.callTool).toHaveBeenCalledWith(TOOL_NAMES.accounts, {});
+  });
+});
+
+// Live July 2026 dump: additionalProperties false, expiry filter is plural.
+const LIVE_INSTRUMENTS_SCHEMA: ToolInputSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    chain_symbol: { type: 'string' },
+    expiration_dates: { type: 'string' },
+    strike_price: { type: 'string' },
+    type: { type: 'string' },
+    state: { type: 'string' },
+    ids: { type: 'string' },
+  },
+};
+
+describe('option instrument args follow the live MCP schema', () => {
+  const contract = {
+    symbol: 'AMZN',
+    optionType: 'call' as const,
+    strike: 230,
+    expiration: '2026-09-02',
+  };
+
+  it('uses expiration_dates and never expiration_date when the schema names the plural', () => {
+    const args = optionInstrumentLookupArgs(LIVE_INSTRUMENTS_SCHEMA, contract);
+    expect(args).toEqual({
+      chain_symbol: 'AMZN',
+      expiration_dates: '2026-09-02',
+      strike_price: '230.0000',
+      type: 'call',
+      state: 'active',
+    });
+    expect(args).not.toHaveProperty('expiration_date');
+  });
+
+  it('uses expiration_date only when that is the advertised property', () => {
+    const args = optionInstrumentLookupArgs(
+      { properties: { chain_symbol: {}, expiration_date: { type: 'string' }, strike_price: {}, type: {} } },
+      contract
+    );
+    expect(args).toEqual({
+      chain_symbol: 'AMZN',
+      expiration_date: '2026-09-02',
+      strike_price: '230.0000',
+      type: 'call',
+    });
+    expect(args).not.toHaveProperty('expiration_dates');
+  });
+
+  it('sends an array when the schema types the expiry filter as array', () => {
+    const args = optionInstrumentLookupArgs(
+      { properties: { expiration_dates: { type: 'array', items: { type: 'string' } } } },
+      contract
+    );
+    expect(args.expiration_dates).toEqual(['2026-09-02']);
+  });
+
+  it('defaults to expiration_dates when no schema is advertised yet', () => {
+    const args = optionInstrumentLookupArgs(undefined, contract);
+    expect(args.expiration_dates).toBe('2026-09-02');
+    expect(args).not.toHaveProperty('expiration_date');
+  });
+
+  it('throws if the live schema has no expiry filter at all', () => {
+    expect(() => optionInstrumentLookupArgs({ properties: { chain_symbol: {} } }, contract)).toThrow(
+      /no expiry filter/
+    );
+  });
+
+  it('looks up instruments by ids when that property is advertised', () => {
+    expect(optionInstrumentIdArgs(LIVE_INSTRUMENTS_SCHEMA, ['opt-1', 'opt-2'])).toEqual({
+      ids: 'opt-1,opt-2',
+    });
+  });
+
+  it('places an order using only properties from the live schema', async () => {
+    const mcp = makeMcp(
+      [TOOL_NAMES.accounts, TOOL_NAMES.optionInstruments, TOOL_NAMES.placeOptionsOrder],
+      {
+        [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+        [TOOL_NAMES.optionInstruments]: INSTRUMENTS_PAYLOAD,
+        [TOOL_NAMES.placeOptionsOrder]: { data: { order: { id: 'order-1', state: 'queued' } } },
+      },
+      { [TOOL_NAMES.optionInstruments]: LIVE_INSTRUMENTS_SCHEMA }
+    );
+    await new RobinhoodTools(mcp).placeOptionsOrder({
+      symbol: 'RIVN',
+      optionType: 'call',
+      strike: 16,
+      expiration: '2026-07-24',
+      contracts: 1,
+      side: 'buy',
+      orderType: 'market',
+    });
+
+    const args = (mcp.callTool as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([name]) => name === TOOL_NAMES.optionInstruments
+    )![1] as Record<string, unknown>;
+    expect(Object.keys(args).every((k) => k in LIVE_INSTRUMENTS_SCHEMA.properties!)).toBe(true);
+    expect(args).toMatchObject({
+      chain_symbol: 'RIVN',
+      expiration_dates: '2026-07-24',
+      strike_price: '16.0000',
+      type: 'call',
+    });
+    expect(args).not.toHaveProperty('expiration_date');
   });
 });

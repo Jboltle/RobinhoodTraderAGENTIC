@@ -9,7 +9,7 @@ import { createLogger } from '../../shared/logger.js';
 import { awaitAuthorizationCode } from './oauthCallback.js';
 import { SupabaseOAuthProvider } from './oauthProvider.js';
 import { readTokenStatus } from './tokenBootstrap.js';
-import type { BrokerTokenStore, CallToolResult, TokenStatus } from './types.js';
+import type { BrokerTokenStore, CallToolResult, TokenStatus, ToolInputSchema } from './types.js';
 
 export type { CallToolResult } from './types.js';
 
@@ -38,6 +38,7 @@ export class RobinhoodMcpClient {
 
   private client: Client | undefined;
   private toolNames: string[] = [];
+  private toolSchemas = new Map<string, ToolInputSchema>();
   private connectPromise: Promise<void> | undefined;
   /** Authorization URL awaiting user consent; null once connected. */
   private pendingAuthUrl: string | null = null;
@@ -190,6 +191,9 @@ export class RobinhoodMcpClient {
   private async introspect(client: Client): Promise<void> {
     const list = await client.listTools();
     this.toolNames = list.tools.map((t) => t.name);
+    this.toolSchemas = new Map(
+      list.tools.map((t) => [t.name, t.inputSchema as ToolInputSchema])
+    );
     log.info('connected to Robinhood MCP', {
       toolCount: this.toolNames.length,
       tools: this.toolNames,
@@ -197,16 +201,21 @@ export class RobinhoodMcpClient {
     });
     // The server validates arguments against these schemas (e.g. quantity is
     // string-typed); log them once so type mismatches are diagnosable from logs.
-    const orderTools = list.tools.filter((t) => t.name.startsWith('place_'));
-    if (orderTools.length > 0) {
-      log.info('order tool input schemas', {
-        schemas: Object.fromEntries(orderTools.map((t) => [t.name, t.inputSchema])),
+    const logged = list.tools.filter((t) => /option|place_/.test(t.name));
+    if (logged.length > 0) {
+      log.info('option/order tool input schemas', {
+        schemas: Object.fromEntries(logged.map((t) => [t.name, t.inputSchema])),
       });
     }
   }
 
   getToolNames(): readonly string[] {
     return this.toolNames;
+  }
+
+  /** Live `tools/list` input schema for a tool, or undefined before connect. */
+  getToolInputSchema(name: string): ToolInputSchema | undefined {
+    return this.toolSchemas.get(name);
   }
 
   isConnected(): boolean {

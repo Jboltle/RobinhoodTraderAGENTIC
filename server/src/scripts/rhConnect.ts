@@ -38,6 +38,8 @@ async function main(): Promise<void> {
 
   const advertised = mcp.getToolNames();
   log.info('connected', { toolCount: advertised.length, tools: advertised });
+  const instrumentsSchema = mcp.getToolInputSchema(TOOL_NAMES.optionInstruments);
+  log.info('get_option_instruments input schema', { schema: instrumentsSchema });
 
   // ---- Verify our canonical mapping ----------------------------------
   const summary: Record<string, { canonical: string; advertised: boolean }> = {};

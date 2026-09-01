@@ -16,6 +16,7 @@ import type {
   PositionsResult,
   QuoteResult,
   TimeInForce,
+  ToolInputSchema,
 } from './types.js';
 
 export type * from './types.js';
@@ -119,7 +120,7 @@ export class RobinhoodTools {
     const ids = [...new Set(result.incomplete.map((row) => row.optionId))];
     const instruments = await this.callTool(
       TOOL_NAMES.optionInstruments,
-      { ids: ids.join(',') },
+      optionInstrumentIdArgs(this.optionInstrumentSchema(), ids),
       parseOptionInstruments
     );
     const positions = [...result.positions];
@@ -216,19 +217,17 @@ export class RobinhoodTools {
     const key = `${symbol}|${optionType}|${strike}|${expiration}`;
     const cached = this.optionIdCache.get(key);
     if (cached) return cached;
-    // Live guide on an empty match: chain_symbol, expiration_date (singular),
-    // type, strike_price. expiration_dates was the July 2026 name and is
-    // ignored now, so the lookup ran with no expiry and returned [].
+    // Input schema (tools/list) is the source of truth. The empty-match *guide*
+    // names response fields (expiration_date); sending that as an argument is
+    // rejected with additionalProperties: false (-32602).
     const optionId = await this.callTool(
       TOOL_NAMES.optionInstruments,
-      {
-        chain_symbol: symbol,
-        expiration_date: expiration,
-        // The schema wants the exact strike string, RH-formatted ("150.0000").
-        strike_price: strike.toFixed(4),
-        type: optionType,
-        state: 'active',
-      },
+      optionInstrumentLookupArgs(this.optionInstrumentSchema(), {
+        symbol,
+        optionType,
+        strike,
+        expiration,
+      }),
       (raw) => parseOptionInstrumentId(raw, `${symbol} ${strike.toFixed(4)} ${optionType} ${expiration}`)
     );
     this.optionIdCache.set(key, optionId);
@@ -282,6 +281,90 @@ export class RobinhoodTools {
     }
     return this.accountNumber;
   }
+
+  private optionInstrumentSchema(): ToolInputSchema | undefined {
+    return this.mcp.getToolInputSchema?.(TOOL_NAMES.optionInstruments);
+  }
+}
+
+// =============================================================================
+// Live-schema argument builders
+// =============================================================================
+
+/** Input filter name from the July 2026 dump; `expiration_date` is a response field. */
+const DEFAULT_EXPIRY_KEY = 'expiration_dates';
+
+/** Build get_option_instruments args from the live tools/list schema. */
+export function optionInstrumentLookupArgs(
+  schema: ToolInputSchema | undefined,
+  contract: {
+    symbol: string;
+    optionType: 'call' | 'put';
+    strike: number;
+    expiration: string;
+  }
+): Record<string, unknown> {
+  const props = schema?.properties;
+  const expiryKey = pickSchemaKey(props, ['expiration_dates', 'expiration_date']);
+  if (props && !expiryKey) {
+    throw new Error(
+      `get_option_instruments schema has no expiry filter. Properties: ${Object.keys(props).join(', ')}`
+    );
+  }
+  const key = expiryKey ?? DEFAULT_EXPIRY_KEY;
+  return retainSchemaProperties(
+    {
+      chain_symbol: contract.symbol,
+      [key]: schemaScalarOrArray(props?.[key], contract.expiration),
+      strike_price: contract.strike.toFixed(4),
+      type: contract.optionType,
+      state: 'active',
+    },
+    props
+  );
+}
+
+/** Build a by-id get_option_instruments query from the live schema. */
+export function optionInstrumentIdArgs(
+  schema: ToolInputSchema | undefined,
+  ids: readonly string[]
+): Record<string, unknown> {
+  const props = schema?.properties;
+  const key = pickSchemaKey(props, ['ids', 'id', 'instrument_ids']);
+  if (props && !key) {
+    throw new Error(
+      `get_option_instruments schema has no id filter. Properties: ${Object.keys(props).join(', ')}`
+    );
+  }
+  const idKey = key ?? 'ids';
+  const value = idKey === 'instrument_ids' ? [...ids] : ids.join(',');
+  return retainSchemaProperties({ [idKey]: value }, props);
+}
+
+function pickSchemaKey(
+  props: Record<string, unknown> | undefined,
+  candidates: readonly string[]
+): string | undefined {
+  if (!props) return undefined;
+  return candidates.find((k) => k in props);
+}
+
+function schemaScalarOrArray(spec: unknown, scalar: string): string | string[] {
+  const rec = asRecord(spec);
+  if (rec?.type === 'array' || rec?.items !== undefined) return [scalar];
+  return scalar;
+}
+
+function retainSchemaProperties(
+  args: Record<string, unknown>,
+  props: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  if (!props) return args;
+  const kept: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (k in props) kept[k] = v;
+  }
+  return kept;
 }
 
 // =============================================================================

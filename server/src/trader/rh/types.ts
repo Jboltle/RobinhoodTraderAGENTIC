@@ -16,6 +16,14 @@ export interface CallToolResult {
   readonly structuredContent?: Record<string, unknown>;
 }
 
+/** JSON Schema fragment advertised by MCP `tools/list` for one tool. */
+export interface ToolInputSchema {
+  readonly type?: string;
+  readonly properties?: Record<string, unknown>;
+  readonly additionalProperties?: boolean;
+  readonly required?: readonly string[];
+}
+
 // ---- Tool results / caller-facing args --------------------------------------
 
 export interface QuoteResult {
