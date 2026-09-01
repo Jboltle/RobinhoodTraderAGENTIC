@@ -15,3 +15,7 @@ _Avoid_: callout group, channel, analyst
 **Following**:
 A user's per-account choice of which Callers they copy-trade. Following is a user setting; ingestion is global and unaffected by it.
 _Avoid_: subscription, allowlist
+
+**User**:
+Someone invited to the dashboard. Identified by email; their user id is the key on trades, settings, and the broker connection.
+_Avoid_: account, profile, auth user

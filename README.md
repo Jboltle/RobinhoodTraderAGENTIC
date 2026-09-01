@@ -49,6 +49,7 @@ One parse serves everyone, which is the cost saving that matters as users are ad
 | `settings` | per-user | One `jsonb` payload — the full resolved settings. Authoritative; no env or file layer behind it. |
 | `allowed_emails` | shared | The signup gate. |
 | `broker_connections` | per-user | Robinhood tokens, AES-256-GCM encrypted under `RH_TOKENS_VAULT_KEY`. The database only ever holds ciphertext. |
+| `user_emails` | view | `user_id` + `email` from `auth.users`. The join for identifying a User. |
 
 Daily trade counts and per-ticker cooldowns are **derived** from `trades` with two count queries rather than stored, so a restart no longer resets the daily cap.
 

@@ -33,6 +33,7 @@ const TABLES = [
   'allowed_emails',
   'broker_connections',
   'callers',
+  'user_emails',
 ] as const;
 
 // Unique per run so reruns never collide with leftovers from a failed teardown.

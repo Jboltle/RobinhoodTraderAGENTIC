@@ -26,6 +26,7 @@
  *   settings            user_id uuid pk -> auth.users, payload jsonb
  *   allowed_emails      email text pk
  *   broker_connections  user_id uuid pk -> auth.users, encrypted_tokens text
+ *   user_emails         view: user_id uuid, email text  (auth.users id↔email)
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
@@ -526,13 +527,13 @@ class SupabaseTraderDb implements TraderDb {
 
   async findUserByEmail(email: string): Promise<AuthUser | null> {
     const wanted = email.trim().toLowerCase();
-    // ponytail: scans the first page of users, so it stops finding people past
-    // ~50 accounts. Only the operator CLIs use it. Upgrade path: a users view
-    // or an RPC that filters server-side.
-    const { data, error } = await this.supabase.auth.admin.listUsers();
-    if (error) throw new Error(`supabase: could not list users: ${error.message}`);
-    const user = data.users.find((u) => u.email?.toLowerCase() === wanted);
-    return user ? { id: user.id, email: user.email ?? null } : null;
+    const { data, error } = await this.supabase
+      .from('user_emails')
+      .select('user_id, email')
+      .eq('email', wanted)
+      .maybeSingle();
+    if (error) throw queryError('find user by email', error);
+    return data ? { id: String(data.user_id), email: data.email ?? null } : null;
   }
 
   async verifyAccessToken(token: string): Promise<AuthUser | null> {
