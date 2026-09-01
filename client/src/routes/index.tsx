@@ -3,8 +3,14 @@ import { useQuery } from '@tanstack/react-query'
 
 import { CalloutCard } from '../components/CalloutCard'
 import { ConnectBanner } from '../components/ConnectBanner'
-import { fetchCallouts, fetchPortfolio, fetchSettings } from '../lib/api'
+import {
+  fetchCallers,
+  fetchCallouts,
+  fetchPortfolio,
+  fetchSettings,
+} from '../lib/api'
 import type {
+  Caller,
   CalloutItem,
   Decision,
   PerformanceRow,
@@ -12,6 +18,7 @@ import type {
   StageEvent,
   TradeSettings,
 } from '../lib/api'
+import { resolveTradeCaller, type TradeCallerFace } from '../lib/following'
 
 export const Route = createFileRoute('/')({ component: Dashboard, ssr: false })
 
@@ -43,6 +50,11 @@ function Dashboard() {
     queryFn: fetchSettings,
     retry: false,
   })
+  const callers = useQuery<Caller[]>({
+    queryKey: ['callers'],
+    queryFn: fetchCallers,
+    retry: false,
+  })
 
   // null (or settings still loading) = show everyone. Callouts stored before
   // author identity was kept (authorId null) stay visible.
@@ -69,6 +81,8 @@ function Dashboard() {
         <TradesTable
           decisions={decisions.data ?? []}
           positions={performance.data ?? []}
+          callouts={callouts.data ?? []}
+          callers={callers.data ?? []}
         />
       </section>
 
@@ -215,11 +229,17 @@ const TRADE_KINDS = new Set([
 function TradesTable({
   decisions,
   positions,
+  callouts,
+  callers,
 }: {
   decisions: Decision[]
   positions: PerformanceRow[]
+  callouts: CalloutItem[]
+  callers: Caller[]
 }) {
   const trades = decisions.filter((d) => TRADE_KINDS.has(d.kind))
+  const calloutByMessageId = new Map(callouts.map((c) => [c.messageId, c]))
+  const rosterByAuthorId = new Map(callers.map((c) => [c.authorId, c]))
 
   if (trades.length === 0) {
     return <EmptyState>No trades yet.</EmptyState>
@@ -230,6 +250,7 @@ function TradesTable({
       <table className="w-full text-left text-sm tabular-nums">
         <thead className="text-xs text-ink-400">
           <tr>
+            <Th>Caller</Th>
             <Th>Ticker</Th>
             <Th>Side</Th>
             <Th>Qty</Th>
@@ -245,6 +266,7 @@ function TradesTable({
               key={`${d.messageId}-${d.at}`}
               decision={d}
               position={matchPosition(d, positions)}
+              caller={resolveTradeCaller(d.messageId, calloutByMessageId, rosterByAuthorId)}
             />
           ))}
         </tbody>
@@ -275,9 +297,11 @@ function matchPosition(
 function TradeRow({
   decision,
   position,
+  caller,
 }: {
   decision: Decision
   position: PerformanceRow | undefined
+  caller: TradeCallerFace | null
 }) {
   const { order } = decision
   const ticker = order?.symbol ?? decision.ticker ?? '—'
@@ -289,6 +313,9 @@ function TradeRow({
 
   return (
     <tr className="border-t border-ink-600 transition-colors hover:bg-ink-700/40">
+      <Td>
+        <CallerCell caller={caller} />
+      </Td>
       <Td className="font-medium text-white">{ticker}</Td>
       <Td>
         <SideChip side={side} />
@@ -311,6 +338,24 @@ function TradeRow({
         <Outcome decision={decision} />
       </Td>
     </tr>
+  )
+}
+
+function CallerCell({ caller }: { caller: TradeCallerFace | null }) {
+  if (!caller) return <span className="text-ink-500">—</span>
+  return (
+    <span className="flex min-w-0 items-center gap-2 font-normal">
+      {caller.avatarUrl ? (
+        <img
+          src={caller.avatarUrl}
+          alt=""
+          className="size-6 shrink-0 rounded-full"
+        />
+      ) : null}
+      <span className="truncate text-white" title={caller.name}>
+        {caller.name}
+      </span>
+    </span>
   )
 }
 

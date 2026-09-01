@@ -10,7 +10,7 @@ import {
   type TradeSettings,
   type TradeSettingsInput,
 } from '../lib/api'
-import { toggleCaller } from '../lib/following'
+import { discordDefaultAvatarUrl, toggleCaller } from '../lib/following'
 import { saveSettings } from '../lib/settingsSync'
 
 export const Route = createFileRoute('/settings')({
@@ -153,13 +153,6 @@ function SettingsForm({
   )
 }
 
-/** Discord derives which of its 6 default avatars a user gets from their ID. */
-const fallbackAvatarUrl = (authorId: string): string => {
-  // A non-numeric id (malformed input) gets index 0 instead of a BigInt throw.
-  const index = /^\d+$/.test(authorId) ? (BigInt(authorId) >> 22n) % 6n : 0n
-  return `https://cdn.discordapp.com/embed/avatars/${index}.png`
-}
-
 /** Who to copy-trade: the roster of Callers, toggled by clicking their avatar. */
 function CallersSection({
   followed,
@@ -247,7 +240,7 @@ function CallerTile({
     >
       <span className="relative">
         <img
-          src={caller.avatarUrl ?? fallbackAvatarUrl(caller.authorId)}
+          src={caller.avatarUrl ?? discordDefaultAvatarUrl(caller.authorId)}
           alt=""
           className={`h-14 w-14 rounded-full ${followed ? 'ring-2 ring-brand' : 'grayscale opacity-40'}`}
         />
