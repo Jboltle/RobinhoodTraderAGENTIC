@@ -42,8 +42,15 @@ export class RobinhoodMcpClient {
   private connectPromise: Promise<void> | undefined;
   /** Authorization URL awaiting user consent; null once connected. */
   private pendingAuthUrl: string | null = null;
-  /** Resolver for a manually pasted redirect URL (dashboard flow); null when no auth is pending. */
-  private manualAuthResolve: ((submission: AuthCodeSubmission) => void) | null = null;
+  /**
+   * Dashboard paste waiter. Armed the moment the auth URL is shown — the same
+   * signal GET /api/broker/status uses — so POST /api/broker/callback cannot
+   * 409 while the paste box is visible. Null when no auth is pending.
+   */
+  private manualAuth: {
+    readonly promise: Promise<AuthCodeSubmission>;
+    readonly resolve: (submission: AuthCodeSubmission) => void;
+  } | null = null;
 
   /**
    * Idempotent: connects on first call, returns the same connection thereafter.
@@ -55,6 +62,8 @@ export class RobinhoodMcpClient {
     if (!this.connectPromise) {
       this.connectPromise = this.connect().catch((err) => {
         this.connectPromise = undefined;
+        this.pendingAuthUrl = null;
+        this.manualAuth = null;
         throw err;
       });
     }
@@ -92,6 +101,7 @@ export class RobinhoodMcpClient {
         // robinhood.com/mcp/trading with identical query params.
         if (url.pathname === '/oauth') url.pathname = '/mcp/trading';
         this.pendingAuthUrl = url.toString();
+        this.armManualAuth();
         log.info('OAuth authorization required', { userId: this.options.userId });
         process.stdout.write('\n========================================\n');
         process.stdout.write('Robinhood authorization required.\n');
@@ -111,7 +121,11 @@ export class RobinhoodMcpClient {
     try {
       await client.connect(transport);
     } catch (err) {
-      if (!(err instanceof UnauthorizedError)) throw err;
+      // Status already advertised pendingAuthUrl (paste box is up). A wrapped
+      // or non-UnauthorizedError after that must not kill the waiter — that's
+      // the 409 the dashboard hit: URL set, manualAuth never armed / already
+      // torn down.
+      if (!(err instanceof UnauthorizedError) && !this.pendingAuthUrl) throw err;
 
       // Tokens missing or refresh failed — fall back to browser OAuth.
       log.info('starting OAuth callback listener');
@@ -132,17 +146,14 @@ export class RobinhoodMcpClient {
       // race while the manual path is viable, so it collapses into a
       // never-resolving promise. The manual path has no timeout: the server
       // just waits for a paste that may never come.
-      const manualSubmission = new Promise<AuthCodeSubmission>((resolve) => {
-        this.manualAuthResolve = resolve;
-      });
       const localListener = awaitAuthorizationCode(host, port, callbackPath).catch((err) => {
         log.warn('OAuth callback listener unavailable; manual paste still works', {
           error: (err as Error).message,
         });
         return new Promise<never>(() => {});
       });
-      const { code, state } = await Promise.race([localListener, manualSubmission]);
-      this.manualAuthResolve = null;
+      const { code, state } = await Promise.race([localListener, this.armManualAuth()]);
+      this.manualAuth = null;
       if (provider.expectedState !== undefined && state !== provider.expectedState) {
         throw new Error('OAuth state mismatch on callback; aborting token exchange');
       }
@@ -177,15 +188,25 @@ export class RobinhoodMcpClient {
    * flow is waiting for a code.
    */
   submitAuthCode(code: string, state: string | null): void {
-    if (!this.manualAuthResolve) {
+    if (!this.manualAuth) {
       throw new Error('no OAuth authorization is pending');
     }
-    this.manualAuthResolve({ code, state });
-    this.manualAuthResolve = null;
+    this.manualAuth.resolve({ code, state });
+    this.manualAuth = null;
   }
 
   isAuthPending(): boolean {
-    return this.manualAuthResolve !== null;
+    return this.manualAuth !== null;
+  }
+
+  private armManualAuth(): Promise<AuthCodeSubmission> {
+    if (this.manualAuth) return this.manualAuth.promise;
+    let resolve!: (submission: AuthCodeSubmission) => void;
+    const promise = new Promise<AuthCodeSubmission>((r) => {
+      resolve = r;
+    });
+    this.manualAuth = { promise, resolve };
+    return promise;
   }
 
   private async introspect(client: Client): Promise<void> {
