@@ -13,8 +13,11 @@ type PositionSize = 'small' | 'medium' | 'full';
 // =============================================================================
 // Sizing — keyword → portfolio percentage
 //
-// All sizing is expressed as a percentage of available buying power so the
-// position scales automatically as the account grows or shrinks.
+// Every size setting is already a plain percentage of available buying power,
+// so resolving a keyword is a lookup, not a calculation. There is exactly one
+// rule to remember: `full` is the per-trade ceiling. Small and Medium clamp to
+// it, and so do explicit dollar / share / contract counts, so no callout can
+// ever deploy more than Full no matter how the other fields are set.
 //
 // Equity:   portfolioPct → notional = buyingPower × pct/100 → shares via quote
 // Options:  portfolioPct → notional = buyingPower × pct/100 → contracts via premium
@@ -22,11 +25,19 @@ type PositionSize = 'small' | 'medium' | 'full';
 // The pipeline fetches buying power once and does the dollar conversion.
 // =============================================================================
 
-function sizeFraction(size: PositionSize, settings: ResolvedTradeSettings): number {
+function sizePct(
+  size: PositionSize,
+  isOption: boolean,
+  settings: ResolvedTradeSettings
+): number {
+  const ceiling = isOption ? settings.optionsFullPct : settings.equityFullPct;
+  // Nothing may exceed the ceiling, including a Small or Medium that the user
+  // typed above it. Without this a "medium size" callout would quietly deploy
+  // more than a "full size" one.
   switch (size) {
-    case 'small':  return settings.positionSmallPct  / 100;
-    case 'medium': return settings.positionMediumPct / 100;
-    case 'full':   return 1.0;
+    case 'small':  return Math.min(isOption ? settings.optionsSmallPct  : settings.equitySmallPct,  ceiling);
+    case 'medium': return Math.min(isOption ? settings.optionsMediumPct : settings.equityMediumPct, ceiling);
+    case 'full':   return ceiling;
   }
 }
 
@@ -34,29 +45,26 @@ function resolveSize(
   callout: Callout,
   settings: ResolvedTradeSettings
 ): { portfolioPct: number; quantityHint: number | null } {
-  const capPct =
-    callout.assetType === 'option'
-      ? settings.maxOptionsNotionalPct
-      : settings.maxNotionalPct;
+  const isOption = callout.assetType === 'option';
+  const ceilingPct = sizePct('full', isOption, settings);
 
   // Explicit share / contract count bypasses percentage sizing entirely.
   if (callout.sizeHint?.kind === 'shares') {
-    return { portfolioPct: capPct, quantityHint: Math.floor(callout.sizeHint.value) };
+    return { portfolioPct: ceilingPct, quantityHint: Math.floor(callout.sizeHint.value) };
   }
   if (callout.sizeHint?.kind === 'contracts') {
-    return { portfolioPct: capPct, quantityHint: Math.floor(callout.sizeHint.value) };
+    return { portfolioPct: ceilingPct, quantityHint: Math.floor(callout.sizeHint.value) };
   }
 
-  // Explicit USD amount: honour it up to the cap (pipeline enforces cap).
-  // We still return portfolioPct = capPct so the pipeline knows the ceiling.
-  // The pipeline reads callout.sizeHint.kind === 'usd' and uses min(usdAmt, notional_from_cap).
+  // Explicit USD amount: honour it up to the ceiling (pipeline enforces it).
+  // We still return portfolioPct = ceilingPct so the pipeline knows the limit.
+  // The pipeline reads callout.sizeHint.kind === 'usd' and uses min(usdAmt, notional_from_ceiling).
   if (callout.sizeHint?.kind === 'usd') {
-    return { portfolioPct: capPct, quantityHint: null };
+    return { portfolioPct: ceilingPct, quantityHint: null };
   }
 
-  // Keyword / default — pure percentage sizing.
-  const size: PositionSize = callout.positionSize ?? (callout.assetType === 'option' ? 'small' : 'medium');
-  return { portfolioPct: capPct * sizeFraction(size, settings), quantityHint: null };
+  const size: PositionSize = callout.positionSize ?? (isOption ? 'small' : 'medium');
+  return { portfolioPct: sizePct(size, isOption, settings), quantityHint: null };
 }
 
 // =============================================================================
@@ -177,7 +185,7 @@ export function checkRisk(
     limitPrice,
     orderType: callout.orderType,
     maxSingleContractPct: settings.maxSingleContractPct,
-    maxOptionsNotionalPct: settings.maxOptionsNotionalPct,
+    optionsFullPct: settings.optionsFullPct,
   };
 }
 

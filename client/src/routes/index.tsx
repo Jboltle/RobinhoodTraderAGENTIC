@@ -1,13 +1,15 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { CalloutCard } from '../components/CalloutCard'
 import { ConnectBanner } from '../components/ConnectBanner'
 import {
+  approveTrade,
   fetchCallers,
   fetchCallouts,
   fetchPortfolio,
   fetchSettings,
+  rejectTrade,
 } from '../lib/api'
 import type {
   Caller,
@@ -222,6 +224,7 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 const TRADE_KINDS = new Set([
   'risk_rejected',
   'pending_approval',
+  'rejected',
   'submitted',
   'execution_failed',
 ])
@@ -237,7 +240,14 @@ function TradesTable({
   callouts: CalloutItem[]
   callers: Caller[]
 }) {
-  const trades = decisions.filter((d) => TRADE_KINDS.has(d.kind))
+  // Anything awaiting a decision goes first: it is the only row here the user
+  // can still act on, and it should not be buried under executed history.
+  const trades = decisions
+    .filter((d) => TRADE_KINDS.has(d.kind))
+    .sort(
+      (a, b) =>
+        Number(b.kind === 'pending_approval') - Number(a.kind === 'pending_approval'),
+    )
   const calloutByMessageId = new Map(callouts.map((c) => [c.messageId, c]))
   const rosterByAuthorId = new Map(callers.map((c) => [c.authorId, c]))
 
@@ -376,6 +386,58 @@ function SideChip({ side }: { side: string }) {
 const chipClass =
   'inline-flex max-w-full items-center truncate rounded-md px-2 py-0.5 text-xs font-medium'
 
+/**
+ * Approve / reject for one parked trade, in its own row.
+ *
+ * Deliberately per-row with no bulk action: the whole point of approval mode
+ * is that each trade gets looked at, and one button that submits a backlog
+ * would hand back the mass-execution problem it exists to prevent.
+ */
+function ApprovalControls({ decision }: { decision: Decision }) {
+  const queryClient = useQueryClient()
+  // The server pushes the resolved decision over SSE, so the mutation only
+  // needs to refresh the callout feed's copy of the same outcome.
+  const act = useMutation({
+    mutationFn: (action: 'approve' | 'reject') =>
+      action === 'approve'
+        ? approveTrade(decision.messageId)
+        : rejectTrade(decision.messageId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['callouts'] }),
+  })
+
+  if (act.isError) {
+    return (
+      <span
+        className={`${chipClass} bg-loss/10 text-loss`}
+        title={(act.error as Error).message}
+      >
+        {(act.error as Error).message}
+      </span>
+    )
+  }
+
+  return (
+    <span className="flex items-center gap-2">
+      <button
+        type="button"
+        disabled={act.isPending}
+        onClick={() => act.mutate('approve')}
+        className="rounded-md bg-gain/15 px-2.5 py-1 text-xs font-medium text-gain transition-colors hover:bg-gain/25 disabled:opacity-50"
+      >
+        {act.isPending ? 'Working…' : 'Approve'}
+      </button>
+      <button
+        type="button"
+        disabled={act.isPending}
+        onClick={() => act.mutate('reject')}
+        className="rounded-md bg-ink-700 px-2.5 py-1 text-xs font-medium text-ink-400 transition-colors hover:text-white disabled:opacity-50"
+      >
+        Reject
+      </button>
+    </span>
+  )
+}
+
 function Outcome({ decision }: { decision: Decision }) {
   // Machine code from the trader (e.g. cooldown_active); older log entries predate it.
   const code = decision.code ? ` [${decision.code}]` : ''
@@ -383,10 +445,10 @@ function Outcome({ decision }: { decision: Decision }) {
     case 'submitted':
       return <span className={`${chipClass} bg-gain/10 text-gain`}>executed</span>
     case 'pending_approval':
+      return <ApprovalControls decision={decision} />
+    case 'rejected':
       return (
-        <span className={`${chipClass} bg-warn/10 text-warn`}>
-          approval pending
-        </span>
+        <span className={`${chipClass} bg-ink-700 text-ink-400`}>rejected</span>
       )
     case 'risk_rejected':
       return (

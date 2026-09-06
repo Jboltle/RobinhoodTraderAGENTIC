@@ -1,17 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ExternalLink } from 'lucide-react'
+import { AlertTriangle, ExternalLink, X } from 'lucide-react'
 
 import { connectBroker, fetchBrokerStatus, submitBrokerRedirect } from '../lib/api'
 import type { BrokerStatus } from '../lib/api'
 
 const STATUS_POLL_MS = 5000
 const CLIPBOARD_POLL_MS = 1000
+const SUCCESS_CLOSE_MS = 1500
 /** A pasted callback URL always has this; anything else in the clipboard isn't one. */
 const CALLBACK_URL_RE = /^https?:\/\/\S*[?&]code=[^&\s]+/
 
 /**
  * Robinhood connect flow.
+ *
+ * Clicking Connect opens a dialog and fetches the authorization URL in the
+ * background. Robinhood itself cannot be framed (X-Frame-Options: SAMEORIGIN),
+ * so the user opens the consent page in a new tab from a button inside the
+ * dialog — a fresh click, so the popup is not blocked.
  *
  * Robinhood pins redirect URIs per client and only allowlists loopback, so
  * after consent the browser lands on the user's own 127.0.0.1 with nothing
@@ -31,6 +37,8 @@ export function ConnectBanner() {
 
   const [redirectUrl, setRedirectUrl] = useState('')
   const [authUrl, setAuthUrl] = useState<string | null>(null)
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const dialogRef = useRef<HTMLDialogElement>(null)
 
   const submit = useMutation({
     mutationFn: submitBrokerRedirect,
@@ -44,99 +52,153 @@ export function ConnectBanner() {
     mutationFn: connectBroker,
     onSuccess: (result) => {
       setAuthUrl(result.authUrl)
-      if (result.authUrl) window.open(result.authUrl, '_blank', 'noopener')
       void queryClient.invalidateQueries({ queryKey: ['broker-status'] })
     },
   })
 
+  useEffect(() => {
+    const el = dialogRef.current
+    if (!el) return
+    if (dialogOpen && !el.open) el.showModal()
+    if (!dialogOpen && el.open) el.close()
+  }, [dialogOpen])
+
   const data = status.data
   const pendingUrl = authUrl ?? data?.authUrl ?? null
-  const awaitingPaste = pendingUrl !== null && !submit.isSuccess
+  const connected = data?.connected === true
+  const awaitingPaste =
+    dialogOpen && !connected && pendingUrl !== null && !submit.isSuccess
+
+  useEffect(() => {
+    if (!connected || !dialogOpen) return
+    const timer = setTimeout(() => setDialogOpen(false), SUCCESS_CLOSE_MS)
+    return () => clearTimeout(timer)
+  }, [connected, dialogOpen])
 
   const clipboard = useClipboardCallback(awaitingPaste, (url) => {
     if (!submit.isPending) submit.mutate(url)
   })
 
-  if (!data || data.connected || data.executionMode !== 'immediate') return null
+  const openDialog = () => {
+    setDialogOpen(true)
+    if (!connect.isPending) connect.mutate()
+  }
+
+  if (!data || data.executionMode !== 'immediate') return null
+  if (connected && !dialogOpen) return null
 
   return (
-    <div className="flex flex-col gap-4 rounded-xl border border-warn/40 bg-warn/10 px-5 py-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <span className="size-2 animate-pulse rounded-full bg-warn" />
-        <span className="text-sm font-medium text-white">Robinhood not connected</span>
-        {!pendingUrl && (
+    <>
+      {!connected && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-warn/40 bg-warn/10 px-5 py-4">
+          <span className="size-2 animate-pulse rounded-full bg-warn" />
+          <span className="text-sm font-medium text-white">Robinhood not connected</span>
           <button
             type="button"
-            onClick={() => connect.mutate()}
-            disabled={connect.isPending}
-            className="rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30 disabled:opacity-50"
+            onClick={openDialog}
+            className="rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30"
           >
-            {connect.isPending ? 'Starting…' : 'Connect Robinhood'}
+            Connect Robinhood
           </button>
-        )}
-      </div>
-
-      <BeforeYouStart />
-
-      {connect.isError && (
-        <p className="text-xs text-loss">{(connect.error as Error).message}</p>
-      )}
-
-      {pendingUrl && (
-        <div className="flex flex-col gap-3">
-          <a
-            href={pendingUrl}
-            target="_blank"
-            rel="noopener"
-            className="inline-flex w-fit items-center gap-1.5 rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30"
-          >
-            Authorize in Robinhood
-            <ExternalLink className="size-3.5" />
-          </a>
-
-          <p className="text-xs text-ink-400">
-            {clipboard.watching
-              ? 'Waiting for you to approve — copy the address from the error page and it will be picked up automatically.'
-              : 'After approving, copy the 127.0.0.1 address from your browser and paste it below.'}
-          </p>
-
-          <form
-            className="flex flex-wrap items-center gap-2"
-            onSubmit={(e) => {
-              e.preventDefault()
-              if (redirectUrl.trim()) submit.mutate(redirectUrl.trim())
-            }}
-          >
-            <input
-              type="text"
-              value={redirectUrl}
-              onChange={(e) => setRedirectUrl(e.target.value)}
-              placeholder="http://127.0.0.1:8788/oauth/callback?code=…"
-              className="w-full max-w-xl rounded-lg border border-ink-600 bg-ink-800 px-3 py-2 text-sm text-white placeholder:text-ink-400 focus:border-brand focus:outline-none"
-            />
-            <button
-              type="submit"
-              disabled={submit.isPending || !redirectUrl.trim()}
-              className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-opacity disabled:opacity-50"
-            >
-              {submit.isPending ? 'Connecting…' : 'Finish connecting'}
-            </button>
-          </form>
-
-          {submit.isPending && (
-            <span className="text-xs text-ink-400">Exchanging the code for tokens…</span>
-          )}
-          {submit.isSuccess && (
-            <span className="text-xs text-ink-400">
-              Code submitted — waiting for the connection to come up…
-            </span>
-          )}
-          {submit.isError && (
-            <span className="text-xs text-loss">{(submit.error as Error).message}</span>
-          )}
         </div>
       )}
-    </div>
+
+      <dialog
+        ref={dialogRef}
+        aria-label="Connect Robinhood"
+        onClose={() => setDialogOpen(false)}
+        className="m-auto w-[calc(100%-2rem)] max-w-xl rounded-xl border border-warn/40 bg-ink-800 p-5 text-white backdrop:bg-black/60"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-sm font-medium text-white">
+            {connected ? 'Connected' : 'Connect Robinhood'}
+          </h2>
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={() => setDialogOpen(false)}
+            className="rounded-md p-1 text-ink-400 transition-colors hover:bg-ink-700 hover:text-white"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+
+        {connected ? (
+          <p className="mt-3 text-sm text-ink-400">Robinhood is connected.</p>
+        ) : (
+          <div className="mt-4 flex flex-col gap-4">
+            <BeforeYouStart />
+
+            {connect.isPending && !pendingUrl && (
+              <p className="text-xs text-ink-400">Starting…</p>
+            )}
+
+            {connect.isError && (
+              <p className="text-xs text-loss">{(connect.error as Error).message}</p>
+            )}
+
+            {pendingUrl && (
+              <div className="flex flex-col gap-3">
+                <a
+                  href={pendingUrl}
+                  target="_blank"
+                  rel="noopener"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    window.open(pendingUrl, '_blank', 'noopener')
+                  }}
+                  className="inline-flex w-fit items-center gap-1.5 rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30"
+                >
+                  Authorize in Robinhood
+                  <ExternalLink className="size-3.5" />
+                </a>
+
+                <p className="text-xs text-ink-400">
+                  {clipboard.watching
+                    ? 'Waiting for you to approve — copy the address from the error page and it will be picked up automatically.'
+                    : 'After approving, copy the 127.0.0.1 address from your browser and paste it below.'}
+                </p>
+
+                <form
+                  className="flex flex-wrap items-center gap-2"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    if (redirectUrl.trim()) submit.mutate(redirectUrl.trim())
+                  }}
+                >
+                  <input
+                    type="text"
+                    value={redirectUrl}
+                    onChange={(e) => setRedirectUrl(e.target.value)}
+                    placeholder="http://127.0.0.1:8788/oauth/callback?code=…"
+                    className="w-full max-w-xl rounded-lg border border-ink-600 bg-ink-900 px-3 py-2 text-sm text-white placeholder:text-ink-400 focus:border-brand focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={submit.isPending || !redirectUrl.trim()}
+                    className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-opacity disabled:opacity-50"
+                  >
+                    {submit.isPending ? 'Connecting…' : 'Finish connecting'}
+                  </button>
+                </form>
+
+                {submit.isPending && (
+                  <span className="text-xs text-ink-400">Exchanging the code for tokens…</span>
+                )}
+                {submit.isSuccess && (
+                  <span className="text-xs text-ink-400">
+                    Code submitted — waiting for the connection to come up…
+                  </span>
+                )}
+                {submit.isError && (
+                  <span className="text-xs text-loss">{(submit.error as Error).message}</span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </dialog>
+    </>
   )
 }
 

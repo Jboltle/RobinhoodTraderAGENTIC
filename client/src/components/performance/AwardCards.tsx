@@ -2,9 +2,10 @@ import type { RecapCallerStats, RecapPerformanceData, RecapTrade } from '../../l
 import { contractLabel, fmtPct, pctToneClass } from './format'
 
 /**
- * Headline awards over the window. Only callers at or above the trade floor
- * can win the avg/rate/consistency awards; "most wins" is a raw count and
- * "best trade" is any single non-soft trade.
+ * Headline awards over the window. Only callers at or above the window's trade
+ * floor can win the avg/rate/consistency awards, and short windows have no
+ * floor at all; "most wins" is a raw count and "best trade" is any single
+ * non-soft trade.
  */
 export function AwardCards({
   awards,
@@ -17,7 +18,9 @@ export function AwardCards({
     <section>
       <div className="mb-3 flex items-baseline justify-between gap-3">
         <h2 className="text-base font-semibold text-white">Awards</h2>
-        <span className="text-xs text-ink-500">callers with ≥ {minTrades} trades</span>
+        <span className="text-xs text-ink-500">
+          {minTrades > 1 ? `callers with ≥ ${minTrades} trades` : 'every caller in the window'}
+        </span>
       </div>
       <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
         <CallerAward

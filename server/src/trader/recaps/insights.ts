@@ -12,7 +12,6 @@ import { createLogger } from '../../shared/logger.js';
 import type { LlmProvider, ToolJsonSchema } from '../../shared/types.js';
 import type { TraderDb } from '../db.js';
 import {
-  MIN_TRADES_FOR_AWARDS,
   RECAP_WINDOW_DAYS_CHOICES,
   computeRecapPerformance,
   isoDateDaysAgo,
@@ -46,14 +45,37 @@ const SYSTEM_PROMPT =
   'where the data shows them.';
 
 /**
- * Recompute stats and regenerate the cached narration for every window.
- * Failures are logged and skipped — a down model must never block ingestion,
- * and the dashboard just keeps showing the previous narration.
+ * The refresh currently running, if any. The live webhook and the hourly
+ * sweep can both land on the same fresh recap, and each pass spends one model
+ * call per window — overlapping triggers join the run in flight instead of
+ * paying twice and racing each other's writes.
+ *
+ * ponytail: in-process only, which is all a single-instance deployment needs
+ * (see render.yaml). Upgrade path if the backend ever scales out: an advisory
+ * lock or a `generating` flag on recap_insights.
  */
-export async function refreshRecapInsights(
+let refreshInFlight: Promise<void> | null = null;
+
+/**
+ * Recompute stats and regenerate the cached narration for every window.
+ * Callers gate this on recap rows having actually changed, so in steady state
+ * it runs once per recap — never on a page load.
+ */
+export function refreshRecapInsights(
   db: TraderDb,
   provider: LlmProvider = createLlmProvider()
 ): Promise<void> {
+  refreshInFlight ??= regenerateEveryWindow(db, provider).finally(() => {
+    refreshInFlight = null;
+  });
+  return refreshInFlight;
+}
+
+/**
+ * Failures are logged and skipped — a down model must never block ingestion,
+ * and the dashboard just keeps showing the previous narration.
+ */
+async function regenerateEveryWindow(db: TraderDb, provider: LlmProvider): Promise<void> {
   for (const windowDays of RECAP_WINDOW_DAYS_CHOICES) {
     try {
       const recaps = await db.listRecapsSince(isoDateDaysAgo(windowDays));
@@ -87,9 +109,12 @@ async function generateInsight(
     `Leaderboard (per-caller stats, percentages are per-trade option gains):`,
     JSON.stringify(performance.leaderboard),
     `Top trades: ${JSON.stringify(performance.topTrades.slice(0, 5))}`,
-    `Write the overall read first (2-4 sentences), then one line per caller with ` +
-      `at least ${MIN_TRADES_FOR_AWARDS} trades, formatted "Name: observation." ` +
-      `Mention callers below the threshold only if something stands out.`,
+    `Write the overall read first (2-4 sentences), then one line per caller, ` +
+      `formatted "Name: observation."` +
+      (performance.minTradesForAwards > 1
+        ? ` Cover every caller with at least ${performance.minTradesForAwards} trades; ` +
+          `mention the ones below that threshold only if something stands out.`
+        : ` Flag thin samples explicitly — several callers may have only a handful of trades.`),
   ].join('\n');
 
   const raw = await provider.callStructured({

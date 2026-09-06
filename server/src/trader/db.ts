@@ -18,7 +18,8 @@
  *                       last_seen_at timestamptz
  *   trades              id uuid pk, user_id uuid -> auth.users, message_id text,
  *                       kind text, code text, reason text, ticker text, action text,
- *                       order_payload jsonb, timestamp timestamptz
+ *                       order_payload jsonb, approved_at timestamptz,
+ *                       timestamp timestamptz
  *   recaps              message_id text pk, channel_id text, posted_at timestamptz,
  *                       recap_date date, content text, content_hash text,
  *                       parse jsonb, parse_status text, parser_version int
@@ -95,6 +96,16 @@ export interface StoredRecapInsight {
   readonly content: string;
 }
 
+/** The state a pending-approval row moves to once the user acts on it. */
+export interface ApprovalOutcome {
+  readonly kind: Extract<Decision['kind'], 'submitted' | 'execution_failed' | 'rejected'>;
+  readonly code: Decision['code'];
+  readonly reason: string;
+  /** The submitted order for 'submitted'; the unchanged sized order otherwise. */
+  readonly order: Decision['order'];
+  readonly approvedAt: string;
+}
+
 /** A user identified by a verified Supabase access token. */
 export interface AuthUser {
   readonly id: string;
@@ -109,6 +120,18 @@ export interface TraderDb {
 
   listDecisions(userId: string, limit: number): Promise<Decision[]>;
   recordDecision(userId: string, decision: Decision): Promise<void>;
+  /**
+   * Move a pending-approval row to its post-approval state, in place.
+   *
+   * Scoped to `kind = 'pending_approval'` so it doubles as a compare-and-set:
+   * returns false when the row is already gone or already resolved, which is
+   * what stops a double-click from submitting the same order twice.
+   */
+  resolvePendingApproval(
+    userId: string,
+    messageId: string,
+    outcome: ApprovalOutcome
+  ): Promise<boolean>;
   /** Decisions for the given callouts, keyed by message id. */
   decisionsByMessageId(userId: string, messageIds: readonly string[]): Promise<Map<string, Decision>>;
 
@@ -229,6 +252,28 @@ class SupabaseTraderDb implements TraderDb {
       timestamp: decision.at,
     });
     if (error) throw queryError('record decision', error);
+  }
+
+  async resolvePendingApproval(
+    userId: string,
+    messageId: string,
+    outcome: ApprovalOutcome
+  ): Promise<boolean> {
+    const { data, error } = await this.supabase
+      .from('trades')
+      .update({
+        kind: outcome.kind,
+        code: outcome.code,
+        reason: outcome.reason,
+        order_payload: outcome.order,
+        approved_at: outcome.approvedAt,
+      })
+      .eq('user_id', userId)
+      .eq('message_id', messageId)
+      .eq('kind', 'pending_approval')
+      .select('message_id');
+    if (error) throw queryError('resolve pending approval', error);
+    return (data ?? []).length > 0;
   }
 
   async decisionsByMessageId(

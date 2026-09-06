@@ -110,6 +110,115 @@ describe('POST /webhook/discord', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Approval
+// ---------------------------------------------------------------------------
+
+describe('/api/trades/:messageId/approve|reject', () => {
+  const SIZED_ORDER = {
+    symbol: 'AAPL',
+    side: 'buy' as const,
+    assetType: 'equity' as const,
+    quantity: 4,
+    orderType: 'market' as const,
+    limitPrice: null,
+    option: null,
+    orderId: null,
+    status: null,
+  };
+
+  const seedPending = (messageId = 'msg-pending') => {
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture(messageId, {
+        kind: 'pending_approval',
+        reason: 'Approval required: BUY 4 AAPL (market). No order submitted.',
+        order: SIZED_ORDER,
+      })
+    );
+    return messageId;
+  };
+
+  it('approve submits the sized order and flips the row to submitted', async () => {
+    const messageId = seedPending();
+
+    const response = await send('POST', `/api/trades/${messageId}/approve`, {});
+
+    expect(response.statusCode).toBe(200);
+    const { decision } = response.json() as { decision: Decision };
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order).toMatchObject({ orderId: 'eq-001', status: 'queued', quantity: 4 });
+
+    const tools = harness.brokerFor(USER.id).tools;
+    expect(tools.placeOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ symbol: 'AAPL', side: 'buy', quantity: 4 })
+    );
+    expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('submitted');
+  });
+
+  it('reject records the outcome without touching the broker', async () => {
+    const messageId = seedPending();
+
+    const response = await send('POST', `/api/trades/${messageId}/reject`, {});
+
+    expect(response.statusCode).toBe(200);
+    expect((response.json() as { decision: Decision }).decision.kind).toBe('rejected');
+    expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+    expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('rejected');
+  });
+
+  // The compare-and-set on kind='pending_approval' is what makes this safe;
+  // without it an impatient double-click buys the position twice.
+  it('a second approve does not submit a second order', async () => {
+    const messageId = seedPending();
+
+    await send('POST', `/api/trades/${messageId}/approve`, {});
+    const second = await send('POST', `/api/trades/${messageId}/approve`, {});
+
+    expect(second.statusCode).toBe(404);
+    expect(harness.brokerFor(USER.id).tools.placeOrder).toHaveBeenCalledOnce();
+  });
+
+  it('404s for a callout with no pending row', async () => {
+    harness.db.seedDecision(USER.id, decisionFixture('msg-done', { kind: 'submitted' }));
+
+    expect((await send('POST', '/api/trades/msg-done/approve', {})).statusCode).toBe(404);
+    expect((await send('POST', '/api/trades/never-seen/approve', {})).statusCode).toBe(404);
+  });
+
+  it('a broker failure records execution_failed instead of leaving the row pending', async () => {
+    const messageId = seedPending();
+    harness.configureBroker(USER.id, {
+      toolsOverrides: {
+        placeOrder: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
+      },
+    });
+
+    const response = await send('POST', `/api/trades/${messageId}/approve`, {});
+
+    expect(response.statusCode).toBe(200);
+    const { decision } = response.json() as { decision: Decision };
+    expect(decision.kind).toBe('execution_failed');
+    expect(decision.reason).toContain('MCP transport closed');
+  });
+
+  // The env kill-switch means the deployment submits nothing, so it has to
+  // outrank the button the same way it outranks a user's 'immediate' setting.
+  it('409s while the trader is booted in approval mode', async () => {
+    const messageId = seedPending();
+    const original = config.tradeExecutionMode;
+    (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = 'approval';
+
+    try {
+      const response = await send('POST', `/api/trades/${messageId}/approve`, {});
+      expect(response.statusCode).toBe(409);
+      expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+    } finally {
+      (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -120,9 +229,18 @@ describe('/api/settings', () => {
 
     const { settings } = response.json() as { settings: Record<string, unknown> };
     expect(settings.minConfidence).toBe(0.7);
-    expect(settings.executionMode).toBe('immediate');
-    expect(settings.maxNotionalPct).toBe(5);
+    expect(settings.equityFullPct).toBe(5);
     expect(settings.allowedTickers).toEqual([]);
+  });
+
+  // A fresh account must not trade anything until its owner opts in twice:
+  // once by picking Callers, once by approving each trade.
+  it('GET defaults a brand-new account to approval mode following nobody', async () => {
+    const { settings } = (await get('/api/settings')).json() as {
+      settings: Record<string, unknown>;
+    };
+    expect(settings.executionMode).toBe('approval');
+    expect(settings.followedCallerIds).toEqual([]);
   });
 
   it('PUT stores validated settings and GET returns them over the defaults', async () => {
@@ -134,7 +252,7 @@ describe('/api/settings', () => {
     };
     expect(settings.minConfidence).toBe(0.95);
     expect(settings.maxTradesPerDay).toBe(2);
-    expect(settings.maxNotionalPct).toBe(5); // default fills the rest
+    expect(settings.equityFullPct).toBe(5); // default fills the rest
   });
 
   it('PUT rejects settings that fail schema validation', async () => {
@@ -354,7 +472,7 @@ describe('GET /api/portfolio', () => {
 
     const response = await get('/api/portfolio');
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ portfolioValueUsd: 25_431.5, openPositions: 2 });
+    expect(response.json()).toMatchObject({ portfolioValueUsd: 25_431.5, openPositions: 2 });
   });
 
   it('returns 503 when Robinhood MCP is unavailable', async () => {

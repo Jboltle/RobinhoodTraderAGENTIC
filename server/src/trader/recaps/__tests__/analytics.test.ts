@@ -1,12 +1,13 @@
 /**
  * Analytics invariants: soft trades never count, the 20-trade floor gates
- * awards, and the cumulative series carries every caller on every row.
+ * awards in long windows only, one caller is never both best and worst, and
+ * the cumulative series carries every caller on every row.
  */
 
 import { describe, expect, it } from 'vitest';
 
 import type { StoredRecap } from '../../db.js';
-import { MIN_TRADES_FOR_AWARDS, computeRecapPerformance } from '../analytics.js';
+import { MIN_TRADES_FOR_LONG_WINDOW, computeRecapPerformance } from '../analytics.js';
 import type { RecapParse, RecapTrade } from '../parser.js';
 
 function makeTrade(overrides: Partial<RecapTrade> & { caller: string; pctGain: number }): RecapTrade {
@@ -90,7 +91,7 @@ describe('computeRecapPerformance', () => {
   });
 
   it('gates awards behind the trade floor but keeps everyone in the table', () => {
-    const steady = dailyTrades('Steady', MIN_TRADES_FOR_AWARDS); // 20 wins of +20
+    const steady = dailyTrades('Steady', MIN_TRADES_FOR_LONG_WINDOW); // 20 wins of +20
     const hotshot = [
       makeRecap('2026-07-30', [makeTrade({ caller: 'Hotshot', pctGain: 999 })]),
     ];
@@ -107,14 +108,55 @@ describe('computeRecapPerformance', () => {
     expect(perf.awards.bestTrade?.caller).toBe('Hotshot');
   });
 
+  it('drops the award floor for the 7D and 30D windows', () => {
+    const steady = dailyTrades('Steady', MIN_TRADES_FOR_LONG_WINDOW); // 20 wins of +20
+    const hotshot = [
+      makeRecap('2026-07-30', [makeTrade({ caller: 'Hotshot', pctGain: 999 })]),
+    ];
+    const recaps = [...steady, ...hotshot];
+
+    for (const days of [7, 30]) {
+      const perf = computeRecapPerformance(recaps, days);
+      expect(perf.minTradesForAwards).toBe(1);
+      expect(perf.leaderboard.every((c) => c.qualifies)).toBe(true);
+      // One trade is enough to win in a short window.
+      expect(perf.awards.bestPerformer?.caller).toBe('Hotshot');
+      expect(perf.awards.worstPerformer?.caller).toBe('Steady');
+    }
+
+    expect(computeRecapPerformance(recaps, 90).minTradesForAwards).toBe(
+      MIN_TRADES_FOR_LONG_WINDOW
+    );
+  });
+
+  it('never names one caller both best and worst performer', () => {
+    // Only Steady clears the 90D floor; drawn from the qualifying pool alone
+    // it would hold both ends of the scale, so worst falls back to the table.
+    const steady = dailyTrades('Steady', MIN_TRADES_FOR_LONG_WINDOW);
+    const dabbler = [
+      makeRecap('2026-07-30', [makeTrade({ caller: 'Dabbler', pctGain: -60 })]),
+    ];
+    const perf = computeRecapPerformance([...steady, ...dabbler], 90);
+
+    expect(perf.awards.bestPerformer?.caller).toBe('Steady');
+    expect(perf.awards.worstPerformer?.caller).toBe('Dabbler');
+  });
+
+  it('leaves worst performer empty when only one caller traded', () => {
+    const perf = computeRecapPerformance(dailyTrades('Solo', 3), 7);
+
+    expect(perf.awards.bestPerformer?.caller).toBe('Solo');
+    expect(perf.awards.worstPerformer).toBeNull();
+  });
+
   it('only profitable callers can be "most consistent"', () => {
     // SteadyLoser: 20 identical -5% trades — std dev 0 but negative avg.
-    const loser = Array.from({ length: MIN_TRADES_FOR_AWARDS }, (_, i) =>
+    const loser = Array.from({ length: MIN_TRADES_FOR_LONG_WINDOW }, (_, i) =>
       makeRecap(`2026-06-${String(i + 1).padStart(2, '0')}`, [
         makeTrade({ caller: 'SteadyLoser', pctGain: -5 }),
       ])
     );
-    const winner = dailyTrades('Grinder', MIN_TRADES_FOR_AWARDS, 2); // mixed +20/-10
+    const winner = dailyTrades('Grinder', MIN_TRADES_FOR_LONG_WINDOW, 2); // mixed +20/-10
     const perf = computeRecapPerformance([...loser, ...winner], 90);
 
     expect(perf.awards.mostConsistent?.caller).toBe('Grinder');

@@ -5,6 +5,8 @@ import type { RobinhoodMcpClient } from './mcpClient.js';
 import type {
   BuyingPowerResult,
   CallToolResult,
+  OptionOrder,
+  OptionOrdersResult,
   OptionPosition,
   OptionPositionsResult,
   OptionsQuoteResult,
@@ -33,6 +35,7 @@ export const TOOL_NAMES = {
   portfolio: 'get_portfolio',
   positions: 'get_equity_positions',
   optionPositions: 'get_option_positions',
+  optionOrders: 'get_option_orders',
   optionInstruments: 'get_option_instruments',
   placeOrder: 'place_equity_order',
   placeOptionsOrder: 'place_option_order',
@@ -137,6 +140,21 @@ export class RobinhoodTools {
       });
     }
     return { positions, raw: result.raw };
+  }
+
+  /**
+   * Historical option orders. Position rows carry no fill price and no
+   * timestamp, so this is the only source for a real cost basis and for
+   * ranking contracts by when they were opened. Returns null when the server
+   * doesn't advertise the tool, so callers degrade instead of throwing.
+   */
+  async getOptionOrders(): Promise<OptionOrdersResult | null> {
+    if (!this.mcp.getToolNames().includes(TOOL_NAMES.optionOrders)) return null;
+    return this.callTool(
+      TOOL_NAMES.optionOrders,
+      { account_number: await this.getDefaultAccountNumber() },
+      parseOptionOrders
+    );
   }
 
   async placeOrder(args: PlaceOrderArgs): Promise<PlaceOrderResult> {
@@ -477,6 +495,42 @@ function parsePositions(result: CallToolResult): PositionsResult {
   return { positions, raw: data ?? result };
 }
 
+function parseOptionOrders(result: CallToolResult): OptionOrdersResult {
+  const data = structuredOrJson(result);
+  const rows =
+    deepFind(data, ['results', 'orders'], (v): v is unknown[] => Array.isArray(v)) ??
+    extractList(data);
+
+  const orders: OptionOrder[] = [];
+  for (const item of rows) {
+    const symbol = deepFindString(item, ['chain_symbol', 'symbol', 'underlying_symbol', 'ticker']);
+    const optionType = normalizeOptionType(deepFindString(item, ['option_type', 'optionType']));
+    const strike = deepFindNumber(item, ['strike_price', 'strike']);
+    const expiration = deepFindString(item, ['expiration_date', 'expiration', 'expires_at']);
+    // Legs carry `side`; only the order envelope carries `direction`. Searched
+    // separately so a top-level 'direction' can't shadow a leg's 'side'.
+    const side =
+      normalizeOrderSide(deepFindString(item, ['side'])) ??
+      normalizeOrderSide(deepFindString(item, ['direction']));
+    if (!symbol || !optionType || strike === null || !expiration || !side) continue;
+
+    orders.push({
+      orderId: deepFindString(item, ['id', 'order_id']),
+      symbol: symbol.toUpperCase(),
+      optionType,
+      strike,
+      expiration: expiration.slice(0, 10),
+      side,
+      state: deepFindString(item, ['state', 'status']),
+      averagePrice: deepFindNumber(item, ['average_price', 'average_fill_price', 'price']),
+      quantity: deepFindNumber(item, ['processed_quantity', 'quantity', 'contracts']) ?? 0,
+      createdAt: deepFindString(item, ['created_at', 'createdAt', 'updated_at']),
+      raw: item,
+    });
+  }
+  return { orders, raw: data ?? result };
+}
+
 /** A position row that only references its contract by option_id. */
 interface IncompleteOptionPosition {
   readonly optionId: string;
@@ -639,6 +693,18 @@ function extractList(value: unknown): unknown[] {
     if (Array.isArray(candidate)) return candidate;
   }
   return [];
+}
+
+/**
+ * Order legs spell the side 'buy'/'sell'; the order envelope spells it
+ * 'debit'/'credit'. For the single-leg long-only orders this system places, a
+ * debit opens a long and a credit closes it.
+ */
+function normalizeOrderSide(value: string | null): 'buy' | 'sell' | null {
+  const normalized = value?.toLowerCase();
+  if (normalized === 'buy' || normalized === 'debit') return 'buy';
+  if (normalized === 'sell' || normalized === 'credit') return 'sell';
+  return null;
 }
 
 function normalizeOptionType(value: string | null): 'call' | 'put' | null {

@@ -43,6 +43,18 @@ const A_TRADE: Decision = {
   },
 };
 
+/** A sized order of A's sitting in approval — the thing B must not be able to submit. */
+const A_PENDING: Decision = {
+  at: '2026-07-20T15:00:00.000Z',
+  messageId: 'msg-pending',
+  kind: 'pending_approval',
+  code: null,
+  reason: 'Approval required: BUY 7 NVDA (limit $111.11). No order submitted.',
+  ticker: 'NVDA',
+  action: 'buy',
+  order: { ...A_TRADE.order!, orderId: null, status: null },
+};
+
 const SHARED_CALLOUT: StoredCallout = {
   messageId: 'msg-shared',
   channelId: 'chan-1',
@@ -68,6 +80,7 @@ beforeEach(() => {
 
   harness.db.seedSettings(USER_A.id, { maxTradesPerDay: 1, blockedTickers: ['NVDA'] });
   harness.db.seedDecision(USER_A.id, A_TRADE);
+  harness.db.seedDecision(USER_A.id, A_PENDING);
   harness.db.seedBrokerTokens(USER_A.id, fakeTokens('a-access-token', 'a-refresh-token'));
   harness.db.seedCallout(SHARED_CALLOUT);
 
@@ -93,6 +106,18 @@ const B_REQUESTS = [
   { name: 'GET /api/callouts', method: 'GET' as const, url: '/api/callouts' },
   { name: 'GET /api/portfolio', method: 'GET' as const, url: '/api/portfolio' },
   { name: 'GET /api/trades/performance', method: 'GET' as const, url: '/api/trades/performance' },
+  {
+    name: 'POST /api/trades/:id/approve',
+    method: 'POST' as const,
+    url: '/api/trades/msg-pending/approve',
+    payload: {},
+  },
+  {
+    name: 'POST /api/trades/:id/reject',
+    method: 'POST' as const,
+    url: '/api/trades/msg-pending/reject',
+    payload: {},
+  },
   { name: 'GET /api/broker/status', method: 'GET' as const, url: '/api/broker/status' },
   { name: 'POST /api/broker/disconnect', method: 'POST' as const, url: '/api/broker/disconnect' },
   {
@@ -169,7 +194,28 @@ describe('user B cannot see user A', () => {
     expect((asB.json() as { decisions: Decision[] }).decisions).toEqual([]);
 
     const asA = await harness.as(TOKEN_A, { method: 'GET', url: '/api/decisions' });
-    expect((asA.json() as { decisions: Decision[] }).decisions).toHaveLength(1);
+    expect((asA.json() as { decisions: Decision[] }).decisions).toHaveLength(2);
+  });
+
+  // Approve is the one endpoint that spends money, so "B sees nothing of A's"
+  // is not enough here: B must also not be able to act on A's parked trade.
+  it("B cannot approve A's pending trade", async () => {
+    const response = await harness.as(TOKEN_B, {
+      method: 'POST',
+      url: '/api/trades/msg-pending/approve',
+      headers: { 'content-type': 'application/json' },
+      payload: '{}',
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(harness.brokerFor(USER_B.id).tools.placeOrder).not.toHaveBeenCalled();
+    expect(harness.brokerFor(USER_A.id).tools.placeOrder).not.toHaveBeenCalled();
+
+    const asA = await harness.as(TOKEN_A, { method: 'GET', url: '/api/decisions' });
+    const pending = (asA.json() as { decisions: Decision[] }).decisions.find(
+      (d) => d.messageId === 'msg-pending'
+    );
+    expect(pending!.kind).toBe('pending_approval');
   });
 
   it("B's broker status reports B's session, not A's live connection", async () => {
@@ -187,7 +233,7 @@ describe('user B cannot see user A', () => {
 
   it("B's portfolio and performance come from B's empty account", async () => {
     const portfolio = await harness.as(TOKEN_B, { method: 'GET', url: '/api/portfolio' });
-    expect(portfolio.json()).toEqual({ portfolioValueUsd: 0, openPositions: 0 });
+    expect(portfolio.json()).toMatchObject({ portfolioValueUsd: 0, openPositions: 0 });
 
     const performance = await harness.as(TOKEN_B, {
       method: 'GET',

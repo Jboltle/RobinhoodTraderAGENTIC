@@ -98,8 +98,10 @@ async function simulateChannelToTrade(
   const db = createFakeDb();
   db.seedBrokerTokens(USER, fakeTokens('token'));
   db.seedSettings(USER, {
+    executionMode: 'immediate',
+    followedCallerIds: null,
     regularHoursOnly: false,
-    maxOptionsNotionalPct: 10,
+    optionsFullPct: 10,
     maxSingleContractPct: 10,
   });
 

@@ -33,34 +33,42 @@ function describeIntent(callout: Callout | null): string {
 const plural = (count: number, noun: string): string =>
   `${count} ${noun}${count === 1 ? '' : 's'}`;
 
-/** Receipt text for a callout parked in approval mode (no order submitted). */
-export function summarizePendingApproval(callout: Callout): string {
-  const symbol = callout.ticker?.toUpperCase() ?? 'UNKNOWN';
-  const side = callout.action ?? 'unknown';
+/**
+ * Receipt text for a sized-but-unsubmitted order awaiting approval. Takes the
+ * sized order rather than the callout so it can state the quantity the user is
+ * actually being asked to approve.
+ */
+export function summarizePendingApproval(order: SubmittedOrder): string {
+  const side = order.side.toUpperCase();
 
-  if (callout.assetType === 'option' && callout.option) {
-    const { optionType, strike, expiration } = callout.option;
+  if (order.assetType === 'option' && order.option) {
+    const { optionType, strike, expiration } = order.option;
     const priceText =
-      callout.orderType === 'limit' && callout.limitPrice !== null
-        ? `limit $${callout.limitPrice.toFixed(2)}/contract`
+      order.orderType === 'limit' && order.limitPrice !== null
+        ? `limit $${order.limitPrice.toFixed(2)}/contract`
         : 'market';
     return (
-      `Approval required: ${side.toUpperCase()} ${symbol} ${strike}${optionType[0]?.toUpperCase()} ${expiration} ` +
-      `(${priceText}). No order submitted.`
+      `Approval required: ${side} ${order.quantity}x ${order.symbol} ` +
+      `${strike}${optionType[0]?.toUpperCase()} ${expiration} (${priceText}). No order submitted.`
     );
   }
 
   const priceText =
-    callout.orderType === 'limit' && callout.limitPrice !== null
-      ? `limit $${callout.limitPrice.toFixed(2)}`
+    order.orderType === 'limit' && order.limitPrice !== null
+      ? `limit $${order.limitPrice.toFixed(2)}`
       : 'market';
-  return `Approval required: ${side.toUpperCase()} ${symbol} equity (${priceText}). No order submitted.`;
+  return `Approval required: ${side} ${order.quantity} ${order.symbol} (${priceText}). No order submitted.`;
 }
 
-/** Receipt text for a submitted order. */
-export function summarize(order: SubmittedOrder, authorName: string): string {
+/**
+ * Receipt text for a submitted order. `authorName` is null when the submit did
+ * not come straight off a Discord message — an approved trade is attributed to
+ * the user who approved it, not re-attributed to the Caller.
+ */
+export function summarize(order: SubmittedOrder, authorName: string | null): string {
   const verb = order.side === 'buy' ? 'Bought' : 'Sold';
   const orderRef = order.orderId ? `, order ${order.orderId}` : '';
+  const from = authorName === null ? '' : ` From @${authorName}.`;
 
   if (order.assetType === 'option' && order.option) {
     const { optionType, strike, expiration } = order.option;
@@ -70,7 +78,7 @@ export function summarize(order: SubmittedOrder, authorName: string): string {
         : 'market';
     return (
       `${verb} ${order.quantity}x ${order.symbol} ${strike}${optionType[0]?.toUpperCase()} ${expiration} (${priceText}). ` +
-      `Status: ${order.status ?? 'submitted'}${orderRef}. From @${authorName}.`
+      `Status: ${order.status ?? 'submitted'}${orderRef}.${from}`
     );
   }
 
@@ -80,6 +88,6 @@ export function summarize(order: SubmittedOrder, authorName: string): string {
       : 'market';
   return (
     `${verb} ${order.quantity} ${order.symbol} (${priceText}). ` +
-    `Status: ${order.status ?? 'submitted'}${orderRef}. From @${authorName}.`
+    `Status: ${order.status ?? 'submitted'}${orderRef}.${from}`
   );
 }

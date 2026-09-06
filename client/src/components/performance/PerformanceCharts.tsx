@@ -127,9 +127,14 @@ function CumulativeGainChart({
 function WinRateChart({ leaderboard }: { leaderboard: RecapCallerStats[] }) {
   const byWinRate = [...leaderboard].sort((a, b) => b.winRatePct - a.winRatePct)
   const colorByCaller = new Map(leaderboard.map((c, i) => [c.caller, callerColor(i)]))
+  // Short windows have no award floor, so nothing is dimmed and the usual
+  // caption would be a lie.
+  const subtitle = byWinRate.every((c) => c.qualifies)
+    ? 'every caller in the window'
+    : 'dimmed bars are under the award floor'
 
   return (
-    <ChartCard title="Win rate by caller" subtitle="dimmed bars are under the award floor">
+    <ChartCard title="Win rate by caller" subtitle={subtitle}>
       <ResponsiveContainer width="100%" height={260}>
         <BarChart data={byWinRate} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid stroke={GRID_STROKE} vertical={false} />

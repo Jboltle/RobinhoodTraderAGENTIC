@@ -64,6 +64,33 @@ export interface OptionPositionsResult {
   readonly raw: unknown;
 }
 
+export interface OptionOrder {
+  readonly orderId: string | null;
+  readonly symbol: string;
+  readonly optionType: 'call' | 'put';
+  readonly strike: number;
+  readonly expiration: string;
+  readonly side: 'buy' | 'sell';
+  /** Robinhood order state: 'filled', 'cancelled', 'queued', … */
+  readonly state: string | null;
+  /**
+   * Fill price exactly as Robinhood reports it. Robinhood quotes option
+   * averages per contract on some endpoints (159.0) and per share on others
+   * (1.59), so confirm the scale against a known fill before treating this as
+   * a cost basis.
+   */
+  readonly averagePrice: number | null;
+  readonly quantity: number;
+  /** ISO timestamp; the ordering key for "most recently opened". */
+  readonly createdAt: string | null;
+  readonly raw: unknown;
+}
+
+export interface OptionOrdersResult {
+  readonly orders: readonly OptionOrder[];
+  readonly raw: unknown;
+}
+
 export interface OptionsQuoteResult {
   /** Mid-market (mark) premium per contract unit (not × 100). */
   readonly markPrice: number;

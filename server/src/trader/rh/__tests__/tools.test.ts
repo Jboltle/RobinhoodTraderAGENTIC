@@ -289,6 +289,103 @@ describe('RobinhoodTools option position enrichment', () => {
   });
 });
 
+describe('RobinhoodTools option order history', () => {
+  // Robinhood nests the contract inside legs[] and spells the envelope side
+  // 'direction'; the leg spells it 'side'.
+  const ORDERS_PAYLOAD = {
+    data: {
+      results: [
+        {
+          id: 'ord-1',
+          chain_symbol: 'QQQ',
+          direction: 'debit',
+          state: 'filled',
+          quantity: '4.0000',
+          processed_quantity: '4.0000',
+          average_price: '159.0000',
+          created_at: '2026-06-11T14:20:00.123456Z',
+          legs: [
+            {
+              side: 'buy',
+              position_effect: 'open',
+              option_type: 'call',
+              strike_price: '707.0000',
+              expiration_date: '2026-06-11',
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  it('parses contract, side, fill price and timestamp out of a nested legs row', async () => {
+    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.optionOrders], {
+      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+      [TOOL_NAMES.optionOrders]: ORDERS_PAYLOAD,
+    });
+
+    const result = await new RobinhoodTools(mcp).getOptionOrders();
+
+    expect(result?.orders).toEqual([
+      expect.objectContaining({
+        orderId: 'ord-1',
+        symbol: 'QQQ',
+        optionType: 'call',
+        strike: 707,
+        expiration: '2026-06-11',
+        side: 'buy',
+        state: 'filled',
+        averagePrice: 159,
+        quantity: 4,
+        createdAt: '2026-06-11T14:20:00.123456Z',
+      }),
+    ]);
+    expect(mcp.callTool).toHaveBeenCalledWith(TOOL_NAMES.optionOrders, {
+      account_number: '633644000',
+    });
+  });
+
+  it("reads a leg's side rather than the envelope's direction", async () => {
+    const sellOrder = {
+      data: {
+        results: [
+          {
+            ...ORDERS_PAYLOAD.data.results[0],
+            direction: 'debit', // stale/contradictory envelope
+            legs: [{ side: 'sell', option_type: 'call', strike_price: '707', expiration_date: '2026-06-11' }],
+          },
+        ],
+      },
+    };
+    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.optionOrders], {
+      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+      [TOOL_NAMES.optionOrders]: sellOrder,
+    });
+
+    const result = await new RobinhoodTools(mcp).getOptionOrders();
+
+    expect(result?.orders[0]?.side).toBe('sell');
+  });
+
+  it('returns null when the server does not advertise the tool', async () => {
+    const mcp = makeMcp([TOOL_NAMES.accounts], { [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD });
+
+    expect(await new RobinhoodTools(mcp).getOptionOrders()).toBeNull();
+  });
+
+  it('skips rows missing contract details rather than emitting a partial order', async () => {
+    const partial = { data: { results: [{ id: 'ord-2', chain_symbol: 'SPY', direction: 'debit' }] } };
+    const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.optionOrders], {
+      [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+      [TOOL_NAMES.optionOrders]: partial,
+    });
+
+    const result = await new RobinhoodTools(mcp).getOptionOrders();
+
+    expect(result?.orders).toEqual([]);
+  });
+});
+
 describe('RobinhoodTools get_portfolio parsing', () => {
   it('parses string-valued buying power and total value', async () => {
     const mcp = makeMcp([TOOL_NAMES.accounts, TOOL_NAMES.portfolio], {

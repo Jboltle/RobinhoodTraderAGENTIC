@@ -109,6 +109,24 @@ export function createFakeDb(): FakeDb {
       trades.push({ userId, decision });
       record('recordDecision', userId, undefined);
     },
+    async resolvePendingApproval(userId, messageId, outcome) {
+      const row = trades.find(
+        (r) =>
+          r.userId === userId &&
+          r.decision.messageId === messageId &&
+          r.decision.kind === 'pending_approval'
+      );
+      if (row) {
+        row.decision = {
+          ...row.decision,
+          kind: outcome.kind,
+          code: outcome.code,
+          reason: outcome.reason,
+          order: outcome.order,
+        };
+      }
+      return record('resolvePendingApproval', userId, row !== undefined);
+    },
     async decisionsByMessageId(userId, messageIds) {
       const wanted = new Set(messageIds);
       const found = new Map<string, Decision>();

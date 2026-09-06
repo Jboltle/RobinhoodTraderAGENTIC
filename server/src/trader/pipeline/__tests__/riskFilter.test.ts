@@ -32,11 +32,14 @@ const SETTINGS: ResolvedTradeSettings = TradeSettingsSchema.parse({
   regularHoursOnly: false,     // disabled by default in tests
   maxTradesPerDay: 3,
   cooldownSeconds: 60,
-  maxNotionalPct: 5,           // equity cap = 5% of buying power
-  maxOptionsNotionalPct: 2,    // options cap = 2%
+  // Each value is a plain % of buying power. `full` is also the ceiling.
+  equitySmallPct: 1.25,
+  equityMediumPct: 2.5,
+  equityFullPct: 5,
+  optionsSmallPct: 0.5,
+  optionsMediumPct: 1,
+  optionsFullPct: 2,
   maxSingleContractPct: 5,
-  positionSmallPct: 25,        // small  = 25% of cap
-  positionMediumPct: 50,       // medium = 50% of cap
 });
 
 const checkRisk = (callout: Callout, now?: Date) =>
@@ -207,14 +210,44 @@ describe('riskFilter — per-user settings', () => {
     expect((result as { reason: string }).reason).toMatch(/AAPL is blocked/);
   });
 
-  it('sizing caps come from the settings object', async () => {
+  it('sizing comes from the settings object', async () => {
     const result = checkRiskWithSettings(
       { ...BASE_EQUITY, positionSize: 'full' },
-      { ...SETTINGS, maxNotionalPct: 8 }
+      { ...SETTINGS, equityFullPct: 8 }
     );
     expect(result.allow).toBe(true);
     if (!result.allow) return;
     expect(result.portfolioPct).toBeCloseTo(8);
+  });
+
+  it('a size keyword is read straight off its setting, not scaled by anything', async () => {
+    const result = checkRiskWithSettings(
+      { ...BASE_EQUITY, positionSize: 'medium' },
+      { ...SETTINGS, equityMediumPct: 3, equityFullPct: 9 }
+    );
+    expect(result.allow).toBe(true);
+    if (!result.allow) return;
+    expect(result.portfolioPct).toBeCloseTo(3);
+  });
+
+  it('a Medium set above Full is clamped to Full, so no keyword outsizes a full-size callout', async () => {
+    const result = checkRiskWithSettings(
+      { ...BASE_EQUITY, positionSize: 'medium' },
+      { ...SETTINGS, equityMediumPct: 10, equityFullPct: 5 }
+    );
+    expect(result.allow).toBe(true);
+    if (!result.allow) return;
+    expect(result.portfolioPct).toBeCloseTo(5);
+  });
+
+  it('an options Small set above the options ceiling clamps to it', async () => {
+    const result = checkRiskWithSettings(
+      { ...BASE_OPTION, positionSize: 'small' },
+      { ...SETTINGS, optionsSmallPct: 9, optionsFullPct: 2 }
+    );
+    expect(result.allow).toBe(true);
+    if (!result.allow) return;
+    expect(result.portfolioPct).toBeCloseTo(2);
   });
 });
 
@@ -223,30 +256,29 @@ describe('riskFilter — per-user settings', () => {
 // ---------------------------------------------------------------------------
 
 describe('riskFilter — equity keyword sizing', () => {
-  it('no size keyword → medium (50% of cap = 2.5% of portfolio)', async () => {
+  it('no size keyword → medium (equityMediumPct = 2.5% of portfolio)', async () => {
     const result = await checkRisk({ ...BASE_EQUITY, positionSize: null });
     expect(result.allow).toBe(true);
     if (!result.allow) return;
-    // cap=5%, medium fraction=50% → 5 * 0.50 = 2.5
     expect(result.portfolioPct).toBeCloseTo(2.5);
     expect(result.quantityHint).toBeNull();
   });
 
-  it('positionSize=small → 25% of cap = 1.25% of portfolio', async () => {
+  it('positionSize=small → equitySmallPct = 1.25% of portfolio', async () => {
     const result = await checkRisk({ ...BASE_EQUITY, positionSize: 'small' });
     expect(result.allow).toBe(true);
     if (!result.allow) return;
     expect(result.portfolioPct).toBeCloseTo(1.25);
   });
 
-  it('positionSize=full → 100% of cap = 5% of portfolio', async () => {
+  it('positionSize=full → equityFullPct = 5% of portfolio', async () => {
     const result = await checkRisk({ ...BASE_EQUITY, positionSize: 'full' });
     expect(result.allow).toBe(true);
     if (!result.allow) return;
     expect(result.portfolioPct).toBeCloseTo(5);
   });
 
-  it('explicit shares → quantityHint set, portfolioPct = cap', async () => {
+  it('explicit shares → quantityHint set, portfolioPct = the Full ceiling', async () => {
     const result = await checkRisk({
       ...BASE_EQUITY,
       sizeHint: { kind: 'shares', value: 10 },
@@ -254,10 +286,10 @@ describe('riskFilter — equity keyword sizing', () => {
     expect(result.allow).toBe(true);
     if (!result.allow) return;
     expect(result.quantityHint).toBe(10);
-    expect(result.portfolioPct).toBeCloseTo(5); // cap
+    expect(result.portfolioPct).toBeCloseTo(5);
   });
 
-  it('explicit USD amount → quantityHint null, portfolioPct = cap (pipeline enforces min)', async () => {
+  it('explicit USD amount → quantityHint null, portfolioPct = the Full ceiling (pipeline enforces min)', async () => {
     const result = await checkRisk({
       ...BASE_EQUITY,
       sizeHint: { kind: 'usd', value: 250 },
@@ -270,16 +302,15 @@ describe('riskFilter — equity keyword sizing', () => {
 });
 
 describe('riskFilter — options keyword sizing', () => {
-  it('no size keyword on option → small (25% of options cap = 0.5% of portfolio)', async () => {
+  it('no size keyword on option → small (optionsSmallPct = 0.5% of portfolio)', async () => {
     const result = await checkRisk({ ...BASE_OPTION, positionSize: null });
     expect(result.allow).toBe(true);
     if (!result.allow) return;
-    // options cap=2%, small fraction=25% → 2 * 0.25 = 0.5
     expect(result.portfolioPct).toBeCloseTo(0.5);
     expect(result.quantityHint).toBeNull();
   });
 
-  it('positionSize=full on option → 100% of options cap = 2% of portfolio', async () => {
+  it('positionSize=full on option → optionsFullPct = 2% of portfolio', async () => {
     const result = await checkRisk({ ...BASE_OPTION, positionSize: 'full' });
     expect(result.allow).toBe(true);
     if (!result.allow) return;
@@ -330,11 +361,10 @@ describe('riskFilter — options keyword sizing', () => {
     if (!result.allow) return;
     expect(result.orderType).toBe('market');
     expect(result.limitPrice).toBeNull();
-    // options cap=2%, medium=50% → 1% of portfolio
-    expect(result.portfolioPct).toBeCloseTo(1);
+    expect(result.portfolioPct).toBeCloseTo(1); // optionsMediumPct
   });
 
-  it('RUNNERS ONLY sell → full options cap sizing', async () => {
+  it('RUNNERS ONLY sell → optionsFullPct sizing', async () => {
     const runnersSell: Callout = {
       ...BASE_OPTION,
       action: 'sell',

@@ -20,9 +20,11 @@ import {
 } from '../shared/types.js';
 import { verifyWebhookBody } from '../shared/webhookAuth.js';
 import { registerAuth, requireUser } from './auth.js';
-import type { StoredCallout, TraderDb } from './db.js';
+import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
+import { submitOrder } from './pipeline/execute.js';
 import type { MessageProcessor } from './pipeline/index.js';
+import { summarize } from './pipeline/summarize.js';
 import {
   DEFAULT_RECAP_WINDOW_DAYS,
   RECAP_WINDOW_DAYS_CHOICES,
@@ -272,6 +274,86 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.send({ callouts: await loadFeed(deps, userId) });
   });
 
+  // ---- Approval ------------------------------------------------------------
+  //
+  // A pending_approval row is a fully-sized order that was never submitted.
+  // Approving submits exactly the quantity that was sized when the callout
+  // arrived: the risk rules already ran then, and re-running them here would
+  // mean a trade the user explicitly said yes to could still silently vanish.
+  // The trade-off is that approving a backlog can outrun maxTradesPerDay or
+  // reach past the closing bell.
+
+  fastify.post('/api/trades/:messageId/approve', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    const { messageId } = request.params as { messageId: string };
+
+    // The env kill-switch means "this deployment submits nothing", so it has
+    // to outrank a button in the dashboard the same way it outranks a user's
+    // 'immediate' setting.
+    if (config.tradeExecutionMode === 'approval') {
+      return reply
+        .status(409)
+        .send({ error: 'trader is running in approval mode — no orders can be submitted' });
+    }
+
+    const pending = await findPendingApproval(deps, userId, messageId);
+    if (pending === null) {
+      return reply.status(404).send({ error: 'no trade awaiting approval for that callout' });
+    }
+    if (pending.order === null) {
+      return reply.status(409).send({ error: 'that trade has no sized order to submit' });
+    }
+
+    const approvedAt = new Date().toISOString();
+    const tools = deps.brokers.for(userId).tools;
+    let outcome: ApprovalOutcome;
+    try {
+      const placed = await submitOrder(pending.order, { tools });
+      const order = {
+        ...pending.order,
+        orderId: placed.orderId,
+        status: placed.status ?? 'submitted',
+      };
+      outcome = {
+        kind: 'submitted',
+        code: null,
+        reason: `Approved — ${summarize(order, null)}`,
+        order,
+        approvedAt,
+      };
+    } catch (err) {
+      outcome = {
+        kind: 'execution_failed',
+        code: 'execution_error',
+        reason: (err as Error).message,
+        order: pending.order,
+        approvedAt,
+      };
+    }
+
+    return reply.send(await applyApproval(deps, userId, messageId, pending, outcome));
+  });
+
+  fastify.post('/api/trades/:messageId/reject', async (request, reply) => {
+    const { id: userId } = requireUser(request);
+    const { messageId } = request.params as { messageId: string };
+
+    const pending = await findPendingApproval(deps, userId, messageId);
+    if (pending === null) {
+      return reply.status(404).send({ error: 'no trade awaiting approval for that callout' });
+    }
+
+    return reply.send(
+      await applyApproval(deps, userId, messageId, pending, {
+        kind: 'rejected',
+        code: null,
+        reason: 'Rejected — no order submitted.',
+        order: pending.order,
+        approvedAt: new Date().toISOString(),
+      })
+    );
+  });
+
   // The Caller roster for the settings Following picker. Shared rows, same
   // for every user; auth is still required like every other /api route.
   fastify.get('/api/callers', async (request, reply) => {
@@ -335,6 +417,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         options.positions.filter((p) => p.quantity > 0).length;
       return reply.send({
         portfolioValueUsd: buyingPower.portfolioValueUsd,
+        buyingPowerUsd: buyingPower.amountUsd,
         openPositions,
       });
     } catch (err) {
@@ -425,6 +508,47 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   return fastify;
+}
+
+// =============================================================================
+// Approval
+// =============================================================================
+
+/** This user's decision for a callout, but only if it is awaiting approval. */
+async function findPendingApproval(
+  deps: ServerDeps,
+  userId: string,
+  messageId: string
+): Promise<Decision | null> {
+  const decisions = await deps.db.decisionsByMessageId(userId, [messageId]);
+  const decision = decisions.get(messageId);
+  return decision?.kind === 'pending_approval' ? decision : null;
+}
+
+/**
+ * Commit an approval outcome to the pending row and push it to the dashboard.
+ *
+ * The write is a compare-and-set on `kind = 'pending_approval'`, so two clicks
+ * racing each other cannot both win. The loser still gets the decision back
+ * rather than an error: the trade did get approved, just not by that request.
+ */
+async function applyApproval(
+  deps: ServerDeps,
+  userId: string,
+  messageId: string,
+  pending: Decision,
+  outcome: ApprovalOutcome
+): Promise<{ decision: Decision }> {
+  const applied = await deps.db.resolvePendingApproval(userId, messageId, outcome);
+  const decision: Decision = {
+    ...pending,
+    kind: outcome.kind,
+    code: outcome.code,
+    reason: outcome.reason,
+    order: outcome.order,
+  };
+  if (applied) deps.events.emitDecision(userId, decision);
+  return { decision };
 }
 
 // =============================================================================

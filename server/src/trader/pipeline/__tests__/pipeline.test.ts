@@ -17,6 +17,7 @@ import type {
   Decision,
   DiscordEnvelope,
   PostReceipt,
+  TradeSettings,
 } from '../../../shared/types.js';
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
 import { TraderEvents } from '../../events.js';
@@ -35,6 +36,20 @@ import {
 
 const USER = 'user-1';
 const OTHER_USER = 'user-2';
+
+/**
+ * A user set up to actually trade: auto-executing, following everyone, and
+ * with the hours/cooldown/options guards relaxed so tests exercise the path
+ * under test rather than the calendar.
+ */
+const TRADING_SETTINGS = {
+  executionMode: 'immediate',
+  followedCallerIds: null,
+  regularHoursOnly: false,
+  cooldownSeconds: 0,
+  optionsFullPct: 10,
+  maxSingleContractPct: 10,
+} as const satisfies TradeSettings;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,7 +116,9 @@ function setup(
   const toolsByUser = new Map<string, RobinhoodTools>();
   for (const userId of users) {
     db.seedBrokerTokens(userId, fakeTokens(`token-${userId}`));
-    db.seedSettings(userId, { regularHoursOnly: false, cooldownSeconds: 0, maxOptionsNotionalPct: 10, maxSingleContractPct: 10 });
+    // The schema now defaults to approval mode and following nobody, so the
+    // baseline test user has to opt back in to auto-execution explicitly.
+    db.seedSettings(userId, { ...TRADING_SETTINGS });
     toolsByUser.set(userId, makeTools(toolsOverrides));
   }
 
@@ -318,15 +335,34 @@ describe('fan-out — parse consistency guardrails', () => {
 
 describe('fan-out — approval mode', () => {
   it("a user's own 'approval' setting parks the trade without submitting", async () => {
-    const { db, deps, postReceipt } = setup(BTO_QQQ_PUT.expectedCallout);
-    db.seedSettings(USER, { executionMode: 'approval', regularHoursOnly: false });
+    const { db, deps, postReceipt, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    db.seedSettings(USER, { ...TRADING_SETTINGS, executionMode: 'approval' });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision!.kind).toBe('pending_approval');
-    expect(decision!.order).toBeNull();
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
     expect(postReceipt).toHaveBeenCalledOnce();
+  });
+
+  // Sizing happens before the approval gate so the dashboard can show what is
+  // being approved, and so the approve endpoint has an order to submit.
+  it('parks a fully sized order, not a bare intent', async () => {
+    const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout);
+    db.seedSettings(USER, { ...TRADING_SETTINGS, executionMode: 'approval' });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision!.order).toMatchObject({
+      symbol: 'QQQ',
+      assetType: 'option',
+      orderId: null,
+      status: null,
+    });
+    expect(decision!.order!.quantity).toBeGreaterThan(0);
+    expect(decision!.reason).toContain(`${decision!.order!.quantity}x QQQ`);
   });
 
   it("ignores a user's 'immediate' setting when the trader booted in approval mode", async () => {
@@ -416,7 +452,7 @@ describe('fan-out — several users', () => {
 
   it('applies each user\u2019s own settings to the same callout', async () => {
     const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout, {}, [USER, OTHER_USER]);
-    db.seedSettings(OTHER_USER, { blockedTickers: ['QQQ'], regularHoursOnly: false });
+    db.seedSettings(OTHER_USER, { ...TRADING_SETTINGS, blockedTickers: ['QQQ'] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
@@ -434,7 +470,7 @@ describe('fan-out — several users', () => {
     ]);
     for (const userId of [USER, OTHER_USER]) {
       db.seedBrokerTokens(userId, fakeTokens(`token-${userId}`));
-      db.seedSettings(userId, { regularHoursOnly: false, maxOptionsNotionalPct: 10, maxSingleContractPct: 10 });
+      db.seedSettings(userId, { ...TRADING_SETTINGS });
     }
 
     await createMessageProcessor({
@@ -479,7 +515,7 @@ describe('fan-out — several users', () => {
 describe('fan-out — Following', () => {
   // envelopeFromFixture always posts as authorId 'test-author'.
 
-  it('null Following (the default) trades on every Caller', async () => {
+  it('legacy null Following trades on every Caller', async () => {
     const { decision } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout
@@ -487,12 +523,20 @@ describe('fan-out — Following', () => {
     expect(decision.kind).toBe('submitted');
   });
 
+  // The reason a fresh account cannot copy nineteen strangers on day one.
+  it('the default follows no one, so a brand-new account trades nothing', async () => {
+    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    db.seedSettings(USER, {});
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(await db.listDecisions(USER, 10)).toEqual([]);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
   it('an explicit list including the author trades normally', async () => {
     const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout);
-    db.seedSettings(USER, {
-      regularHoursOnly: false, maxOptionsNotionalPct: 10, maxSingleContractPct: 10,
-      followedCallerIds: ['test-author'],
-    });
+    db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: ['test-author'] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
@@ -501,7 +545,7 @@ describe('fan-out — Following', () => {
 
   it('an explicit list excluding the author skips silently — no trade, no record', async () => {
     const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
-    db.seedSettings(USER, { regularHoursOnly: false, followedCallerIds: ['someone-else'] });
+    db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: ['someone-else'] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
@@ -511,7 +555,7 @@ describe('fan-out — Following', () => {
 
   it('an empty list follows no one', async () => {
     const { db, deps, tools, postReceipt } = setup(BTO_QQQ_PUT.expectedCallout);
-    db.seedSettings(USER, { regularHoursOnly: false, followedCallerIds: [] });
+    db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: [] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
@@ -523,7 +567,7 @@ describe('fan-out — Following', () => {
 
   it('Following is per user: one user skips while the other trades', async () => {
     const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout, {}, [USER, OTHER_USER]);
-    db.seedSettings(OTHER_USER, { regularHoursOnly: false, followedCallerIds: [] });
+    db.seedSettings(OTHER_USER, { ...TRADING_SETTINGS, followedCallerIds: [] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 

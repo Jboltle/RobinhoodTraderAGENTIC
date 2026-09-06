@@ -298,20 +298,22 @@ Per user, not per environment. Each user owns one row in `settings`, edited from
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `maxNotionalPct` | 5 | Max equity notional per order, as % of buying power |
-| `maxOptionsNotionalPct` | 2 | Max options premium per order, as % of buying power |
+| `equitySmallPct` / `equityMediumPct` / `equityFullPct` | 1.25 / 2.5 / 5 | What a stock callout deploys, as % of buying power, per size keyword |
+| `optionsSmallPct` / `optionsMediumPct` / `optionsFullPct` | 0.5 / 1 / 2 | Same, for options |
 | `maxSingleContractPct` | 5 | Skip options trades where even 1 contract exceeds this % of buying power |
-| `positionSmallPct` / `positionMediumPct` | 25 / 50 | % of the per-trade cap used for the small/medium size keywords |
 | `maxTradesPerDay` | 10 | Total daily submitted trades across all tickers |
 | `cooldownSeconds` | 300 | Minimum gap between two trades on the same ticker |
 | `allowedTickers` / `blockedTickers` | `[]` / `[]` | Symbol allow/block lists; empty allowlist means allow everything |
 | `minConfidence` | 0.7 | Drop callouts the LLM rates below this confidence |
 | `regularHoursOnly` | `true` | Reject orders outside US/Eastern 09:30–16:00 weekdays |
-| `executionMode` | `immediate` | This user's own switch: `immediate` submits after risk checks, `approval` records without submitting |
+| `followedCallerIds` | `[]` | Which Callers to copy. Empty means nobody, so a new account trades nothing until its owner picks some |
+| `executionMode` | `approval` | This user's own switch: `approval` sizes and parks each trade for a per-row Approve/Reject in the dashboard, `immediate` submits as soon as risk checks pass |
 
-`maxTradesPerDay` and `cooldownSeconds` are enforced against the `trades` table rather than an in-process counter, so they hold across restarts.
+**Sizing has one layer, not two.** Each percentage above is taken directly off buying power — a `medium size` stock callout deploys 2.5%, full stop, with nothing multiplied by anything else. A callout that names no size uses Medium for stock and Small for options. `full` is the per-trade ceiling and everything clamps to it: a callout asking for an explicit $5,000 or 300 shares is trimmed to it, and so is a Small or Medium that a user sets above it, so no callout can ever deploy more than Full.
 
-The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch. It can only tighten: a trader booted in `approval` mode holds every user regardless of their own `executionMode`, because the MCP sessions it would need to submit with are never wired up.
+`maxTradesPerDay` and `cooldownSeconds` are enforced against the `trades` table rather than an in-process counter, so they hold across restarts. They are checked when the callout arrives, which for an approval-mode trade is not when it is submitted — approving a backlog can therefore outrun the daily cap.
+
+The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch. It can only tighten: a trader booted in `approval` mode holds every user regardless of their own `executionMode`, and rejects the dashboard's Approve button with a 409, so the deployment submits nothing at all.
 
 ## Project layout
 

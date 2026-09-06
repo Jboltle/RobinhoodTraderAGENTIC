@@ -7,12 +7,16 @@ import { describe, expect, it } from 'vitest';
 import { TradeSettingsSchema } from '../types.js';
 
 describe('TradeSettingsSchema — followedCallerIds', () => {
-  it('defaults to null: follow every Caller, including future ones', () => {
-    expect(TradeSettingsSchema.parse({}).followedCallerIds).toBeNull();
+  it('defaults to an empty list: follow no one until Callers are picked', () => {
+    expect(TradeSettingsSchema.parse({}).followedCallerIds).toEqual([]);
   });
 
   it('keeps an empty list: follow no one', () => {
     expect(TradeSettingsSchema.parse({ followedCallerIds: [] }).followedCallerIds).toEqual([]);
+  });
+
+  it('keeps an explicit null: legacy rows still follow every Caller', () => {
+    expect(TradeSettingsSchema.parse({ followedCallerIds: null }).followedCallerIds).toBeNull();
   });
 
   it('keeps an explicit list: follow exactly those author ids', () => {

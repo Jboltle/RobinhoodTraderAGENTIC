@@ -15,8 +15,9 @@ import type { McpRegistry } from '../rh/mcpRegistry.js';
 import {
   CapitalConstraintError,
   ParseInconsistencyError,
-  executeEquity,
-  executeOptions,
+  sizeEquityOrder,
+  sizeOptionsOrder,
+  submitOrder,
 } from './execute.js';
 import { checkRisk, deriveRiskState } from './riskFilter.js';
 import { summarize, summarizeFanout, summarizePendingApproval } from './summarize.js';
@@ -316,16 +317,6 @@ export async function runForUser(
   const symbol = callout.ticker!.toUpperCase();
   const side = callout.action!;
 
-  if (settings.executionMode === 'approval') {
-    return finalize(userId, deps, {
-      ...base,
-      ...identity,
-      kind: 'pending_approval',
-      code: null,
-      reason: summarizePendingApproval(callout),
-    });
-  }
-
   deps.events.emitStage(userId, {
     messageId: envelope.messageId,
     ticker: symbol,
@@ -364,21 +355,44 @@ export async function runForUser(
     }
   }
 
-  // ---- 3. Execute ---------------------------------------------------------
+  // ---- 3. Size, then submit ------------------------------------------------
+  // Sizing runs in both modes: it only reads from the broker, and a parked
+  // trade that cannot say how many shares it is worth is not something anyone
+  // can meaningfully approve.
   try {
-    const placed =
+    const quantity =
       risk.assetType === 'option'
-        ? await executeOptions(symbol, side, risk, callout, buyingPower, context)
-        : await executeEquity(symbol, side, risk, callout, buyingPower, context);
+        ? await sizeOptionsOrder(symbol, side, risk, callout, buyingPower, context)
+        : await sizeEquityOrder(symbol, side, risk, callout, buyingPower, context);
 
-    const order: SubmittedOrder = {
+    const sized: SubmittedOrder = {
       symbol,
       side,
       assetType: risk.assetType,
-      quantity: placed.quantity,
+      quantity,
       orderType: risk.orderType,
       limitPrice: risk.limitPrice,
       option: risk.assetType === 'option' ? callout.option : null,
+      orderId: null,
+      status: null,
+    };
+
+    // Approval is the last gate: everything above has already passed, and the
+    // row carries the sized order so the dashboard can show what is at stake.
+    if (settings.executionMode === 'approval') {
+      return finalize(userId, deps, {
+        ...base,
+        ...identity,
+        kind: 'pending_approval',
+        code: null,
+        reason: summarizePendingApproval(sized),
+        order: sized,
+      });
+    }
+
+    const placed = await submitOrder(sized, context);
+    const order: SubmittedOrder = {
+      ...sized,
       orderId: placed.orderId,
       status: placed.status ?? 'submitted',
     };

@@ -53,7 +53,7 @@ export function resolveTradeCaller(
     }
   }
 
-  const name = callout.authorName.trim().slice(0,12)
+  const name = callout.authorName.trim()
   if (!name) return null
   return { name, avatarUrl: null }
 }

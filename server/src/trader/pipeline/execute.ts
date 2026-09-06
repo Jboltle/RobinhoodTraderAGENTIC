@@ -1,5 +1,15 @@
+/**
+ * Execution is two halves, and both modes use them.
+ *
+ * `size*` resolves how many shares or contracts to trade and touches only
+ * read-only broker calls, so approval mode can run it to show the user what
+ * they are about to approve. `submitOrder` is the only function here that
+ * places anything, and it works from the already-sized SubmittedOrder — which
+ * is what lets the approve endpoint submit a trade that was sized hours ago
+ * without re-deriving it.
+ */
 import { createLogger } from '../../shared/logger.js';
-import type { Callout, OptionContract, RiskCheck } from '../../shared/types.js';
+import type { Callout, OptionContract, RiskCheck, SubmittedOrder } from '../../shared/types.js';
 import type { OptionPosition, RobinhoodTools } from '../rh/tools.js';
 
 const log = createLogger('trader:pipeline');
@@ -15,7 +25,6 @@ export type RiskAllow = Extract<RiskCheck, { allow: true }>;
 export interface PlacedResult {
   readonly orderId: string | null;
   readonly status: string | null;
-  readonly quantity: number;
 }
 
 /**
@@ -47,14 +56,15 @@ export class ParseInconsistencyError extends Error {
 // as misparses rather than aggressive orders.
 const EQUITY_LIMIT_MIN_QUOTE_FRACTION = 0.2;
 
-export async function executeEquity(
+/** Resolve the share count for an equity order. Read-only broker calls. */
+export async function sizeEquityOrder(
   symbol: string,
   side: 'buy' | 'sell',
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
   deps: ExecutionContext
-): Promise<PlacedResult> {
+): Promise<number> {
   const price =
     risk.limitPrice !== null
       ? risk.limitPrice
@@ -63,9 +73,8 @@ export async function executeEquity(
 
   // Sanity: an equity buy limit wildly below the live quote is a misparse
   // (e.g. an option premium taken as a share price), not a bargain order.
-  // ponytail: only guards immediate-mode buys with a limit; approval-mode
-  // parses rely on the pipeline's options-language veto, and a stale/absent
-  // quote skips the check. Upgrade path: quote-check at risk-filter time.
+  // ponytail: a stale or absent quote skips the check. Upgrade path:
+  // quote-check at risk-filter time.
   if (side === 'buy' && risk.limitPrice !== null) {
     const quote = await deps.tools.getQuote(symbol).then((q) => q.price);
     if (quote !== null && risk.limitPrice < quote * EQUITY_LIMIT_MIN_QUOTE_FRACTION) {
@@ -96,25 +105,22 @@ export async function executeEquity(
     );
   }
 
-  const result = await deps.tools.placeOrder({
-    symbol, side, orderType: risk.orderType, quantity,
-    ...(risk.limitPrice !== null ? { limitPrice: risk.limitPrice } : {}),
-  });
-  return { orderId: result.orderId, status: result.status, quantity };
+  return quantity;
 }
 
-export async function executeOptions(
+/** Resolve the contract count for an options order. Read-only broker calls. */
+export async function sizeOptionsOrder(
   symbol: string,
   side: 'buy' | 'sell',
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
   deps: ExecutionContext
-): Promise<PlacedResult> {
+): Promise<number> {
   const option = callout.option!;
 
   if (side === 'sell') {
-    return executeOptionExit(symbol, risk, callout, deps);
+    return sizeOptionExit(symbol, risk, callout, deps);
   }
 
   // ---- Resolve premium ----------------------------------------------------
@@ -175,14 +181,14 @@ export async function executeOptions(
     contracts = 1;
   }
 
-  // ---- Hard cap: never exceed maxOptionsNotionalPct -----------------------
+  // ---- Hard cap: never exceed the options ceiling (optionsFullPct) --------
   // Applies regardless of whether contracts came from a hint or budget math.
   if (contractCost !== null) {
-    const hardMax = Math.max(1, Math.floor(buyingPower * risk.maxOptionsNotionalPct / 100 / contractCost));
+    const hardMax = Math.max(1, Math.floor(buyingPower * risk.optionsFullPct / 100 / contractCost));
     if (contracts > hardMax) {
       log.warn('capping contracts to hard max', {
         symbol, requested: contracts, capped: hardMax,
-        hardMaxPct: `${risk.maxOptionsNotionalPct}%`,
+        hardMaxPct: `${risk.optionsFullPct}%`,
       });
       contracts = hardMax;
     }
@@ -200,20 +206,15 @@ export async function executeOptions(
     });
   }
 
-  const result = await deps.tools.placeOptionsOrder({
-    symbol, optionType: option.optionType, strike: option.strike,
-    expiration: option.expiration, contracts, side, orderType: risk.orderType,
-    ...(risk.limitPrice !== null ? { limitPremium: risk.limitPrice } : {}),
-  });
-  return { orderId: result.orderId, status: result.status, quantity: contracts };
+  return contracts;
 }
 
-async function executeOptionExit(
+async function sizeOptionExit(
   symbol: string,
   risk: RiskAllow,
   callout: Callout,
   deps: ExecutionContext
-): Promise<PlacedResult> {
+): Promise<number> {
   const option = callout.option!;
   const position = await findOpenOptionPosition(deps, symbol, option);
   const heldContracts = Math.floor(position?.quantity ?? 0);
@@ -243,18 +244,43 @@ async function executeOptionExit(
     positionSize: callout.positionSize ?? 'default',
   });
 
-  const result = await deps.tools.placeOptionsOrder({
-    symbol,
-    optionType: option.optionType,
-    strike: option.strike,
-    expiration: option.expiration,
-    contracts,
-    side: 'sell',
-    orderType: risk.orderType,
-    ...(risk.limitPrice !== null ? { limitPremium: risk.limitPrice } : {}),
-  });
+  return contracts;
+}
 
-  return { orderId: result.orderId, status: result.status, quantity: contracts };
+/**
+ * Place an already-sized order. The only function in this module that writes
+ * to the broker, and the only one the approve endpoint needs — everything it
+ * requires is on the SubmittedOrder the sizing half produced.
+ */
+export async function submitOrder(
+  order: SubmittedOrder,
+  deps: ExecutionContext
+): Promise<PlacedResult> {
+  if (order.assetType === 'option') {
+    if (order.option === null) {
+      throw new Error(`options order for ${order.symbol} is missing its contract details`);
+    }
+    const result = await deps.tools.placeOptionsOrder({
+      symbol: order.symbol,
+      optionType: order.option.optionType,
+      strike: order.option.strike,
+      expiration: order.option.expiration,
+      contracts: order.quantity,
+      side: order.side,
+      orderType: order.orderType,
+      ...(order.limitPrice !== null ? { limitPremium: order.limitPrice } : {}),
+    });
+    return { orderId: result.orderId, status: result.status };
+  }
+
+  const result = await deps.tools.placeOrder({
+    symbol: order.symbol,
+    side: order.side,
+    orderType: order.orderType,
+    quantity: order.quantity,
+    ...(order.limitPrice !== null ? { limitPrice: order.limitPrice } : {}),
+  });
+  return { orderId: result.orderId, status: result.status };
 }
 
 async function findOpenOptionPosition(

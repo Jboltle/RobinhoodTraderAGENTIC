@@ -85,16 +85,22 @@ const pct = z.number().positive().max(100);
 const tickerList = z.array(z.string().transform((t) => t.toUpperCase()));
 
 export const TradeSettingsSchema = z.object({
-  executionMode: z.enum(['immediate', 'approval']).default('immediate'),
-  /** Max equity notional per trade as % of buying power. */
-  maxNotionalPct: pct.default(5),
-  /** Max options premium spend per trade as % of buying power. */
-  maxOptionsNotionalPct: pct.default(2),
+  executionMode: z.enum(['immediate', 'approval']).default('approval'),
+  /**
+   * Position sizing. Every value below is a plain percentage of buying power,
+   * so a "medium size" stock callout deploys exactly equityMediumPct of the
+   * account — nothing is multiplied by anything else. The `full` value doubles
+   * as the per-trade ceiling: an explicit dollar, share or contract count from
+   * a callout is clamped to it.
+   */
+  equitySmallPct: pct.default(1.25),
+  equityMediumPct: pct.default(2.5),
+  equityFullPct: pct.default(5),
+  optionsSmallPct: pct.default(0.5),
+  optionsMediumPct: pct.default(1),
+  optionsFullPct: pct.default(2),
   /** Skip options trades where even 1 contract exceeds this % of buying power. */
   maxSingleContractPct: pct.default(5),
-  /** % of the per-trade cap used for the "small" / "medium" size keywords. */
-  positionSmallPct: pct.default(25),
-  positionMediumPct: pct.default(50),
   maxTradesPerDay: z.number().int().nonnegative().default(10),
   cooldownSeconds: z.number().nonnegative().default(300),
   /** Empty = allow every ticker. */
@@ -103,10 +109,13 @@ export const TradeSettingsSchema = z.object({
   minConfidence: z.number().min(0).max(1).default(0.7),
   regularHoursOnly: z.boolean().default(true),
   /**
-   * Following: null = follow every Caller including future ones (default),
-   * [] = follow no one, non-empty = follow exactly those Discord author ids.
+   * Following: [] = follow no one (default — a new account trades nothing until
+   * its owner picks Callers), non-empty = follow exactly those Discord author
+   * ids. null still means "follow every Caller including future ones" so rows
+   * written before this default flipped keep their meaning, but nothing in the
+   * UI produces it any more.
    */
-  followedCallerIds: z.array(z.string()).nullable().default(null),
+  followedCallerIds: z.array(z.string()).nullable().default([]),
 });
 
 /** What a client may send: every field optional, defaults fill the rest. */
@@ -175,8 +184,9 @@ export type RiskCheck =
       readonly allow: true;
       readonly assetType: 'equity' | 'option';
       /**
-       * Percentage of available buying power to deploy (0–100).
-       * The pipeline fetches buying power once and computes:
+       * Percentage of available buying power to deploy (0–100), resolved
+       * straight from the size keyword's setting. The pipeline fetches buying
+       * power once and computes:
        *   notionalUsd = buyingPower × portfolioPct / 100
        * Ignored when quantityHint is set.
        */
@@ -190,7 +200,8 @@ export type RiskCheck =
       readonly orderType: 'market' | 'limit';
       /** Resolved caps carried through so execution honours per-request settings. */
       readonly maxSingleContractPct: number;
-      readonly maxOptionsNotionalPct: number;
+      /** The options ceiling: no trade may exceed this % of buying power. */
+      readonly optionsFullPct: number;
     };
 
 // =============================================================================
@@ -207,7 +218,10 @@ export type DecisionKind =
   | 'not_callout'
   | 'parser_error'
   | 'risk_rejected'
+  /** Sized and waiting for the user to approve or reject it in the dashboard. */
   | 'pending_approval'
+  /** The user turned down a pending_approval. Terminal. */
+  | 'rejected'
   | 'submitted'
   | 'execution_failed'
   /** Seen on catch-up but too old to execute at a price that still makes sense. */

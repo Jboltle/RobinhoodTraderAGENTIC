@@ -58,6 +58,7 @@ export type DecisionKind =
   | 'parser_error'
   | 'risk_rejected'
   | 'pending_approval'
+  | 'rejected'
   | 'submitted'
   | 'execution_failed'
   | 'missed'
@@ -139,6 +140,8 @@ export interface PerformanceRow {
 export interface PortfolioSummary {
   /** Null when Robinhood's account payload omits a total-value field. */
   portfolioValueUsd: number | null
+  /** What position sizing percentages are taken of. */
+  buyingPowerUsd: number
   openPositions: number
 }
 
@@ -151,11 +154,14 @@ export type TradeSettingsInput = Partial<TradeSettings>
 /** Resolved settings from GET /api/settings: every field populated. */
 export interface TradeSettings {
   executionMode: 'immediate' | 'approval'
-  maxNotionalPct: number
-  maxOptionsNotionalPct: number
+  /** Each sizing value is a plain % of buying power; `full` is also the ceiling. */
+  equitySmallPct: number
+  equityMediumPct: number
+  equityFullPct: number
+  optionsSmallPct: number
+  optionsMediumPct: number
+  optionsFullPct: number
   maxSingleContractPct: number
-  positionSmallPct: number
-  positionMediumPct: number
   maxTradesPerDay: number
   cooldownSeconds: number
   allowedTickers: string[]
@@ -331,6 +337,20 @@ export const fetchPortfolio = (): Promise<PortfolioSummary> =>
 
 export const fetchBrokerStatus = (): Promise<BrokerStatus> =>
   request<BrokerStatus>('/api/broker/status')
+
+/** Submit a trade that was sized and parked in approval mode. */
+export const approveTrade = (messageId: string): Promise<Decision> =>
+  postJson<{ decision: Decision }>(
+    `/api/trades/${encodeURIComponent(messageId)}/approve`,
+    {},
+  ).then((r) => r.decision)
+
+/** Turn down a parked trade. Nothing is sent to the broker. */
+export const rejectTrade = (messageId: string): Promise<Decision> =>
+  postJson<{ decision: Decision }>(
+    `/api/trades/${encodeURIComponent(messageId)}/reject`,
+    {},
+  ).then((r) => r.decision)
 
 /** Start the Robinhood OAuth flow and get the URL the user must approve. */
 export const connectBroker = (): Promise<BrokerConnectResult> =>

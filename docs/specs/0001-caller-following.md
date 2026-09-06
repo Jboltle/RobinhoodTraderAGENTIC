@@ -1,7 +1,16 @@
 # Spec: Caller Following
 
-Status: ready-for-agent
+Status: shipped; the opt-in default below was later reversed
 Produced by: grilling session, 2026-07-29 (see `CONTEXT.md` for glossary — Caller, Callout, Following)
+
+> **Superseded in part.** Stories 4, 5 and 9 and the `null`-by-default decision
+> read the wrong way round now. Following someone's money by default turned out
+> to be the wrong bet: an account that had never opened Settings copied every
+> Caller in the roster at once. `followedCallerIds` now defaults to `[]` (follow
+> nobody) and "Select all" writes the explicit current roster instead of `null`,
+> so future Callers are never picked up silently. `null` still means "follow
+> everyone including future ones" on the server, for rows written before the
+> flip. Everything else here still describes the shipped behavior.
 
 ## Problem Statement
 

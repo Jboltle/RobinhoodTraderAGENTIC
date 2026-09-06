@@ -5,6 +5,7 @@ import { Check } from 'lucide-react'
 
 import {
   fetchCallers,
+  fetchPortfolio,
   fetchSettings,
   type Caller,
   type TradeSettings,
@@ -104,11 +105,36 @@ function SettingsForm({
       </FormSection>
 
       <FormSection title="Position sizing">
-        <NumberField label="Max equity notional per trade (% of buying power)" value={form.maxNotionalPct} onChange={(v) => set('maxNotionalPct', v)} placeholder={ph('maxNotionalPct')} min={0} max={100} step={0.5} />
-        <NumberField label="Max options notional per trade (%)" value={form.maxOptionsNotionalPct} onChange={(v) => set('maxOptionsNotionalPct', v)} placeholder={ph('maxOptionsNotionalPct')} min={0} max={100} step={0.5} />
-        <NumberField label="Max single contract cost (%)" value={form.maxSingleContractPct} onChange={(v) => set('maxSingleContractPct', v)} placeholder={ph('maxSingleContractPct')} min={0} max={100} step={0.5} />
-        <NumberField label="'Small' position (% of cap)" value={form.positionSmallPct} onChange={(v) => set('positionSmallPct', v)} placeholder={ph('positionSmallPct')} min={0} max={100} step={0.5} />
-        <NumberField label="'Medium' position (% of cap)" value={form.positionMediumPct} onChange={(v) => set('positionMediumPct', v)} placeholder={ph('positionMediumPct')} min={0} max={100} step={0.5} />
+        <p className="-mt-2 text-xs leading-relaxed text-ink-400">
+          Each number below is a slice of your buying power. A stock callout
+          that says <em>medium size</em> deploys{' '}
+          {Math.min(form.equityMediumPct ?? 0, form.equityFullPct ?? 0)}% of it.
+          A callout with no size word uses Medium for stock and Small for
+          options. Full is the ceiling nothing gets past: a callout asking for
+          $5,000 is trimmed to it, and so is a Small or Medium you set above it.
+        </p>
+
+        <SizingPreview form={form} />
+
+        <SizingRow
+          asset="Stock"
+          small={form.equitySmallPct}
+          medium={form.equityMediumPct}
+          full={form.equityFullPct}
+          onSmall={(v) => set('equitySmallPct', v)}
+          onMedium={(v) => set('equityMediumPct', v)}
+          onFull={(v) => set('equityFullPct', v)}
+        />
+        <SizingRow
+          asset="Options"
+          small={form.optionsSmallPct}
+          medium={form.optionsMediumPct}
+          full={form.optionsFullPct}
+          onSmall={(v) => set('optionsSmallPct', v)}
+          onMedium={(v) => set('optionsMediumPct', v)}
+          onFull={(v) => set('optionsFullPct', v)}
+        />
+        <NumberField label="Skip an options trade if one contract alone costs more than (% of buying power)" value={form.maxSingleContractPct} onChange={(v) => set('maxSingleContractPct', v)} placeholder={ph('maxSingleContractPct')} min={0} max={100} step={0.5} />
       </FormSection>
 
       <FormSection title="Limits & cooldowns">
@@ -153,6 +179,143 @@ function SettingsForm({
   )
 }
 
+// =============================================================================
+// Position sizing
+// =============================================================================
+
+const USD = new Intl.NumberFormat(undefined, {
+  style: 'currency',
+  currency: 'USD',
+  maximumFractionDigits: 0,
+})
+
+/** The three size keywords for one asset type, side by side. */
+function SizingRow({
+  asset,
+  small,
+  medium,
+  full,
+  onSmall,
+  onMedium,
+  onFull,
+}: {
+  asset: string
+  small: number | undefined
+  medium: number | undefined
+  full: number | undefined
+  onSmall: (value: number | undefined) => void
+  onMedium: (value: number | undefined) => void
+  onFull: (value: number | undefined) => void
+}) {
+  return (
+    <div className="grid grid-cols-3 gap-3">
+      <NumberField label={`${asset} · Small (%)`} value={small} onChange={onSmall} placeholder="" min={0} max={100} step={0.25} />
+      <NumberField label={`${asset} · Medium (%)`} value={medium} onChange={onMedium} placeholder="" min={0} max={100} step={0.25} />
+      <NumberField label={`${asset} · Full / ceiling (%)`} value={full} onChange={onFull} placeholder="" min={0} max={100} step={0.25} />
+    </div>
+  )
+}
+
+/**
+ * What the numbers above actually do to the account: one bar per size, scaled
+ * against the largest of them, plus the total that a full day of trading at
+ * the daily cap could deploy.
+ */
+function SizingPreview({ form }: { form: TradeSettingsInput }) {
+  // Shares the dashboard's cache; `retry: false` so a disconnected broker
+  // degrades to percentages immediately instead of after three attempts.
+  const portfolio = useQuery({
+    queryKey: ['portfolio'],
+    queryFn: fetchPortfolio,
+    retry: false,
+  })
+  const buyingPower = portfolio.data?.buyingPowerUsd ?? null
+
+  // Mirrors sizePct() in the server's riskFilter: Full is the ceiling, so a
+  // Small or Medium typed above it is clamped. Showing the clamped bar means
+  // the preview is always what the next callout actually deploys.
+  const equityFull = form.equityFullPct ?? 0
+  const optionsFull = form.optionsFullPct ?? 0
+  const sizes = [
+    { label: 'Stock · Small', pct: Math.min(form.equitySmallPct ?? 0, equityFull) },
+    { label: 'Stock · Medium', pct: Math.min(form.equityMediumPct ?? 0, equityFull) },
+    { label: 'Stock · Full', pct: equityFull },
+    { label: 'Options · Small', pct: Math.min(form.optionsSmallPct ?? 0, optionsFull) },
+    { label: 'Options · Medium', pct: Math.min(form.optionsMediumPct ?? 0, optionsFull) },
+    { label: 'Options · Full', pct: optionsFull },
+  ]
+  const widest = Math.max(...sizes.map((s) => s.pct))
+  const dailyPct = (form.maxTradesPerDay ?? 0) * (form.equityFullPct ?? 0)
+
+  return (
+    <div className="rounded-lg border border-ink-600 bg-ink-700/40 p-4">
+      <div className="mb-3 flex items-baseline justify-between gap-3">
+        <span className="text-xs font-medium text-white">One trade costs</span>
+        <span className="text-xs text-ink-400">
+          {buyingPower === null
+            ? 'connect Robinhood to see dollar amounts'
+            : `of ${USD.format(buyingPower)} buying power`}
+        </span>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        {sizes.map((size) => (
+          <SizingBar
+            key={size.label}
+            label={size.label}
+            pct={size.pct}
+            widthPct={widest > 0 ? (size.pct / widest) * 100 : 0}
+            buyingPower={buyingPower}
+          />
+        ))}
+      </div>
+
+      <div className="mt-3 border-t border-ink-600 pt-3">
+        <SizingBar
+          label="All day, worst case"
+          pct={dailyPct}
+          widthPct={Math.min(dailyPct, 100)}
+          buyingPower={buyingPower}
+          tone="warn"
+        />
+        <p className="mt-1.5 text-[11px] text-ink-400">
+          {form.maxTradesPerDay ?? 0} trades per day at Stock · Full.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function SizingBar({
+  label,
+  pct,
+  widthPct,
+  buyingPower,
+  tone = 'brand',
+}: {
+  label: string
+  pct: number
+  widthPct: number
+  buyingPower: number | null
+  tone?: 'brand' | 'warn'
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-32 shrink-0 text-xs text-ink-400">{label}</span>
+      <div className="h-2 flex-1 overflow-hidden rounded-full bg-ink-700">
+        <div
+          className={`h-full rounded-full ${tone === 'warn' ? 'bg-loss/70' : 'bg-brand'}`}
+          style={{ width: `${widthPct}%` }}
+        />
+      </div>
+      <span className="w-28 shrink-0 text-right text-xs tabular-nums text-white">
+        {buyingPower !== null && `${USD.format((buyingPower * pct) / 100)} `}
+        <span className="text-ink-400">{pct}%</span>
+      </span>
+    </div>
+  )
+}
+
 /** Who to copy-trade: the roster of Callers, toggled by clicking their avatar. */
 function CallersSection({
   followed,
@@ -178,7 +341,7 @@ function CallersSection({
         <button
           type="button"
           className="text-brand hover:underline"
-          onClick={() => onChange(null)}
+          onClick={() => onChange(roster.map((c) => c.authorId))}
         >
           Select all
         </button>

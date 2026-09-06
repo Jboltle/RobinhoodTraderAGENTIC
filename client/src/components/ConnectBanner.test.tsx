@@ -30,17 +30,45 @@ function renderBanner() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <ConnectBanner />
-    </QueryClientProvider>,
-  )
+  return {
+    queryClient,
+    ...render(
+      <QueryClientProvider client={queryClient}>
+        <ConnectBanner />
+      </QueryClientProvider>,
+    ),
+  }
+}
+
+/** jsdom's <dialog> is incomplete; showModal/close must flip the open flag. */
+function stubDialog() {
+  const proto = HTMLDialogElement.prototype
+  if (!proto.showModal || proto.showModal.toString().includes('not implemented')) {
+    proto.showModal = function showModal() {
+      this.setAttribute('open', '')
+    }
+  }
+  if (!proto.close || proto.close.toString().includes('not implemented')) {
+    proto.close = function close() {
+      this.removeAttribute('open')
+      this.dispatchEvent(new Event('close'))
+    }
+  }
+}
+
+async function openConnectDialog(
+  utils: ReturnType<typeof renderBanner>,
+): Promise<void> {
+  fireEvent.click(await utils.findByRole('button', { name: 'Connect Robinhood' }))
+  await utils.findByRole('dialog')
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
   submitBrokerRedirect.mockResolvedValue(undefined)
+  connectBroker.mockResolvedValue({ connected: false, authUrl: AUTH_URL })
   vi.stubGlobal('open', vi.fn())
+  stubDialog()
 })
 
 // The suite runs without `globals`, so Testing Library's auto-cleanup never
@@ -50,40 +78,48 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-test('warns about the dead-end page and the Claude Code slot before connecting', async () => {
+test('slim banner hides the warnings until the dialog opens', async () => {
   fetchBrokerStatus.mockResolvedValue(disconnected)
-  const { container } = renderBanner()
+  const { container, findByRole } = renderBanner()
 
   await waitFor(() =>
     expect(container.textContent).toContain('Robinhood not connected'),
   )
-  expect(container.textContent).toContain('can’t reach this page')
-  expect(container.textContent).toContain('127.0.0.1')
-  expect(container.textContent).toContain('Claude Code')
-})
-
-test('connecting opens the authorization URL and reveals the paste fallback', async () => {
-  fetchBrokerStatus.mockResolvedValue(disconnected)
-  connectBroker.mockResolvedValue({ connected: false, authUrl: AUTH_URL })
-  const { container, findByRole } = renderBanner()
+  const dialog = container.querySelector('dialog')
+  expect(dialog).not.toBeNull()
+  expect(dialog!.open).toBe(false)
 
   fireEvent.click(await findByRole('button', { name: 'Connect Robinhood' }))
+  await waitFor(() => expect(dialog!.open).toBe(true))
+  expect(dialog!.textContent).toContain('can’t reach this page')
+  expect(dialog!.textContent).toContain('127.0.0.1')
+  expect(dialog!.textContent).toContain('Claude Code')
+})
+
+test('Connect opens the dialog without popping Robinhood; Authorize does', async () => {
+  fetchBrokerStatus.mockResolvedValue(disconnected)
+  const utils = renderBanner()
+
+  await openConnectDialog(utils)
+  expect(window.open).not.toHaveBeenCalled()
 
   await waitFor(() =>
-    expect(container.querySelector(`a[href="${AUTH_URL}"]`)).not.toBeNull(),
+    expect(utils.container.querySelector(`a[href="${AUTH_URL}"]`)).not.toBeNull(),
   )
+  fireEvent.click(utils.container.querySelector(`a[href="${AUTH_URL}"]`)!)
   expect(window.open).toHaveBeenCalledWith(AUTH_URL, '_blank', 'noopener')
-  expect(container.querySelector('input')).not.toBeNull()
+  expect(utils.container.querySelector('input')).not.toBeNull()
 })
 
 test('a pasted redirect URL is submitted to the trader', async () => {
   fetchBrokerStatus.mockResolvedValue({ ...disconnected, authUrl: AUTH_URL })
-  const { container, findByRole } = renderBanner()
+  const utils = renderBanner()
 
-  await waitFor(() => expect(container.querySelector('input')).not.toBeNull())
+  await openConnectDialog(utils)
+  await waitFor(() => expect(utils.container.querySelector('input')).not.toBeNull())
   const pasted = 'http://127.0.0.1:8788/oauth/callback?code=the-code&state=s'
-  fireEvent.change(container.querySelector('input')!, { target: { value: pasted } })
-  fireEvent.click(await findByRole('button', { name: 'Finish connecting' }))
+  fireEvent.change(utils.container.querySelector('input')!, { target: { value: pasted } })
+  fireEvent.click(await utils.findByRole('button', { name: 'Finish connecting' }))
 
   await waitFor(() => expect(submittedUrls()).toEqual([pasted]))
 })
@@ -105,7 +141,8 @@ test('clipboard polling auto-submits a copied callback URL', async () => {
     clipboard: { readText: vi.fn().mockResolvedValue(pasted) },
   })
 
-  renderBanner()
+  const utils = renderBanner()
+  await openConnectDialog(utils)
 
   await waitFor(() => expect(submittedUrls()).toEqual([pasted]), { timeout: 4000 })
 })
@@ -116,10 +153,25 @@ test('falls back to the paste box when clipboard permission is denied', async ()
   vi.stubGlobal('isSecureContext', true)
   vi.stubGlobal('navigator', { ...navigator, clipboard: { readText } })
 
-  const { container } = renderBanner()
+  const utils = renderBanner()
+  await openConnectDialog(utils)
 
   await waitFor(() => expect(readText).toHaveBeenCalled(), { timeout: 4000 })
-  // The manual path is still there and nothing was auto-submitted.
-  expect(container.querySelector('input')).not.toBeNull()
+  expect(utils.container.querySelector('input')).not.toBeNull()
   expect(submitBrokerRedirect).not.toHaveBeenCalled()
+})
+
+test('flashes Connected then closes the dialog', async () => {
+  fetchBrokerStatus.mockResolvedValue(disconnected)
+  const utils = renderBanner()
+  await openConnectDialog(utils)
+
+  fetchBrokerStatus.mockResolvedValue({ ...disconnected, connected: true })
+  await utils.queryClient.invalidateQueries({ queryKey: ['broker-status'] })
+
+  await waitFor(() =>
+    expect(utils.container.textContent).toContain('Robinhood is connected.'),
+  )
+
+  await waitFor(() => expect(utils.container.textContent).toBe(''), { timeout: 3000 })
 })

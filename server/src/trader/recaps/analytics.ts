@@ -14,10 +14,21 @@ import type { RecapTrade } from './parser.js';
 /** Window choices offered by the dashboard filter. */
 export const RECAP_WINDOW_DAYS_CHOICES: readonly number[] = [7, 30, 90, 180, 365];
 export const DEFAULT_RECAP_WINDOW_DAYS = 90;
+/** Windows this long or longer gate awards behind a trade count. */
+const LONG_WINDOW_DAYS = 90;
 /** Callers below this trade count appear in the table but win no awards. */
-export const MIN_TRADES_FOR_AWARDS = 20;
+export const MIN_TRADES_FOR_LONG_WINDOW = 20;
 const TOP_TRADES_LIMIT = 10;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Award floor for a window. A week or a month can't accumulate 20 trades for
+ * most callers, so short windows run unfiltered and award whoever traded;
+ * 90D and up demand a real track record before an average- or rate-based
+ * award means anything.
+ */
+export const minTradesForAwards = (windowDays: number): number =>
+  windowDays >= LONG_WINDOW_DAYS ? MIN_TRADES_FOR_LONG_WINDOW : 1;
 
 export interface CallerStats {
   readonly caller: string;
@@ -31,7 +42,7 @@ export interface CallerStats {
   readonly bestPct: number;
   readonly worstPct: number;
   readonly stdDevPct: number;
-  /** trades >= MIN_TRADES_FOR_AWARDS — award eligibility. */
+  /** trades >= the window's award floor — award eligibility. */
   readonly qualifies: boolean;
 }
 
@@ -108,8 +119,14 @@ export function computeRecapPerformance(
   const included = allTrades.filter((t) => !t.isSoft);
   const softExcluded = allTrades.length - included.length;
 
-  const leaderboard = buildLeaderboard(included);
+  const floor = minTradesForAwards(windowDays);
+  const leaderboard = buildLeaderboard(included, floor);
   const qualifying = leaderboard.filter((c) => c.qualifies);
+  const bestPerformer = maxBy(qualifying, (c) => c.avgPct);
+  const worstPerformer = maxBy(
+    worstPerformerPool(leaderboard, qualifying, bestPerformer),
+    (c) => -c.avgPct
+  );
   const topTrades = [...included]
     .sort((a, b) => b.pctGain - a.pctGain)
     .slice(0, TOP_TRADES_LIMIT);
@@ -120,7 +137,7 @@ export function computeRecapPerformance(
 
   return {
     windowDays,
-    minTradesForAwards: MIN_TRADES_FOR_AWARDS,
+    minTradesForAwards: floor,
     fromDate: dates.length ? dates.reduce((a, b) => (a < b ? a : b)) : null,
     toDate: dates.length ? dates.reduce((a, b) => (a > b ? a : b)) : null,
     recapCount: recaps.length,
@@ -136,8 +153,8 @@ export function computeRecapPerformance(
     },
     leaderboard,
     awards: {
-      bestPerformer: maxBy(qualifying, (c) => c.avgPct),
-      worstPerformer: maxBy(qualifying, (c) => -c.avgPct),
+      bestPerformer,
+      worstPerformer,
       mostWins: maxBy(leaderboard, (c) => c.wins),
       highestWinRate: maxBy(qualifying, (c) => c.winRatePct),
       // Consistency only means something for profitable callers: a steady
@@ -161,7 +178,22 @@ export function computeRecapPerformance(
   };
 }
 
-function buildLeaderboard(trades: readonly HighlightTrade[]): CallerStats[] {
+/**
+ * Callers eligible for "worst performer". The best performer is never in it —
+ * one caller can't hold both ends of the scale. When the floor leaves fewer
+ * than two qualifiers the pool falls back to the whole table, so a window with
+ * a single high-volume caller still names someone else as worst.
+ */
+function worstPerformerPool(
+  leaderboard: readonly CallerStats[],
+  qualifying: readonly CallerStats[],
+  bestPerformer: CallerStats | null
+): CallerStats[] {
+  const pool = qualifying.length >= 2 ? qualifying : leaderboard;
+  return pool.filter((c) => c.caller !== bestPerformer?.caller);
+}
+
+function buildLeaderboard(trades: readonly HighlightTrade[], floor: number): CallerStats[] {
   const byCaller = new Map<string, HighlightTrade[]>();
   for (const trade of trades) {
     const list = byCaller.get(trade.caller) ?? [];
@@ -187,7 +219,7 @@ function buildLeaderboard(trades: readonly HighlightTrade[]): CallerStats[] {
         bestPct: round(Math.max(...pcts)),
         worstPct: round(Math.min(...pcts)),
         stdDevPct: round(stdDev(pcts, avg)),
-        qualifies: callerTrades.length >= MIN_TRADES_FOR_AWARDS,
+        qualifies: callerTrades.length >= floor,
       };
     })
     .sort((a, b) => b.avgPct - a.avgPct);
