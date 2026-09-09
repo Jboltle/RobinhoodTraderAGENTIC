@@ -53,6 +53,8 @@ export interface ProcessOptions {
 
 export interface MessageProcessor {
   process(envelope: DiscordEnvelope, options?: ProcessOptions): Promise<void>;
+  /** Serialize work on one user's Robinhood session (callouts and Max Loss). */
+  enqueue<T>(userId: string, run: () => Promise<T>): Promise<T>;
 }
 
 /**
@@ -71,16 +73,14 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
   // process lifetime. Upgrade path is dropping the entry once its chain idles.
   const chains = new Map<string, Promise<unknown>>();
 
-  const queueForUser = (
-    userId: string,
-    run: () => Promise<Decision | null>
-  ): Promise<Decision | null> => {
+  const queueForUser = <T>(userId: string, run: () => Promise<T>): Promise<T> => {
     const chain = (chains.get(userId) ?? Promise.resolve()).then(run, run);
     chains.set(userId, chain);
-    return chain;
+    return chain as Promise<T>;
   };
 
   return {
+    enqueue: queueForUser,
     async process(envelope: DiscordEnvelope, options: ProcessOptions = {}): Promise<void> {
       const userIds = await deps.db.listBrokerUserIds();
       for (const userId of userIds) {

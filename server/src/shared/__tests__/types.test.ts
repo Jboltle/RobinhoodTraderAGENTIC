@@ -25,3 +25,25 @@ describe('TradeSettingsSchema — followedCallerIds', () => {
     ).toEqual(['author-1', 'author-2']);
   });
 });
+
+describe('TradeSettingsSchema — max loss', () => {
+  it('defaults both thresholds to off', () => {
+    const settings = TradeSettingsSchema.parse({});
+    expect(settings.maxLossPct).toBeNull();
+    expect(settings.maxLossUsd).toBeNull();
+  });
+
+  it('accepts 0 (the trip function treats it as off)', () => {
+    expect(TradeSettingsSchema.parse({ maxLossPct: 0, maxLossUsd: 0 })).toMatchObject({
+      maxLossPct: 0,
+      maxLossUsd: 0,
+    });
+  });
+
+  it('keeps an explicit percent and dollar cap', () => {
+    expect(TradeSettingsSchema.parse({ maxLossPct: 50, maxLossUsd: 150 })).toMatchObject({
+      maxLossPct: 50,
+      maxLossUsd: 150,
+    });
+  });
+});

@@ -34,7 +34,10 @@ const optionsFor = (messageId: string): ProcessOptions =>
 beforeEach(() => {
   db = createFakeDb();
   process = vi.fn().mockResolvedValue(undefined);
-  processor = { process: process as MessageProcessor['process'] };
+  processor = {
+    process: process as MessageProcessor['process'],
+    enqueue: <T>(_userId: string, run: () => Promise<T>) => run(),
+  };
 });
 
 const run = (messages: CalloutMessage[]) =>

@@ -206,6 +206,7 @@ const brokers: McpRegistry = {
 
 const processor: MessageProcessor = {
   process: (async () => {}) as MessageProcessor['process'],
+  enqueue: <T>(_userId: string, run: () => Promise<T>) => run(),
 };
 
 const fastify = buildServer({ db, events: new TraderEvents(), brokers, processor });

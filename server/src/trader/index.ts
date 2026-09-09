@@ -9,6 +9,7 @@ import { createTraderDb } from './db.js';
 import { TraderEvents } from './events.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { createMessageProcessor } from './pipeline/index.js';
+import { startMaxLossMonitor } from './maxLoss.js';
 import { startRecapScheduler } from './recaps/sweep.js';
 import { createMcpRegistry } from './rh/mcpRegistry.js';
 import { buildServer } from './server.js';
@@ -85,6 +86,14 @@ async function main(): Promise<void> {
   // Recap ingestion: boot backfill/catch-up + hourly weekday sweep. Errors
   // are contained inside the scheduler; the trading path never depends on it.
   startRecapScheduler(db);
+
+  // Max Loss: process-lifetime flatten loop. Independent of the dashboard.
+  startMaxLossMonitor({
+    db,
+    brokers,
+    events,
+    enqueue: (userId, run) => processor.enqueue(userId, run),
+  });
 
   // Self-healing Caller data: production has no shell for one-time scripts,
   // so the roster seed and the legacy author_id backfill run at every boot.

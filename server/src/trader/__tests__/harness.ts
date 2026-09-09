@@ -69,7 +69,10 @@ export function makeHarness(): Harness {
   };
 
   const process = vi.fn().mockResolvedValue(undefined);
-  const processor: MessageProcessor = { process: process as MessageProcessor['process'] };
+  const processor: MessageProcessor = {
+    process: process as MessageProcessor['process'],
+    enqueue: <T>(_userId: string, run: () => Promise<T>) => run(),
+  };
   const app = buildServer({ db, events, brokers, processor });
 
   return {
@@ -120,6 +123,7 @@ function makeBrokerStub(userId: string, options: BrokerStubOptions): UserBroker 
     getOptionPositions: vi
       .fn()
       .mockResolvedValue({ positions: options.optionPositions ?? [], raw: {} }),
+    getOptionOrders: vi.fn().mockResolvedValue(null),
     ...options.toolsOverrides,
   } as unknown as RobinhoodTools;
 

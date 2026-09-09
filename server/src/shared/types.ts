@@ -116,6 +116,12 @@ export const TradeSettingsSchema = z.object({
    * UI produces it any more.
    */
   followedCallerIds: z.array(z.string()).nullable().default([]),
+  /**
+   * Max Loss: flatten one open position when unrealized loss hits either
+   * threshold. null / 0 = that side is off. Both off (the default) = feature off.
+   */
+  maxLossPct: z.number().min(0).max(100).nullable().default(null),
+  maxLossUsd: z.number().min(0).nullable().default(null),
 });
 
 /** What a client may send: every field optional, defaults fill the rest. */
@@ -225,7 +231,9 @@ export type DecisionKind =
   | 'submitted'
   | 'execution_failed'
   /** Seen on catch-up but too old to execute at a price that still makes sense. */
-  | 'missed';
+  | 'missed'
+  /** Server-side Max Loss flattened this open position. Does not count as a submitted entry. */
+  | 'max_loss_exit';
 
 export interface SubmittedOrder {
   readonly symbol: string;

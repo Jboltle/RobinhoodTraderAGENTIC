@@ -19,3 +19,7 @@ _Avoid_: subscription, allowlist
 **User**:
 Someone invited to the dashboard. Identified by email; their user id is the key on trades, settings, and the broker connection.
 _Avoid_: account, profile, auth user
+
+**Max Loss**:
+A per-user setting that closes one open position when its unrealized loss exceeds a percent of entry and/or a dollar amount.
+_Avoid_: stop loss, circuit breaker, flatten

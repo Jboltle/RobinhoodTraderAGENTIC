@@ -227,6 +227,7 @@ const TRADE_KINDS = new Set([
   'rejected',
   'submitted',
   'execution_failed',
+  'max_loss_exit',
 ])
 
 function TradesTable({
@@ -477,6 +478,12 @@ function Outcome({ decision }: { decision: Decision }) {
           missed: too old to trade when the trader woke up
         </span>
       )
+    case 'max_loss_exit':
+      return (
+        <span className={`${chipClass} bg-loss/10 text-loss`} title={decision.reason}>
+          max loss
+        </span>
+      )
     default:
       return (
         <span className={`${chipClass} bg-ink-700 text-ink-400`}>
@@ -530,7 +537,7 @@ function CalloutFeedCard({ callout }: { callout: CalloutItem }) {
         decision ? (
           <>
             <Outcome decision={decision} />
-            {decision.kind === 'submitted' && (
+            {(decision.kind === 'submitted' || decision.kind === 'max_loss_exit') && (
               <span className="text-ink-400">{decision.reason}</span>
             )}
           </>

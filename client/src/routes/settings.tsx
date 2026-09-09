@@ -142,6 +142,32 @@ function SettingsForm({
         <NumberField label="Per-ticker cooldown (seconds)" value={form.cooldownSeconds} onChange={(v) => set('cooldownSeconds', v)} placeholder={ph('cooldownSeconds')} min={0} step={1} />
       </FormSection>
 
+      <FormSection title="Max loss">
+        <p className="-mt-2 text-xs leading-relaxed text-ink-400">
+          Closes that one open position when either limit is hit — a losing
+          NVDA call does not touch anything else. Stock loss is{' '}
+          <em>(entry − mark) × shares</em>. Options loss is{' '}
+          <em>(entry − mark) × 100 × contracts</em>. Blank is off.
+        </p>
+        <NumberField
+          label="Max loss (%)"
+          value={form.maxLossPct ?? undefined}
+          onChange={(v) => set('maxLossPct', v === 0 ? null : v ?? null)}
+          placeholder={defaults?.maxLossPct == null ? 'off' : ph('maxLossPct')}
+          min={0}
+          max={100}
+          step={1}
+        />
+        <NumberField
+          label="Max loss ($)"
+          value={form.maxLossUsd ?? undefined}
+          onChange={(v) => set('maxLossUsd', v === 0 ? null : v ?? null)}
+          placeholder={defaults?.maxLossUsd == null ? 'off' : ph('maxLossUsd')}
+          min={0}
+          step={1}
+        />
+      </FormSection>
+
       <FormSection title="Tickers">
         <TickerListField label="Allowed tickers (comma-separated, * = any)" value={form.allowedTickers} onChange={(v) => set('allowedTickers', v)} placeholder={ph('allowedTickers')} />
         <TickerListField label="Blocked tickers (comma-separated)" value={form.blockedTickers} onChange={(v) => set('blockedTickers', v)} placeholder={ph('blockedTickers')} />

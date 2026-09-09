@@ -62,6 +62,7 @@ export type DecisionKind =
   | 'submitted'
   | 'execution_failed'
   | 'missed'
+  | 'max_loss_exit'
 
 /** Machine-readable rejection code; mirrors RejectionCode in server/src/shared/types.ts. */
 export type RejectionCode =
@@ -170,6 +171,10 @@ export interface TradeSettings {
   regularHoursOnly: boolean
   /** null = follow every Caller including future ones; [] = follow no one. */
   followedCallerIds: string[] | null
+  /** Flatten that position at this % drop from entry. null = off. */
+  maxLossPct: number | null
+  /** Flatten that position at this dollar loss (options × 100). null = off. */
+  maxLossUsd: number | null
 }
 
 /** One row from GET /api/callers: a Caller known to the roster. */
