@@ -316,14 +316,37 @@ export async function runForUser(
 
   const symbol = callout.ticker!.toUpperCase();
   const side = callout.action!;
+  const context = { tools: deps.brokers.for(userId).tools };
+
+  // Confirm Robinhood can quote the underlying before sizing or looking up
+  // option instruments. Garbage tickers (e.g. ANSI-glued MTSLA) fail here
+  // instead of after three empty get_option_instruments retries.
+  try {
+    const quote = await context.tools.getQuote(symbol);
+    if (!(quote.price > 0)) {
+      return finalize(userId, deps, {
+        ...base,
+        ...identity,
+        kind: 'risk_rejected',
+        code: 'ticker_invalid',
+        reason: `${symbol} has no tradable Robinhood quote`,
+      });
+    }
+  } catch (err) {
+    return finalize(userId, deps, {
+      ...base,
+      ...identity,
+      kind: 'risk_rejected',
+      code: 'ticker_invalid',
+      reason: `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`,
+    });
+  }
 
   deps.events.emitStage(userId, {
     messageId: envelope.messageId,
     ticker: symbol,
     stage: 'executing',
   });
-
-  const context = { tools: deps.brokers.for(userId).tools };
 
   // ---- 2. Fetch buying power ----------------------------------------------
   // Entries need capital validation. Option exits are sized from current

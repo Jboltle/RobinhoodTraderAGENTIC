@@ -574,7 +574,13 @@ export class LlmCalloutParser implements CalloutParser {
   }
 
   async parse(envelope: DiscordEnvelope): Promise<Callout> {
-    const deterministic = tryParseDeterministicCallout(envelope);
+    // Discord ANSI color codes end in `m` (`\u001b[1;32mTSLA` → `mTSLA`).
+    const cleaned: DiscordEnvelope = {
+      ...envelope,
+      content: envelope.content.replace(/\u001b\[[0-9;]*m/g, ''),
+    };
+
+    const deterministic = tryParseDeterministicCallout(cleaned);
     if (deterministic) {
       log.debug('parsed deterministic callout', {
         messageId: envelope.messageId,
@@ -585,26 +591,26 @@ export class LlmCalloutParser implements CalloutParser {
       return deterministic;
     }
 
-    if (isProfitBrag(envelope.content)) {
+    if (isProfitBrag(cleaned.content)) {
       log.debug('P/L brag/update pattern; skipping LLM', {
         messageId: envelope.messageId,
-        content: envelope.content.slice(0, 200),
+        content: cleaned.content.slice(0, 200),
       });
       return buildNonCallout('P/L brag/update pattern (bold % gain or price-to-price-now); skipped LLM (pre-filter)');
     }
 
-    if (!messageHasTradeSignal(envelope.content)) {
+    if (!messageHasTradeSignal(cleaned.content)) {
       log.debug('no ticker or trade verb; skipping LLM', {
         messageId: envelope.messageId,
-        content: envelope.content.slice(0, 200),
+        content: cleaned.content.slice(0, 200),
       });
       return buildNonCallout('no ticker or trade verb present; skipped LLM (pre-filter)');
     }
 
     const userMessage = [
-      'Reference timestamp (use as "now" for relative dates): ' + envelope.timestamp,
-      'Author: ' + envelope.authorName,
-      'Message: ' + envelope.content,
+      'Reference timestamp (use as "now" for relative dates): ' + cleaned.timestamp,
+      'Author: ' + cleaned.authorName,
+      'Message: ' + cleaned.content,
     ].join('\n');
 
     const args = await this.provider.callStructured({

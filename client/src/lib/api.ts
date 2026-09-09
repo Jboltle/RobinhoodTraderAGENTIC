@@ -74,6 +74,7 @@ export type RejectionCode =
   | 'parse_inconsistent'
   | 'ticker_blocked'
   | 'ticker_not_allowed'
+  | 'ticker_invalid'
   | 'outside_market_hours'
   | 'daily_cap_reached'
   | 'cooldown_active'

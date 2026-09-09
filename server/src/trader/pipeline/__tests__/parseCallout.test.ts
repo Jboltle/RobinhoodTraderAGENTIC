@@ -310,6 +310,25 @@ describe('parseCallout — BTO / entry signals', () => {
     });
   });
 
+  it('strips Discord ANSI color codes so mTSLA is not parsed as the ticker', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(
+      makeEnvelope('BTO \u001b[1;32mTSLA 375C 0DTE $1.50', '2026-09-09T14:35:00.000Z')
+    );
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      action: 'buy',
+      ticker: 'TSLA',
+      option: { optionType: 'call', strike: 375, expiration: '2026-09-09' },
+    });
+  });
+
   it('BTO $SPY 755C 0DTE $0.71 parses deterministically without the LLM', async () => {
     const mockProvider: LlmProvider = {
       callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),

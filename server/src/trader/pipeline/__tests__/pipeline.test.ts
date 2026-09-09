@@ -416,6 +416,22 @@ describe('fan-out — error paths', () => {
     expect(decision.reason).toMatch(/zero/i);
   });
 
+  it('rejects before placing when the broker has no quote for the ticker', async () => {
+    const mtsla: Callout = { ...BTO_QQQ_PUT.expectedCallout, ticker: 'MTSLA' };
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(BTO_QQQ_PUT),
+      mtsla,
+      { getQuote: vi.fn().mockRejectedValue(new Error('could not parse quote price')) }
+    );
+
+    expect(decision.kind).toBe('risk_rejected');
+    expect(decision.code).toBe('ticker_invalid');
+    expect(decision.reason).toMatch(/MTSLA/);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(tools.getOptionsMarkPrice).not.toHaveBeenCalled();
+    expect(tools.getBuyingPower).not.toHaveBeenCalled();
+  });
+
   it('records execution_failed when placeOptionsOrder throws', async () => {
     const { decision } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
