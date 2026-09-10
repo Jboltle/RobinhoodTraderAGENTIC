@@ -8,9 +8,7 @@ import { defineConfig } from 'vitest/config';
 loadDotenv({ path: new URL('../.env', import.meta.url) });
 
 const dummyEnvForMissingRequiredVars: Record<string, string> = {
-  LLM_PROVIDER: 'ollama',
   LLM_MODEL: 'test-dummy-model',
-  TRADE_EXECUTION_MODE: 'approval',
   // Not required at import, but forwardToTrader.test.ts signs real HMAC
   // payloads with config.botTraderSecret, and an empty secret fails verify.
   BOT_TRADER_SECRET: 'test-dummy-secret',

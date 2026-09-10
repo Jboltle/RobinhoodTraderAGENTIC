@@ -8,6 +8,8 @@ import type {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
+import type { OptionContract, OrderSide, OrderType } from '../../shared/types.js';
+
 // ---- MCP transport ----------------------------------------------------------
 
 export interface CallToolResult {
@@ -50,11 +52,8 @@ export interface PositionsResult {
   readonly raw: unknown;
 }
 
-export interface OptionPosition {
+export interface OptionPosition extends OptionContract {
   readonly symbol: string;
-  readonly optionType: 'call' | 'put';
-  readonly strike: number;
-  readonly expiration: string;
   readonly quantity: number;
   readonly raw: unknown;
 }
@@ -64,13 +63,10 @@ export interface OptionPositionsResult {
   readonly raw: unknown;
 }
 
-export interface OptionOrder {
+export interface OptionOrder extends OptionContract {
   readonly orderId: string | null;
   readonly symbol: string;
-  readonly optionType: 'call' | 'put';
-  readonly strike: number;
-  readonly expiration: string;
-  readonly side: 'buy' | 'sell';
+  readonly side: OrderSide;
   /** Robinhood order state: 'filled', 'cancelled', 'queued', … */
   readonly state: string | null;
   /**
@@ -97,8 +93,6 @@ export interface OptionsQuoteResult {
   readonly raw: unknown;
 }
 
-export type OrderSide = 'buy' | 'sell';
-export type OrderType = 'market' | 'limit';
 export type TimeInForce = 'day' | 'gtc';
 
 /** Ergonomic camelCase shape used by callers (e.g. `executeTrade`). */
@@ -111,6 +105,7 @@ export interface PlaceOrderArgs {
   readonly timeInForce?: TimeInForce;
 }
 
+/** Broker acknowledgement of a placed order — equity and options alike. */
 export interface PlaceOrderResult {
   readonly orderId: string | null;
   readonly status: string | null;
@@ -118,22 +113,13 @@ export interface PlaceOrderResult {
 }
 
 /** Ergonomic camelCase shape used by callers. */
-export interface PlaceOptionsOrderArgs {
+export interface PlaceOptionsOrderArgs extends OptionContract {
   readonly symbol: string;
-  readonly optionType: 'call' | 'put';
-  readonly strike: number;
-  readonly expiration: string;      // YYYY-MM-DD
   readonly contracts: number;       // each controls 100 shares
   readonly side: OrderSide;
   readonly orderType: OrderType;
   readonly limitPremium?: number;
   readonly timeInForce?: TimeInForce;
-}
-
-export interface PlaceOptionsOrderResult {
-  readonly orderId: string | null;
-  readonly status: string | null;
-  readonly raw: unknown;
 }
 
 // ---- OAuth persistence -------------------------------------------------------
@@ -164,7 +150,5 @@ export type TokenState = 'missing' | 'valid' | 'refreshable' | 'expired';
 
 export interface TokenStatus {
   readonly state: TokenState;
-  /** Seconds until the access token's `exp`; null when unknown/missing. */
-  readonly expiresInSec: number | null;
   readonly hasRefreshToken: boolean;
 }

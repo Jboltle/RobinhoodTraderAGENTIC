@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { RobinhoodMcpClient } from '../mcpClient.js';
 import type { CallToolResult } from '../types.js';
-import type { ToolInputSchema } from '../types.js';
+import type { TokenStatus, ToolInputSchema } from '../types.js';
 import {
   optionInstrumentIdArgs,
   optionInstrumentLookupArgs,
@@ -55,12 +55,14 @@ function textResult(payload: unknown): CallToolResult {
 function makeMcp(
   toolNames: string[],
   responses: Record<string, unknown>,
-  schemas: Record<string, ToolInputSchema> = {}
+  schemas: Record<string, ToolInputSchema> = {},
+  tokenStatus: TokenStatus = { state: 'valid', hasRefreshToken: true }
 ): RobinhoodMcpClient {
   return {
     isConnected: vi.fn().mockReturnValue(true),
     getToolNames: vi.fn().mockReturnValue(toolNames),
     getToolInputSchema: vi.fn((name: string) => schemas[name]),
+    getTokenStatus: vi.fn().mockResolvedValue(tokenStatus),
     callTool: vi.fn(async (name: string) => textResult(responses[name])),
   } as unknown as RobinhoodMcpClient;
 }
@@ -249,6 +251,48 @@ describe('RobinhoodTools order placement argument shapes', () => {
     const args = lastCallArgs(mcp, TOOL_NAMES.placeOrder);
     expect(args.limit_price).toBe('100');
     expect(args).not.toHaveProperty('price');
+  });
+
+  it('refuses equity and options orders when no Robinhood token is stored', async () => {
+    const missing: TokenStatus = { state: 'missing', hasRefreshToken: false };
+    const equity = makeMcp(
+      [TOOL_NAMES.accounts, TOOL_NAMES.placeOrder],
+      { [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD, [TOOL_NAMES.placeOrder]: ORDER_PAYLOAD },
+      {},
+      missing
+    );
+    const options = makeMcp(
+      [TOOL_NAMES.accounts, TOOL_NAMES.optionInstruments, TOOL_NAMES.placeOptionsOrder],
+      {
+        [TOOL_NAMES.accounts]: ACCOUNTS_PAYLOAD,
+        [TOOL_NAMES.optionInstruments]: INSTRUMENTS_PAYLOAD,
+        [TOOL_NAMES.placeOptionsOrder]: ORDER_PAYLOAD,
+      },
+      {},
+      missing
+    );
+
+    await expect(
+      new RobinhoodTools(equity).placeOrder({
+        symbol: 'AMD',
+        side: 'buy',
+        quantity: 2,
+        orderType: 'market',
+      })
+    ).rejects.toThrow(/token is missing/);
+    await expect(
+      new RobinhoodTools(options).placeOptionsOrder({
+        symbol: 'RIVN',
+        optionType: 'call',
+        strike: 16,
+        expiration: '2026-07-24',
+        contracts: 1,
+        side: 'buy',
+        orderType: 'market',
+      })
+    ).rejects.toThrow(/token is missing/);
+    expect(equity.callTool).not.toHaveBeenCalled();
+    expect(options.callTool).not.toHaveBeenCalled();
   });
 });
 

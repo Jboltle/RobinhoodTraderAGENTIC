@@ -1,44 +1,55 @@
 /**
- * The only place in the codebase that talks to Supabase.
+ * The only place in the codebase that talks to the database.
+ *
+ * Table queries run through Drizzle over a direct Postgres connection
+ * (SUPABASE_DB_URL — session pooler), skipping the PostgREST HTTP hop.
+ * supabase-js remains for exactly three things, all Supabase Auth:
+ * ensureUser, sendMagicLink, verifyAccessToken.
  *
  * Every method that touches per-user data takes `userId` as its first
  * argument, so a caller cannot forget to scope a query. The shared-data and
  * auth methods are grouped separately below and are the only ones without it.
  *
- * The client is created with the service-role key, which bypasses RLS — RLS
- * still matters because the anon key ships in the browser bundle and PostgREST
- * is public, but it is not what scopes these queries. This module is.
+ * The direct connection authenticates as the database owner and is not subject
+ * to RLS — RLS still matters because the anon key ships in the browser bundle
+ * and PostgREST is public, but it is not what scopes these queries. This
+ * module is.
  *
- * Expected schema (owned by supabase/migrations/, reconcile there):
- *   callouts            message_id text pk, channel_id text, channel_name text,
- *                       author_id text, author_name text, content text,
- *                       timestamp timestamptz, embeds jsonb, parse jsonb,
- *                       parse_status text
- *   callers             author_id text pk, display_name text, avatar_url text,
- *                       last_seen_at timestamptz
- *   trades              id uuid pk, user_id uuid -> auth.users, message_id text,
- *                       kind text, code text, reason text, ticker text, action text,
- *                       order_payload jsonb, approved_at timestamptz,
- *                       timestamp timestamptz
- *   recaps              message_id text pk, channel_id text, posted_at timestamptz,
- *                       recap_date date, content text, content_hash text,
- *                       parse jsonb, parse_status text, parser_version int
- *   recap_insights      window_days int pk, generated_at timestamptz, content text
- *   settings            user_id uuid pk -> auth.users, payload jsonb
- *   allowed_emails      email text pk
- *   broker_connections  user_id uuid pk -> auth.users, encrypted_tokens text
- *   user_emails         view: user_id uuid, email text  (auth.users id↔email)
+ * Schema is owned by supabase/migrations/ and mirrored for the type system in
+ * ./db/schema.ts — reconcile all three when it changes. Notable shape:
+ *   users               id/email synced from auth.users by trigger; trade
+ *                       settings as typed columns (defaults mirror
+ *                       TradeSettingsSchema)
+ *   trades              per-user decision audit log, fk -> users
+ *   broker_connections  user_id pk (exactly one Robinhood connection per user),
+ *                       fk -> users, ciphertext only
+ *   callouts / callers / recaps / recap_insights   shared, no user scope
+ *   allowed_emails      invite gate, independent of the sign-in mechanism
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { and, asc, count, desc, eq, gte, inArray, isNull, lt } from 'drizzle-orm';
+import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
 
 import { config } from '../shared/config.js';
 import {
   TradeSettingsSchema,
+  defaultSettings,
   type Callout,
   type Decision,
   type ResolvedTradeSettings,
   type TradeSettings,
 } from '../shared/types.js';
+import {
+  allowedEmails,
+  brokerConnections,
+  callers,
+  callouts,
+  recapInsights,
+  recaps,
+  trades,
+  users,
+} from './db/schema.js';
 import { decryptTokens, encryptTokens } from './rh/tokenCrypto.js';
 import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
 import type { PersistedState } from './rh/types.js';
@@ -186,72 +197,60 @@ export interface TraderDb {
 }
 
 export function createTraderDb(): TraderDb {
+  // prepare: false keeps the connection compatible with Supabase's transaction
+  // pooler too, should the env ever point at port 6543 instead of session mode.
+  const client = postgres(config.supabaseDbUrl, { prepare: false });
   const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
-  return new SupabaseTraderDb(supabase);
+  return new DrizzleTraderDb(drizzle(client), supabase);
 }
 
 // =============================================================================
 // Implementation
 // =============================================================================
 
-const DECISION_COLUMNS = 'message_id, kind, code, reason, ticker, action, order_payload, timestamp';
-const CALLOUT_COLUMNS =
-  'message_id, channel_id, channel_name, author_id, author_name, content, timestamp, embeds, parse, parse_status';
-const RECAP_COLUMNS =
-  'message_id, channel_id, posted_at, recap_date, content, content_hash, parse, parse_status, parser_version';
-const RECAP_META_CHUNK = 100;
-
-class SupabaseTraderDb implements TraderDb {
-  constructor(private readonly supabase: SupabaseClient) {}
+class DrizzleTraderDb implements TraderDb {
+  constructor(
+    private readonly db: PostgresJsDatabase,
+    private readonly supabase: SupabaseClient
+  ) {}
 
   async getSettings(userId: string): Promise<ResolvedTradeSettings> {
-    const { data, error } = await this.supabase
-      .from('settings')
-      .select('payload')
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error) throw queryError('load settings', error);
-    // A user with no row (or a row written before a schema field existed) gets
-    // the schema defaults rather than an error.
-    const parsed = TradeSettingsSchema.safeParse(data?.payload ?? {});
-    return parsed.success ? parsed.data : TradeSettingsSchema.parse({});
+    const [row] = await this.db.select().from(users).where(eq(users.id, userId)).limit(1);
+    // The auth sync trigger gives every user a row; a manually deleted one
+    // falls back to the schema defaults rather than an error.
+    return row ? toSettings(row) : defaultSettings();
   }
 
   async saveSettings(userId: string, settings: TradeSettings): Promise<ResolvedTradeSettings> {
     const payload = TradeSettingsSchema.parse(settings);
-    const { error } = await this.supabase
-      .from('settings')
-      .upsert({ user_id: userId, payload }, { onConflict: 'user_id' });
-    if (error) throw queryError('save settings', error);
+    await this.db.update(users).set(payload).where(eq(users.id, userId));
     return payload;
   }
 
   async listDecisions(userId: string, limit: number): Promise<Decision[]> {
-    const { data, error } = await this.supabase
-      .from('trades')
-      .select(DECISION_COLUMNS)
-      .eq('user_id', userId)
-      .order('timestamp', { ascending: false })
+    const rows = await this.db
+      .select()
+      .from(trades)
+      .where(eq(trades.userId, userId))
+      .orderBy(desc(trades.timestamp))
       .limit(limit);
-    if (error) throw queryError('list decisions', error);
-    return (data ?? []).map(toDecision);
+    return rows.map(toDecision);
   }
 
   async recordDecision(userId: string, decision: Decision): Promise<void> {
-    const { error } = await this.supabase.from('trades').insert({
-      user_id: userId,
-      message_id: decision.messageId,
+    await this.db.insert(trades).values({
+      userId,
+      messageId: decision.messageId,
       kind: decision.kind,
       code: decision.code,
       reason: decision.reason,
       ticker: decision.ticker,
       action: decision.action,
-      order_payload: decision.order,
-      timestamp: decision.at,
+      orderPayload: decision.order,
+      timestamp: new Date(decision.at),
     });
-    if (error) throw queryError('record decision', error);
   }
 
   async resolvePendingApproval(
@@ -259,21 +258,24 @@ class SupabaseTraderDb implements TraderDb {
     messageId: string,
     outcome: ApprovalOutcome
   ): Promise<boolean> {
-    const { data, error } = await this.supabase
-      .from('trades')
-      .update({
+    const updated = await this.db
+      .update(trades)
+      .set({
         kind: outcome.kind,
         code: outcome.code,
         reason: outcome.reason,
-        order_payload: outcome.order,
-        approved_at: outcome.approvedAt,
+        orderPayload: outcome.order,
+        approvedAt: new Date(outcome.approvedAt),
       })
-      .eq('user_id', userId)
-      .eq('message_id', messageId)
-      .eq('kind', 'pending_approval')
-      .select('message_id');
-    if (error) throw queryError('resolve pending approval', error);
-    return (data ?? []).length > 0;
+      .where(
+        and(
+          eq(trades.userId, userId),
+          eq(trades.messageId, messageId),
+          eq(trades.kind, 'pending_approval')
+        )
+      )
+      .returning({ messageId: trades.messageId });
+    return updated.length > 0;
   }
 
   async decisionsByMessageId(
@@ -281,276 +283,253 @@ class SupabaseTraderDb implements TraderDb {
     messageIds: readonly string[]
   ): Promise<Map<string, Decision>> {
     if (messageIds.length === 0) return new Map();
-    const { data, error } = await this.supabase
-      .from('trades')
-      .select(DECISION_COLUMNS)
-      .eq('user_id', userId)
-      .in('message_id', [...messageIds])
-      .order('timestamp', { ascending: true });
-    if (error) throw queryError('load decisions for callouts', error);
+    const rows = await this.db
+      .select()
+      .from(trades)
+      .where(and(eq(trades.userId, userId), inArray(trades.messageId, [...messageIds])))
+      .orderBy(asc(trades.timestamp));
     // Ascending order means the last write for a message id wins, which is the
     // newest outcome — a retried message shows its final state.
-    return new Map((data ?? []).map((row) => [String(row.message_id), toDecision(row)]));
+    return new Map(rows.map((row) => [row.messageId, toDecision(row)]));
   }
 
   async countSubmittedSince(userId: string, since: Date): Promise<number> {
-    const { count, error } = await this.supabase
-      .from('trades')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .eq('kind', 'submitted')
-      .gte('timestamp', since.toISOString());
-    if (error) throw queryError('count submitted trades', error);
-    return count ?? 0;
+    const [row] = await this.db
+      .select({ value: count() })
+      .from(trades)
+      .where(
+        and(eq(trades.userId, userId), eq(trades.kind, 'submitted'), gte(trades.timestamp, since))
+      );
+    return row?.value ?? 0;
   }
 
   async lastSubmittedAt(userId: string, ticker: string): Promise<Date | null> {
-    const { data, error } = await this.supabase
-      .from('trades')
-      .select('timestamp')
-      .eq('user_id', userId)
-      .eq('kind', 'submitted')
-      .eq('ticker', ticker.toUpperCase())
-      .order('timestamp', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) throw queryError('load last trade time', error);
-    return data?.timestamp ? new Date(String(data.timestamp)) : null;
+    const [row] = await this.db
+      .select({ timestamp: trades.timestamp })
+      .from(trades)
+      .where(
+        and(
+          eq(trades.userId, userId),
+          eq(trades.kind, 'submitted'),
+          eq(trades.ticker, ticker.toUpperCase())
+        )
+      )
+      .orderBy(desc(trades.timestamp))
+      .limit(1);
+    return row?.timestamp ?? null;
   }
 
   async getBrokerTokens(userId: string): Promise<PersistedState | null> {
-    const { data, error } = await this.supabase
-      .from('broker_connections')
-      .select('encrypted_tokens')
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error) throw queryError('load broker connection', error);
-    if (!data?.encrypted_tokens) return null;
-    const blob = Buffer.from(String(data.encrypted_tokens), 'base64');
+    const [row] = await this.db
+      .select({ encryptedTokens: brokerConnections.encryptedTokens })
+      .from(brokerConnections)
+      .where(eq(brokerConnections.userId, userId))
+      .limit(1);
+    if (!row) return null;
+    const blob = Buffer.from(row.encryptedTokens, 'base64');
     return JSON.parse(decryptTokens(blob, config.rhTokensVaultKey)) as PersistedState;
   }
 
   async saveBrokerTokens(userId: string, state: PersistedState): Promise<void> {
     const blob = encryptTokens(JSON.stringify(state), config.rhTokensVaultKey);
-    const { error } = await this.supabase.from('broker_connections').upsert(
-      { user_id: userId, encrypted_tokens: blob.toString('base64') },
-      { onConflict: 'user_id' }
-    );
-    if (error) throw queryError('save broker connection', error);
+    const encryptedTokens = blob.toString('base64');
+    await this.db
+      .insert(brokerConnections)
+      .values({ userId, encryptedTokens })
+      .onConflictDoUpdate({
+        target: brokerConnections.userId,
+        set: { encryptedTokens, updatedAt: new Date() },
+      });
   }
 
   async deleteBrokerTokens(userId: string): Promise<void> {
-    const { error } = await this.supabase
-      .from('broker_connections')
-      .delete()
-      .eq('user_id', userId);
-    if (error) throw queryError('delete broker connection', error);
+    await this.db.delete(brokerConnections).where(eq(brokerConnections.userId, userId));
   }
 
   async listBrokerUserIds(): Promise<string[]> {
-    const { data, error } = await this.supabase.from('broker_connections').select('user_id');
-    if (error) throw queryError('list connected users', error);
-    return (data ?? []).map((row) => String(row.user_id));
+    const rows = await this.db.select({ userId: brokerConnections.userId }).from(brokerConnections);
+    return rows.map((row) => row.userId);
   }
 
   async getCallout(messageId: string): Promise<StoredCallout | null> {
-    const { data, error } = await this.supabase
-      .from('callouts')
-      .select(CALLOUT_COLUMNS)
-      .eq('message_id', messageId)
-      .maybeSingle();
-    if (error) throw queryError('load callout', error);
-    return data ? toStoredCallout(data) : null;
+    const [row] = await this.db
+      .select()
+      .from(callouts)
+      .where(eq(callouts.messageId, messageId))
+      .limit(1);
+    return row ? toStoredCallout(row) : null;
   }
 
   async saveCallout(callout: StoredCallout): Promise<void> {
-    const { error } = await this.supabase.from('callouts').upsert(
-      {
-        message_id: callout.messageId,
-        channel_id: callout.channelId,
-        channel_name: callout.channelName,
-        author_id: callout.authorId,
-        author_name: callout.authorName,
-        content: callout.content,
-        timestamp: callout.timestamp,
-        embeds: callout.embeds,
-        parse: callout.parse,
-        parse_status: callout.parseStatus,
-      },
-      { onConflict: 'message_id' }
-    );
-    if (error) throw queryError('save callout', error);
+    const values = {
+      messageId: callout.messageId,
+      channelId: callout.channelId,
+      channelName: callout.channelName,
+      authorId: callout.authorId,
+      authorName: callout.authorName,
+      content: callout.content,
+      timestamp: new Date(callout.timestamp),
+      embeds: [...callout.embeds],
+      parse: callout.parse,
+      parseStatus: callout.parseStatus,
+    };
+    await this.db
+      .insert(callouts)
+      .values(values)
+      .onConflictDoUpdate({ target: callouts.messageId, set: values });
   }
 
   async listCallouts(limit: number): Promise<StoredCallout[]> {
-    const { data, error } = await this.supabase
-      .from('callouts')
-      .select(CALLOUT_COLUMNS)
-      .order('timestamp', { ascending: false })
+    const rows = await this.db
+      .select()
+      .from(callouts)
+      .orderBy(desc(callouts.timestamp))
       .limit(limit);
-    if (error) throw queryError('list callouts', error);
-    return (data ?? []).map(toStoredCallout);
+    return rows.map(toStoredCallout);
   }
 
   async upsertCaller(caller: Caller): Promise<void> {
-    const { error } = await this.supabase.from('callers').upsert(
-      {
-        author_id: caller.authorId,
-        display_name: caller.displayName,
-        // Null avatar (old-bot envelopes) must not clobber a stored one:
-        // omitting the column leaves the existing value untouched on conflict.
-        ...(caller.avatarUrl !== null && { avatar_url: caller.avatarUrl }),
-        last_seen_at: caller.lastSeenAt,
-      },
-      { onConflict: 'author_id' }
-    );
-    if (error) throw queryError('upsert caller', error);
+    await this.db
+      .insert(callers)
+      .values({
+        authorId: caller.authorId,
+        displayName: caller.displayName,
+        avatarUrl: caller.avatarUrl,
+        lastSeenAt: new Date(caller.lastSeenAt),
+      })
+      .onConflictDoUpdate({
+        target: callers.authorId,
+        set: {
+          displayName: caller.displayName,
+          lastSeenAt: new Date(caller.lastSeenAt),
+          // Null avatar (old-bot envelopes) must not clobber a stored one:
+          // omitting the column leaves the existing value untouched on conflict.
+          ...(caller.avatarUrl !== null && { avatarUrl: caller.avatarUrl }),
+        },
+      });
   }
 
   async listCallers(): Promise<Caller[]> {
-    const { data, error } = await this.supabase
-      .from('callers')
-      .select('author_id, display_name, avatar_url, last_seen_at')
-      .order('display_name', { ascending: true });
-    if (error) throw queryError('list callers', error);
-    return (data ?? []).map((row) => ({
-      authorId: String(row.author_id),
-      displayName: String(row.display_name),
-      avatarUrl: (row.avatar_url as string | null) ?? null,
-      lastSeenAt: String(row.last_seen_at),
+    const rows = await this.db.select().from(callers).orderBy(asc(callers.displayName));
+    return rows.map((row) => ({
+      authorId: row.authorId,
+      displayName: row.displayName,
+      avatarUrl: row.avatarUrl,
+      lastSeenAt: row.lastSeenAt.toISOString(),
     }));
   }
 
   async listCalloutsMissingAuthor(): Promise<{ messageId: string; timestamp: string }[]> {
-    const { data, error } = await this.supabase
-      .from('callouts')
-      .select('message_id, timestamp')
-      .is('author_id', null);
-    if (error) throw queryError('list callouts missing author', error);
-    return (data ?? []).map((row) => ({
-      messageId: String(row.message_id),
-      timestamp: String(row.timestamp),
+    const rows = await this.db
+      .select({ messageId: callouts.messageId, timestamp: callouts.timestamp })
+      .from(callouts)
+      .where(isNull(callouts.authorId));
+    return rows.map((row) => ({
+      messageId: row.messageId,
+      timestamp: row.timestamp.toISOString(),
     }));
   }
 
   async setCalloutAuthor(messageId: string, authorId: string): Promise<void> {
-    const { error } = await this.supabase
-      .from('callouts')
-      .update({ author_id: authorId })
-      .eq('message_id', messageId);
-    if (error) throw queryError('backfill callout author', error);
+    await this.db.update(callouts).set({ authorId }).where(eq(callouts.messageId, messageId));
   }
 
   async saveRecap(recap: StoredRecap): Promise<void> {
-    const { error } = await this.supabase.from('recaps').upsert(
-      {
-        message_id: recap.messageId,
-        channel_id: recap.channelId,
-        posted_at: recap.postedAt,
-        recap_date: recap.recapDate,
-        content: recap.content,
-        content_hash: recap.contentHash,
-        parse: recap.parse,
-        parse_status: recap.parseStatus,
-        parser_version: recap.parserVersion,
-      },
-      { onConflict: 'message_id' }
-    );
-    if (error) throw queryError('save recap', error);
+    const values = {
+      messageId: recap.messageId,
+      channelId: recap.channelId,
+      postedAt: new Date(recap.postedAt),
+      recapDate: recap.recapDate,
+      content: recap.content,
+      contentHash: recap.contentHash,
+      parse: recap.parse,
+      parseStatus: recap.parseStatus,
+      parserVersion: recap.parserVersion,
+    };
+    await this.db
+      .insert(recaps)
+      .values(values)
+      .onConflictDoUpdate({ target: recaps.messageId, set: values });
   }
 
   async listRecapMetas(messageIds: readonly string[]): Promise<Map<string, StoredRecapMeta>> {
-    const metas = new Map<string, StoredRecapMeta>();
-    // Chunked: a year-deep sweep can carry hundreds of ids, and PostgREST
-    // `in` filters ride in the query string.
-    for (let start = 0; start < messageIds.length; start += RECAP_META_CHUNK) {
-      const chunk = messageIds.slice(start, start + RECAP_META_CHUNK);
-      const { data, error } = await this.supabase
-        .from('recaps')
-        .select('message_id, content_hash, parser_version')
-        .in('message_id', [...chunk]);
-      if (error) throw queryError('load recap metas', error);
-      for (const row of data ?? []) {
-        metas.set(String(row.message_id), {
-          messageId: String(row.message_id),
-          contentHash: String(row.content_hash),
-          parserVersion: Number(row.parser_version),
-        });
-      }
-    }
-    return metas;
+    // Unlike PostgREST (where `in` filters ride in the query string), a SQL IN
+    // list has no practical size limit at this scale — no chunking needed.
+    if (messageIds.length === 0) return new Map();
+    const rows = await this.db
+      .select({
+        messageId: recaps.messageId,
+        contentHash: recaps.contentHash,
+        parserVersion: recaps.parserVersion,
+      })
+      .from(recaps)
+      .where(inArray(recaps.messageId, [...messageIds]));
+    return new Map(rows.map((row) => [row.messageId, row]));
   }
 
   async listRecapsSince(sinceDate: string): Promise<StoredRecap[]> {
-    const { data, error } = await this.supabase
-      .from('recaps')
-      .select(RECAP_COLUMNS)
-      .gte('recap_date', sinceDate)
-      .order('recap_date', { ascending: true });
-    if (error) throw queryError('list recaps', error);
-    return (data ?? []).map(toStoredRecap);
+    const rows = await this.db
+      .select()
+      .from(recaps)
+      .where(gte(recaps.recapDate, sinceDate))
+      .orderBy(asc(recaps.recapDate));
+    return rows.map(toStoredRecap);
   }
 
   async latestRecapPostedAt(): Promise<string | null> {
-    const { data, error } = await this.supabase
-      .from('recaps')
-      .select('posted_at')
-      .order('posted_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) throw queryError('load latest recap time', error);
-    return data?.posted_at ? String(data.posted_at) : null;
+    const [row] = await this.db
+      .select({ postedAt: recaps.postedAt })
+      .from(recaps)
+      .orderBy(desc(recaps.postedAt))
+      .limit(1);
+    return row ? row.postedAt.toISOString() : null;
   }
 
   async listRecapsWithStaleParse(version: number): Promise<StoredRecap[]> {
-    const { data, error } = await this.supabase
-      .from('recaps')
-      .select(RECAP_COLUMNS)
-      .lt('parser_version', version);
-    if (error) throw queryError('list stale recap parses', error);
-    return (data ?? []).map(toStoredRecap);
+    const rows = await this.db.select().from(recaps).where(lt(recaps.parserVersion, version));
+    return rows.map(toStoredRecap);
   }
 
   async getRecapInsight(windowDays: number): Promise<StoredRecapInsight | null> {
-    const { data, error } = await this.supabase
-      .from('recap_insights')
-      .select('window_days, generated_at, content')
-      .eq('window_days', windowDays)
-      .maybeSingle();
-    if (error) throw queryError('load recap insight', error);
-    if (!data) return null;
+    const [row] = await this.db
+      .select()
+      .from(recapInsights)
+      .where(eq(recapInsights.windowDays, windowDays))
+      .limit(1);
+    if (!row) return null;
     return {
-      windowDays: Number(data.window_days),
-      generatedAt: String(data.generated_at),
-      content: String(data.content),
+      windowDays: row.windowDays,
+      generatedAt: row.generatedAt.toISOString(),
+      content: row.content,
     };
   }
 
   async saveRecapInsight(insight: StoredRecapInsight): Promise<void> {
-    const { error } = await this.supabase.from('recap_insights').upsert(
-      {
-        window_days: insight.windowDays,
-        generated_at: insight.generatedAt,
-        content: insight.content,
-      },
-      { onConflict: 'window_days' }
-    );
-    if (error) throw queryError('save recap insight', error);
+    const values = {
+      windowDays: insight.windowDays,
+      generatedAt: new Date(insight.generatedAt),
+      content: insight.content,
+    };
+    await this.db
+      .insert(recapInsights)
+      .values(values)
+      .onConflictDoUpdate({ target: recapInsights.windowDays, set: values });
   }
 
   async isEmailAllowed(email: string): Promise<boolean> {
-    const { data, error } = await this.supabase
-      .from('allowed_emails')
-      .select('email')
-      .eq('email', email.trim().toLowerCase())
-      .maybeSingle();
-    if (error) throw queryError('check signup allowlist', error);
-    return data !== null;
+    const [row] = await this.db
+      .select({ email: allowedEmails.email })
+      .from(allowedEmails)
+      .where(eq(allowedEmails.email, email.trim().toLowerCase()))
+      .limit(1);
+    return row !== undefined;
   }
 
   async ensureUser(email: string): Promise<void> {
     // Passwordless: the only way in is the emailed link. The admin API works
-    // even with self-serve signups disabled on the Supabase project.
+    // even with self-serve signups disabled on the Supabase project. The
+    // sync_user_from_auth trigger creates the public.users row — no follow-up
+    // write needed here.
     const { error } = await this.supabase.auth.admin.createUser({
       email: email.trim().toLowerCase(),
       email_confirm: true,
@@ -571,14 +550,12 @@ class SupabaseTraderDb implements TraderDb {
   }
 
   async findUserByEmail(email: string): Promise<AuthUser | null> {
-    const wanted = email.trim().toLowerCase();
-    const { data, error } = await this.supabase
-      .from('user_emails')
-      .select('user_id, email')
-      .eq('email', wanted)
-      .maybeSingle();
-    if (error) throw queryError('find user by email', error);
-    return data ? { id: String(data.user_id), email: data.email ?? null } : null;
+    const [row] = await this.db
+      .select({ id: users.id, email: users.email })
+      .from(users)
+      .where(eq(users.email, email.trim().toLowerCase()))
+      .limit(1);
+    return row ?? null;
   }
 
   async verifyAccessToken(token: string): Promise<AuthUser | null> {
@@ -589,50 +566,70 @@ class SupabaseTraderDb implements TraderDb {
 }
 
 // =============================================================================
-// Row mapping
+// Row mapping — Drizzle rows are already camelCase and typed; what remains is
+// Date -> ISO string conversion and trimming table rows to their public shapes.
 // =============================================================================
 
-const queryError = (action: string, error: { message: string }): Error =>
-  new Error(`supabase: could not ${action}: ${error.message}`);
-
-function toDecision(row: Record<string, unknown>): Decision {
+function toSettings(row: typeof users.$inferSelect): ResolvedTradeSettings {
   return {
-    at: String(row.timestamp),
-    messageId: String(row.message_id),
-    kind: row.kind as Decision['kind'],
-    code: (row.code as Decision['code']) ?? null,
-    reason: String(row.reason ?? ''),
-    ticker: (row.ticker as string | null) ?? null,
-    action: (row.action as Decision['action']) ?? null,
-    order: (row.order_payload as Decision['order']) ?? null,
+    executionMode: row.executionMode,
+    equitySmallPct: row.equitySmallPct,
+    equityMediumPct: row.equityMediumPct,
+    equityFullPct: row.equityFullPct,
+    optionsSmallPct: row.optionsSmallPct,
+    optionsMediumPct: row.optionsMediumPct,
+    optionsFullPct: row.optionsFullPct,
+    maxSingleContractPct: row.maxSingleContractPct,
+    maxTradesPerDay: row.maxTradesPerDay,
+    cooldownSeconds: row.cooldownSeconds,
+    allowedTickers: row.allowedTickers,
+    blockedTickers: row.blockedTickers,
+    minConfidence: row.minConfidence,
+    regularHoursOnly: row.regularHoursOnly,
+    followedCallerIds: row.followedCallerIds,
+    maxLossPct: row.maxLossPct,
+    maxLossUsd: row.maxLossUsd,
   };
 }
 
-function toStoredRecap(row: Record<string, unknown>): StoredRecap {
+function toDecision(row: typeof trades.$inferSelect): Decision {
   return {
-    messageId: String(row.message_id),
-    channelId: String(row.channel_id ?? ''),
-    postedAt: String(row.posted_at),
-    recapDate: (row.recap_date as string | null) ?? null,
-    content: String(row.content ?? ''),
-    contentHash: String(row.content_hash ?? ''),
-    parse: (row.parse as RecapParse | null) ?? null,
-    parseStatus: (row.parse_status as RecapParseStatus) ?? 'failed',
-    parserVersion: Number(row.parser_version ?? 0),
+    at: row.timestamp.toISOString(),
+    messageId: row.messageId,
+    kind: row.kind,
+    code: row.code,
+    reason: row.reason,
+    ticker: row.ticker,
+    action: row.action,
+    order: row.orderPayload,
   };
 }
 
-function toStoredCallout(row: Record<string, unknown>): StoredCallout {
+function toStoredCallout(row: typeof callouts.$inferSelect): StoredCallout {
   return {
-    messageId: String(row.message_id),
-    channelId: String(row.channel_id ?? ''),
-    channelName: (row.channel_name as string | null) ?? null,
-    authorId: (row.author_id as string | null) ?? null,
-    authorName: String(row.author_name ?? ''),
-    content: String(row.content ?? ''),
-    timestamp: String(row.timestamp),
-    embeds: (row.embeds as Record<string, unknown>[] | null) ?? [],
-    parse: (row.parse as Callout | null) ?? null,
-    parseStatus: (row.parse_status as CalloutParseStatus) ?? 'skipped',
+    messageId: row.messageId,
+    channelId: row.channelId,
+    channelName: row.channelName,
+    authorId: row.authorId,
+    authorName: row.authorName,
+    content: row.content,
+    timestamp: row.timestamp.toISOString(),
+    embeds: row.embeds,
+    parse: row.parse,
+    parseStatus: row.parseStatus,
+  };
+}
+
+function toStoredRecap(row: typeof recaps.$inferSelect): StoredRecap {
+  return {
+    messageId: row.messageId,
+    channelId: row.channelId,
+    postedAt: row.postedAt.toISOString(),
+    recapDate: row.recapDate,
+    content: row.content,
+    contentHash: row.contentHash,
+    parse: row.parse,
+    parseStatus: row.parseStatus,
+    parserVersion: row.parserVersion,
   };
 }

@@ -3,7 +3,7 @@ import { REST, Routes } from 'discord.js';
 import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import { PostReceipt } from '../shared/types.js';
-import { backfillCalloutAuthors, seedMissingCallers } from './callerBootstrap.js';
+import { backfillCalloutAuthors } from './callouts.js';
 import { catchUpOnWake } from './catchup.js';
 import { createTraderDb } from './db.js';
 import { TraderEvents } from './events.js';
@@ -53,10 +53,6 @@ async function main(): Promise<void> {
     postReceipt: buildPostReceipt(discordRest),
   });
 
-  if (config.tradeExecutionMode === 'approval') {
-    log.warn('booted in approval mode; no orders will be submitted for any user');
-  }
-
   const fastify = buildServer({ db, events, brokers, processor });
 
   // Listen before anything else: on a deployed box the OAuth flow can only
@@ -95,12 +91,8 @@ async function main(): Promise<void> {
     enqueue: (userId, run) => processor.enqueue(userId, run),
   });
 
-  // Self-healing Caller data: production has no shell for one-time scripts,
-  // so the roster seed and the legacy author_id backfill run at every boot.
-  // Both are idempotent and neither may block or crash the trading path.
-  void seedMissingCallers(db).catch((err: unknown) =>
-    log.warn('caller seed failed', { error: (err as Error).message })
-  );
+  // Legacy callouts written before author capture have a null author_id.
+  // Idempotent; must not block or crash the trading path.
   void backfillCalloutAuthors(db).catch((err: unknown) =>
     log.warn('callout author backfill failed', { error: (err as Error).message })
   );

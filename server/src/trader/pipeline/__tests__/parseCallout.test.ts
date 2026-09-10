@@ -615,7 +615,11 @@ describe('parseCallout — invalid model output repair', () => {
     };
     const parser = new LlmCalloutParser(mockProvider);
 
-    const result = await parser.parse(makeEnvelope('KEEL looks interesting here', '2026-07-01T14:35:00.000Z'));
+    // Freeform enough to dodge every deterministic template, but every field
+    // of the corrected output is grounded in the text (post-validation).
+    const result = await parser.parse(
+      makeEnvelope('thinking KEEL 6 calls for 8/21, around 1.15', '2026-07-01T14:35:00.000Z')
+    );
 
     expect(mockProvider.callStructured).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject<Partial<Callout>>({
@@ -668,7 +672,7 @@ describe('parseCallout — pre-LLM chatter gate', () => {
     };
     const parser = new LlmCalloutParser(mockProvider);
 
-    await parser.parse(makeEnvelope('still watching SBUX here'));
+    await parser.parse(makeEnvelope('thoughts on SBUX here?'));
 
     expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
   });
@@ -752,28 +756,27 @@ describe('parseCallout — pre-LLM brag/P/L-update filter', () => {
     expect(result.limitPrice).toBe(4.9);
   });
 
-  it('does not filter a lotto callout with a code-blocked contract (reaches the LLM)', async () => {
+  it('parses a lotto callout with a code-blocked contract deterministically', async () => {
+    // Backtick fences are stripped like other markdown, so the lotto template
+    // owns this shape — it must never depend on the LLM.
     const mockProvider: LlmProvider = {
-      callStructured: vi.fn().mockResolvedValue({
-        isCallout: true,
-        assetType: 'option',
-        action: 'buy',
-        ticker: 'SPY',
-        orderType: 'limit',
-        limitPrice: 1.7,
-        sizeHint: null,
-        positionSize: 'small',
-        option: { optionType: 'call', strike: 745, expiration: '2026-06-15' },
-        confidence: 0.9,
-        rationale: 'lotto SPY 745C',
-      }),
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
     };
     const parser = new LlmCalloutParser(mockProvider);
 
     const result = await parser.parse(makeEnvelope('⚠️ Lotto — RISKY\n```\nSPY 745C 0DTE $1.7\n```'));
 
-    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
-    expect(result.isCallout).toBe(true);
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'limit',
+      limitPrice: 1.7,
+      positionSize: 'small',
+      option: { optionType: 'call', strike: 745, expiration: '2026-06-15' },
+    });
   });
 });
 
@@ -797,7 +800,7 @@ describe('parseCallout — partial model output coercion', () => {
     };
     const parser = new LlmCalloutParser(mockProvider);
 
-    const result = await parser.parse(makeEnvelope('anyone else watching SPY today?'));
+    const result = await parser.parse(makeEnvelope('anyone else in SPY today?'));
 
     expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject<Partial<Callout>>({
@@ -1016,6 +1019,204 @@ describe('parseCallout — full channel format with @Pro / header noise', () => 
     const result = await parser.parse(makeEnvelope(fullMessage));
     expect(result.action).toBe('sell');
     expect(result.limitPrice).toBeNull();  // P/L line must NOT be parsed as a limit price
+  });
+});
+
+describe('parseCallout — language pre-filters (no LLM)', () => {
+  const PREFILTERED_MESSAGES: readonly [string, string][] = [
+    ['P/L-only status', 'SPY 745C 2026-06-12\n1.7000  →  1.8   P/L: +5.88% ($10.00)\n\n@Namrood - LIVE DASHBOARD'],
+    ['LETS BANK hype', 'LETS BANK NEXT WEEK! @Pro'],
+    ['fill complaint', 'everyone had MUCH better fill than me!! This dropped to .8 @Pro'],
+    ['vibes opinion', '$SBUX gives me $CVS vibes full transparency @Pro'],
+    ['watchlist mention', 'still watching SBUX here'],
+    ['holding update', 'Still in $SBUX ! @Pro'],
+  ];
+
+  it.each(PREFILTERED_MESSAGES)('%s → non-callout without the LLM', async (_label, content) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(makeEnvelope(content));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(false);
+    expect(result.rationale).toMatch(/pre-filter/);
+  });
+
+  it('a directive verb disarms every language pre-filter', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: false,
+        assetType: 'equity',
+        action: null,
+        ticker: null,
+        orderType: 'market',
+        limitPrice: null,
+        sizeHint: null,
+        positionSize: null,
+        option: null,
+        confidence: 0.2,
+        rationale: 'ambiguous — watching but also talking about buying',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    await parser.parse(makeEnvelope('watching SOFI, might buy at 5'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+
+  it('a contract-like token disarms the holding-update pre-filter', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: false,
+        assetType: 'equity',
+        action: null,
+        ticker: null,
+        orderType: 'market',
+        limitPrice: null,
+        sizeHint: null,
+        positionSize: null,
+        option: null,
+        confidence: 0.2,
+        rationale: 'holding update mentioning a contract',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    await parser.parse(makeEnvelope('Still in SPY 755C, looking strong'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('parseCallout — LLM grounding post-validation', () => {
+  const llmCallout = (overrides: Partial<Callout>): Record<string, unknown> => ({
+    isCallout: true,
+    assetType: 'option',
+    action: 'buy',
+    ticker: 'SPY',
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: null,
+    option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+    confidence: 0.9,
+    rationale: 'model output under test',
+    ...overrides,
+  });
+
+  it('rejects a ticker that does not appear in the message', async () => {
+    const parser = parserWithMock(llmCallout({ ticker: 'NVDA' }));
+
+    const result = await parser.parse(makeEnvelope('grabbing some calls here soon'));
+
+    expect(result.isCallout).toBe(false);
+    expect(result.rationale).toMatch(/post-validation/);
+  });
+
+  it('rejects a strike that does not appear in the message', async () => {
+    const parser = parserWithMock(llmCallout({}));
+
+    const result = await parser.parse(makeEnvelope('adding to my SPY position'));
+
+    expect(result.isCallout).toBe(false);
+    expect(result.rationale).toMatch(/strike 755/);
+  });
+
+  it('accepts an expiration resolved from a weekday alias in the message', async () => {
+    // 2026-07-01 is a Wednesday; "Friday" resolves to 2026-07-03.
+    const parser = parserWithMock(llmCallout({
+      action: 'buy',
+      option: { optionType: 'put', strike: 180, expiration: '2026-07-03' },
+      ticker: 'AAPL',
+    }));
+
+    const result = await parser.parse(
+      makeEnvelope('grabbing AAPL 180 puts Friday', '2026-07-01T14:35:00.000Z')
+    );
+
+    expect(result.isCallout).toBe(true);
+    expect(result.option?.expiration).toBe('2026-07-03');
+  });
+
+  it('rejects an expiration with no supporting date token in the message', async () => {
+    const parser = parserWithMock(llmCallout({
+      ticker: 'AAPL',
+      option: { optionType: 'put', strike: 180, expiration: '2026-09-18' },
+    }));
+
+    const result = await parser.parse(
+      makeEnvelope('grabbing AAPL 180 puts', '2026-07-01T14:35:00.000Z')
+    );
+
+    expect(result.isCallout).toBe(false);
+    expect(result.rationale).toMatch(/expiration/);
+  });
+
+  it('accepts a same-day expiration even without a 0DTE token (intraday default)', async () => {
+    const parser = parserWithMock(llmCallout({
+      ticker: 'SPY',
+      option: { optionType: 'call', strike: 755, expiration: '2026-06-15' },
+    }));
+
+    const result = await parser.parse(makeEnvelope('grabbing SPY 755 calls'));
+
+    expect(result.isCallout).toBe(true);
+  });
+});
+
+describe('parseCallout — parseTraced', () => {
+  it('reports the deterministic path with zero LLM calls', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const traced = await parser.parseTraced(makeEnvelope('BTO $SPY 755C 0DTE $0.71'));
+
+    expect(traced.path).toBe('deterministic');
+    expect(traced.llmCalls).toBe(0);
+    expect(traced.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(traced.callout.isCallout).toBe(true);
+  });
+
+  it('reports the language pre-filter path', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const traced = await parser.parseTraced(makeEnvelope('Still in $SBUX ! @Pro'));
+
+    expect(traced.path).toBe('prefilter_language');
+    expect(traced.llmCalls).toBe(0);
+  });
+
+  it('reports the llm path with one call for a leftover message', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({
+        isCallout: false,
+        assetType: 'equity',
+        action: null,
+        ticker: null,
+        orderType: 'market',
+        limitPrice: null,
+        sizeHint: null,
+        positionSize: null,
+        option: null,
+        confidence: 0.1,
+        rationale: 'chatter',
+      }),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const traced = await parser.parseTraced(makeEnvelope('thoughts on SBUX here?'));
+
+    expect(traced.path).toBe('llm');
+    expect(traced.llmCalls).toBe(1);
   });
 });
 

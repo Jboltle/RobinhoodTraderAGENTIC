@@ -21,7 +21,6 @@ import { BTO_QQQ_PUT } from '../../trader/pipeline/__tests__/fixtures/discordMes
 
 // isAllowed keeps its real semantics so channel/author gating is exercised.
 vi.mock('../../shared/config.js', () => ({
-  config: { tradeExecutionMode: 'immediate' },
   isAllowed: (v: string, allowlist: readonly string[]): boolean =>
     allowlist.length === 0 || allowlist.includes(v),
 }));

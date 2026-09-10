@@ -5,12 +5,6 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../../shared/config.js', () => ({
-  config: { tradeExecutionMode: 'immediate' },
-  isAllowed: (v: string, allowlist: readonly string[]): boolean =>
-    allowlist.length === 0 || allowlist.includes(v),
-}));
-
 import type {
   Callout,
   CalloutParser,
@@ -363,23 +357,6 @@ describe('fan-out — approval mode', () => {
     });
     expect(decision!.order!.quantity).toBeGreaterThan(0);
     expect(decision!.reason).toContain(`${decision!.order!.quantity}x QQQ`);
-  });
-
-  it("ignores a user's 'immediate' setting when the trader booted in approval mode", async () => {
-    const { config } = await import('../../../shared/config.js');
-    const original = config.tradeExecutionMode;
-    (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = 'approval';
-
-    try {
-      const { decision, tools } = await runWith(
-        envelopeFromFixture(BTO_QQQ_PUT),
-        BTO_QQQ_PUT.expectedCallout
-      );
-      expect(decision.kind).toBe('pending_approval');
-      expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
-    } finally {
-      (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
-    }
   });
 });
 

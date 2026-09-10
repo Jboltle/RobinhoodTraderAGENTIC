@@ -5,17 +5,18 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { CalloutMessage } from '../callouts.js';
 import { catchUpOnWake, STALENESS_WINDOW_MS } from '../catchup.js';
 import { createFakeDb, type FakeDb } from './fakeDb.js';
 import type { MessageProcessor, ProcessOptions } from '../pipeline/index.js';
+import type { DiscordEnvelope } from '../../shared/types.js';
 
 const NOW = new Date('2026-07-20T15:00:00.000Z');
 
-const messageAt = (messageId: string, msAgo: number): CalloutMessage => ({
+const messageAt = (messageId: string, msAgo: number): DiscordEnvelope => ({
   messageId,
   channelId: 'chan-1',
   channelName: 'alerts',
+  guildId: null,
   authorId: 'author-1',
   authorName: 'Demon Alerts',
   authorAvatarUrl: 'https://cdn.discordapp.com/embed/avatars/0.png',
@@ -40,7 +41,7 @@ beforeEach(() => {
   };
 });
 
-const run = (messages: CalloutMessage[]) =>
+const run = (messages: DiscordEnvelope[]) =>
   catchUpOnWake({ db, processor, fetchHistory: async () => messages }, NOW);
 
 describe('catchUpOnWake', () => {

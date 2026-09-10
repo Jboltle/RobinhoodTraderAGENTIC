@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
 import { createLogger } from '../../shared/logger.js';
+import type { OptionContract, OptionType, OrderSide } from '../../shared/types.js';
 import type { RobinhoodMcpClient } from './mcpClient.js';
+import { assertTokenForTrade } from './mcpClient.js';
 import type {
   BuyingPowerResult,
   CallToolResult,
@@ -11,7 +13,6 @@ import type {
   OptionPositionsResult,
   OptionsQuoteResult,
   PlaceOptionsOrderArgs,
-  PlaceOptionsOrderResult,
   PlaceOrderArgs,
   PlaceOrderResult,
   Position,
@@ -20,8 +21,6 @@ import type {
   TimeInForce,
   ToolInputSchema,
 } from './types.js';
-
-export type * from './types.js';
 
 const log = createLogger('trader:rh:tools');
 
@@ -64,7 +63,7 @@ export class RobinhoodTools {
    */
   async getOptionsMarkPrice(
     symbol: string,
-    optionType: 'call' | 'put',
+    optionType: OptionType,
     strike: number,
     expiration: string
   ): Promise<OptionsQuoteResult | null> {
@@ -158,6 +157,7 @@ export class RobinhoodTools {
   }
 
   async placeOrder(args: PlaceOrderArgs): Promise<PlaceOrderResult> {
+    await this.requireTokenForTrade();
     if (args.orderType === 'limit' && typeof args.limitPrice !== 'number') {
       throw new Error('limitPrice required for limit orders');
     }
@@ -184,7 +184,8 @@ export class RobinhoodTools {
     );
   }
 
-  async placeOptionsOrder(args: PlaceOptionsOrderArgs): Promise<PlaceOptionsOrderResult> {
+  async placeOptionsOrder(args: PlaceOptionsOrderArgs): Promise<PlaceOrderResult> {
+    await this.requireTokenForTrade();
     if (args.orderType === 'limit' && typeof args.limitPremium !== 'number') {
       throw new Error('limitPremium (per-contract price) required for limit options orders');
     }
@@ -228,7 +229,7 @@ export class RobinhoodTools {
    */
   private async resolveOptionId(
     symbol: string,
-    optionType: 'call' | 'put',
+    optionType: OptionType,
     strike: number,
     expiration: string
   ): Promise<string> {
@@ -250,6 +251,10 @@ export class RobinhoodTools {
     );
     this.optionIdCache.set(key, optionId);
     return optionId;
+  }
+
+  private async requireTokenForTrade(): Promise<void> {
+    assertTokenForTrade(await this.mcp.getTokenStatus());
   }
 
   /**
@@ -315,12 +320,7 @@ const DEFAULT_EXPIRY_KEY = 'expiration_dates';
 /** Build get_option_instruments args from the live tools/list schema. */
 export function optionInstrumentLookupArgs(
   schema: ToolInputSchema | undefined,
-  contract: {
-    symbol: string;
-    optionType: 'call' | 'put';
-    strike: number;
-    expiration: string;
-  }
+  contract: OptionContract & { symbol: string }
 ): Record<string, unknown> {
   const props = schema?.properties;
   const expiryKey = pickSchemaKey(props, ['expiration_dates', 'expiration_date']);
@@ -584,11 +584,8 @@ function parseOptionPositions(result: CallToolResult): ParsedOptionPositions {
   return { positions, incomplete, raw: data ?? result };
 }
 
-interface OptionInstrument {
+interface OptionInstrument extends OptionContract {
   readonly symbol: string;
-  readonly optionType: 'call' | 'put';
-  readonly strike: number;
-  readonly expiration: string;
 }
 
 /** Rows of get_option_instruments keyed by instrument UUID. */
@@ -700,14 +697,14 @@ function extractList(value: unknown): unknown[] {
  * 'debit'/'credit'. For the single-leg long-only orders this system places, a
  * debit opens a long and a credit closes it.
  */
-function normalizeOrderSide(value: string | null): 'buy' | 'sell' | null {
+function normalizeOrderSide(value: string | null): OrderSide | null {
   const normalized = value?.toLowerCase();
   if (normalized === 'buy' || normalized === 'debit') return 'buy';
   if (normalized === 'sell' || normalized === 'credit') return 'sell';
   return null;
 }
 
-function normalizeOptionType(value: string | null): 'call' | 'put' | null {
+function normalizeOptionType(value: string | null): OptionType | null {
   const normalized = value?.toLowerCase();
   if (normalized === 'call' || normalized === 'c') return 'call';
   if (normalized === 'put' || normalized === 'p') return 'put';

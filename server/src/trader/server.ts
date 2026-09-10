@@ -16,12 +16,15 @@ import { createLogger } from '../shared/logger.js';
 import {
   DiscordEnvelopeSchema,
   TradeSettingsSchema,
+  type AssetType,
   type Decision,
+  type OptionType,
 } from '../shared/types.js';
 import { verifyWebhookBody } from '../shared/webhookAuth.js';
 import { registerAuth, requireUser } from './auth.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
+import { findEquityEntry, findOptionEntry } from './maxLoss.js';
 import { submitOrder } from './pipeline/execute.js';
 import type { MessageProcessor } from './pipeline/index.js';
 import { summarize } from './pipeline/summarize.js';
@@ -153,11 +156,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // platform health check. Its liveness signal is whether it answers at all,
   // not what it says: src/index.ts runs the bot in the same process tree and
   // tears the tree down if the bot dies, so a dead Gateway means this stops
-  // responding. The
-  // body is diagnostics only — the execution kill-switch is the one piece of
-  // process-wide state worth reading without an account.
+  // responding. executionMode is per-user (settings.payload), not process-wide.
   fastify.get('/health', async (_request, reply) => {
-    return reply.send({ ok: true, executionMode: config.tradeExecutionMode });
+    return reply.send({ ok: true });
   });
 
   // Sign-in is an emailed magic link; there are no passwords. The allowlist is
@@ -186,11 +187,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const { id: userId } = requireUser(request);
     const broker = deps.brokers.existing(userId);
     const tokens = broker ? await broker.mcp.getTokenStatus() : null;
+    const settings = await deps.db.getSettings(userId);
     return reply.send({
       connected: broker?.mcp.isConnected() ?? false,
       authUrl: broker?.mcp.getPendingAuthUrl() ?? null,
       tokenState: tokens?.state ?? null,
-      executionMode: config.tradeExecutionMode,
+      executionMode: settings.executionMode,
     });
   });
 
@@ -287,15 +289,6 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const { id: userId } = requireUser(request);
     const { messageId } = request.params as { messageId: string };
 
-    // The env kill-switch means "this deployment submits nothing", so it has
-    // to outrank a button in the dashboard the same way it outranks a user's
-    // 'immediate' setting.
-    if (config.tradeExecutionMode === 'approval') {
-      return reply
-        .status(409)
-        .send({ error: 'trader is running in approval mode — no orders can be submitted' });
-    }
-
     const pending = await findPendingApproval(deps, userId, messageId);
     if (pending === null) {
       return reply.status(404).send({ error: 'no trade awaiting approval for that callout' });
@@ -308,7 +301,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const tools = deps.brokers.for(userId).tools;
     let outcome: ApprovalOutcome;
     try {
-      const placed = await submitOrder(pending.order, { tools });
+      const placed = await submitOrder(pending.order, tools);
       const order = {
         ...pending.order,
         orderId: placed.orderId,
@@ -589,10 +582,10 @@ async function waitForAuthUrl(broker: UserBroker): Promise<string | null> {
 // =============================================================================
 
 interface PerformanceRow {
-  readonly assetType: 'equity' | 'option';
+  readonly assetType: AssetType;
   readonly symbol: string;
   readonly quantity: number;
-  readonly optionType?: 'call' | 'put';
+  readonly optionType?: OptionType;
   readonly strike?: number;
   readonly expiration?: string;
   /**
@@ -616,72 +609,46 @@ async function collectPerformance(deps: ServerDeps, userId: string): Promise<Per
   // Already newest-first, so find() picks the most recent entry for a position.
   const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);
 
-  const rows: PerformanceRow[] = [];
-
-  for (const position of equity.positions) {
-    if (position.quantity <= 0) continue;
-    const entryPrice = findEquityEntry(submitted, position.symbol);
-    const currentPrice = await tools.getQuote(position.symbol).then((q) => q.price);
-    rows.push({
-      assetType: 'equity',
-      symbol: position.symbol,
-      quantity: position.quantity,
-      entryPrice,
-      currentPrice,
-      pctChange: pctChange(entryPrice, currentPrice),
+  const equityRows = equity.positions
+    .filter((position) => position.quantity > 0)
+    .map(async (position): Promise<PerformanceRow> => {
+      const entryPrice = findEquityEntry(submitted, position.symbol);
+      const currentPrice = await tools.getQuote(position.symbol).then((q) => q.price);
+      return {
+        assetType: 'equity',
+        symbol: position.symbol,
+        quantity: position.quantity,
+        entryPrice,
+        currentPrice,
+        pctChange: pctChange(entryPrice, currentPrice),
+      };
     });
-  }
 
-  for (const position of options.positions) {
-    if (position.quantity <= 0) continue;
-    const entryPrice = findOptionEntry(submitted, position);
-    const quote = await tools.getOptionsMarkPrice(
-      position.symbol,
-      position.optionType,
-      position.strike,
-      position.expiration
-    );
-    const currentPrice = quote?.markPrice ?? null;
-    rows.push({
-      assetType: 'option',
-      symbol: position.symbol,
-      quantity: position.quantity,
-      optionType: position.optionType,
-      strike: position.strike,
-      expiration: position.expiration,
-      entryPrice,
-      currentPrice,
-      pctChange: pctChange(entryPrice, currentPrice),
+  const optionRows = options.positions
+    .filter((position) => position.quantity > 0)
+    .map(async (position): Promise<PerformanceRow> => {
+      const entryPrice = findOptionEntry(submitted, position);
+      const quote = await tools.getOptionsMarkPrice(
+        position.symbol,
+        position.optionType,
+        position.strike,
+        position.expiration
+      );
+      const currentPrice = quote?.markPrice ?? null;
+      return {
+        assetType: 'option',
+        symbol: position.symbol,
+        quantity: position.quantity,
+        optionType: position.optionType,
+        strike: position.strike,
+        expiration: position.expiration,
+        entryPrice,
+        currentPrice,
+        pctChange: pctChange(entryPrice, currentPrice),
+      };
     });
-  }
 
-  return rows;
-}
-
-function findEquityEntry(submitted: readonly Decision[], symbol: string): number | null {
-  const match = submitted.find(
-    (d) => d.order!.side === 'buy' && d.order!.assetType === 'equity' && d.order!.symbol === symbol
-  );
-  return match?.order?.limitPrice ?? null;
-}
-
-function findOptionEntry(
-  submitted: readonly Decision[],
-  position: { symbol: string; optionType: 'call' | 'put'; strike: number; expiration: string }
-): number | null {
-  const match = submitted.find((d) => {
-    const order = d.order!;
-    return (
-      order.side === 'buy' &&
-      order.assetType === 'option' &&
-      order.symbol === position.symbol &&
-      order.option !== null &&
-      order.option.optionType === position.optionType &&
-      Math.abs(order.option.strike - position.strike) < 0.0001 &&
-      order.option.expiration === position.expiration
-    );
-  });
-  return match?.order?.limitPrice ?? null;
+  return Promise.all([...equityRows, ...optionRows]);
 }
 
 const pctChange = (entry: number | null, current: number | null): number | null =>

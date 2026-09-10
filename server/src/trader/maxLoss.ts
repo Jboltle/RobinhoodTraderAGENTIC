@@ -5,15 +5,21 @@
  * Entry-time risk is unchanged. This loop is independent of the dashboard —
  * SSE performance polling only runs while a client is connected.
  */
-import { config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
-import type { Decision, SubmittedOrder } from '../shared/types.js';
+import {
+  optionLabel,
+  type AssetType,
+  type Decision,
+  type OptionContract,
+  type SubmittedOrder,
+} from '../shared/types.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import type { McpRegistry } from './rh/mcpRegistry.js';
-import type { OptionOrder, OptionPosition, Position, RobinhoodTools } from './rh/tools.js';
+import type { RobinhoodTools } from './rh/tools.js';
+import type { OptionOrder, OptionPosition, Position } from './rh/types.js';
 
 const log = createLogger('trader:max-loss');
 
@@ -78,7 +84,6 @@ export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
 export async function sweepMaxLoss(deps: MaxLossDeps, flattening: Set<string>): Promise<void> {
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
-  if (config.tradeExecutionMode === 'approval') return;
 
   const userIds = await deps.db.listBrokerUserIds();
   await Promise.all(
@@ -184,7 +189,7 @@ interface ConsiderArgs {
   readonly key: string;
   readonly symbol: string;
   readonly quantity: number;
-  readonly assetType: 'equity' | 'option';
+  readonly assetType: AssetType;
   readonly option: SubmittedOrder['option'];
   readonly entry: number | null;
   readonly mark: number | null;
@@ -232,7 +237,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
       orderId: null,
       status: null,
     };
-    const placed = await submitOrder(sized, { tools: args.tools });
+    const placed = await submitOrder(sized, args.tools);
     const order: SubmittedOrder = {
       ...sized,
       orderId: placed.orderId,
@@ -266,7 +271,7 @@ export function lossEnabled(maxLossPct: number | null, maxLossUsd: number | null
 }
 
 function positionKey(
-  assetType: 'equity' | 'option',
+  assetType: AssetType,
   symbol: string,
   optionType?: string,
   strike?: number,
@@ -276,16 +281,21 @@ function positionKey(
   return `opt:${symbol.toUpperCase()}:${optionType}:${strike}:${expiration}`;
 }
 
-function findEquityEntry(submitted: readonly Decision[], symbol: string): number | null {
+/**
+ * Entry price from the user's most recent submitted buy for the position.
+ * Shared with the dashboard's performance view (server.ts) — `submitted` must
+ * be newest-first so find() picks the latest entry.
+ */
+export function findEquityEntry(submitted: readonly Decision[], symbol: string): number | null {
   const match = submitted.find(
     (d) => d.order!.side === 'buy' && d.order!.assetType === 'equity' && d.order!.symbol === symbol
   );
   return match?.order?.limitPrice ?? null;
 }
 
-function findOptionEntry(
+export function findOptionEntry(
   submitted: readonly Decision[],
-  position: { symbol: string; optionType: 'call' | 'put'; strike: number; expiration: string }
+  position: OptionContract & { symbol: string }
 ): number | null {
   const match = submitted.find((d) => {
     const order = d.order!;
@@ -366,9 +376,7 @@ function numberFromRaw(raw: unknown, keys: readonly string[]): number | null {
 
 function maxLossReason(order: SubmittedOrder, entry: number, mark: number): string {
   const contract =
-    order.assetType === 'option' && order.option
-      ? ` ${order.option.strike}${order.option.optionType[0]?.toUpperCase()} ${order.option.expiration}`
-      : '';
+    order.assetType === 'option' && order.option ? ` ${optionLabel(order.option)}` : '';
   return (
     `Max loss: sold ${order.quantity} ${order.symbol}${contract} ` +
     `at mark $${mark.toFixed(2)} (entry $${entry.toFixed(2)})`

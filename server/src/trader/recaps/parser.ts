@@ -13,6 +13,7 @@
  * plus futures win/loss counts — and any mismatch or unmatched marker line
  * downgrades the row to 'parsed_partial', never silently.
  */
+import type { OptionType } from '../../shared/types.js';
 
 export const PARSER_VERSION = 1;
 
@@ -27,7 +28,7 @@ export interface RecapTrade {
   /** Raw expiration token as posted ("8/19", "0DTE"); display-only. */
   readonly expiration: string | null;
   readonly strike: number | null;
-  readonly optionType: 'call' | 'put' | null;
+  readonly optionType: OptionType | null;
   readonly entryPrice: number | null;
   readonly exitPrice: number | null;
   readonly pctGain: number;

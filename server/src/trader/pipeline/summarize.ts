@@ -1,4 +1,28 @@
-import type { Callout, Decision, SubmittedOrder } from '../../shared/types.js';
+import { optionLabel, type Callout, type Decision, type SubmittedOrder } from '../../shared/types.js';
+
+function priceText(order: SubmittedOrder): string {
+  if (order.orderType !== 'limit' || order.limitPrice === null) return 'market';
+  const dollars = `$${order.limitPrice.toFixed(2)}`;
+  return order.assetType === 'option' ? `limit ${dollars}/contract` : `limit ${dollars}`;
+}
+
+/** Quantity, symbol, contract, and price — the shared body of both receipts. */
+function describeOrder(order: SubmittedOrder): string {
+  const body =
+    order.assetType === 'option' && order.option
+      ? `${order.quantity}x ${order.symbol} ${optionLabel(order.option)}`
+      : `${order.quantity} ${order.symbol}`;
+  return `${body} (${priceText(order)})`;
+}
+
+function describeIntent(callout: Callout | null): string {
+  if (!callout || !callout.ticker) return 'Callout';
+  const side = (callout.action ?? 'trade').toUpperCase();
+  if (callout.assetType === 'option' && callout.option) {
+    return `${side} ${callout.ticker} ${optionLabel(callout.option)}`;
+  }
+  return `${side} ${callout.ticker}`;
+}
 
 /**
  * The single Discord receipt for a callout, covering every account at once.
@@ -17,21 +41,9 @@ export function summarizeFanout(callout: Callout | null, outcomes: readonly Deci
   }
 
   const breakdown = [...counts.entries()].map(([kind, count]) => `${count} ${kind}`).join(', ');
-  return `${describeIntent(callout)} — ${breakdown} across ${plural(outcomes.length, 'account')}.`;
+  const accounts = `${outcomes.length} account${outcomes.length === 1 ? '' : 's'}`;
+  return `${describeIntent(callout)} — ${breakdown} across ${accounts}.`;
 }
-
-function describeIntent(callout: Callout | null): string {
-  if (!callout || !callout.ticker) return 'Callout';
-  const side = (callout.action ?? 'trade').toUpperCase();
-  if (callout.assetType === 'option' && callout.option) {
-    const { optionType, strike, expiration } = callout.option;
-    return `${side} ${callout.ticker} ${strike}${optionType[0]?.toUpperCase()} ${expiration}`;
-  }
-  return `${side} ${callout.ticker}`;
-}
-
-const plural = (count: number, noun: string): string =>
-  `${count} ${noun}${count === 1 ? '' : 's'}`;
 
 /**
  * Receipt text for a sized-but-unsubmitted order awaiting approval. Takes the
@@ -39,25 +51,7 @@ const plural = (count: number, noun: string): string =>
  * actually being asked to approve.
  */
 export function summarizePendingApproval(order: SubmittedOrder): string {
-  const side = order.side.toUpperCase();
-
-  if (order.assetType === 'option' && order.option) {
-    const { optionType, strike, expiration } = order.option;
-    const priceText =
-      order.orderType === 'limit' && order.limitPrice !== null
-        ? `limit $${order.limitPrice.toFixed(2)}/contract`
-        : 'market';
-    return (
-      `Approval required: ${side} ${order.quantity}x ${order.symbol} ` +
-      `${strike}${optionType[0]?.toUpperCase()} ${expiration} (${priceText}). No order submitted.`
-    );
-  }
-
-  const priceText =
-    order.orderType === 'limit' && order.limitPrice !== null
-      ? `limit $${order.limitPrice.toFixed(2)}`
-      : 'market';
-  return `Approval required: ${side} ${order.quantity} ${order.symbol} (${priceText}). No order submitted.`;
+  return `Approval required: ${order.side.toUpperCase()} ${describeOrder(order)}. No order submitted.`;
 }
 
 /**
@@ -69,25 +63,5 @@ export function summarize(order: SubmittedOrder, authorName: string | null): str
   const verb = order.side === 'buy' ? 'Bought' : 'Sold';
   const orderRef = order.orderId ? `, order ${order.orderId}` : '';
   const from = authorName === null ? '' : ` From @${authorName}.`;
-
-  if (order.assetType === 'option' && order.option) {
-    const { optionType, strike, expiration } = order.option;
-    const priceText =
-      order.orderType === 'limit' && order.limitPrice !== null
-        ? `limit $${order.limitPrice.toFixed(2)}/contract`
-        : 'market';
-    return (
-      `${verb} ${order.quantity}x ${order.symbol} ${strike}${optionType[0]?.toUpperCase()} ${expiration} (${priceText}). ` +
-      `Status: ${order.status ?? 'submitted'}${orderRef}.${from}`
-    );
-  }
-
-  const priceText =
-    order.orderType === 'limit' && order.limitPrice !== null
-      ? `limit $${order.limitPrice.toFixed(2)}`
-      : 'market';
-  return (
-    `${verb} ${order.quantity} ${order.symbol} (${priceText}). ` +
-    `Status: ${order.status ?? 'submitted'}${orderRef}.${from}`
-  );
+  return `${verb} ${describeOrder(order)}. Status: ${order.status ?? 'submitted'}${orderRef}.${from}`;
 }

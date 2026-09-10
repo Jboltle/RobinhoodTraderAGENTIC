@@ -3,12 +3,12 @@ import {
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
+import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
 import { awaitAuthorizationCode } from './oauthCallback.js';
 import { SupabaseOAuthProvider } from './oauthProvider.js';
-import { readTokenStatus } from './tokenBootstrap.js';
 import type { BrokerTokenStore, CallToolResult, TokenStatus, ToolInputSchema } from './types.js';
 
 export type { CallToolResult } from './types.js';
@@ -16,6 +16,35 @@ export type { CallToolResult } from './types.js';
 const log = createLogger('trader:rh:mcp');
 
 const CLIENT_INFO = { name: 'rh-discord-trader', version: '0.1.0' };
+
+// =============================================================================
+// Token presence
+//
+// Access tokens from Robinhood's OAuth token endpoint are opaque bearers, not
+// JWTs. The token response carries `expires_in`, but that clock starts at
+// issuance and we do not store issued-at, so it cannot be used later. Expiry
+// is the SDK's job on 401. These helpers only answer "is anything stored?"
+// =============================================================================
+
+/** Never throws — absent token material is reported as `missing`. */
+export function readTokenStatus(tokens: OAuthTokens | undefined): TokenStatus {
+  const hasAccessToken = Boolean(tokens?.access_token);
+  const hasRefreshToken = Boolean(tokens?.refresh_token);
+  if (!hasAccessToken) {
+    return {
+      state: hasRefreshToken ? 'refreshable' : 'missing',
+      hasRefreshToken,
+    };
+  }
+  return { state: 'valid', hasRefreshToken };
+}
+
+/** Throws when nothing is stored that can authorize a broker call. */
+export function assertTokenForTrade(status: TokenStatus): void {
+  if (status.state === 'missing') {
+    throw new Error('Robinhood token is missing; connect before placing a trade');
+  }
+}
 
 interface AuthCodeSubmission {
   readonly code: string;
@@ -85,7 +114,6 @@ export class RobinhoodMcpClient {
     log.info('Robinhood token status', {
       userId: this.options.userId,
       state: status.state,
-      expiresInMin: status.expiresInSec !== null ? Math.round(status.expiresInSec / 60) : null,
       hasRefreshToken: status.hasRefreshToken,
     });
 

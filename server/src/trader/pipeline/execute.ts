@@ -9,23 +9,21 @@
  * without re-deriving it.
  */
 import { createLogger } from '../../shared/logger.js';
-import type { Callout, OptionContract, RiskCheck, SubmittedOrder } from '../../shared/types.js';
-import type { OptionPosition, RobinhoodTools } from '../rh/tools.js';
+import {
+  optionLabel,
+  type Callout,
+  type OptionContract,
+  type OrderSide,
+  type RiskCheck,
+  type SubmittedOrder,
+} from '../../shared/types.js';
+import type { RobinhoodTools } from '../rh/tools.js';
+import type { OptionPosition, PlaceOrderResult } from '../rh/types.js';
 
 const log = createLogger('trader:pipeline');
 
-/** Everything the order-placement paths need: one user's broker session. */
-export interface ExecutionContext {
-  readonly tools: RobinhoodTools;
-}
-
 /** The allow=true branch of a risk check — the shape execution paths consume. */
 export type RiskAllow = Extract<RiskCheck, { allow: true }>;
-
-export interface PlacedResult {
-  readonly orderId: string | null;
-  readonly status: string | null;
-}
 
 /**
  * Thrown when the current account balance makes a trade unviable (e.g. even
@@ -59,16 +57,16 @@ const EQUITY_LIMIT_MIN_QUOTE_FRACTION = 0.2;
 /** Resolve the share count for an equity order. Read-only broker calls. */
 export async function sizeEquityOrder(
   symbol: string,
-  side: 'buy' | 'sell',
+  side: OrderSide,
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  deps: ExecutionContext
+  tools: RobinhoodTools
 ): Promise<number> {
   const price =
     risk.limitPrice !== null
       ? risk.limitPrice
-      : await deps.tools.getQuote(symbol).then((q) => q.price);
+      : await tools.getQuote(symbol).then((q) => q.price);
   if (price === null) throw new Error(`could not determine price for ${symbol}`);
 
   // Sanity: an equity buy limit wildly below the live quote is a misparse
@@ -76,7 +74,7 @@ export async function sizeEquityOrder(
   // ponytail: a stale or absent quote skips the check. Upgrade path:
   // quote-check at risk-filter time.
   if (side === 'buy' && risk.limitPrice !== null) {
-    const quote = await deps.tools.getQuote(symbol).then((q) => q.price);
+    const quote = await tools.getQuote(symbol).then((q) => q.price);
     if (quote !== null && risk.limitPrice < quote * EQUITY_LIMIT_MIN_QUOTE_FRACTION) {
       throw new ParseInconsistencyError(
         `equity limit $${risk.limitPrice.toFixed(2)} is <${EQUITY_LIMIT_MIN_QUOTE_FRACTION * 100}% of ${symbol} quote $${quote.toFixed(2)} — likely an option premium misread as a share price`
@@ -111,16 +109,16 @@ export async function sizeEquityOrder(
 /** Resolve the contract count for an options order. Read-only broker calls. */
 export async function sizeOptionsOrder(
   symbol: string,
-  side: 'buy' | 'sell',
+  side: OrderSide,
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  deps: ExecutionContext
+  tools: RobinhoodTools
 ): Promise<number> {
   const option = callout.option!;
 
   if (side === 'sell') {
-    return sizeOptionExit(symbol, risk, callout, deps);
+    return sizeOptionExit(symbol, risk, callout, tools);
   }
 
   // ---- Resolve premium ----------------------------------------------------
@@ -128,7 +126,7 @@ export async function sizeOptionsOrder(
   const premium: number | null =
     risk.limitPrice !== null
       ? risk.limitPrice
-      : await deps.tools
+      : await tools
           .getOptionsMarkPrice(symbol, option.optionType, option.strike, option.expiration)
           .then((q) => q?.markPrice ?? null);
 
@@ -213,15 +211,15 @@ async function sizeOptionExit(
   symbol: string,
   risk: RiskAllow,
   callout: Callout,
-  deps: ExecutionContext
+  tools: RobinhoodTools
 ): Promise<number> {
   const option = callout.option!;
-  const position = await findOpenOptionPosition(deps, symbol, option);
+  const position = await findOpenOptionPosition(tools, symbol, option);
   const heldContracts = Math.floor(position?.quantity ?? 0);
 
   if (heldContracts < 1) {
     throw new CapitalConstraintError(
-      `no open ${symbol} ${option.strike}${option.optionType[0]?.toUpperCase()} ${option.expiration} position to trim`
+      `no open ${symbol} ${optionLabel(option)} position to trim`
     );
   }
 
@@ -254,13 +252,13 @@ async function sizeOptionExit(
  */
 export async function submitOrder(
   order: SubmittedOrder,
-  deps: ExecutionContext
-): Promise<PlacedResult> {
+  tools: RobinhoodTools
+): Promise<PlaceOrderResult> {
   if (order.assetType === 'option') {
     if (order.option === null) {
       throw new Error(`options order for ${order.symbol} is missing its contract details`);
     }
-    const result = await deps.tools.placeOptionsOrder({
+    return tools.placeOptionsOrder({
       symbol: order.symbol,
       optionType: order.option.optionType,
       strike: order.option.strike,
@@ -270,25 +268,23 @@ export async function submitOrder(
       orderType: order.orderType,
       ...(order.limitPrice !== null ? { limitPremium: order.limitPrice } : {}),
     });
-    return { orderId: result.orderId, status: result.status };
   }
 
-  const result = await deps.tools.placeOrder({
+  return tools.placeOrder({
     symbol: order.symbol,
     side: order.side,
     orderType: order.orderType,
     quantity: order.quantity,
     ...(order.limitPrice !== null ? { limitPrice: order.limitPrice } : {}),
   });
-  return { orderId: result.orderId, status: result.status };
 }
 
 async function findOpenOptionPosition(
-  deps: ExecutionContext,
+  tools: RobinhoodTools,
   symbol: string,
   option: OptionContract
 ): Promise<OptionPosition | null> {
-  const result = await deps.tools.getOptionPositions();
+  const result = await tools.getOptionPositions();
   return (
     result.positions.find(
       (p) =>

@@ -201,21 +201,6 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(decision.reason).toContain('MCP transport closed');
   });
 
-  // The env kill-switch means the deployment submits nothing, so it has to
-  // outrank the button the same way it outranks a user's 'immediate' setting.
-  it('409s while the trader is booted in approval mode', async () => {
-    const messageId = seedPending();
-    const original = config.tradeExecutionMode;
-    (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = 'approval';
-
-    try {
-      const response = await send('POST', `/api/trades/${messageId}/approve`, {});
-      expect(response.statusCode).toBe(409);
-      expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
-    } finally {
-      (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
-    }
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -512,6 +497,7 @@ describe('/api/broker', () => {
     expect((await get('/api/broker/status')).json()).toMatchObject({
       connected: false,
       authUrl: null,
+      executionMode: 'approval',
     });
   });
 

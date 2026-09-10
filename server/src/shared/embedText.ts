@@ -25,3 +25,36 @@ export function flattenEmbedText(embed: EmbedLike): string {
     .filter(Boolean)
     .join('\n');
 }
+
+/**
+ * Assemble one message's full text: body + sticker names + attachment URLs +
+ * flattened embeds. The bot (gateway messages) and the trader's REST history
+ * reader flatten through this so a catch-up message is shaped exactly like a
+ * live one. Callers prepend any context of their own (e.g. the bot's reply
+ * prefix goes into `body` first).
+ */
+export function assembleMessageText(parts: {
+  body: string;
+  stickerNames: readonly string[];
+  attachmentUrls: readonly string[];
+  embeds: readonly EmbedLike[];
+}): string {
+  let body = parts.body.trim();
+
+  if (parts.stickerNames.length > 0) {
+    const names = parts.stickerNames.map((name) => `:${name}:`).join(' ');
+    body = (body ? body + '\n' : '') + `🏷️ sticker: ${names}`;
+  }
+
+  if (parts.attachmentUrls.length > 0) {
+    body = (body ? body + '\n' : '') + parts.attachmentUrls.join('\n');
+  }
+
+  if (parts.embeds.length > 0) {
+    // Separate flattened embeds so consecutive callout cards don't merge into one.
+    const embedText = parts.embeds.map(flattenEmbedText).filter(Boolean).join('\n---\n');
+    if (embedText) body = (body ? body + '\n' : '') + embedText;
+  }
+
+  return body;
+}

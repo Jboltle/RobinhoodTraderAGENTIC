@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { backfillCalloutAuthors, seedMissingCallers } from '../callerBootstrap.js';
-import type { CalloutMessage, fetchTodaysCallouts } from '../callouts.js';
+import { backfillCalloutAuthors, type fetchTodaysCallouts } from '../callouts.js';
 import type { StoredCallout } from '../db.js';
+import type { DiscordEnvelope } from '../../shared/types.js';
 import { createFakeDb } from './fakeDb.js';
 
 const callout = (overrides: Partial<StoredCallout>): StoredCallout => ({
@@ -19,59 +19,17 @@ const callout = (overrides: Partial<StoredCallout>): StoredCallout => ({
   ...overrides,
 });
 
-const historyMessage = (messageId: string, authorId: string): CalloutMessage => ({
+const historyMessage = (messageId: string, authorId: string): DiscordEnvelope => ({
   messageId,
   channelId: 'c1',
   channelName: null,
+  guildId: null,
   authorId,
   authorName: 'Trader Dan',
   authorAvatarUrl: 'https://cdn.discordapp.com/embed/avatars/0.png',
   timestamp: '2026-07-29T12:00:00.000Z',
   content: 'BUY SPY',
   embeds: [],
-});
-
-describe('seedMissingCallers', () => {
-  it('seeds only authors without a callers row, leaving existing rows untouched', async () => {
-    const db = createFakeDb();
-    await db.upsertCaller({
-      authorId: '111',
-      displayName: 'Live-Captured Name',
-      avatarUrl: 'https://cdn.discordapp.com/avatars/111/abc.png',
-      lastSeenAt: '2026-07-29T10:00:00.000Z',
-    });
-
-    const fetched: string[] = [];
-    const fakeFetch = (async (url: string | URL) => {
-      fetched.push(String(url));
-      return {
-        ok: true,
-        json: async () => ({ username: 'newbie', global_name: 'New Caller', avatar: 'def' }),
-      };
-    }) as unknown as typeof fetch;
-
-    const seeded = await seedMissingCallers(db, ['111', '222'], fakeFetch);
-
-    expect(seeded).toBe(1);
-    expect(fetched).toEqual(['https://discord.com/api/v10/users/222']);
-    const callers = await db.listCallers();
-    expect(callers).toHaveLength(2);
-    expect(callers.find((c) => c.authorId === '111')?.displayName).toBe('Live-Captured Name');
-    expect(callers.find((c) => c.authorId === '222')).toMatchObject({
-      displayName: 'New Caller',
-      avatarUrl: 'https://cdn.discordapp.com/avatars/222/def.png',
-    });
-  });
-
-  it('skips an author Discord will not return, without throwing', async () => {
-    const db = createFakeDb();
-    const fakeFetch = (async () => ({ ok: false, status: 404 })) as unknown as typeof fetch;
-
-    const seeded = await seedMissingCallers(db, ['333'], fakeFetch);
-
-    expect(seeded).toBe(0);
-    expect(await db.listCallers()).toHaveLength(0);
-  });
 });
 
 describe('backfillCalloutAuthors', () => {

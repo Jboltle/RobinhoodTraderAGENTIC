@@ -1,4 +1,3 @@
-import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
 import type {
   Callout,
@@ -21,8 +20,6 @@ import {
 } from './execute.js';
 import { checkRisk, deriveRiskState } from './riskFilter.js';
 import { summarize, summarizeFanout, summarizePendingApproval } from './summarize.js';
-
-export type { ExecutionContext } from './execute.js';
 
 const log = createLogger('trader:pipeline');
 
@@ -316,13 +313,13 @@ export async function runForUser(
 
   const symbol = callout.ticker!.toUpperCase();
   const side = callout.action!;
-  const context = { tools: deps.brokers.for(userId).tools };
+  const tools = deps.brokers.for(userId).tools;
 
   // Confirm Robinhood can quote the underlying before sizing or looking up
   // option instruments. Garbage tickers (e.g. ANSI-glued MTSLA) fail here
   // instead of after three empty get_option_instruments retries.
   try {
-    const quote = await context.tools.getQuote(symbol);
+    const quote = await tools.getQuote(symbol);
     if (!(quote.price > 0)) {
       return finalize(userId, deps, {
         ...base,
@@ -355,7 +352,7 @@ export async function runForUser(
   let buyingPower = 0;
   if (needsBuyingPower) {
     try {
-      const bp = await context.tools.getBuyingPower();
+      const bp = await tools.getBuyingPower();
       buyingPower = bp.amountUsd;
     } catch (err) {
       return finalize(userId, deps, {
@@ -385,8 +382,8 @@ export async function runForUser(
   try {
     const quantity =
       risk.assetType === 'option'
-        ? await sizeOptionsOrder(symbol, side, risk, callout, buyingPower, context)
-        : await sizeEquityOrder(symbol, side, risk, callout, buyingPower, context);
+        ? await sizeOptionsOrder(symbol, side, risk, callout, buyingPower, tools)
+        : await sizeEquityOrder(symbol, side, risk, callout, buyingPower, tools);
 
     const sized: SubmittedOrder = {
       symbol,
@@ -413,7 +410,7 @@ export async function runForUser(
       });
     }
 
-    const placed = await submitOrder(sized, context);
+    const placed = await submitOrder(sized, tools);
     const order: SubmittedOrder = {
       ...sized,
       orderId: placed.orderId,
@@ -446,22 +443,8 @@ export async function runForUser(
 // Helpers
 // =============================================================================
 
-/**
- * MCP sessions are only wired up when the trader boots in immediate mode, so a
- * user setting 'immediate' on a trader booted in approval mode would execute
- * against disabled stubs. Clamp escalation to the boot mode; de-escalation
- * (immediate → approval) is always honoured.
- */
 async function loadSettings(userId: string, deps: PipelineDeps): Promise<ResolvedTradeSettings> {
-  const settings = await deps.db.getSettings(userId);
-  if (settings.executionMode === 'immediate' && config.tradeExecutionMode === 'approval') {
-    log.warn(
-      "executionMode 'immediate' ignored: trader booted in approval mode without live MCP; restart with TRADE_EXECUTION_MODE=immediate to enable",
-      { userId }
-    );
-    return { ...settings, executionMode: 'approval' };
-  }
-  return settings;
+  return deps.db.getSettings(userId);
 }
 
 async function finalize(userId: string, deps: PipelineDeps, decision: Decision): Promise<Decision> {

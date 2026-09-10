@@ -6,6 +6,12 @@ import { describe, expect, it } from 'vitest';
 
 import { TradeSettingsSchema } from '../types.js';
 
+describe('TradeSettingsSchema — executionMode', () => {
+  it('defaults a new account to approval', () => {
+    expect(TradeSettingsSchema.parse({}).executionMode).toBe('approval');
+  });
+});
+
 describe('TradeSettingsSchema — followedCallerIds', () => {
   it('defaults to an empty list: follow no one until Callers are picked', () => {
     expect(TradeSettingsSchema.parse({}).followedCallerIds).toEqual([]);

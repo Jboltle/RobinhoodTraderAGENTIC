@@ -1,10 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../shared/config.js', () => ({
-  config: { tradeExecutionMode: 'immediate' },
-}));
-
-import { config } from '../../shared/config.js';
 import type { Decision, SubmittedOrder } from '../../shared/types.js';
 import { TradeSettingsSchema } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
@@ -172,28 +167,6 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening);
 
     expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
-  });
-
-  it('does not flatten when the process is locked in approval mode', async () => {
-    const { tools, flattening, deps } = setupMonitor({
-      maxLossPct: 50,
-      optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
-      ],
-      markFor: () => 0.75,
-    });
-    deps.db.seedDecision(
-      USER,
-      submittedBuy('QQQ', 1.5, { optionType: 'call', strike: 707, expiration: '2026-06-11' })
-    );
-    const original = config.tradeExecutionMode;
-    (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = 'approval';
-    try {
-      await sweepMaxLoss(deps, flattening);
-    } finally {
-      (config as { tradeExecutionMode: 'immediate' | 'approval' }).tradeExecutionMode = original;
-    }
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 });
 

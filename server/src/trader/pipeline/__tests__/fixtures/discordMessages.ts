@@ -320,6 +320,8 @@ export const LOTTO_SPY_RISKY: DiscordMessageFixture = {
     'Manage your risk!',
     '@Namrood - LIVE DASHBOARD',
   ].join('\n'),
+  // Matches the @Optionality header date so 0DTE resolves to the posted day.
+  timestamp: '2026-06-12T15:24:00.000Z',
   expectedCallout: {
     isCallout: true,
     assetType: 'option',

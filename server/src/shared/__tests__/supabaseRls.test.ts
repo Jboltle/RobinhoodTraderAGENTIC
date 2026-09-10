@@ -29,11 +29,10 @@ const CONFIGURED = Boolean(supabaseUrl && anonKey && serviceRoleKey);
 const TABLES = [
   'callouts',
   'trades',
-  'settings',
+  'users',
   'allowed_emails',
   'broker_connections',
   'callers',
-  'user_emails',
 ] as const;
 
 // Unique per run so reruns never collide with leftovers from a failed teardown.
@@ -129,7 +128,8 @@ async function seedOneRowPerTable(): Promise<void> {
     ticker: 'QQQ',
     action: 'buy',
   });
-  await insertAsServiceRole('settings', { user_id: probeUserId, payload: { maxTradesPerDay: 10 } });
+  // No explicit seed for `users`: the sync_user_from_auth trigger creates the
+  // row when the probe auth user is created above.
   await insertAsServiceRole('allowed_emails', { email: probeEmail });
   await insertAsServiceRole('broker_connections', {
     user_id: probeUserId,
@@ -143,7 +143,7 @@ async function seedOneRowPerTable(): Promise<void> {
 }
 
 async function deleteProbeFixtures(): Promise<void> {
-  // Deleting the user cascades trades, settings and broker_connections.
+  // Deleting the auth user cascades users, trades and broker_connections.
   if (probeUserId) {
     await request(`/auth/v1/admin/users/${probeUserId}`, { apiKey: serviceRoleKey!, method: 'DELETE' });
   }

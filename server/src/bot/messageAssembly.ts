@@ -1,6 +1,6 @@
 import type { Message } from 'discord.js';
 
-import { flattenEmbedText } from '../shared/embedText.js';
+import { assembleMessageText } from '../shared/embedText.js';
 import {
   DiscordEnvelopeSchema,
   type DiscordEnvelope,
@@ -52,24 +52,12 @@ function truncateSafe(text: string, max: number): string {
  */
 export async function buildMessageContent(message: Message): Promise<string> {
   const replyPrefix = await buildReplyPrefix(message);
-  let body = (replyPrefix + (message.content ?? '')).trim();
-
-  if (message.stickers?.size) {
-    const names = [...message.stickers.values()].map((s) => `:${s.name}:`).join(' ');
-    body = (body ? body + '\n' : '') + `🏷️ sticker: ${names}`;
-  }
-
-  if (message.attachments.size) {
-    const urls = [...message.attachments.values()].map((a) => a.url).join('\n');
-    body = (body ? body + '\n' : '') + urls;
-  }
-
-  if (message.embeds?.length) {
-    // Separate flattened embeds so consecutive callout cards don't merge into one.
-    const embedText = message.embeds.map(flattenEmbedText).filter(Boolean).join('\n---\n');
-    if (embedText) body = (body ? body + '\n' : '') + embedText;
-  }
-
+  const body = assembleMessageText({
+    body: replyPrefix + (message.content ?? ''),
+    stickerNames: message.stickers ? [...message.stickers.values()].map((s) => s.name) : [],
+    attachmentUrls: [...message.attachments.values()].map((a) => a.url),
+    embeds: message.embeds ?? [],
+  });
   return truncateSafe(body, MAX_CONTENT_LENGTH);
 }
 

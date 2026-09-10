@@ -1,14 +1,10 @@
 import { isAllowed } from '../../shared/config.js';
-import type { Callout, ResolvedTradeSettings, RiskCheck } from '../../shared/types.js';
-
-/**
- * Qualitative position-size keywords extracted from the message.
- * - small / light / scalp  →  small
- * - medium / half          →  medium
- * - full / max / heavy     →  full
- * null = no size qualifier present (sizing defaults per asset type below).
- */
-type PositionSize = 'small' | 'medium' | 'full';
+import type {
+  Callout,
+  PositionSize,
+  ResolvedTradeSettings,
+  RiskCheck,
+} from '../../shared/types.js';
 
 // =============================================================================
 // Sizing — keyword → portfolio percentage

@@ -103,7 +103,7 @@ function makeBrokerStub(userId: string, options: BrokerStubOptions): UserBroker 
     ensureConnected: vi.fn().mockResolvedValue(undefined),
     getTokenStatus: vi
       .fn()
-      .mockResolvedValue({ state: 'missing', expiresInSec: null, hasRefreshToken: false }),
+      .mockResolvedValue({ state: 'missing', hasRefreshToken: false }),
     getToolNames: vi.fn().mockReturnValue([]),
   } as unknown as RobinhoodMcpClient;
 

@@ -26,9 +26,7 @@ describe('stack supervisor', () => {
       env: {
         ...process.env,
         // Enough for the supervisor's own config import to succeed...
-        LLM_PROVIDER: 'ollama',
         LLM_MODEL: 'qwen3:8b',
-        TRADE_EXECUTION_MODE: 'approval',
         // ...and guaranteed to fail assertConfigValid('trader') in the child.
         SUPABASE_SERVICE_ROLE_KEY: '',
       },

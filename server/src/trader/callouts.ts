@@ -14,8 +14,15 @@
  */
 
 import { config, isAllowed } from '../shared/config.js';
-import { flattenEmbedText, type EmbedLike } from '../shared/embedText.js';
+import {
+  assembleMessageText,
+  flattenEmbedText,
+  type EmbedLike,
+} from '../shared/embedText.js';
 import { createLogger } from '../shared/logger.js';
+import type { DiscordEnvelope } from '../shared/types.js';
+import type { TraderDb } from './db.js';
+import { startOfDay } from './pipeline/riskFilter.js';
 
 const log = createLogger('trader:callouts');
 
@@ -42,19 +49,6 @@ export interface RestMessage {
   readonly sticker_items?: readonly { readonly name: string }[];
 }
 
-/** A Discord message worth putting through the pipeline. */
-export interface CalloutMessage {
-  readonly messageId: string;
-  readonly channelId: string;
-  readonly channelName: string | null;
-  readonly authorId: string;
-  readonly authorName: string;
-  readonly authorAvatarUrl: string;
-  readonly timestamp: string;
-  readonly content: string;
-  readonly embeds: readonly Record<string, unknown>[];
-}
-
 /**
  * Public CDN avatar URL for a Discord user: custom avatar when a hash is
  * known, otherwise Discord's id-derived default avatar (every user has one).
@@ -67,13 +61,6 @@ export function discordAvatarUrl(userId: string, avatarHash?: string | null): st
   return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
 }
 
-/** Local midnight (server timezone) — the history window's "today" boundary. */
-export function localMidnight(now: Date = new Date()): Date {
-  const midnight = new Date(now);
-  midnight.setHours(0, 0, 0, 0);
-  return midnight;
-}
-
 /**
  * Flatten a REST message the same way the bot's buildMessageContent flattens a
  * gateway message: body + sticker names + attachment URLs + flattened embeds.
@@ -81,24 +68,12 @@ export function localMidnight(now: Date = new Date()): Date {
  * reply); the raw embeds are returned alongside for rendering anyway.
  */
 export function flattenRestMessage(msg: RestMessage): string {
-  let body = (msg.content ?? '').trim();
-
-  if (msg.sticker_items?.length) {
-    const names = msg.sticker_items.map((s) => `:${s.name}:`).join(' ');
-    body = (body ? body + '\n' : '') + `🏷️ sticker: ${names}`;
-  }
-
-  if (msg.attachments?.length) {
-    const urls = msg.attachments.map((a) => a.url).join('\n');
-    body = (body ? body + '\n' : '') + urls;
-  }
-
-  if (msg.embeds?.length) {
-    const embedText = msg.embeds.map(flattenEmbedText).filter(Boolean).join('\n---\n');
-    if (embedText) body = (body ? body + '\n' : '') + embedText;
-  }
-
-  return body;
+  return assembleMessageText({
+    body: msg.content ?? '',
+    stickerNames: (msg.sticker_items ?? []).map((s) => s.name),
+    attachmentUrls: (msg.attachments ?? []).map((a) => a.url),
+    embeds: msg.embeds ?? [],
+  });
 }
 
 /** Header the bot prepends in buildMirrorPayload (bot/messageAssembly.ts). */
@@ -107,12 +82,12 @@ const MIRROR_HEADER_RE =
 
 /**
  * Parse a funnel-channel mirror post (buildMirrorPayload in
- * bot/messageAssembly.ts) back into a CalloutMessage. Returns null for
+ * bot/messageAssembly.ts) back into a DiscordEnvelope. Returns null for
  * anything without the mirror header (humans chatting in the funnel,
  * receipts, ...) — header-parse success is the gate: the bot only mirrors
  * already-allowlisted callouts, so no author filtering is needed.
  */
-export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
+export function parseMirrorMessage(msg: RestMessage): DiscordEnvelope | null {
   const match = MIRROR_HEADER_RE.exec(msg.content ?? '');
   if (!match) return null;
 
@@ -128,6 +103,7 @@ export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
     messageId: match[4]!,
     channelId: match[3]!,
     channelName: null, // resolved by the caller via the cached channel-name lookup
+    guildId: null,
     authorId: match[2]!,
     authorName: match[1]!,
     // The mirror header carries no avatar hash; the id-derived default is the
@@ -137,7 +113,7 @@ export function parseMirrorMessage(msg: RestMessage): CalloutMessage | null {
     // close enough for ordering and for the staleness window.
     timestamp: msg.timestamp,
     content,
-    embeds: msg.embeds ?? [],
+    embeds: [...(msg.embeds ?? [])],
   };
 }
 
@@ -213,8 +189,8 @@ async function discordGet(url: URL, fetchImpl: typeof fetch): Promise<unknown> {
  */
 export async function fetchTodaysCallouts(
   fetchImpl: typeof fetch = fetch,
-  since: Date = localMidnight()
-): Promise<CalloutMessage[]> {
+  since: Date = startOfDay()
+): Promise<DiscordEnvelope[]> {
   const channelNames = new Map<string, string | null>();
   const channelName = async (channelId: string): Promise<string | null> => {
     if (!channelNames.has(channelId)) {
@@ -232,7 +208,7 @@ export async function fetchTodaysCallouts(
     return channelNames.get(channelId) ?? null;
   };
 
-  const messages: CalloutMessage[] = [];
+  const messages: DiscordEnvelope[] = [];
 
   if (config.discordForwardChannelId) {
     const raw = await fetchChannelMessagesSince(config.discordForwardChannelId, since, fetchImpl);
@@ -251,16 +227,50 @@ export async function fetchTodaysCallouts(
           messageId: msg.id,
           channelId: msg.channel_id,
           channelName: name,
+          guildId: null,
           authorId: msg.author.id,
           authorName: msg.author.global_name ?? msg.author.username,
           authorAvatarUrl: discordAvatarUrl(msg.author.id, msg.author.avatar),
           timestamp: msg.timestamp,
           content: flattenRestMessage(msg),
-          embeds: msg.embeds ?? [],
+          embeds: [...(msg.embeds ?? [])],
         });
       }
     }
   }
 
   return messages.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+}
+
+/**
+ * Boot-time callout author backfill (docs/specs/0001-caller-following.md).
+ *
+ * `callouts` rows written before author capture carry a null author_id;
+ * re-read the same REST history that catch-up uses and fill them in by
+ * message id. The Caller roster itself is written on ingest from envelope
+ * data — no boot-time seed.
+ */
+export async function backfillCalloutAuthors(
+  db: TraderDb,
+  fetchHistory: typeof fetchTodaysCallouts = fetchTodaysCallouts
+): Promise<number> {
+  const rows = await db.listCalloutsMissingAuthor();
+  if (rows.length === 0) return 0;
+
+  // Page history back to the oldest null-author row. The window is bounded by
+  // the table's own contents, and rows history no longer covers simply stay
+  // null (the feed tolerates that; they age out of the feed window anyway).
+  const oldest = rows.reduce((a, b) => (a.timestamp < b.timestamp ? a : b));
+  const history = await fetchHistory(fetch, new Date(Date.parse(oldest.timestamp)));
+  const authorByMessage = new Map(history.map((m) => [m.messageId, m.authorId]));
+
+  let updated = 0;
+  for (const row of rows) {
+    const authorId = authorByMessage.get(row.messageId);
+    if (!authorId) continue;
+    await db.setCalloutAuthor(row.messageId, authorId);
+    updated += 1;
+  }
+  log.info('backfilled callout authors', { updated, stillNull: rows.length - updated });
+  return updated;
 }

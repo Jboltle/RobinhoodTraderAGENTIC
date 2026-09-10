@@ -12,10 +12,9 @@
  * broker.
  */
 import { createLogger } from '../shared/logger.js';
-import { fetchTodaysCallouts, type CalloutMessage } from './callouts.js';
+import { fetchTodaysCallouts } from './callouts.js';
 import type { TraderDb } from './db.js';
 import type { MessageProcessor } from './pipeline/index.js';
-import type { DiscordEnvelope } from '../shared/types.js';
 
 const log = createLogger('trader:catchup');
 
@@ -55,8 +54,8 @@ export async function catchUpOnWake(
     }
 
     const stale = now.getTime() - Date.parse(message.timestamp) > STALENESS_WINDOW_MS;
-    await deps.processor.process(toEnvelope(message), {
-      channelName: message.channelName,
+    await deps.processor.process(message, {
+      channelName: message.channelName ?? null,
       missed: stale,
     });
     if (stale) missed += 1;
@@ -66,15 +65,3 @@ export async function catchUpOnWake(
   log.info('catch-up complete', { processed, missed, alreadySeen });
   return { processed, missed, alreadySeen };
 }
-
-const toEnvelope = (message: CalloutMessage): DiscordEnvelope => ({
-  messageId: message.messageId,
-  channelId: message.channelId,
-  guildId: null,
-  authorId: message.authorId,
-  authorName: message.authorName,
-  authorAvatarUrl: message.authorAvatarUrl,
-  content: message.content,
-  timestamp: message.timestamp,
-  embeds: [...message.embeds],
-});

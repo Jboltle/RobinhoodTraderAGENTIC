@@ -1,5 +1,4 @@
 import { config as loadDotenv } from 'dotenv';
-import { z } from 'zod';
 
 // .env lives at the repo root (one level above server/). Resolve it relative
 // to this file, not cwd, so env loads no matter where the process starts.
@@ -25,25 +24,6 @@ const num = (s: string | undefined, fallback: number): number => {
 const bool = (s: string | undefined, fallback: boolean): boolean =>
   s === undefined ? fallback : s.toLowerCase() === 'true';
 
-/**
- * Fail-fast enum parse: a missing or unknown value aborts startup instead of
- * silently defaulting, which matters for anything that changes trading behavior.
- */
-const requiredEnum = <const T extends readonly [string, ...Array<string>]>(
-  name: string,
-  values: T
-): T[number] => {
-  const parsed = z.enum(values).safeParse(env[name]);
-  if (!parsed.success) {
-    const got = env[name] === undefined ? 'unset' : `"${env[name]}"`;
-    throw new Error(
-      `${name} must be one of: ${values.join(' | ')} (got ${got}). ` +
-        `Set it in .env (see .env.example).`
-    );
-  }
-  return parsed.data;
-};
-
 const requiredString = (name: string): string => {
   const value = env[name]?.trim();
   if (!value) {
@@ -51,8 +31,6 @@ const requiredString = (name: string): string => {
   }
   return value;
 };
-
-const llmProvider = requiredEnum('LLM_PROVIDER', ['ollama', 'openai', 'anthropic']);
 
 // OAuth: the browser is redirected to `redirectUri`; the local listener binds
 // `callbackHost:callbackPort`. `redirectUri` defaults to the redirect host so
@@ -82,7 +60,8 @@ export const config = {
   discordLogIgnoredMessages: bool(env.DISCORD_LOG_IGNORED_MESSAGES, false),
 
   // ---- LLM -------------------------------------------------------------------
-  llmProvider,
+  // Backend is inferred from this id in llm.ts. Optional `openai/`,
+  // `anthropic/`, or `ollama/` prefix overrides the heuristic.
   llmModel: requiredString('LLM_MODEL'),
   ollamaBaseUrl: env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
   anthropicApiKey: env.ANTHROPIC_API_KEY ?? '',
@@ -111,13 +90,6 @@ export const config = {
   robinhoodOAuthCallbackPort: oauthCallbackPort,
   robinhoodOAuthCallbackHost: env.ROBINHOOD_OAUTH_CALLBACK_HOST ?? '0.0.0.0',
 
-  // ---- Execution -------------------------------------------------------------
-  /**
-   * immediate = submit orders as soon as a callout passes risk checks.
-   * approval  = parse/risk-check/log callouts but do not submit orders.
-   */
-  tradeExecutionMode: requiredEnum('TRADE_EXECUTION_MODE', ['immediate', 'approval']),
-
   // ---- Inter-service ---------------------------------------------------------
   botTraderSecret: env.BOT_TRADER_SECRET ?? '',
   // 127.0.0.1 by default; every /api route verifies a Supabase JWT, but a
@@ -136,6 +108,12 @@ export const config = {
   supabaseAnonKey: env.SUPABASE_ANON_KEY?.trim() ?? '',
   /** Bypasses RLS. Server-only, never sent to a browser. */
   supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? '',
+  /**
+   * Direct Postgres connection string (Supabase session pooler, port 5432).
+   * All table queries go through Drizzle on this connection; supabase-js keeps
+   * only the auth methods (see server/src/trader/db.ts).
+   */
+  supabaseDbUrl: env.SUPABASE_DB_URL?.trim() ?? '',
   /** AES-256-GCM key material for broker tokens at rest. */
   rhTokensVaultKey: env.RH_TOKENS_VAULT_KEY?.trim() ?? '',
 } as const;
@@ -155,11 +133,10 @@ export function assertConfigValid(scope: 'trader' | 'bot'): void {
   if (!config.discordBotToken) missing.push('DISCORD_BOT_TOKEN');
   if (!config.botTraderSecret) missing.push('BOT_TRADER_SECRET');
   if (scope === 'trader') {
-    if (config.llmProvider === 'openai' && !config.openaiApiKey) missing.push('OPENAI_API_KEY');
-    if (config.llmProvider === 'anthropic' && !config.anthropicApiKey) missing.push('ANTHROPIC_API_KEY');
     if (!config.supabaseUrl) missing.push('SUPABASE_URL');
     if (!config.supabaseAnonKey) missing.push('SUPABASE_ANON_KEY');
     if (!config.supabaseServiceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
+    if (!config.supabaseDbUrl) missing.push('SUPABASE_DB_URL');
     if (!config.rhTokensVaultKey) missing.push('RH_TOKENS_VAULT_KEY');
   }
 

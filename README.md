@@ -92,7 +92,7 @@ Fill in:
 | `DISCORD_BOT_TOKEN` | from https://discord.com/developers/applications |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | channel(s) to monitor |
 | `DISCORD_ALLOWED_AUTHOR_IDS` | whitelisted callout authors |
-| `LLM_PROVIDER` + `LLM_MODEL` | `ollama` \| `openai` \| `anthropic` (startup fails if unset) |
+| `LLM_MODEL` | Model id. Backend is inferred (`qwen3:8b` → Ollama, `gpt-4o` → OpenAI, `claude-*` → Anthropic). Optional `openai/` / `anthropic/` / `ollama/` prefix. Startup fails if unset. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | only for the matching cloud provider |
 | `BOT_TRADER_SECRET` | `openssl rand -hex 32` |
 | `SUPABASE_URL` | `API_URL` from `npx supabase status` |
@@ -172,7 +172,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen3:8b
 ```
 
-With `LLM_PROVIDER=ollama` and `LLM_MODEL=qwen3:8b` in `.env`, the trader uses it at `OLLAMA_BASE_URL` (default `http://localhost:11434`).
+With `LLM_MODEL=qwen3:8b` in `.env`, the trader uses it at `OLLAMA_BASE_URL` (default `http://localhost:11434`).
 
 ## Tests and typecheck
 

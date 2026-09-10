@@ -40,6 +40,19 @@ describe('message fixtures — entry signals (BTO / lotto)', () => {
     }
     expect(result.option).toEqual(fixture.expectedCallout.option);
   });
+
+  it.each(ENTRY_FIXTURES.map((f) => [f.id, f] as const))('%s parses deterministically without the LLM', async (_id, fixture) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(envelopeFromFixture(fixture));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(true);
+    expect(result.action).toBe('buy');
+  });
 });
 
 describe('message fixtures — exit / management (TRIM / RUNNERS ONLY)', () => {
@@ -86,6 +99,23 @@ describe('message fixtures — non-callouts (hype / commentary / status)', () =>
     expect(result.isCallout).toBe(false);
     expect(result.action).toBeNull();
   });
+
+  // The portfolio recap contains directive verbs ("chasing", "loading"), which
+  // disarm every language pre-filter — it is the one fixture that must still
+  // reach the model. Everything else is classified without an LLM call.
+  const PREFILTERED = NON_CALLOUT_FIXTURES.filter((f) => f.id !== 'commentary-portfolio-recap');
+
+  it.each(PREFILTERED.map((f) => [f.id, f] as const))('%s is classified without the LLM', async (_id, fixture) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(mockProvider);
+
+    const result = await parser.parse(envelopeFromFixture(fixture));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(false);
+  });
 });
 
 describe('message fixtures — full catalog schema acceptance', () => {
@@ -101,9 +131,10 @@ describe('message fixtures — full catalog schema acceptance', () => {
 
 describe('message fixtures — prompt includes message content', () => {
   it('passes envelope content and timestamp to the LLM provider', async () => {
-    // Uses the lotto fixture: trim exits now parse deterministically and
-    // never reach the LLM, so they cannot exercise the prompt wiring.
-    const fixture = ALL_FIXTURES.find((f) => f.id === 'lotto-spy-risky')!;
+    // Uses the portfolio recap: every templated alert parses deterministically
+    // and every hype/status shape is pre-filtered, so this directive-verb
+    // chatter is the fixture that still exercises the LLM prompt wiring.
+    const fixture = ALL_FIXTURES.find((f) => f.id === 'commentary-portfolio-recap')!;
     const mockCall = vi.fn().mockResolvedValue(fixture.expectedCallout);
     const parser = new LlmCalloutParser({ callStructured: mockCall });
     const envelope = envelopeFromFixture(fixture);
@@ -115,9 +146,14 @@ describe('message fixtures — prompt includes message content', () => {
     expect(call.user).toContain(envelope.content);
     expect(call.user).toContain(envelope.timestamp);
     expect(call.user).toContain(envelope.authorName);
-    expect(call.system).toContain('TRIM');
-    expect(call.system).toContain('RUNNERS ONLY');
-    expect(call.system).toContain('BANG!');
+    expect(call.user).toContain('Candidates');
+    // The residual prompt teaches grounding rules, not the templates and
+    // hype examples the parser now owns.
+    expect(call.system).toContain('report_callout');
+    expect(call.system).toContain('PREMIUM');
+    expect(call.system).toContain('Candidates');
+    expect(call.system).not.toContain('RUNNERS ONLY');
+    expect(call.system).not.toContain('BANG');
   });
 });
 

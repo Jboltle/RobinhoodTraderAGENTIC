@@ -1,12 +1,43 @@
 import { z } from 'zod';
 
 // =============================================================================
+// Trading vocabulary — the single source of truth for every string union.
+//
+// Zod schemas consume the tuples and everything else imports the named types,
+// so adding a member updates the schema, the types, and every exhaustive
+// switch in one edit.
+// =============================================================================
+
+export const ORDER_SIDES = ['buy', 'sell'] as const;
+export type OrderSide = (typeof ORDER_SIDES)[number];
+
+export const ORDER_TYPES = ['market', 'limit'] as const;
+export type OrderType = (typeof ORDER_TYPES)[number];
+
+export const ASSET_TYPES = ['equity', 'option'] as const;
+export type AssetType = (typeof ASSET_TYPES)[number];
+
+export const OPTION_TYPES = ['call', 'put'] as const;
+export type OptionType = (typeof OPTION_TYPES)[number];
+
+export const POSITION_SIZES = ['small', 'medium', 'full'] as const;
+export type PositionSize = (typeof POSITION_SIZES)[number];
+
+export const SIZE_HINT_KINDS = ['shares', 'usd', 'contracts'] as const;
+export type SizeHintKind = (typeof SIZE_HINT_KINDS)[number];
+
+export const EXECUTION_MODES = ['immediate', 'approval'] as const;
+export type ExecutionMode = (typeof EXECUTION_MODES)[number];
+
+// =============================================================================
 // Discord envelope
 // =============================================================================
 
 export const DiscordEnvelopeSchema = z.object({
   messageId: z.string().min(1),
   channelId: z.string().min(1),
+  /** Discord channel name. Webhook envelopes omit it; REST catch-up resolves it. */
+  channelName: z.string().nullable().optional(),
   guildId: z.string().nullable(),
   authorId: z.string().min(1),
   authorName: z.string(),
@@ -34,7 +65,7 @@ export type EnvelopeKind = NonNullable<DiscordEnvelope['kind']>;
 const validateTicker = (ticker: string): boolean => /^[A-Z][A-Z0-9]{0,5}$/.test(ticker.toUpperCase());
 
 export const OptionContractSchema = z.object({
-  optionType: z.enum(['call', 'put']),
+  optionType: z.enum(OPTION_TYPES),
   strike: z.number().positive(),
   expiration: z
     .string()
@@ -43,23 +74,28 @@ export const OptionContractSchema = z.object({
 
 export type OptionContract = z.infer<typeof OptionContractSchema>;
 
+/** Strike + C/P + expiration, e.g. `397.5C 2026-06-11` — the one contract label. */
+export function optionLabel(option: OptionContract): string {
+  return `${option.strike}${option.optionType[0]?.toUpperCase()} ${option.expiration}`;
+}
+
 export const CalloutSchema = z
   .object({
     isCallout: z.boolean(),
-    assetType: z.enum(['equity', 'option']),
-    action: z.enum(['buy', 'sell']).nullable(),
+    assetType: z.enum(ASSET_TYPES),
+    action: z.enum(ORDER_SIDES).nullable(),
     ticker: z.string().refine(validateTicker, { error: 'Invalid ticker' }).nullable(),
-    orderType: z.enum(['market', 'limit']),
+    orderType: z.enum(ORDER_TYPES),
     /** For options this is the per-contract premium, NOT the strike. */
     limitPrice: z.number().positive().nullable(),
     sizeHint: z
       .object({
-        kind: z.enum(['shares', 'usd', 'contracts']),
+        kind: z.enum(SIZE_HINT_KINDS),
         value: z.number().positive(),
       })
       .nullable(),
     /** Qualitative size keyword extracted from the message. */
-    positionSize: z.enum(['small', 'medium', 'full']).nullable(),
+    positionSize: z.enum(POSITION_SIZES).nullable(),
     option: OptionContractSchema.nullable(),
     confidence: z.number().min(0).max(1),
     rationale: z.string(),
@@ -85,7 +121,7 @@ const pct = z.number().positive().max(100);
 const tickerList = z.array(z.string().transform((t) => t.toUpperCase()));
 
 export const TradeSettingsSchema = z.object({
-  executionMode: z.enum(['immediate', 'approval']).default('approval'),
+  executionMode: z.enum(EXECUTION_MODES).default('approval'),
   /**
    * Position sizing. Every value below is a plain percentage of buying power,
    * so a "medium size" stock callout deploys exactly equityMediumPct of the
@@ -189,7 +225,7 @@ export type RiskCheck =
   | { readonly allow: false; readonly code: RejectionCode; readonly reason: string }
   | {
       readonly allow: true;
-      readonly assetType: 'equity' | 'option';
+      readonly assetType: AssetType;
       /**
        * Percentage of available buying power to deploy (0–100), resolved
        * straight from the size keyword's setting. The pipeline fetches buying
@@ -204,7 +240,7 @@ export type RiskCheck =
        */
       readonly quantityHint: number | null;
       readonly limitPrice: number | null;
-      readonly orderType: 'market' | 'limit';
+      readonly orderType: OrderType;
       /** Resolved caps carried through so execution honours per-request settings. */
       readonly maxSingleContractPct: number;
       /** The options ceiling: no trade may exceed this % of buying power. */
@@ -238,11 +274,11 @@ export type DecisionKind =
 
 export interface SubmittedOrder {
   readonly symbol: string;
-  readonly side: 'buy' | 'sell';
-  readonly assetType: 'equity' | 'option';
+  readonly side: OrderSide;
+  readonly assetType: AssetType;
   /** Shares for equity orders; contracts for options orders. */
   readonly quantity: number;
-  readonly orderType: 'market' | 'limit';
+  readonly orderType: OrderType;
   readonly limitPrice: number | null;
   /** Populated for options orders; null for equity. */
   readonly option: OptionContract | null;
@@ -266,7 +302,7 @@ export interface Decision {
   /** Human-readable: rejection reason or success summary. Always populated. */
   readonly reason: string;
   readonly ticker: string | null;
-  readonly action: 'buy' | 'sell' | null;
+  readonly action: OrderSide | null;
   /** Set when we attempted to submit (kind: 'submitted' or 'execution_failed'). */
   readonly order: SubmittedOrder | null;
 }
