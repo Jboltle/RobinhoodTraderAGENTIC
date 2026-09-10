@@ -7,6 +7,7 @@ name: rh-discord-trader
 # The flag is not optional. env_file below only injects variables into running
 # containers; the client's Supabase keys are Docker BUILD args, and those come
 # from compose's own interpolation, which does not read ../.env on its own.
+# API_URL is runtime on the client (the proxy target), not a build arg.
 
 services:
   # Trader + Discord bot in one container, same as production (see
@@ -62,12 +63,12 @@ services:
       context: ..
       dockerfile: Dockerfile.client
       args:
-        # Baked into the bundle at build time; the BROWSER calls these, so they
-        # must be host-reachable (the server's published loopback port), NOT
-        # the compose-internal "http://server:3000".
-        API_URL: ${API_URL:-http://localhost:${TRADER_PORT:-3000}}
+        # Auth only — baked into the bundle. The browser calls /api on this
+        # container; server.ts proxies to API_URL below (compose DNS).
         SUPABASE_URL: ${SUPABASE_URL:-http://127.0.0.1:54331}
         SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+    environment:
+      API_URL: http://server:${TRADER_PORT:-3000}
     ports:
       - "127.0.0.1:3001:3001"
     restart: unless-stopped

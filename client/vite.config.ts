@@ -7,9 +7,9 @@ import viteReact from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
 const config = defineConfig({
-  // Expose the plain API_URL / SUPABASE_* env vars (set on Render) to
-  // import.meta.env. SUPABASE_SERVICE_ROLE_KEY is deliberately not matched by
-  // the SUPABASE_ prefix rule here — it is never set in the client's env.
+  // Expose the plain API_URL / SUPABASE_* env vars to import.meta.env.
+  // API_URL is optional at build (same-origin /api + server.ts proxy).
+  // SUPABASE_SERVICE_ROLE_KEY is deliberately not matched — never in this env.
   envPrefix: ['VITE_', 'API_URL', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'],
   resolve: { tsconfigPaths: true },
   plugins: [

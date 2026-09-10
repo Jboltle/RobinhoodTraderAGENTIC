@@ -1,5 +1,5 @@
-# Client: TanStack Start dashboard, built with Vite and served by a small Bun
-# static+SSR server (client/server.ts). Same base image as the other services.
+# Client: dashboard SPA. Serves dist/client and proxies /api to the trader.
+# The trader is a separate service — this image does not run it.
 FROM oven/bun:1.2.18-slim
 WORKDIR /app
 
@@ -9,14 +9,12 @@ RUN bun install --frozen-lockfile
 
 COPY --chown=bun:bun client ./
 
-# Baked into the static bundle at build time, so the BROWSER must be able to
-# reach both (default: the server's published port, and a host-local Supabase).
-# The anon key is public by design; the service-role key must never be passed
-# here -- vite.config.ts only exposes SUPABASE_URL and SUPABASE_ANON_KEY.
-ARG API_URL=http://localhost:3000
+# Baked into the static bundle. The anon key is public by design; never pass
+# SUPABASE_SERVICE_ROLE_KEY — vite.config.ts does not expose it.
+# Do not bake API_URL: the browser uses same-origin /api, and server.ts
+# forwards those requests to the runtime API_URL (the trader).
 ARG SUPABASE_URL
 ARG SUPABASE_ANON_KEY
-ENV API_URL=${API_URL}
 ENV SUPABASE_URL=${SUPABASE_URL}
 ENV SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
 RUN bun --bun run build

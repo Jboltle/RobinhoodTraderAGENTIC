@@ -1,36 +1,100 @@
 /**
- * Production server: static assets from dist/client, everything else to the
- * TanStack Start SSR handler. Run `bun run build` first, then `bun server.ts`.
+ * Production host for the dashboard SPA. This process does not run the trader.
  *
- * ponytail: minimal take on TanStack's start-bun template — no asset
- * preloading or cache headers. Upgrade path: copy the full template from
- * https://github.com/TanStack/router/tree/main/examples/react/start-bun
+ * - GET /health          — this container is up (Railway / compose)
+ * - /api/*               — proxied to the trader at API_URL (runtime)
+ * - everything else      — Vite build in dist/client, SPA fallback to index.html
  *
- * Excluded from tsconfig (needs bun-types + imports untyped build output);
- * it is executed directly by Bun, never compiled.
+ * The browser uses same-origin /api when API_URL is not baked into the bundle.
+ * Set API_URL on this process to the trader's reachable base URL
+ * (Railway private: http://<server-service>.railway.internal:3000).
  */
 import { join, normalize } from 'node:path'
 
-// @ts-ignore untyped build artifact
-import serverEntry from './dist/server/server.js'
-
 const PORT = Number(process.env.PORT ?? 3001)
+const TRADER_URL = (process.env.API_URL ?? '').replace(/\/$/, '')
 const CLIENT_DIR = join(import.meta.dir, 'dist/client')
+const INDEX_HTML = join(CLIENT_DIR, 'index.html')
+
+if (!TRADER_URL) {
+  throw new Error(
+    'API_URL must be the trader base URL (e.g. http://127.0.0.1:3000). ' +
+      'The browser talks to /api on this host; this process forwards it.',
+  )
+}
+
+const PROXY_REQUEST_HEADERS = ['accept', 'authorization', 'content-type'] as const
+
+async function proxyToTrader(req: Request, url: URL): Promise<Response> {
+  const headers = new Headers()
+  for (const name of PROXY_REQUEST_HEADERS) {
+    const value = req.headers.get(name)
+    if (value) headers.set(name, value)
+  }
+
+  const method = req.method
+  const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS'
+  let upstream: Response
+  try {
+    upstream = await fetch(`${TRADER_URL}${url.pathname}${url.search}`, {
+      method,
+      headers,
+      body: hasBody ? req.body : undefined,
+      // Bun/Node: stream the request body without buffering it first.
+      duplex: 'half',
+    } as RequestInit)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'trader unreachable'
+    return Response.json({ error: message }, { status: 502 })
+  }
+
+  // Rebuild headers so we never forward content-encoding for a body fetch()
+  // already decoded (that pair would make the browser try to inflate twice).
+  const out = new Headers()
+  const contentType = upstream.headers.get('content-type')
+  if (contentType) out.set('content-type', contentType)
+  if (contentType?.includes('text/event-stream')) {
+    out.set('cache-control', 'no-cache')
+    out.set('connection', 'keep-alive')
+  }
+  return new Response(upstream.body, { status: upstream.status, headers: out })
+}
+
+async function serveStatic(pathname: string): Promise<Response | null> {
+  if (pathname === '/') return null
+  const filePath = join(CLIENT_DIR, normalize(pathname))
+  if (!filePath.startsWith(CLIENT_DIR)) return null
+  const file = Bun.file(filePath)
+  if (!(await file.exists())) return null
+  return new Response(file)
+}
 
 Bun.serve({
   port: PORT,
+  hostname: '0.0.0.0',
   async fetch(req: Request): Promise<Response> {
-    const { pathname } = new URL(req.url)
-    if (pathname !== '/') {
-      // normalize() collapses ".." so a crafted path cannot escape CLIENT_DIR.
-      const filePath = join(CLIENT_DIR, normalize(pathname))
-      if (filePath.startsWith(CLIENT_DIR)) {
-        const file = Bun.file(filePath)
-        if (await file.exists()) return new Response(file)
-      }
+    const url = new URL(req.url)
+    const { pathname } = url
+
+    if (pathname === '/health') {
+      return Response.json({ ok: true })
     }
-    return serverEntry.fetch(req)
+
+    if (pathname.startsWith('/api/')) {
+      return proxyToTrader(req, url)
+    }
+
+    const file = await serveStatic(pathname)
+    if (file) return file
+
+    const index = Bun.file(INDEX_HTML)
+    if (await index.exists()) {
+      return new Response(index, {
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      })
+    }
+    return new Response('client build missing — run bun run build', { status: 500 })
   },
 })
 
-console.log(`client listening on http://localhost:${PORT}`)
+console.log(`client listening on http://0.0.0.0:${PORT} → trader ${TRADER_URL}`)

@@ -57,6 +57,7 @@ const llmProvider = requiredEnum('LLM_PROVIDER', ['ollama', 'openai', 'anthropic
 // OAuth: the browser is redirected to `redirectUri`; the local listener binds
 // `callbackHost:callbackPort`. `redirectUri` defaults to the redirect host so
 // it need not be set explicitly, but stays overridable for WSL/remote setups.
+const traderPort = num(env.PORT ?? env.TRADER_PORT, 3000);
 const oauthCallbackPort = num(env.ROBINHOOD_OAUTH_CALLBACK_PORT, 8788);
 const oauthRedirectHost = env.ROBINHOOD_OAUTH_REDIRECT_HOST?.trim() || '127.0.0.1';
 const oauthRedirectUri =
@@ -124,8 +125,10 @@ export const config = {
   // ponytail: a set PORT env var (Render/PaaS convention) flips the default
   // to 0.0.0.0 so the platform proxy can reach us; explicit TRADER_HOST wins.
   traderHost: env.TRADER_HOST ?? (env.PORT ? '0.0.0.0' : '127.0.0.1'),
-  traderPort: num(env.PORT ?? env.TRADER_PORT, 3000),
-  traderWebhookUrl: env.TRADER_WEBHOOK_URL ?? 'http://localhost:3000/webhook/discord',
+  traderPort,
+  // Bot and trader share this process. The webhook never leaves loopback.
+  traderWebhookUrl:
+    env.TRADER_WEBHOOK_URL ?? `http://127.0.0.1:${traderPort}/webhook/discord`,
 
   // ---- Supabase ---------------------------------------------------------------
   supabaseUrl: env.SUPABASE_URL?.trim() ?? '',

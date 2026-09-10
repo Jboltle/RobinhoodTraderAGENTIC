@@ -45,7 +45,7 @@ async function main(): Promise<void> {
   startKeepAlive();
 
   log.info('stack running', {
-    health: `http://localhost:${config.traderPort}/health`,
+    health: `http://127.0.0.1:${config.traderPort}/health`,
     webhook: config.traderWebhookUrl,
   });
 }

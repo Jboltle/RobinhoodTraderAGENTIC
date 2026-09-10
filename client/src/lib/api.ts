@@ -10,15 +10,12 @@
  * types package or generate from the zod schemas.
  */
 
-// Local `vite dev` can default; a production bundle must bake in API_URL or
-// every fetch silently goes to localhost:3000 (the browser reports CORS).
+// Empty = same origin. `bun server.ts` proxies /api to the trader (API_URL
+// on that process, runtime). vite dev still talks to localhost:3000 unless
+// a public trader URL is baked in (Render static site).
 export const TRADER_URL: string =
   import.meta.env.API_URL ||
   (import.meta.env.DEV ? 'http://localhost:3000' : '')
-
-if (!TRADER_URL) {
-  throw new Error('API_URL must be set at build time (see client/.env.example)')
-}
 
 // Set once by AuthProvider (lib/auth.tsx). A getter rather than a value so a
 // refreshed token is picked up without re-wiring anything.
