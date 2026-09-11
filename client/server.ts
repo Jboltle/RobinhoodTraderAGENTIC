@@ -16,16 +16,16 @@ const TRADER_URL = (process.env.API_URL ?? '').replace(/\/$/, '')
 const CLIENT_DIR = join(import.meta.dir, 'dist/client')
 const INDEX_HTML = join(CLIENT_DIR, 'index.html')
 
-if (!TRADER_URL) {
-  throw new Error(
-    'API_URL must be the trader base URL (e.g. http://127.0.0.1:3000). ' +
-      'The browser talks to /api on this host; this process forwards it.',
-  )
-}
-
 const PROXY_REQUEST_HEADERS = ['accept', 'authorization', 'content-type'] as const
 
 async function proxyToTrader(req: Request, url: URL): Promise<Response> {
+  if (!TRADER_URL) {
+    return Response.json(
+      { error: 'API_URL is not set — cannot proxy /api to the trader' },
+      { status: 503 },
+    )
+  }
+
   const headers = new Headers()
   for (const name of PROXY_REQUEST_HEADERS) {
     const value = req.headers.get(name)
@@ -97,4 +97,8 @@ Bun.serve({
   },
 })
 
-console.log(`client listening on http://0.0.0.0:${PORT} → trader ${TRADER_URL}`)
+console.log(
+  TRADER_URL
+    ? `client listening on http://0.0.0.0:${PORT} → trader ${TRADER_URL}`
+    : `client listening on http://0.0.0.0:${PORT} — API_URL unset, /api returns 503`,
+)
