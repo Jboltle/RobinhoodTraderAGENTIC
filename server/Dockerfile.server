@@ -7,6 +7,11 @@
 # used because discord.js/fastify leave lazy require()s (ajv, ...) unresolved
 # in the bundle. See README "Deployment" for details.
 FROM oven/bun:1.2.18-slim
+# Slim images omit CA certs; postgres.js TLS to the Supabase pooler then fails
+# on the first query and Drizzle reports only "Failed query".
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY package.json bun.lock ./

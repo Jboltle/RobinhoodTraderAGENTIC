@@ -63,16 +63,21 @@ async function main(): Promise<void> {
 
   // Reconnect everyone who was connected before the restart, so their stored
   // tokens are refreshed and their MCP session is warm before the first
-  // callout arrives rather than during it.
-  const userIds = await db.listBrokerUserIds();
-  log.info('restoring broker sessions', { users: userIds.length });
-  for (const userId of userIds) {
-    void brokers
-      .for(userId)
-      .mcp.ensureConnected()
-      .catch((err: unknown) =>
-        log.warn('could not restore Robinhood session', { userId, error: (err as Error).message })
-      );
+  // callout arrives rather than during it. Contained: a bad first query must
+  // not take the already-listening process down (see listen comment above).
+  try {
+    const userIds = await db.listBrokerUserIds();
+    log.info('restoring broker sessions', { users: userIds.length });
+    for (const userId of userIds) {
+      void brokers
+        .for(userId)
+        .mcp.ensureConnected()
+        .catch((err: unknown) =>
+          log.warn('could not restore Robinhood session', { userId, error: (err as Error).message })
+        );
+    }
+  } catch (err: unknown) {
+    log.error('could not restore broker sessions', errorFields(err));
   }
 
   void catchUpOnWake({ db, processor }).catch((err: unknown) =>
@@ -99,6 +104,17 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  log.error('startup failed', { error: (err as Error).message, stack: (err as Error).stack });
+  log.error('startup failed', errorFields(err));
   process.exit(1);
 });
+
+/** Drizzle's message is just the SQL; the driver error is on `cause`. */
+function errorFields(err: unknown): Record<string, unknown> {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const cause = error.cause;
+  return {
+    error: error.message,
+    stack: error.stack,
+    cause: cause instanceof Error ? cause.message : cause !== undefined ? String(cause) : undefined,
+  };
+}

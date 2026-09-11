@@ -199,7 +199,16 @@ export interface TraderDb {
 export function createTraderDb(): TraderDb {
   // prepare: false keeps the connection compatible with Supabase's transaction
   // pooler too, should the env ever point at port 6543 instead of session mode.
-  const client = postgres(config.supabaseDbUrl, { prepare: false });
+  // Remote URLs often omit sslmode=require; Supabase still demands TLS. Local
+  // CLI / host.docker.internal Postgres does not.
+  const local = /localhost|127\.0\.0\.1|host\.docker\.internal/i.test(config.supabaseDbUrl);
+  const client = postgres(config.supabaseDbUrl, {
+    prepare: false,
+    ssl: local ? false : 'require',
+    // Pooler startups can omit public; unqualified "broker_connections" then
+    // fails as relation-not-exist and Drizzle reports only the SQL.
+    connection: { search_path: 'public' },
+  });
   const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
