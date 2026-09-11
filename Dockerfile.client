@@ -1,23 +1,30 @@
 # Client: dashboard SPA. Serves dist/client and proxies /api to the trader.
 # The trader is a separate service — this image does not run it.
 FROM oven/bun:1.2.18-slim
+# Slim images omit CA certs; runtime fetch() to an https API_URL then fails.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-COPY package.json bun.lock ./
+COPY client/package.json client/bun.lock ./
 # Dev deps included: vite runs the build inside the image.
 RUN bun install --frozen-lockfile
 
-COPY --chown=bun:bun . ./
+COPY --chown=bun:bun client ./
 
 # Baked into the static bundle. The anon key is public by design; never pass
 # SUPABASE_SERVICE_ROLE_KEY — vite.config.ts does not expose it.
 # Do not bake API_URL: the browser uses same-origin /api, and server.ts
-# forwards those requests to the runtime API_URL (the trader).
+# forwards those requests to the runtime API_URL (the trader). Railway
+# injects service vars into the build env too; strip API_URL so Vite cannot
+# leak a .railway.internal URL into the browser bundle.
 ARG SUPABASE_URL
 ARG SUPABASE_ANON_KEY
 ENV SUPABASE_URL=${SUPABASE_URL}
 ENV SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
-RUN bun --bun run build
+RUN test -n "$SUPABASE_URL" && test -n "$SUPABASE_ANON_KEY" \
+  && env -u API_URL -u VITE_API_URL bun --bun run build
 
 USER bun
 EXPOSE 3001
