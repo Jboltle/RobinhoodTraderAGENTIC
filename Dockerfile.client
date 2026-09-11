@@ -15,15 +15,14 @@ COPY --chown=bun:bun client ./
 
 # Baked into the static bundle. The anon key is public by design; never pass
 # SUPABASE_SERVICE_ROLE_KEY — vite.config.ts does not expose it.
-# Do not bake API_URL: the browser uses same-origin /api, and server.ts
-# forwards those requests to the runtime API_URL (the trader). Railway
-# injects service vars into the build env too; strip API_URL so Vite cannot
-# leak a .railway.internal URL into the browser bundle.
+# API_URL is optional: when set (public trader URL) Vite bakes it and the
+# browser calls that host. When unset, the browser uses same-origin /api and
+# server.ts proxies to the runtime API_URL. Do not bake a .railway.internal URL.
 # ARG (not ENV): compose --build-arg fills these for RUN. An ENV line
 # here would clobber Railway's build-time ENV with an empty ARG.
 ARG SUPABASE_URL
 ARG SUPABASE_ANON_KEY
-RUN env -u API_URL -u VITE_API_URL bun --bun run build
+RUN bun --bun run build
 
 USER bun
 CMD ["bun", "server.ts"]
