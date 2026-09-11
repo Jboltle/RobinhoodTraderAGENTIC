@@ -15,6 +15,15 @@ const PORT = Number(process.env.PORT ?? 3001)
 const TRADER_URL = (process.env.API_URL ?? '').replace(/\/$/, '')
 const CLIENT_DIR = join(import.meta.dir, 'dist/client')
 const INDEX_HTML = join(CLIENT_DIR, 'index.html')
+// Browser cannot reach Railway private DNS; leave those on same-origin + proxy.
+const BROWSER_API_URL =
+  TRADER_URL && !TRADER_URL.includes('.railway.internal') ? TRADER_URL : ''
+
+function indexHtml(html: string): string {
+  if (!BROWSER_API_URL) return html
+  const tag = `<script>window.__API_URL__=${JSON.stringify(BROWSER_API_URL)}</script>`
+  return html.includes('<head>') ? html.replace('<head>', `<head>${tag}`) : tag + html
+}
 
 const PROXY_REQUEST_HEADERS = ['accept', 'authorization', 'content-type'] as const
 
@@ -89,7 +98,7 @@ Bun.serve({
 
     const index = Bun.file(INDEX_HTML)
     if (await index.exists()) {
-      return new Response(index, {
+      return new Response(indexHtml(await index.text()), {
         headers: { 'content-type': 'text/html; charset=utf-8' },
       })
     }
