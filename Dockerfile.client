@@ -3,11 +3,11 @@
 FROM oven/bun:1.2.18-slim
 WORKDIR /app
 
-COPY client/package.json client/bun.lock ./
+COPY package.json bun.lock ./
 # Dev deps included: vite runs the build inside the image.
 RUN bun install --frozen-lockfile
 
-COPY --chown=bun:bun client ./
+COPY --chown=bun:bun . ./
 
 # Baked into the static bundle. The anon key is public by design; never pass
 # SUPABASE_SERVICE_ROLE_KEY — vite.config.ts does not expose it.
