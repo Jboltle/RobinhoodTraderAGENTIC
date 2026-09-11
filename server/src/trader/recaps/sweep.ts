@@ -16,7 +16,7 @@
 import { createHash } from 'node:crypto';
 
 import { config } from '../../shared/config.js';
-import { createLogger } from '../../shared/logger.js';
+import { createLogger, errorFields } from '../../shared/logger.js';
 import type { DiscordEnvelope } from '../../shared/types.js';
 import { fetchChannelMessagesSince, flattenRestMessage, USER_MESSAGE_TYPES } from '../callouts.js';
 import type { StoredRecap, TraderDb } from '../db.js';
@@ -184,7 +184,7 @@ export function startRecapScheduler(db: TraderDb): void {
 
   const safeRun = (trigger: string): void => {
     void run(trigger).catch((err: unknown) =>
-      log.error('recap sweep failed', { trigger, error: (err as Error).message })
+      log.error('recap sweep failed', { trigger, ...errorFields(err) })
     );
   };
 

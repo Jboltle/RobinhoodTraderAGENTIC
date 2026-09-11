@@ -1,7 +1,7 @@
 import { REST, Routes } from 'discord.js';
 
 import { assertConfigValid, config } from '../shared/config.js';
-import { createLogger } from '../shared/logger.js';
+import { createLogger, errorFields } from '../shared/logger.js';
 import { PostReceipt } from '../shared/types.js';
 import { backfillCalloutAuthors } from './callouts.js';
 import { catchUpOnWake } from './catchup.js';
@@ -107,14 +107,3 @@ main().catch((err) => {
   log.error('startup failed', errorFields(err));
   process.exit(1);
 });
-
-/** Drizzle's message is just the SQL; the driver error is on `cause`. */
-function errorFields(err: unknown): Record<string, unknown> {
-  const error = err instanceof Error ? err : new Error(String(err));
-  const cause = error.cause;
-  return {
-    error: error.message,
-    stack: error.stack,
-    cause: cause instanceof Error ? cause.message : cause !== undefined ? String(cause) : undefined,
-  };
-}

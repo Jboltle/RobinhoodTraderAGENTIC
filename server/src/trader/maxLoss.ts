@@ -5,7 +5,7 @@
  * Entry-time risk is unchanged. This loop is independent of the dashboard —
  * SSE performance polling only runs while a client is connected.
  */
-import { createLogger } from '../shared/logger.js';
+import { createLogger, errorFields } from '../shared/logger.js';
 import {
   optionLabel,
   type AssetType,
@@ -72,7 +72,7 @@ export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
   const flattening = new Set<string>();
   const tick = (): void => {
     void sweepMaxLoss(deps, flattening).catch((err: unknown) =>
-      log.error('max-loss sweep failed', { error: err instanceof Error ? err.message : String(err) })
+      log.error('max-loss sweep failed', errorFields(err))
     );
   };
   tick();

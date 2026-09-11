@@ -19,13 +19,11 @@ COPY --chown=bun:bun client ./
 # forwards those requests to the runtime API_URL (the trader). Railway
 # injects service vars into the build env too; strip API_URL so Vite cannot
 # leak a .railway.internal URL into the browser bundle.
+# ARG (not ENV): compose --build-arg fills these for RUN. An ENV line
+# here would clobber Railway's build-time ENV with an empty ARG.
 ARG SUPABASE_URL
 ARG SUPABASE_ANON_KEY
-ENV SUPABASE_URL=${SUPABASE_URL}
-ENV SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
-RUN test -n "$SUPABASE_URL" && test -n "$SUPABASE_ANON_KEY" \
-  && env -u API_URL -u VITE_API_URL bun --bun run build
+RUN env -u API_URL -u VITE_API_URL bun --bun run build
 
 USER bun
-EXPOSE 3001
 CMD ["bun", "server.ts"]

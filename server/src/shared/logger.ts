@@ -25,6 +25,17 @@ function emit(level: Level, scope: string, message: string, meta?: Record<string
   target.write(`${JSON.stringify(line)}\n`);
 }
 
+/** Drizzle's message is just the SQL; the driver error is on `cause`. */
+export function errorFields(err: unknown): Record<string, unknown> {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const cause = error.cause;
+  return {
+    error: error.message,
+    stack: error.stack,
+    cause: cause instanceof Error ? cause.message : cause !== undefined ? String(cause) : undefined,
+  };
+}
+
 export function createLogger(scope: string): Logger {
   return {
     debug: (msg, meta) => emit('debug', scope, msg, meta),

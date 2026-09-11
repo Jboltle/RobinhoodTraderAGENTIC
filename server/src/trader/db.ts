@@ -207,7 +207,7 @@ export function createTraderDb(): TraderDb {
     ssl: local ? false : 'require',
     // Pooler startups can omit public; unqualified "broker_connections" then
     // fails as relation-not-exist and Drizzle reports only the SQL.
-    connection: { search_path: 'public' },
+    connection: { options: '-c search_path=public' },
   });
   const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
