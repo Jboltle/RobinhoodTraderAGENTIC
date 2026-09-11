@@ -18,7 +18,7 @@ import {
   integer,
   jsonb,
   numeric,
-  pgSchema,
+  pgTable,
   text,
   timestamp,
   uuid,
@@ -30,9 +30,6 @@ import type { RecapParse, RecapParseStatus } from '../recaps/parser.js';
 
 const isoTimestamp = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
 const numericAsNumber = (name: string) => numeric(name, { mode: 'number' });
-// Qualify every table. Supabase poolers often omit `public` from search_path,
-// and Drizzle then reports only "Failed query" for a missing relation.
-const publicTables = pgSchema('public');
 
 // ---- Per-user -----------------------------------------------------------------
 
@@ -41,7 +38,7 @@ const publicTables = pgSchema('public');
  * from auth.users by the sync_user_from_auth trigger; the app writes only the
  * settings columns. Defaults mirror TradeSettingsSchema (shared/types.ts).
  */
-export const users = publicTables.table('users', {
+export const users = pgTable('users', {
   id: uuid('id').primaryKey(),
   email: text('email').notNull(),
   executionMode: text('execution_mode').$type<ExecutionMode>().notNull().default('approval'),
@@ -66,7 +63,7 @@ export const users = publicTables.table('users', {
 });
 
 /** Per-user decision audit log; one row per callout per user. */
-export const trades = publicTables.table('trades', {
+export const trades = pgTable('trades', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id')
     .notNull()
@@ -86,7 +83,7 @@ export const trades = publicTables.table('trades', {
  * One Robinhood connection per user — user_id as pk is what enforces that
  * product rule. Ciphertext only (AES-256-GCM under RH_TOKENS_VAULT_KEY).
  */
-export const brokerConnections = publicTables.table('broker_connections', {
+export const brokerConnections = pgTable('broker_connections', {
   userId: uuid('user_id')
     .primaryKey()
     .references(() => users.id, { onDelete: 'cascade' }),
@@ -97,7 +94,7 @@ export const brokerConnections = publicTables.table('broker_connections', {
 // ---- Shared data ----------------------------------------------------------------
 
 /** Discord snapshot + cached LLM parse; also the ingest idempotency ledger. */
-export const callouts = publicTables.table('callouts', {
+export const callouts = pgTable('callouts', {
   messageId: text('message_id').primaryKey(),
   channelId: text('channel_id').notNull(),
   channelName: text('channel_name'),
@@ -112,7 +109,7 @@ export const callouts = publicTables.table('callouts', {
 });
 
 /** The Caller roster: one row per Discord author, upserted on ingest. */
-export const callers = publicTables.table('callers', {
+export const callers = pgTable('callers', {
   authorId: text('author_id').primaryKey(),
   displayName: text('display_name').notNull(),
   avatarUrl: text('avatar_url'),
@@ -120,7 +117,7 @@ export const callers = publicTables.table('callers', {
 });
 
 /** Raw daily-recap posts + cached parse (raw-first: content re-parses freely). */
-export const recaps = publicTables.table('recaps', {
+export const recaps = pgTable('recaps', {
   messageId: text('message_id').primaryKey(),
   channelId: text('channel_id').notNull(),
   postedAt: isoTimestamp('posted_at').notNull(),
@@ -134,14 +131,14 @@ export const recaps = publicTables.table('recaps', {
 });
 
 /** Cached LLM narration per recap window. */
-export const recapInsights = publicTables.table('recap_insights', {
+export const recapInsights = pgTable('recap_insights', {
   windowDays: integer('window_days').primaryKey(),
   generatedAt: isoTimestamp('generated_at').notNull(),
   content: text('content').notNull(),
 });
 
 /** Invite-only signup gate; independent of the sign-in mechanism. */
-export const allowedEmails = publicTables.table('allowed_emails', {
+export const allowedEmails = pgTable('allowed_emails', {
   email: text('email').primaryKey(),
   addedAt: isoTimestamp('added_at').notNull().defaultNow(),
 });
