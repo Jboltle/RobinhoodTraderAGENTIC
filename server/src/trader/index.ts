@@ -1,59 +1,32 @@
-import { REST, Routes } from 'discord.js';
-
 import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger, errorFields } from '../shared/logger.js';
-import { PostReceipt } from '../shared/types.js';
-import { backfillCalloutAuthors } from './callouts.js';
-import { catchUpOnWake } from './catchup.js';
 import { createTraderDb } from './db.js';
 import { TraderEvents } from './events.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { createMessageProcessor } from './pipeline/index.js';
 import { startMaxLossMonitor } from './maxLoss.js';
-import { startRecapScheduler } from './recaps/sweep.js';
+import { startPoller } from './poller.js';
+import { reparseStaleRecaps } from './recaps/sweep.js';
 import { createMcpRegistry } from './rh/mcpRegistry.js';
 import { buildServer } from './server.js';
 
 const log = createLogger('trader');
 
-const RECEIPT_MAX_LENGTH = 1900;
-
-function buildPostReceipt(rest: REST): PostReceipt {
-  return async (channelId: string, content: string) => {
-    try {
-      const trimmed =
-        content.length > RECEIPT_MAX_LENGTH
-          ? content.slice(0, RECEIPT_MAX_LENGTH - 3) + '...'
-          : content;
-      await rest.post(Routes.channelMessages(channelId), {
-        body: { content: trimmed },
-      });
-    } catch (err) {
-      log.warn('failed to post receipt to discord', {
-        channelId,
-        error: (err as Error).message,
-      });
-    }
-  };
-}
-
 async function main(): Promise<void> {
-  assertConfigValid('trader');
+  assertConfigValid();
 
   const db = createTraderDb();
   const events = new TraderEvents();
   const brokers = createMcpRegistry(db);
-  const discordRest = new REST({ version: '10' }).setToken(config.discordBotToken);
 
   const processor = createMessageProcessor({
     parser: new LlmCalloutParser(),
     db,
     events,
     brokers,
-    postReceipt: buildPostReceipt(discordRest),
   });
 
-  const fastify = buildServer({ db, events, brokers, processor });
+  const fastify = buildServer({ db, events, brokers });
 
   // Listen before anything else: on a deployed box the OAuth flow can only
   // complete via the dashboard hitting /api/broker/*, so the port must be open
@@ -80,13 +53,16 @@ async function main(): Promise<void> {
     log.error('could not restore broker sessions', errorFields(err));
   }
 
-  void catchUpOnWake({ db, processor }).catch((err: unknown) =>
-    log.error('catch-up failed', { error: (err as Error).message })
-  );
+  // The consumer loop over the messages table — the entire ingestion path.
+  // Its first drain doubles as catch-up: rows the Listener captured while
+  // this process was down are judged now (stale ones land as 'missed').
+  startPoller({ db, processor });
 
-  // Recap ingestion: boot backfill/catch-up + hourly weekday sweep. Errors
-  // are contained inside the scheduler; the trading path never depends on it.
-  startRecapScheduler(db);
+  // Recap format-drift recovery: rows parsed under an older PARSER_VERSION
+  // re-parse from raw content. Errors are contained; trading never depends on it.
+  void reparseStaleRecaps(db).catch((err: unknown) =>
+    log.error('recap re-parse failed', errorFields(err))
+  );
 
   // Max Loss: process-lifetime flatten loop. Independent of the dashboard.
   startMaxLossMonitor({
@@ -95,12 +71,6 @@ async function main(): Promise<void> {
     events,
     enqueue: (userId, run) => processor.enqueue(userId, run),
   });
-
-  // Legacy callouts written before author capture have a null author_id.
-  // Idempotent; must not block or crash the trading path.
-  void backfillCalloutAuthors(db).catch((err: unknown) =>
-    log.warn('callout author backfill failed', { error: (err as Error).message })
-  );
 }
 
 main().catch((err) => {

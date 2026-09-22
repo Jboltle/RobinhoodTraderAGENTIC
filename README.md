@@ -1,41 +1,43 @@
 # Discord-driven Robinhood Auto-Trader
 
-An invite-only, multi-tenant TypeScript system. One Discord channel fans out to each signed-up user's own Robinhood account, settings and risk limits.
+An invite-only, multi-tenant system. One Discord ingest fans out to each signed-up user's own Robinhood account, settings and risk limits.
 
-- **`server/src/bot/`** — a Discord Gateway client (`discord.js`) that listens to `MESSAGE_CREATE` events on configured channels, filters by author allowlist, and forwards each candidate as an HMAC-signed JSON POST to the trader.
-- **`server/src/trader/`** — a Fastify HTTP service that verifies the HMAC signature, uses an LLM to extract a structured trade callout **once**, then runs it per connected user: their settings, their risk state, their [Robinhood Trading MCP](https://agent.robinhood.com/mcp/trading) session (Streamable HTTP + OAuth).
+- **`server/listener/`** — the **Listener**: a Python Discord gateway client (`discord.py-self`) that reads watched channels **as a member with your own user token** and writes every captured message raw into the `messages` table. Capture only — it never parses, trades, or posts.
+- **`server/src/trader/`** — a Fastify HTTP service whose poller drains unprocessed `messages` rows, uses an LLM to extract a structured trade callout **once** per message, then runs it per connected user: their settings, their risk state, their [Robinhood Trading MCP](https://agent.robinhood.com/mcp/trading) session (Streamable HTTP + OAuth).
 - **`client/`** — a TanStack Start dashboard. Users sign in with Supabase Auth, connect their own Robinhood account, edit their own limits, and watch their own feed.
 
-All state lives in Supabase (Postgres). Users, per-user trades, per-user settings and encrypted per-user broker tokens are rows, not files.
+All state lives in Supabase (Postgres). Users, per-user trades, per-user settings, encrypted per-user broker tokens — and now the raw Discord archive — are rows, not files. **The database is the entire interface between capture and trading** ([ADR-0001](docs/adr/0001-database-as-integration-boundary.md)): the Listener only writes, the trader only polls, and nothing forwards anything anywhere.
 
-## Why a Gateway bot, not Discord webhook events
+## Self-bot risk — read before setting DISCORD_USER_TOKEN
 
-Discord's outgoing webhook-events transport only delivers `APPLICATION_*`, `ENTITLEMENT_*`, `LOBBY_MESSAGE_*`, and `GAME_DIRECT_MESSAGE_*`. Regular guild text-channel messages are **not** in that list, so a Gateway bot is the only supported way to read them. The bot synthesizes the "incoming webhook" shape internally by POSTing each match to the trader.
+The Listener authenticates with a Discord **user token**, because the channels worth copying live in servers where you are a member and cannot invite a bot. Automating a user account is prohibited by Discord's Terms of Service and the enforcement outcome is **account termination**. The codebase keeps the account's behaviour close to a normal idle client: one gateway session (never run two Listeners on one token), the library's own backoff/RESUME handling (a hot reconnect loop is a strong automation signal), no member-list chunking, and `discord.py-self` pinned to a commit that tracks the current Discord client fingerprint (see `server/listener/pyproject.toml`). The token bypasses two-factor auth — treat it like a password, and note the Listener redacts it from its own logs. If a source channel is an *Announcement* channel, prefer Discord's native Follow feature: it needs no token and carries no ToS exposure.
 
 ## Architecture
 
 ```
-Discord Gateway ──▶ bot (discord.js) ──HMAC POST──▶ trader (Fastify)
-                                                         │
-                                              LLM parse ONCE, cached in `callouts`
-                                                         │
-                                          ┌──────────────┴──────────────┐
+Discord Gateway ──▶ Listener (Python, user token) ──INSERT──▶ messages (Postgres)
+                                                                  │
+                                            trader poller (~1s): unprocessed rows
+                                                                  │
+                                            LLM parse ONCE ──▶ disposition + parse
+                                                                  │
+                                          ┌───────────────────────┴─────┐
                                        user A                        user B
                                    their settings                their settings
                                    derived risk state            derived risk state
                                    their Robinhood MCP           their Robinhood MCP
-                                          └──────────────┬──────────────┘
-                                                         │
-      ◀── "BUY QQQ 710P — 1 submitted, 1 risk_rejected across 2 accounts." ─┘
+                                          └───────────────────────┬─────┘
+                                                                  ▼
+                                                          decisions in `trades`
 
 browser (client/) ──Supabase JWT──▶ /api/* ──service_role──▶ Supabase Postgres
 ```
 
-One parse serves everyone, which is the cost saving that matters as users are added. Users then run concurrently — separate Robinhood sessions — while each user's own messages stay serialized so no account ever has two orders in flight. The Discord receipt counts outcomes rather than naming who traded what, because the source channel is shared.
+One parse serves everyone, which is the cost saving that matters as users are added. Users then run concurrently — separate Robinhood sessions — while each user's own messages stay serialized so no account ever has two orders in flight. Every message gets a **disposition** (`callout`, `not_callout`, `failed`, `missed`, `recap`) recorded on its row; a Callout is simply a message whose disposition says so, with its parse attached. If the trader is down, messages pile up unprocessed and the poller's first drain on boot is the catch-up — anything older than the **2-minute** staleness window is recorded as *missed* rather than executed at a price that has since moved. The system is Discord-read-only: the dashboard is the only output surface.
 
 ### Access model
 
-- Every route is behind a Fastify `preHandler` that verifies the Supabase JWT. The only public ones are `/health`, `/webhook/discord` (HMAC over the raw body) and `/api/auth/magic-link`.
+- Every route is behind a Fastify `preHandler` that verifies the Supabase JWT. The only public ones are `/health` and `/api/auth/magic-link`.
 - Sign-in is passwordless: `/api/auth/magic-link` checks the email against the `allowed_emails` table server-side, creates the account if needed (admin API), and has Supabase email a one-time sign-in link. Self-serve Supabase signups are disabled, so the anon key in the browser bundle cannot create accounts around the invite gate.
 - [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that constructs a Supabase client. It uses the service-role key, and every per-user method takes `userId` as its first argument so a caller cannot forget to scope a query.
 - RLS is on with **default-deny** (no policies, grants revoked) for all five tables. This is mandatory, not defense in depth: the anon key ships in the JS bundle and PostgREST is publicly reachable, so without it `GET /rest/v1/trades?select=*` is a full data leak. The browser's anon key is used **only** for auth, never for data. [`supabaseRls.test.ts`](server/src/shared/__tests__/supabaseRls.test.ts) is the guard on that.
@@ -44,7 +46,7 @@ One parse serves everyone, which is the cost saving that matters as users are ad
 
 | Table | Scope | Holds |
 | --- | --- | --- |
-| `callouts` | shared | Discord snapshot + the cached LLM parse. Also the idempotency ledger for catch-up. |
+| `messages` | shared | The raw Discord archive (Listener-written) + the trader's verdict: `disposition`, `parse`, `processed_at`. The poller's work queue, the idempotency ledger, and the feed source, all in one table. |
 | `trades` | per-user | One decision row per callout per user. Denormalized so it reads standalone. |
 | `settings` | per-user | One `jsonb` payload — the full resolved settings. Authoritative; no env or file layer behind it. |
 | `allowed_emails` | shared | The signup gate. |
@@ -53,7 +55,7 @@ One parse serves everyone, which is the cost saving that matters as users are ad
 
 Daily trade counts and per-ticker cooldowns are **derived** from `trades` with two count queries rather than stored, so a restart no longer resets the daily cap.
 
-On startup the trader replays Discord messages it slept through, skipping any that already have a `callouts` row. Anything older than the **2-minute** staleness window is recorded as *missed* rather than executed at a price that has since moved.
+Deletes are soft (`deleted_at`): a retracted alert is itself a signal, so the archive shows that it existed and was withdrawn. Edits update the row; on recap channels they also reset the processing marks so corrected P/L numbers re-ingest, while callout-channel edits never re-trigger trades.
 
 ## Setup
 
@@ -65,6 +67,14 @@ Backend code lives in `server/`, the dashboard in `client/`; run bun commands fr
 cd server && bun install
 cd ../client && bun install
 ```
+
+The Listener needs [uv](https://docs.astral.sh/uv/) on PATH (one-time):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+That's the whole Python setup — `uv run` provisions CPython and syncs the Listener's locked dependencies automatically on first start.
 
 ### 2. Start local Supabase
 
@@ -89,18 +99,18 @@ Fill in:
 
 | Var | Value |
 | --- | --- |
-| `DISCORD_BOT_TOKEN` | from https://discord.com/developers/applications |
-| `DISCORD_ALLOWED_CHANNEL_IDS` | channel(s) to monitor |
-| `DISCORD_ALLOWED_AUTHOR_IDS` | whitelisted callout authors |
+| `DISCORD_USER_TOKEN` | your own Discord **user** token — see "Self-bot risk" above before setting it |
+| `DISCORD_ALLOWED_CHANNEL_IDS` | channel(s) the Listener captures |
+| `DISCORD_ALLOWED_AUTHOR_IDS` | authors captured in callout channels (empty = everyone) |
 | `LLM_MODEL` | Model id. Backend is inferred (`qwen3:8b` → Ollama, `gpt-4o` → OpenAI, `claude-*` → Anthropic). Optional `openai/` / `anthropic/` / `ollama/` prefix. Startup fails if unset. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | only for the matching cloud provider |
-| `BOT_TRADER_SECRET` | `openssl rand -hex 32` |
 | `SUPABASE_URL` | `API_URL` from `npx supabase status` |
 | `SUPABASE_ANON_KEY` | `ANON_KEY` from the same output |
 | `SUPABASE_SERVICE_ROLE_KEY` | `SERVICE_ROLE_KEY` — bypasses RLS, server-side only, never in the client bundle |
-| `RH_TOKENS_VAULT_KEY` | any long random string (e.g. from a password manager, or `openssl rand -hex 32`). Encrypts Robinhood tokens at rest; losing it means everyone reconnects. On Render it is generated automatically. |
+| `SUPABASE_DB_URL` | direct Postgres connection string (session pooler); both the trader and the Listener write over it |
+| `RH_TOKENS_VAULT_KEY` | any long random string (e.g. from a password manager, or `openssl rand -hex 32`). Encrypts Robinhood tokens at rest; losing it means everyone reconnects. |
 
-The trader refuses to boot without the four Supabase/vault values.
+The trader refuses to boot without the four Supabase/vault values; the Listener refuses without the user token and `SUPABASE_DB_URL`.
 
 Then the dashboard's own build-time config:
 
@@ -124,8 +134,6 @@ The email must be lowercase (there is a check constraint). Sign-in links from th
 
 To have the allowlist survive a `npx supabase db reset`, put the same statement in `supabase/seed.sql`; `[db.seed]` in `config.toml` is already enabled and pointed at that path.
 
-The Discord bot needs the **Message Content** privileged intent enabled in the developer portal (Bot → Privileged Gateway Intents).
-
 ## Run
 
 Local Supabase needs to be up first (`npx supabase start`). Then the backend, from `server/`:
@@ -135,7 +143,7 @@ cd server
 bun run dev
 ```
 
-`dev` starts the trader first, waits for `GET /health`, then starts the Discord bot. Both processes read the same root `.env`. The bot only forwards messages whose `channelId` is in `DISCORD_ALLOWED_CHANNEL_IDS`; `DISCORD_ALLOWED_AUTHOR_IDS` remains an optional author allowlist.
+`dev` starts the trader first, waits for `GET /health`, then starts the Listener (`uv run python -m listener` — first run installs its locked deps automatically). Both processes read the same root `.env`. The Listener only captures messages whose channel is in `DISCORD_ALLOWED_CHANNEL_IDS` / `DISCORD_RECAP_CHANNEL_IDS`; `DISCORD_ALLOWED_AUTHOR_IDS` remains an optional author allowlist on the callout channels.
 
 And the dashboard, from `client/`:
 
@@ -148,13 +156,13 @@ On the sign-in screen, enter the address you added to `allowed_emails` — a sig
 
 On restart the trader reconnects every user who already had stored tokens, so their MCP session is warm before the first callout rather than during it.
 
-`GET /health` is public and returns `{ ok, executionMode }` — it is a liveness signal, not an auth report. Per-user Robinhood state is at `GET /api/broker/status`.
+`GET /health` is public and returns `{ ok }` — it is a liveness signal, not an auth report. Per-user Robinhood state is at `GET /api/broker/status`.
 
 You can still run components separately when debugging:
 
 ```bash
 bun run trader
-bun run bot
+bun run listener
 ```
 
 ## Ollama in WSL (local LLM)
@@ -280,11 +288,11 @@ QQQ 707C 2026-06-11
 
 In `approval` mode every user gets an approval-required outcome and no order is submitted. Switch to `TRADE_EXECUTION_MODE=immediate` only when you want passed callouts to submit live orders.
 
-One thing that surprises people: the pipeline fans out to users who have a `broker_connections` row, so if nobody has connected Robinhood yet, a callout is parsed and stored but produces no per-user outcomes and no receipt. Connect at least one account before wondering where the feed went.
+One thing that surprises people: the pipeline fans out to users who have a `broker_connections` row, so if nobody has connected Robinhood yet, a callout is parsed and stored but produces no per-user outcomes. Connect at least one account before wondering where the decisions went.
 
 ## Deployment
 
-Owned separately — see `render.yaml` and `server/docker-compose.yml`. In outline: the trader and bot run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a static site, and Supabase moves from the local CLI stack to a hosted project with `npx supabase db push`. Nothing in `supabase/migrations/` is local-only.
+Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries bun for the trader and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a static site (a UI deploy must never restart the gateway session or warm broker sessions), and Supabase moves from the local CLI stack to a hosted project with `npx supabase db push`. Nothing in `supabase/migrations/` is local-only. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
 
 Magic-link sign-in needs three things configured on the hosted Supabase project (dashboard, not code):
 
@@ -319,17 +327,19 @@ The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-swi
 
 ```
 server/
+├── listener/          the Listener: Python/uv gateway capture (user token) -> messages table
+│   ├── src/listener/  config, models, db, gateway client, __main__
+│   └── tests/         pytest suite (gates, models, config)
 ├── src/
-│   ├── index.ts       supervises trader + bot as one process tree
-│   ├── shared/        config + validation, types, HMAC signing, logger, LLM providers
-│   ├── bot/           discord.js Gateway client (filter, assemble, forward)
+│   ├── index.ts       supervises trader + Listener as one process tree
+│   ├── shared/        config + validation, types, logger, LLM providers
 │   ├── scripts/       one-shot operator CLIs (connect, auth:reset)
 │   └── trader/
-│       ├── index.ts   process entrypoint (wires deps, starts the server, catch-up)
-│       ├── server.ts  Fastify routes: POST /webhook/discord, GET /health, /api/*
+│       ├── index.ts   process entrypoint (wires deps, starts the server + poller)
+│       ├── poller.ts  the consumer loop: unprocessed messages -> pipeline (catch-up included)
+│       ├── server.ts  Fastify routes: GET /health, /api/*
 │       ├── auth.ts    Supabase JWT preHandler; the public-route list lives here
-│       ├── db.ts      the only Supabase client; every per-user method takes userId first
-│       ├── catchup.ts replays messages missed while asleep, with the staleness window
+│       ├── db.ts      the only database client; every per-user method takes userId first
 │       ├── pipeline/  parse-once + per-user fan-out, riskFilter, execute, summarize
 │       └── rh/        per-user MCP registry, MCP client, OAuth, token crypto, tool wrappers
 supabase/

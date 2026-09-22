@@ -1,25 +1,43 @@
 # Server: the whole backend in one container -- src/index.ts supervises the
-# Fastify trader and the Discord Gateway bot as a single process tree, so one
-# keep-alive ping on /health keeps both awake. See src/index.ts for why they
-# are not separate services any more.
+# Fastify trader and the Listener (server/listener, Python gateway capture) as
+# a single process tree, so one keep-alive ping on /health keeps both awake.
+# See src/index.ts for why they are not separate services.
 #
 # Runs from source with production node_modules -- bundled dist/ output is NOT
-# used because discord.js/fastify leave lazy require()s (ajv, ...) unresolved
-# in the bundle. See README "Deployment" for details.
+# used because fastify leaves lazy require()s (ajv, ...) unresolved in the
+# bundle. See README "Deployment" for details.
 FROM oven/bun:1.2.18-slim
 # Slim images omit CA certs; postgres.js TLS to the Supabase pooler then fails
 # on the first query and Drizzle reports only "Failed query".
+# git: discord.py-self is pinned to a git commit (the pin tracks Discord's
+# client fingerprint -- see listener/pyproject.toml), so uv resolves it from
+# GitHub and slim images ship without git.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates git \
   && rm -rf /var/lib/apt/lists/*
+# uv is a single static binary; it provisions its own CPython for the Listener,
+# so no python base layer or pip is needed.
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
+ENV UV_LINK_MODE=copy
 WORKDIR /app
 
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
-COPY --chown=bun:bun src ./src
+# Everything below runs as the runtime user so uv's managed CPython, cache and
+# the venv land in bun's home and `uv run` at startup is a no-op sync.
+RUN chown bun:bun /app
 USER bun
 
-# 3000 = webhook + /health, 8788 = Robinhood OAuth browser callback
+# Listener deps in their own layer: rebuilt only when the lockfile moves.
+COPY --chown=bun:bun listener/pyproject.toml listener/uv.lock listener/
+RUN cd listener && uv sync --frozen --no-dev --no-install-project
+
+COPY --chown=bun:bun src ./src
+COPY --chown=bun:bun listener ./listener
+# Install the listener package itself (deps are already in the cached layer).
+RUN cd listener && uv sync --frozen --no-dev
+
+# 3000 = /health + /api, 8788 = Robinhood OAuth browser callback
 EXPOSE 3000 8788
 CMD ["bun", "src/index.ts"]

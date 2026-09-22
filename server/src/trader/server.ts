@@ -1,6 +1,7 @@
 /**
- * Trader HTTP server: signed Discord webhook + per-user REST API (feed,
- * position performance, trade settings, Robinhood connection).
+ * Trader HTTP server: the per-user REST API (feed, position performance,
+ * trade settings, Robinhood connection). Message ingestion does not pass
+ * through HTTP any more — the poller reads the `messages` table directly.
  *
  * Every /api route runs behind the Supabase JWT hook in auth.ts and reads or
  * writes only the acting user's rows. Kept separate from index.ts (which
@@ -11,22 +12,18 @@ import fastifyCors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
-import { config } from '../shared/config.js';
-import { createLogger } from '../shared/logger.js';
+import { createLogger, errorFields } from '../shared/logger.js';
 import {
-  DiscordEnvelopeSchema,
   TradeSettingsSchema,
   type AssetType,
   type Decision,
   type OptionType,
 } from '../shared/types.js';
-import { verifyWebhookBody } from '../shared/webhookAuth.js';
 import { registerAuth, requireUser } from './auth.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { findEquityEntry, findOptionEntry } from './maxLoss.js';
 import { submitOrder } from './pipeline/execute.js';
-import type { MessageProcessor } from './pipeline/index.js';
 import { summarize } from './pipeline/summarize.js';
 import {
   DEFAULT_RECAP_WINDOW_DAYS,
@@ -34,8 +31,6 @@ import {
   computeRecapPerformance,
   isoDateDaysAgo,
 } from './recaps/analytics.js';
-import { refreshRecapInsights } from './recaps/insights.js';
-import { ingestRecapEnvelope } from './recaps/sweep.js';
 import type { McpRegistry, UserBroker } from './rh/mcpRegistry.js';
 import type { RobinhoodTools } from './rh/tools.js';
 
@@ -57,14 +52,6 @@ const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
 const AUTH_URL_TIMEOUT_MS = 15_000;
 const AUTH_URL_POLL_MS = 100;
 
-/**
- * Webhook body = `{ envelope }`. The bot signs and sends the whole wrapper and
- * HMAC verification is over the raw body string, so both sides change shape
- * together (see src/bot/forwarder.ts). Trade settings are per user and live in
- * the database, so no settings ride along with a message any more.
- */
-const WebhookBodySchema = z.object({ envelope: DiscordEnvelopeSchema });
-
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
 const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 
@@ -74,7 +61,6 @@ export interface ServerDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
-  readonly processor: MessageProcessor;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -86,76 +72,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // scope is harmless. Upgrade path: move /api routes into a prefixed scope.
   fastify.register(fastifyCors, { origin: true, methods: ['GET', 'PUT', 'POST'] });
 
-  fastify.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
-    try {
-      (request as { rawBody?: string }).rawBody = body as string;
-      done(null, JSON.parse(body as string));
-    } catch (err) {
-      done(err as Error);
-    }
-  });
-
   registerAuth(fastify, deps.db);
 
   // ---- Public -----------------------------------------------------------------
 
-  fastify.post('/webhook/discord', async (request, reply) => {
-    const rawBody = (request as { rawBody?: string }).rawBody ?? JSON.stringify(request.body);
-    const auth = verifyWebhookBody(rawBody, request.headers, config.botTraderSecret);
-    if (!auth.ok) {
-      log.warn('webhook: rejected - unauthorized', { reason: auth.reason });
-      return reply.status(401).send({ error: 'unauthorized' });
-    }
-
-    const result = WebhookBodySchema.safeParse(request.body);
-    if (!result.success) {
-      log.warn('webhook: rejected — invalid envelope', { error: result.error.message });
-      return reply.status(400).send({ error: 'invalid envelope' });
-    }
-
-    const { envelope } = result.data;
-
-    // Recaps are analytics data, never trades: they route to the recaps table
-    // and refresh the cached narration. Structurally unreachable by the
-    // trade pipeline below.
-    if (envelope.kind === 'recap') {
-      log.info('webhook: received recap', {
-        messageId: envelope.messageId,
-        channel: envelope.channelId,
-      });
-      void ingestRecapEnvelope(deps.db, envelope)
-        .then((changed) => (changed ? refreshRecapInsights(deps.db) : undefined))
-        .catch((err: unknown) =>
-          log.error('recap ingest crashed', {
-            messageId: envelope.messageId,
-            error: (err as Error).message,
-          })
-        );
-      return reply.status(202).send({ ok: true });
-    }
-
-    log.info('webhook: received callout candidate', {
-      messageId: envelope.messageId,
-      author: envelope.authorName,
-      channel: envelope.channelId,
-    });
-
-    // Acknowledge immediately; the fan-out runs async so the bot never times
-    // out. Per-user ordering is preserved inside the processor.
-    void deps.processor.process(envelope).catch((err: unknown) =>
-      log.error('fan-out crashed', {
-        messageId: envelope.messageId,
-        error: (err as Error).message,
-      })
-    );
-
-    return reply.status(202).send({ ok: true });
-  });
-
   // Keep-alive target for the supervisor's self-ping (src/index.ts) and the
   // platform health check. Its liveness signal is whether it answers at all,
-  // not what it says: src/index.ts runs the bot in the same process tree and
-  // tears the tree down if the bot dies, so a dead Gateway means this stops
+  // not what it says: src/index.ts runs the Listener in the same process tree
+  // and tears the tree down if it dies, so a dead Gateway means this stops
   // responding. executionMode is per-user (settings.payload), not process-wide.
   fastify.get('/health', async (_request, reply) => {
     return reply.send({ ok: true });
@@ -171,12 +95,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.status(400).send({ error: 'body must be { email: string }' });
     }
     const { email } = parsed.data;
-    if (!(await deps.db.isEmailAllowed(email))) {
-      log.warn('magic link rejected: email not on the allowlist', { email });
-      return reply.status(403).send({ error: 'this email is not invited' });
+    let step = 'allowlist';
+    try {
+      if (!(await deps.db.isEmailAllowed(email))) {
+        log.warn('magic link rejected: email not on the allowlist', { email });
+        return reply.status(403).send({ error: 'this email is not invited' });
+      }
+      step = 'ensureUser';
+      await deps.db.ensureUser(email);
+      step = 'sendMagicLink';
+      await deps.db.sendMagicLink(email);
+    } catch (err) {
+      log.error('magic-link failed', { email, step, ...errorFields(err) });
+      return reply.status(500).send({ error: 'could not send sign-in link' });
     }
-    await deps.db.ensureUser(email);
-    await deps.db.sendMagicLink(email);
     log.info('sent sign-in link', { email });
     return reply.send({ ok: true });
   });

@@ -15,7 +15,6 @@ import { createLogger } from '../shared/logger.js';
 import type { Decision, SubmittedOrder } from '../shared/types.js';
 import { createFakeDb } from '../trader/__tests__/fakeDb.js';
 import { TraderEvents } from '../trader/events.js';
-import type { MessageProcessor } from '../trader/pipeline/index.js';
 import type { McpRegistry, UserBroker } from '../trader/rh/mcpRegistry.js';
 import type { RobinhoodMcpClient } from '../trader/rh/mcpClient.js';
 import type { RobinhoodTools } from '../trader/rh/tools.js';
@@ -204,12 +203,7 @@ const brokers: McpRegistry = {
   drop: () => {},
 };
 
-const processor: MessageProcessor = {
-  process: (async () => {}) as MessageProcessor['process'],
-  enqueue: <T>(_userId: string, run: () => Promise<T>) => run(),
-};
-
-const fastify = buildServer({ db, events: new TraderEvents(), brokers, processor });
+const fastify = buildServer({ db, events: new TraderEvents(), brokers });
 
 await fastify.listen({ port: PORT, host: '127.0.0.1' });
 log.info('dev trader listening', { url: `http://127.0.0.1:${PORT}`, user: USER.id });

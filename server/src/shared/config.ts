@@ -1,10 +1,18 @@
 import { config as loadDotenv } from 'dotenv';
 
-// .env lives at the repo root (one level above server/). Resolve it relative
-// to this file, not cwd, so env loads no matter where the process starts.
-// In Docker the file doesn't exist (compose env_file injects vars) and dotenv
-// silently no-ops.
-loadDotenv({ path: new URL('../../../.env', import.meta.url) });
+// Env files live at the repo root (one level above server/). Resolve them
+// relative to this file, not cwd, so env loads no matter where the process
+// starts. In Docker the files don't exist (compose env_file injects vars) and
+// dotenv silently no-ops.
+const rootEnvFile = (name: string) => new URL(`../../../${name}`, import.meta.url);
+
+// Base .env first (shared config; may set NODE_ENV), then the profile it
+// selects. dotenv never overrides variables that are already set, so a
+// NODE_ENV from the shell or a package.json script beats the .env line, and
+// base values beat profile values on overlap.
+loadDotenv({ path: rootEnvFile('.env') });
+const nodeEnv = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+loadDotenv({ path: rootEnvFile(`.env.${nodeEnv}`) });
 
 const env = process.env;
 
@@ -20,9 +28,6 @@ const num = (s: string | undefined, fallback: number): number => {
   const parsed = Number(s);
   return Number.isFinite(parsed) ? parsed : fallback;
 };
-
-const bool = (s: string | undefined, fallback: boolean): boolean =>
-  s === undefined ? fallback : s.toLowerCase() === 'true';
 
 const requiredString = (name: string): string => {
   const value = env[name]?.trim();
@@ -44,20 +49,15 @@ const oauthRedirectUri =
 
 export const config = {
   // ---- Discord ----------------------------------------------------------------
-  discordBotToken: env.DISCORD_BOT_TOKEN ?? '',
+  // Capture-side channel/author allowlists (DISCORD_ALLOWED_CHANNEL_IDS,
+  // DISCORD_ALLOWED_AUTHOR_IDS, DISCORD_USER_TOKEN) are read by the Listener
+  // (server/listener) from the same .env; the trader only needs to know which
+  // captured channels are recaps.
   /**
-   * Comma-separated channel IDs to listen on (same server, one trader endpoint).
-   * Leave empty to ignore all Discord messages.
-   */
-  discordAllowedChannelIds: list(env.DISCORD_ALLOWED_CHANNEL_IDS),
-  discordAllowedAuthorIds: list(env.DISCORD_ALLOWED_AUTHOR_IDS),
-  /**
-   * Channels carrying daily trade-recap posts. Stored + parsed for the
-   * Performance & Metrix dashboard; structurally isolated from trading.
+   * Channels carrying daily trade-recap posts. The poller routes their
+   * `messages` rows to the recaps table; structurally isolated from trading.
    */
   discordRecapChannelIds: list(env.DISCORD_RECAP_CHANNEL_IDS),
-  discordForwardChannelId: env.DISCORD_FORWARD_CHANNEL_ID?.trim() || null,
-  discordLogIgnoredMessages: bool(env.DISCORD_LOG_IGNORED_MESSAGES, false),
 
   // ---- LLM -------------------------------------------------------------------
   // Backend is inferred from this id in llm.ts. Optional `openai/`,
@@ -90,17 +90,13 @@ export const config = {
   robinhoodOAuthCallbackPort: oauthCallbackPort,
   robinhoodOAuthCallbackHost: env.ROBINHOOD_OAUTH_CALLBACK_HOST ?? '0.0.0.0',
 
-  // ---- Inter-service ---------------------------------------------------------
-  botTraderSecret: env.BOT_TRADER_SECRET ?? '',
+  // ---- HTTP ------------------------------------------------------------------
   // 127.0.0.1 by default; every /api route verifies a Supabase JWT, but a
   // loopback bind keeps a misconfigured box off the local network anyway.
   // ponytail: a set PORT env var (Render/PaaS convention) flips the default
   // to 0.0.0.0 so the platform proxy can reach us; explicit TRADER_HOST wins.
   traderHost: env.TRADER_HOST ?? (env.PORT ? '0.0.0.0' : '127.0.0.1'),
   traderPort,
-  // Bot and trader share this process. The webhook never leaves loopback.
-  traderWebhookUrl:
-    env.TRADER_WEBHOOK_URL ?? `http://127.0.0.1:${traderPort}/webhook/discord`,
 
   // ---- Supabase ---------------------------------------------------------------
   supabaseUrl: env.SUPABASE_URL?.trim() ?? '',
@@ -124,21 +120,15 @@ export const isAllowed = (v: string, allowlist: readonly string[]): boolean =>
 /**
  * Fail fast at process startup with a single message listing every missing
  * required variable, instead of surfacing cryptic runtime errors later.
- *
- * Both processes need Discord + the shared HMAC secret. Only the trader talks
- * to Supabase and parses callouts, so only it requires those keys.
+ * (The Listener validates its own env — DISCORD_USER_TOKEN etc. — in Python.)
  */
-export function assertConfigValid(scope: 'trader' | 'bot'): void {
+export function assertConfigValid(): void {
   const missing: string[] = [];
-  if (!config.discordBotToken) missing.push('DISCORD_BOT_TOKEN');
-  if (!config.botTraderSecret) missing.push('BOT_TRADER_SECRET');
-  if (scope === 'trader') {
-    if (!config.supabaseUrl) missing.push('SUPABASE_URL');
-    if (!config.supabaseAnonKey) missing.push('SUPABASE_ANON_KEY');
-    if (!config.supabaseServiceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
-    if (!config.supabaseDbUrl) missing.push('SUPABASE_DB_URL');
-    if (!config.rhTokensVaultKey) missing.push('RH_TOKENS_VAULT_KEY');
-  }
+  if (!config.supabaseUrl) missing.push('SUPABASE_URL');
+  if (!config.supabaseAnonKey) missing.push('SUPABASE_ANON_KEY');
+  if (!config.supabaseServiceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
+  if (!config.supabaseDbUrl) missing.push('SUPABASE_DB_URL');
+  if (!config.rhTokensVaultKey) missing.push('RH_TOKENS_VAULT_KEY');
 
   if (missing.length > 0) {
     throw new Error(

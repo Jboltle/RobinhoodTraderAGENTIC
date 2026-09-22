@@ -9,9 +9,6 @@ loadDotenv({ path: new URL('../.env', import.meta.url) });
 
 const dummyEnvForMissingRequiredVars: Record<string, string> = {
   LLM_MODEL: 'test-dummy-model',
-  // Not required at import, but forwardToTrader.test.ts signs real HMAC
-  // payloads with config.botTraderSecret, and an empty secret fails verify.
-  BOT_TRADER_SECRET: 'test-dummy-secret',
 };
 
 export default defineConfig({

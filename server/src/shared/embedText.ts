@@ -1,8 +1,10 @@
 /**
- * Pure embed-text flattening shared by the bot (discord.js Embed objects) and
- * the trader's callout history feed (raw REST embed JSON). Structural type so
- * both shapes satisfy it without casts.
+ * Pure embed-text flattening over raw Discord embed JSON, shared by the
+ * pipeline's parse path (flattenEnvelope) and the feed's read-time flatten in
+ * db.ts. Structural type so any embed-shaped JSON satisfies it without casts.
  */
+
+import type { DiscordEnvelope } from './types.js';
 
 export interface EmbedLike {
   readonly author?: { readonly name?: string | null } | null;
@@ -57,4 +59,36 @@ export function assembleMessageText(parts: {
   }
 
   return body;
+}
+
+/** Discord caps total embed text at 6000 chars; parse text stays within that no matter the producer. */
+export const MAX_CONTENT_LENGTH = 6000;
+
+/** Slice to `max` chars, dropping a trailing lone high surrogate so JSON encoding stays valid. */
+export function truncateSafe(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const sliced = text.slice(0, max);
+  const last = sliced.charCodeAt(sliced.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
+}
+
+/**
+ * The trader-side half of the envelope contract (see DiscordEnvelopeSchema):
+ * producers send raw parts — `content` as the message text, `embeds` as raw
+ * embed JSON — and this flattens the embeds into `content` so everything
+ * downstream (parser, guards, stored feed content) reads one text field.
+ *
+ * Call it exactly once per envelope, at a domain entry point (the trade
+ * pipeline's process(), the recap ingest); a second call would duplicate the
+ * embed text. `embeds` stay raw on the returned envelope for storage/display.
+ */
+export function flattenEnvelope(envelope: DiscordEnvelope): DiscordEnvelope {
+  // Envelope embeds are permissive Record JSON; EmbedLike reads the textual
+  // parts through optional chaining, so unknown-shaped values flatten to ''.
+  const embeds = (envelope.embeds ?? []) as readonly EmbedLike[];
+  const content = truncateSafe(
+    assembleMessageText({ body: envelope.content, stickerNames: [], attachmentUrls: [], embeds }),
+    MAX_CONTENT_LENGTH
+  );
+  return { ...envelope, content };
 }

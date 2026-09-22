@@ -10,7 +10,6 @@ import type {
   CalloutParser,
   Decision,
   DiscordEnvelope,
-  PostReceipt,
   TradeSettings,
 } from '../../../shared/types.js';
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
@@ -95,7 +94,6 @@ function makeParser(callout: Callout | Error): CalloutParser {
 interface Setup {
   readonly db: FakeDb;
   readonly deps: PipelineDeps;
-  readonly postReceipt: PostReceipt;
   readonly tools: RobinhoodTools;
   readonly events: TraderEvents;
 }
@@ -117,15 +115,13 @@ function setup(
   }
 
   const events = new TraderEvents();
-  const postReceipt = vi.fn().mockResolvedValue(undefined);
   const deps: PipelineDeps = {
     parser: makeParser(callout),
     db,
     events,
     brokers: makeRegistry(toolsByUser),
-    postReceipt,
   };
-  return { db, deps, postReceipt, tools: toolsByUser.get(users[0]!)!, events };
+  return { db, deps, tools: toolsByUser.get(users[0]!)!, events };
 }
 
 /** Run one message through the fan-out and return the first user's outcome. */
@@ -133,11 +129,11 @@ async function runWith(
   envelope: DiscordEnvelope,
   callout: Callout | Error,
   toolsOverrides: Partial<RobinhoodTools> = {}
-): Promise<{ decision: Decision; postReceipt: PostReceipt; tools: RobinhoodTools; db: FakeDb }> {
-  const { db, deps, postReceipt, tools } = setup(callout, toolsOverrides);
+): Promise<{ decision: Decision; tools: RobinhoodTools; db: FakeDb }> {
+  const { db, deps, tools } = setup(callout, toolsOverrides);
   await createMessageProcessor(deps).process(envelope);
   const decisions = await db.listDecisions(USER, 10);
-  return { decision: decisions[0]!, postReceipt, tools, db };
+  return { decision: decisions[0]!, tools, db };
 }
 
 // ---------------------------------------------------------------------------
@@ -146,20 +142,19 @@ async function runWith(
 
 describe('fan-out — non-callouts', () => {
   it('records channel chatter on the shared row only, with no per-user work', async () => {
-    const { db, deps, postReceipt } = setup(HYPE_BANG.expectedCallout, {}, [USER, OTHER_USER]);
+    const { db, deps } = setup(HYPE_BANG.expectedCallout, {}, [USER, OTHER_USER]);
 
     await createMessageProcessor(deps).process(envelopeFromFixture(HYPE_BANG));
 
-    const stored = await db.getCallout(envelopeFromFixture(HYPE_BANG).messageId);
-    expect(stored?.parseStatus).toBe('not_callout');
-    // The callouts table constraint keeps `parse` for real callouts only, and
+    const stored = db.getMessage(envelopeFromFixture(HYPE_BANG).messageId);
+    expect(stored?.disposition).toBe('not_callout');
+    // The messages table constraint keeps `parse` for real Callouts only, and
     // nothing downstream reads a non-callout parse.
     expect(stored?.parse).toBeNull();
 
-    // No trade rows and no Discord noise for a message nobody can act on.
+    // No trade rows for a message nobody can act on.
     expect(await db.listDecisions(USER, 10)).toEqual([]);
     expect(await db.listDecisions(OTHER_USER, 10)).toEqual([]);
-    expect(postReceipt).not.toHaveBeenCalled();
   });
 
   it('clears the in-flight banner for every user when the parse is chatter', async () => {
@@ -175,7 +170,7 @@ describe('fan-out — non-callouts', () => {
 
 describe('fan-out — BTO entry', () => {
   it('submits a limit buy for BTO $QQQ 710p', async () => {
-    const { decision, tools, postReceipt } = await runWith(
+    const { decision, tools } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout
     );
@@ -189,13 +184,12 @@ describe('fan-out — BTO entry', () => {
       limitPrice: 0.97,
     });
     expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
-    expect(postReceipt).toHaveBeenCalledOnce();
   });
 
-  it('caches the parse on the callouts row', async () => {
+  it('records the callout verdict and its parse on the messages row', async () => {
     const { db } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), BTO_QQQ_PUT.expectedCallout);
-    const stored = await db.getCallout(envelopeFromFixture(BTO_QQQ_PUT).messageId);
-    expect(stored?.parseStatus).toBe('parsed');
+    const stored = db.getMessage(envelopeFromFixture(BTO_QQQ_PUT).messageId);
+    expect(stored?.disposition).toBe('callout');
     expect(stored?.parse).toMatchObject({ ticker: 'QQQ', assetType: 'option' });
   });
 });
@@ -287,13 +281,12 @@ describe('fan-out — parse consistency guardrails', () => {
   };
 
   it('rejects an equity parse of an options-language message (the AAPL incident)', async () => {
-    const { decision, tools, postReceipt } = await runWith(INCIDENT_ENVELOPE, BAD_EQUITY_PARSE);
+    const { decision, tools } = await runWith(INCIDENT_ENVELOPE, BAD_EQUITY_PARSE);
 
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.code).toBe('parse_inconsistent');
     expect(decision.order).toBeNull();
     expect(tools.placeOrder).not.toHaveBeenCalled();
-    expect(postReceipt).toHaveBeenCalledOnce();
   });
 
   it('rejects an equity limit buy wildly below the live quote', async () => {
@@ -329,7 +322,7 @@ describe('fan-out — parse consistency guardrails', () => {
 
 describe('fan-out — approval mode', () => {
   it("a user's own 'approval' setting parks the trade without submitting", async () => {
-    const { db, deps, postReceipt, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
     db.seedSettings(USER, { ...TRADING_SETTINGS, executionMode: 'approval' });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
@@ -337,7 +330,6 @@ describe('fan-out — approval mode', () => {
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision!.kind).toBe('pending_approval');
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
-    expect(postReceipt).toHaveBeenCalledOnce();
   });
 
   // Sizing happens before the approval gate so the dashboard can show what is
@@ -369,7 +361,7 @@ describe('fan-out — error paths', () => {
 
     expect(decision.kind).toBe('parser_error');
     expect(decision.code).toBe('parse_failed');
-    expect((await db.getCallout(envelopeFromFixture(BTO_QQQ_PUT).messageId))?.parseStatus).toBe('failed');
+    expect(db.getMessage(envelopeFromFixture(BTO_QQQ_PUT).messageId)?.disposition).toBe('failed');
   });
 
   it('records risk_rejected for a low-confidence callout', async () => {
@@ -471,37 +463,11 @@ describe('fan-out — several users', () => {
       db,
       events: new TraderEvents(),
       brokers: makeRegistry(toolsByUser),
-      postReceipt: vi.fn().mockResolvedValue(undefined),
     }).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('execution_failed');
     expect((await db.listDecisions(OTHER_USER, 10))[0]!.kind).toBe('submitted');
     expect(toolsByUser.get(OTHER_USER)!.placeOptionsOrder).toHaveBeenCalledOnce();
-  });
-
-  it('posts a single aggregate receipt rather than one per account', async () => {
-    const { deps, postReceipt } = setup(BTO_QQQ_PUT.expectedCallout, {}, [USER, OTHER_USER]);
-
-    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
-
-    expect(postReceipt).toHaveBeenCalledOnce();
-    const [, text] = (postReceipt as ReturnType<typeof vi.fn>).mock.calls[0]!;
-    expect(text).toContain('2 submitted');
-    expect(text).toContain('2 accounts');
-    // No per-account detail: the source channel is shared.
-    expect(text).not.toContain(USER);
-    expect(text).not.toContain(OTHER_USER);
-  });
-
-  it('reuses the cached parse on a second delivery of the same message', async () => {
-    const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout);
-    const processor = createMessageProcessor(deps);
-
-    await processor.process(envelopeFromFixture(BTO_QQQ_PUT));
-    await processor.process(envelopeFromFixture(BTO_QQQ_PUT));
-
-    expect(deps.parser.parse).toHaveBeenCalledOnce();
-    expect(await db.listDecisions(USER, 10)).toHaveLength(2);
   });
 });
 
@@ -547,15 +513,13 @@ describe('fan-out — Following', () => {
   });
 
   it('an empty list follows no one', async () => {
-    const { db, deps, tools, postReceipt } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
     db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: [] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect(await db.listDecisions(USER, 10)).toEqual([]);
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
-    // Every account skipped: nothing worth a Discord receipt either.
-    expect(postReceipt).not.toHaveBeenCalled();
   });
 
   it('Following is per user: one user skips while the other trades', async () => {
@@ -638,6 +602,42 @@ describe('fan-out — lifecycle stage events', () => {
   });
 });
 
+describe('fan-out — envelope contract', () => {
+  // The producer-agnostic guarantee: an envelope carrying its callout only in
+  // raw embed JSON (what a replacement forwarder may send) is flattened once
+  // at the pipeline entry, so the parser and the stored feed row see the text.
+  it('flattens an embed-only envelope before parsing and storing', async () => {
+    const card = { title: 'Buy To Open', description: 'BTO $QQQ 710p 06/08 0.97' };
+    const embedOnly: DiscordEnvelope = {
+      messageId: 'embed-only-1',
+      channelId: 'test-channel',
+      guildId: 'test-guild',
+      authorId: 'test-author',
+      authorName: 'Demon Alerts',
+      authorAvatarUrl: null,
+      content: '',
+      timestamp: '2026-06-09T14:27:00.000Z',
+      embeds: [card],
+    };
+    const { db, deps } = setup(BTO_QQQ_PUT.expectedCallout);
+
+    await createMessageProcessor(deps).process(embedOnly);
+
+    const parsedEnvelope = (deps.parser.parse as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0] as DiscordEnvelope;
+    expect(parsedEnvelope.content).toBe('Buy To Open\nBTO $QQQ 710p 06/08 0.97');
+
+    // The verdict lands on the messages row; content stays raw there (the feed
+    // flattens at read — covered by the fakeDb/listCallouts parity in
+    // server.test.ts) and the parse is retained for the real callout.
+    const stored = db.getMessage('embed-only-1');
+    expect(stored?.disposition).toBe('callout');
+    expect(stored?.parse).toMatchObject({ ticker: 'QQQ' });
+
+    expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('submitted');
+  });
+});
+
 describe('fan-out — missed callouts', () => {
   it('records missed without touching the broker or the LLM', async () => {
     const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
@@ -649,7 +649,7 @@ describe('fan-out — missed callouts', () => {
     expect(decision!.reason).toMatch(/stale/);
     expect(deps.parser.parse).not.toHaveBeenCalled();
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
-    expect((await db.getCallout(envelopeFromFixture(BTO_QQQ_PUT).messageId))?.parseStatus).toBe('skipped');
+    expect(db.getMessage(envelopeFromFixture(BTO_QQQ_PUT).messageId)?.disposition).toBe('missed');
   });
 });
 

@@ -7,16 +7,60 @@
  * every per-user call, which is what isolation.test.ts asserts against: no
  * endpoint may query a user id other than the caller's.
  */
-import { TradeSettingsSchema, type Decision, type ResolvedTradeSettings, type TradeSettings } from '../../shared/types.js';
+import {
+  EmbedLike,
+  MAX_CONTENT_LENGTH,
+  assembleMessageText,
+  truncateSafe,
+} from '../../shared/embedText.js';
+import { TradeSettingsSchema, type Callout, type Decision, type ResolvedTradeSettings, type TradeSettings } from '../../shared/types.js';
 import type {
   AuthUser,
   Caller,
+  CalloutFeedStatus,
+  MessageDisposition,
+  PendingMessage,
   StoredCallout,
   StoredRecap,
   StoredRecapInsight,
   TraderDb,
 } from '../db.js';
 import type { PersistedState } from '../rh/types.js';
+
+/** An in-memory `messages` row: capture columns + the trader's verdict marks. */
+export interface FakeMessageRow {
+  readonly messageId: string;
+  readonly channelId: string;
+  readonly channelName: string | null;
+  readonly authorId: string;
+  readonly authorName: string;
+  readonly authorAvatarUrl: string | null;
+  readonly content: string;
+  readonly embeds: readonly Record<string, unknown>[];
+  readonly sentAt: string;
+  readonly deletedAt: string | null;
+  readonly disposition: MessageDisposition | null;
+  readonly parse: Callout | null;
+  readonly processedAt: string | null;
+}
+
+/** Seed shape for messages rows; everything optional except identity + time. */
+export type SeedMessage = Partial<FakeMessageRow> &
+  Pick<FakeMessageRow, 'messageId' | 'sentAt'>;
+
+const FEED_STATUS: Record<Exclude<MessageDisposition, 'recap'>, CalloutFeedStatus> = {
+  callout: 'parsed',
+  not_callout: 'not_callout',
+  failed: 'failed',
+  missed: 'skipped',
+};
+
+const DISPOSITION_FROM_FEED_STATUS: Record<CalloutFeedStatus, MessageDisposition> = {
+  parsed: 'callout',
+  not_callout: 'not_callout',
+  failed: 'failed',
+  skipped: 'missed',
+};
 
 export interface ScopedCall {
   readonly method: string;
@@ -42,7 +86,12 @@ export interface FakeDb extends TraderDb {
   seedSettings(userId: string, settings: TradeSettings): void;
   seedDecision(userId: string, decision: Decision): void;
   seedBrokerTokens(userId: string, state: PersistedState): void;
+  /** Seed an already-judged message row from its feed shape. */
   seedCallout(callout: StoredCallout): void;
+  /** Seed a raw messages row (unprocessed unless marks are given). */
+  seedMessage(row: SeedMessage): void;
+  /** Inspect a messages row (verdict marks included); null when unknown. */
+  getMessage(messageId: string): FakeMessageRow | null;
   allowEmail(email: string): void;
 }
 
@@ -52,7 +101,7 @@ export function createFakeDb(): FakeDb {
   const settings = new Map<string, ResolvedTradeSettings>();
   const trades: Array<{ userId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
-  const callouts = new Map<string, StoredCallout>();
+  const messages = new Map<string, FakeMessageRow>();
   const callers = new Map<string, Caller>();
   const recaps = new Map<string, StoredRecap>();
   const recapInsights = new Map<number, StoredRecapInsight>();
@@ -85,7 +134,40 @@ export function createFakeDb(): FakeDb {
       brokerTokens.set(userId, state);
     },
     seedCallout(callout) {
-      callouts.set(callout.messageId, callout);
+      messages.set(callout.messageId, {
+        messageId: callout.messageId,
+        channelId: callout.channelId,
+        channelName: callout.channelName,
+        authorId: callout.authorId ?? '',
+        authorName: callout.authorName,
+        authorAvatarUrl: null,
+        content: callout.content,
+        embeds: callout.embeds,
+        sentAt: callout.timestamp,
+        deletedAt: null,
+        disposition: DISPOSITION_FROM_FEED_STATUS[callout.parseStatus],
+        parse: callout.parse,
+        processedAt: callout.timestamp,
+      });
+    },
+    seedMessage(row) {
+      messages.set(row.messageId, {
+        channelId: 'chan-001',
+        channelName: null,
+        authorId: 'author-001',
+        authorName: 'Demon Alerts',
+        authorAvatarUrl: null,
+        content: '',
+        embeds: [],
+        deletedAt: null,
+        disposition: null,
+        parse: null,
+        processedAt: null,
+        ...row,
+      });
+    },
+    getMessage(messageId) {
+      return messages.get(messageId) ?? null;
     },
     allowEmail(email) {
       allowedEmails.add(email.toLowerCase());
@@ -164,16 +246,82 @@ export function createFakeDb(): FakeDb {
     async listBrokerUserIds() {
       return [...brokerTokens.keys()];
     },
-    async getCallout(messageId) {
-      return callouts.get(messageId) ?? null;
+    async listUnprocessedMessages(limit) {
+      return [...messages.values()]
+        .filter((row) => row.processedAt === null)
+        .sort((a, b) => a.sentAt.localeCompare(b.sentAt))
+        .slice(0, limit)
+        .map(
+          (row): PendingMessage => ({
+            messageId: row.messageId,
+            channelId: row.channelId,
+            channelName: row.channelName,
+            authorId: row.authorId,
+            authorName: row.authorName,
+            authorAvatarUrl: row.authorAvatarUrl,
+            content: row.content,
+            embeds: row.embeds,
+            sentAt: row.sentAt,
+            deletedAt: row.deletedAt,
+            disposition: row.disposition,
+          })
+        );
     },
-    async saveCallout(callout) {
-      callouts.set(callout.messageId, callout);
+    async setMessageDisposition(messageId, disposition, parse) {
+      // Mirrors the real UPDATE, except a missing row is created so pipeline
+      // tests can process bare envelopes and still assert the verdict.
+      const existing = messages.get(messageId);
+      messages.set(messageId, {
+        channelId: 'chan-001',
+        channelName: null,
+        authorId: 'author-001',
+        authorName: 'Demon Alerts',
+        authorAvatarUrl: null,
+        content: '',
+        embeds: [],
+        sentAt: new Date(0).toISOString(),
+        deletedAt: null,
+        processedAt: null,
+        messageId,
+        ...existing,
+        disposition,
+        parse,
+      });
+    },
+    async markMessageProcessed(messageId) {
+      const existing = messages.get(messageId);
+      if (existing) {
+        messages.set(messageId, { ...existing, processedAt: new Date().toISOString() });
+      }
     },
     async listCallouts(limit) {
-      return [...callouts.values()]
-        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
-        .slice(0, limit);
+      return [...messages.values()]
+        .filter((row) => row.disposition !== null && row.disposition !== 'recap')
+        .sort((a, b) => b.sentAt.localeCompare(a.sentAt))
+        .slice(0, limit)
+        .map(
+          (row): StoredCallout => ({
+            messageId: row.messageId,
+            channelId: row.channelId,
+            channelName: row.channelName,
+            authorId: row.authorId,
+            authorName: row.authorName,
+            // Same read-time flatten the real listCallouts performs.
+            content: truncateSafe(
+              assembleMessageText({
+                body: row.content,
+                stickerNames: [],
+                attachmentUrls: [],
+                embeds: row.embeds as readonly EmbedLike[],
+              }),
+              MAX_CONTENT_LENGTH
+            ),
+            timestamp: row.sentAt,
+            embeds: row.embeds,
+            parse: row.parse,
+            parseStatus: FEED_STATUS[row.disposition as Exclude<MessageDisposition, 'recap'>],
+          })
+        );
     },
     async upsertCaller(caller) {
       // Mirrors the real upsert: a null avatar never overwrites a stored one.
@@ -182,15 +330,6 @@ export function createFakeDb(): FakeDb {
     },
     async listCallers() {
       return [...callers.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
-    },
-    async listCalloutsMissingAuthor() {
-      return [...callouts.values()]
-        .filter((c) => c.authorId === null)
-        .map((c) => ({ messageId: c.messageId, timestamp: c.timestamp }));
-    },
-    async setCalloutAuthor(messageId, authorId) {
-      const existing = callouts.get(messageId);
-      if (existing) callouts.set(messageId, { ...existing, authorId });
     },
     async saveRecap(recap) {
       recaps.set(recap.messageId, recap);

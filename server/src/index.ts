@@ -1,20 +1,23 @@
 /**
- * Service entrypoint: supervises the trader and the Discord bot as one process
- * tree. Used for `bun run dev` and in production — they are the same thing, and
- * a production path that differs from the one you develop against is a
- * production path nobody has tested.
+ * Service entrypoint: supervises the trader and the Listener (server/listener,
+ * the Python gateway capture service) as one process tree. Used for `bun run
+ * dev` and in production — they are the same thing, and a production path that
+ * differs from the one you develop against is a production path nobody has
+ * tested.
  *
- * Why one process at all: the bot holds a Discord Gateway websocket and binds
- * no port of its own, so nothing can ping it awake. On a host that suspends
- * idle services (Render's free tier) a sleeping bot silently drops callouts —
- * no order is placed and nothing surfaces as an error. Sharing the trader's
- * port means the one keep-alive ping on /health also keeps the Gateway alive.
+ * Why one process at all: the Listener holds a Discord Gateway websocket and
+ * binds no port of its own, so nothing can ping it awake. On a host that
+ * suspends idle services (Render's free tier) a sleeping Listener silently
+ * drops callouts — no order is placed and nothing surfaces as an error.
+ * Sharing the trader's port means the one keep-alive ping on /health also
+ * keeps the Gateway alive.
  *
  * Failure is deliberately all-or-nothing: if either child exits, the whole tree
  * goes down with a non-zero code. A process still answering /health while its
  * Gateway socket is dead is the exact silent failure this file exists to
- * prevent, so the honest signal is to stop answering. The platform restarts us
- * and catchUpOnWake replays whatever arrived in the gap.
+ * prevent, so the honest signal is to stop answering. The platform restarts us,
+ * the Listener resumes capturing, and the trader's poller drains whatever
+ * accumulated in the messages table during the gap.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 
@@ -36,17 +39,19 @@ const children = new Map<string, ChildProcess>();
 let shuttingDown = false;
 
 async function main(): Promise<void> {
-  const trader = start('trader', 'src/trader/index.ts');
+  const trader = start('trader', 'bun', ['src/trader/index.ts']);
 
-  // The bot POSTs every callout to the trader's webhook, so starting it first
-  // would drop whatever arrives before the trader is listening.
+  // The Listener only writes to the database, so strictly it could start
+  // first — but a healthy trader gate keeps startup failures ordered and the
+  // logs readable (a broken trader surfaces alone, not interleaved).
   await waitForTraderHealth(trader);
-  start('bot', 'src/bot/index.ts');
+  // `uv run` syncs the environment from the lockfile before launching, so a
+  // fresh checkout needs only uv on PATH — no separate install step.
+  start('listener', 'uv', ['run', 'python', '-m', 'listener'], { cwd: 'listener' });
   startKeepAlive();
 
   log.info('stack running', {
     health: `http://127.0.0.1:${config.traderPort}/health`,
-    webhook: config.traderWebhookUrl,
   });
 }
 
@@ -74,10 +79,15 @@ function startKeepAlive(): void {
   }, KEEP_ALIVE_INTERVAL_MS);
 }
 
-function start(name: string, entrypoint: string): ChildProcess {
-  log.info('starting process', { name, entrypoint });
+function start(
+  name: string,
+  command: string,
+  args: string[],
+  options: { cwd?: string } = {}
+): ChildProcess {
+  log.info('starting process', { name, command: [command, ...args].join(' ') });
 
-  const child = spawn('bun', [entrypoint], { env: process.env, stdio: 'inherit' });
+  const child = spawn(command, args, { env: process.env, stdio: 'inherit', ...options });
 
   children.set(name, child);
   child.once('exit', (code, signal) => {

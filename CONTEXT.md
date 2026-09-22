@@ -4,8 +4,20 @@ Invite-only multi-tenant Discord→Robinhood copy-trader. One Discord ingest fan
 
 ## Language
 
+**Message**:
+A raw Discord message captured by the Listener into the `messages` table, exactly as it arrived. Not every Message is a Callout — the Disposition records what became of it.
+_Avoid_: alert, capture, envelope
+
+**Listener**:
+The service that reads watched channels as a Discord member (user token) and writes Messages. Capture only: it never parses, trades, or posts anything anywhere.
+_Avoid_: resender, bot, ingester
+
+**Disposition**:
+The pipeline's verdict on a Message: `callout`, `not_callout`, `failed`, `missed`, or `recap`. Unset until judged. A Message carries a parse exactly when its Disposition is `callout`.
+_Avoid_: parse status, state
+
 **Callout**:
-A Discord message parsed by the LLM into a trade instruction. Stored once in the `callouts` table, regardless of which users act on it.
+A Message the LLM parsed into a trade instruction — Disposition `callout`, parse attached. One verdict is recorded once and serves every user, regardless of who acts on it.
 _Avoid_: signal, alert, message
 
 **Caller**:

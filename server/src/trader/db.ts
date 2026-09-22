@@ -23,11 +23,15 @@
  *   trades              per-user decision audit log, fk -> users
  *   broker_connections  user_id pk (exactly one Robinhood connection per user),
  *                       fk -> users, ciphertext only
- *   callouts / callers / recaps / recap_insights   shared, no user scope
+ *   messages            raw Discord archive written by the Listener
+ *                       (server/listener) + the trader's verdict columns
+ *                       (disposition/parse/processed_at); the poller's work
+ *                       queue AND the feed source
+ *   callers / recaps / recap_insights   shared, no user scope
  *   allowed_emails      invite gate, independent of the sign-in mechanism
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { and, asc, count, desc, eq, gte, inArray, isNull, lt } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, ne } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 
@@ -41,10 +45,16 @@ import {
   type TradeSettings,
 } from '../shared/types.js';
 import {
+  EmbedLike,
+  MAX_CONTENT_LENGTH,
+  assembleMessageText,
+  truncateSafe,
+} from '../shared/embedText.js';
+import {
   allowedEmails,
   brokerConnections,
   callers,
-  callouts,
+  messages,
   recapInsights,
   recaps,
   trades,
@@ -54,22 +64,58 @@ import { decryptTokens, encryptTokens } from './rh/tokenCrypto.js';
 import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
 import type { PersistedState } from './rh/types.js';
 
-/** How far the LLM got on a callout. Staleness is per-user, not recorded here. */
-export type CalloutParseStatus = 'parsed' | 'not_callout' | 'failed' | 'skipped';
+/**
+ * The trader's verdict on a captured Message. Null on the row means the poller
+ * has not judged it yet. A Callout IS a message with disposition 'callout' —
+ * the check constraint keeps `parse` present exactly then.
+ */
+export type MessageDisposition = 'callout' | 'not_callout' | 'failed' | 'missed' | 'recap';
 
-/** A row in the shared `callouts` table: Discord snapshot plus the cached parse. */
+/**
+ * Legacy wire alias of MessageDisposition on the feed API, kept so the client
+ * needs no changes: callout→parsed, missed→skipped, the rest map one-to-one.
+ */
+export type CalloutFeedStatus = 'parsed' | 'not_callout' | 'failed' | 'skipped';
+
+const FEED_STATUS: Record<Exclude<MessageDisposition, 'recap'>, CalloutFeedStatus> = {
+  callout: 'parsed',
+  not_callout: 'not_callout',
+  failed: 'failed',
+  missed: 'skipped',
+};
+
+/** A feed item: a judged message row trimmed to the shape the dashboard reads. */
 export interface StoredCallout {
   readonly messageId: string;
   readonly channelId: string;
   readonly channelName: string | null;
-  /** Null only on rows written before Caller Following existed. */
+  /** '' only on rows migrated from before Caller Following existed. */
   readonly authorId: string | null;
   readonly authorName: string;
+  /** Flattened at read: raw text + embed text, one field for display/search. */
   readonly content: string;
   readonly timestamp: string;
   readonly embeds: readonly Record<string, unknown>[];
   readonly parse: Callout | null;
-  readonly parseStatus: CalloutParseStatus;
+  readonly parseStatus: CalloutFeedStatus;
+}
+
+/** An unprocessed `messages` row, as the poller consumes it. */
+export interface PendingMessage {
+  readonly messageId: string;
+  readonly channelId: string;
+  readonly channelName: string | null;
+  readonly authorId: string;
+  readonly authorName: string;
+  /** Recovered from the raw snapshot (raw.author.avatar_url); null when absent. */
+  readonly authorAvatarUrl: string | null;
+  /** Raw text + attachment URLs, exactly as the Listener stored it. */
+  readonly content: string;
+  readonly embeds: readonly Record<string, unknown>[];
+  readonly sentAt: string;
+  readonly deletedAt: string | null;
+  /** Non-null only on crash replay: the verdict was written but the row was never marked processed. */
+  readonly disposition: MessageDisposition | null;
 }
 
 /** A row in the shared `callers` table: one Caller (Discord author) in the roster. */
@@ -160,17 +206,23 @@ export interface TraderDb {
   /** Users with a broker connection — the pipeline's fan-out set. */
   listBrokerUserIds(): Promise<string[]>;
 
-  getCallout(messageId: string): Promise<StoredCallout | null>;
-  saveCallout(callout: StoredCallout): Promise<void>;
+  /** The poller's work queue: unjudged rows, oldest first. */
+  listUnprocessedMessages(limit: number): Promise<PendingMessage[]>;
+  /** Record the pipeline's verdict on a message. `parse` only for 'callout'. */
+  setMessageDisposition(
+    messageId: string,
+    disposition: MessageDisposition,
+    parse: Callout | null
+  ): Promise<void>;
+  /** Take the row off the work queue once fully handled (fan-out included). */
+  markMessageProcessed(messageId: string): Promise<void>;
+
+  /** The feed: judged messages (recaps excluded), newest first. */
   listCallouts(limit: number): Promise<StoredCallout[]>;
 
   /** Insert a Caller or refresh their display name/avatar/last-seen. */
   upsertCaller(caller: Caller): Promise<void>;
   listCallers(): Promise<Caller[]>;
-
-  /** Rows written before author capture existed (author_id is null). */
-  listCalloutsMissingAuthor(): Promise<{ messageId: string; timestamp: string }[]>;
-  setCalloutAuthor(messageId: string, authorId: string): Promise<void>;
 
   saveRecap(recap: StoredRecap): Promise<void>;
   /** Hash + parser version for the given message ids, for sweep upsert decisions. */
@@ -360,39 +412,37 @@ class DrizzleTraderDb implements TraderDb {
     return rows.map((row) => row.userId);
   }
 
-  async getCallout(messageId: string): Promise<StoredCallout | null> {
-    const [row] = await this.db
+  async listUnprocessedMessages(limit: number): Promise<PendingMessage[]> {
+    const rows = await this.db
       .select()
-      .from(callouts)
-      .where(eq(callouts.messageId, messageId))
-      .limit(1);
-    return row ? toStoredCallout(row) : null;
+      .from(messages)
+      .where(isNull(messages.processedAt))
+      .orderBy(asc(messages.sentAt))
+      .limit(limit);
+    return rows.map(toPendingMessage);
   }
 
-  async saveCallout(callout: StoredCallout): Promise<void> {
-    const values = {
-      messageId: callout.messageId,
-      channelId: callout.channelId,
-      channelName: callout.channelName,
-      authorId: callout.authorId,
-      authorName: callout.authorName,
-      content: callout.content,
-      timestamp: new Date(callout.timestamp),
-      embeds: [...callout.embeds],
-      parse: callout.parse,
-      parseStatus: callout.parseStatus,
-    };
+  async setMessageDisposition(
+    messageId: string,
+    disposition: MessageDisposition,
+    parse: Callout | null
+  ): Promise<void> {
+    await this.db.update(messages).set({ disposition, parse }).where(eq(messages.id, messageId));
+  }
+
+  async markMessageProcessed(messageId: string): Promise<void> {
     await this.db
-      .insert(callouts)
-      .values(values)
-      .onConflictDoUpdate({ target: callouts.messageId, set: values });
+      .update(messages)
+      .set({ processedAt: new Date() })
+      .where(eq(messages.id, messageId));
   }
 
   async listCallouts(limit: number): Promise<StoredCallout[]> {
     const rows = await this.db
       .select()
-      .from(callouts)
-      .orderBy(desc(callouts.timestamp))
+      .from(messages)
+      .where(and(isNotNull(messages.disposition), ne(messages.disposition, 'recap')))
+      .orderBy(desc(messages.sentAt))
       .limit(limit);
     return rows.map(toStoredCallout);
   }
@@ -426,21 +476,6 @@ class DrizzleTraderDb implements TraderDb {
       avatarUrl: row.avatarUrl,
       lastSeenAt: row.lastSeenAt.toISOString(),
     }));
-  }
-
-  async listCalloutsMissingAuthor(): Promise<{ messageId: string; timestamp: string }[]> {
-    const rows = await this.db
-      .select({ messageId: callouts.messageId, timestamp: callouts.timestamp })
-      .from(callouts)
-      .where(isNull(callouts.authorId));
-    return rows.map((row) => ({
-      messageId: row.messageId,
-      timestamp: row.timestamp.toISOString(),
-    }));
-  }
-
-  async setCalloutAuthor(messageId: string, authorId: string): Promise<void> {
-    await this.db.update(callouts).set({ authorId }).where(eq(callouts.messageId, messageId));
   }
 
   async saveRecap(recap: StoredRecap): Promise<void> {
@@ -614,18 +649,54 @@ function toDecision(row: typeof trades.$inferSelect): Decision {
   };
 }
 
-function toStoredCallout(row: typeof callouts.$inferSelect): StoredCallout {
+/**
+ * The read-time flatten: messages rows hold raw parts (text + embeds), and the
+ * feed shows one text field. Same assembly flattenEnvelope performs on the
+ * parse path; rows migrated from callouts history carry pre-flattened content
+ * with empty embeds, so they pass through unchanged.
+ */
+function flattenRowContent(content: string, embeds: readonly Record<string, unknown>[]): string {
+  return truncateSafe(
+    assembleMessageText({
+      body: content,
+      stickerNames: [],
+      attachmentUrls: [],
+      embeds: embeds as readonly EmbedLike[],
+    }),
+    MAX_CONTENT_LENGTH
+  );
+}
+
+function toStoredCallout(row: typeof messages.$inferSelect): StoredCallout {
   return {
-    messageId: row.messageId,
+    messageId: row.id,
     channelId: row.channelId,
     channelName: row.channelName,
     authorId: row.authorId,
     authorName: row.authorName,
-    content: row.content,
-    timestamp: row.timestamp.toISOString(),
+    content: flattenRowContent(row.content, row.embeds),
+    timestamp: row.sentAt.toISOString(),
     embeds: row.embeds,
     parse: row.parse,
-    parseStatus: row.parseStatus,
+    // listCallouts filters recap rows out, so the cast never sees 'recap'.
+    parseStatus: FEED_STATUS[row.disposition as Exclude<MessageDisposition, 'recap'>],
+  };
+}
+
+function toPendingMessage(row: typeof messages.$inferSelect): PendingMessage {
+  const author = (row.raw as { author?: { avatar_url?: string | null } }).author;
+  return {
+    messageId: row.id,
+    channelId: row.channelId,
+    channelName: row.channelName,
+    authorId: row.authorId,
+    authorName: row.authorName,
+    authorAvatarUrl: author?.avatar_url ?? null,
+    content: row.content,
+    embeds: row.embeds,
+    sentAt: row.sentAt.toISOString(),
+    deletedAt: row.deletedAt?.toISOString() ?? null,
+    disposition: row.disposition,
   };
 }
 

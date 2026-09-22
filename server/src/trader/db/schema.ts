@@ -25,7 +25,7 @@ import {
 } from 'drizzle-orm/pg-core';
 
 import type { Callout, Decision, ExecutionMode } from '../../shared/types.js';
-import type { CalloutParseStatus } from '../db.js';
+import type { MessageDisposition } from '../db.js';
 import type { RecapParse, RecapParseStatus } from '../recaps/parser.js';
 
 const isoTimestamp = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
@@ -93,19 +93,33 @@ export const brokerConnections = pgTable('broker_connections', {
 
 // ---- Shared data ----------------------------------------------------------------
 
-/** Discord snapshot + cached LLM parse; also the ingest idempotency ledger. */
-export const callouts = pgTable('callouts', {
-  messageId: text('message_id').primaryKey(),
+/**
+ * Raw Discord archive + processing outcome, one row per captured message.
+ * The Listener (server/listener) writes the capture columns; the trader's
+ * poller writes only disposition/parse/processed_at. A Callout is a row whose
+ * disposition says so — parse present iff disposition = 'callout' (check
+ * constraint in the migration).
+ */
+export const messages = pgTable('messages', {
+  id: text('id').primaryKey(),
   channelId: text('channel_id').notNull(),
   channelName: text('channel_name'),
-  /** Null only on rows written before Caller Following existed. */
-  authorId: text('author_id'),
+  authorId: text('author_id').notNull(),
   authorName: text('author_name').notNull(),
-  content: text('content').notNull(),
-  timestamp: isoTimestamp('timestamp').notNull(),
+  authorIsBot: boolean('author_is_bot').notNull().default(false),
+  /** Raw text + attachment URLs. Embeds are flattened at read, never stored in. */
+  content: text('content').notNull().default(''),
   embeds: jsonb('embeds').$type<Record<string, unknown>[]>().notNull().default([]),
+  attachments: jsonb('attachments').$type<Record<string, unknown>[]>().notNull().default([]),
+  raw: jsonb('raw').$type<Record<string, unknown>>().notNull().default({}),
+  sentAt: isoTimestamp('sent_at').notNull(),
+  editedAt: isoTimestamp('edited_at'),
+  capturedAt: isoTimestamp('captured_at').notNull().defaultNow(),
+  deletedAt: isoTimestamp('deleted_at'),
+  /** Null until the poller has judged the row. */
+  disposition: text('disposition').$type<MessageDisposition>(),
   parse: jsonb('parse').$type<Callout>(),
-  parseStatus: text('parse_status').$type<CalloutParseStatus>().notNull().default('skipped'),
+  processedAt: isoTimestamp('processed_at'),
 });
 
 /** The Caller roster: one row per Discord author, upserted on ingest. */

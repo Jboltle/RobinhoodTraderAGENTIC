@@ -27,7 +27,7 @@ const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 const CONFIGURED = Boolean(supabaseUrl && anonKey && serviceRoleKey);
 
 const TABLES = [
-  'callouts',
+  'messages',
   'trades',
   'users',
   'allowed_emails',
@@ -113,12 +113,13 @@ async function seedOneRowPerTable(): Promise<void> {
   if (!signedIn.ok) throw new Error(`probe user sign-in failed: HTTP ${signedIn.status}`);
   probeUserJwt = ((await signedIn.json()) as { access_token: string }).access_token;
 
-  await insertAsServiceRole('callouts', {
-    message_id: probeMessageId,
+  await insertAsServiceRole('messages', {
+    id: probeMessageId,
     channel_id: 'rls-probe-channel',
+    author_id: 'rls-probe-author',
     author_name: 'rls-probe',
     content: 'BTO $QQQ 710p 06/08 0.97',
-    timestamp: new Date(runId).toISOString(),
+    sent_at: new Date(runId).toISOString(),
   });
   await insertAsServiceRole('trades', {
     user_id: probeUserId,
@@ -147,7 +148,7 @@ async function deleteProbeFixtures(): Promise<void> {
   if (probeUserId) {
     await request(`/auth/v1/admin/users/${probeUserId}`, { apiKey: serviceRoleKey!, method: 'DELETE' });
   }
-  await request(`/rest/v1/callouts?message_id=eq.${probeMessageId}`, {
+  await request(`/rest/v1/messages?id=eq.${probeMessageId}`, {
     apiKey: serviceRoleKey!,
     method: 'DELETE',
   });

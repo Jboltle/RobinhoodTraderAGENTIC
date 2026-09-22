@@ -1,14 +1,14 @@
+import { flattenEnvelope } from '../../shared/embedText.js';
 import { createLogger } from '../../shared/logger.js';
 import type {
   Callout,
   CalloutParser,
   Decision,
   DiscordEnvelope,
-  PostReceipt,
   ResolvedTradeSettings,
   SubmittedOrder,
 } from '../../shared/types.js';
-import type { CalloutParseStatus, StoredCallout, TraderDb } from '../db.js';
+import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import type { McpRegistry } from '../rh/mcpRegistry.js';
 import {
@@ -19,7 +19,7 @@ import {
   submitOrder,
 } from './execute.js';
 import { checkRisk, deriveRiskState } from './riskFilter.js';
-import { summarize, summarizeFanout, summarizePendingApproval } from './summarize.js';
+import { summarize, summarizePendingApproval } from './summarize.js';
 
 const log = createLogger('trader:pipeline');
 
@@ -32,18 +32,13 @@ export interface PipelineDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
-  readonly postReceipt: PostReceipt;
 }
 
 export interface ProcessOptions {
   /**
-   * Discord snapshot fields the webhook envelope doesn't carry. Catch-up
-   * supplies the channel name it already resolved.
-   */
-  readonly channelName?: string | null;
-  /**
-   * Seen too late to trade (see catchup.ts). The callout is stored and shown
-   * in every user's feed as missed, but no order is ever placed.
+   * Seen too late to trade (the poller's staleness gate). The message is
+   * recorded as missed and shown in every user's feed, but no order is ever
+   * placed and the LLM is never called.
    */
   readonly missed?: boolean;
 }
@@ -78,7 +73,13 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
 
   return {
     enqueue: queueForUser,
-    async process(envelope: DiscordEnvelope, options: ProcessOptions = {}): Promise<void> {
+    async process(rawEnvelope: DiscordEnvelope, options: ProcessOptions = {}): Promise<void> {
+      // The one flatten site on the trade path: producers send raw content +
+      // embeds (envelope contract in shared/types.ts). Everything downstream
+      // — parser, option-context guard, stored feed content — reads the
+      // flattened text; `embeds` stay raw for storage/display.
+      const envelope = flattenEnvelope(rawEnvelope);
+
       const userIds = await deps.db.listBrokerUserIds();
       for (const userId of userIds) {
         deps.events.emitStage(userId, {
@@ -123,12 +124,8 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
         )
       );
 
-      const outcomes: Decision[] = [];
       for (const [index, result] of settled.entries()) {
-        if (result.status === 'fulfilled') {
-          // null = the user does not follow this Caller (silent skip).
-          if (result.value) outcomes.push(result.value);
-        } else {
+        if (result.status === 'rejected') {
           log.error('user pipeline crashed', {
             userId: userIds[index],
             messageId: envelope.messageId,
@@ -136,81 +133,70 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
           });
         }
       }
-
-      await postFanoutReceipt(envelope, parsed.callout, outcomes, deps);
     },
   };
 }
 
 // =============================================================================
-// Parse — once per Discord message, cached on the shared callouts row
+// Parse — once per Discord message, the verdict recorded on the messages row
 // =============================================================================
 
-type ParseStatus = CalloutParseStatus | 'missed';
+type ParseStatus = Exclude<MessageDisposition, 'recap'>;
 
 interface ParsedCallout {
   readonly status: ParseStatus;
-  /** Only ever set when status is 'parsed' — see the callouts table constraint. */
+  /** Only ever set when status is 'callout' — see the messages table constraint. */
   readonly callout: Callout | null;
   /** Set when the LLM itself failed, as opposed to producing a non-callout. */
   readonly parseError: string | null;
 }
 
+/**
+ * Judge the message and stamp its disposition. No cache read: the poller only
+ * feeds unprocessed rows, and its disposition guard handles crash replays, so
+ * a message reaches this function at most once per verdict. 'failed' is
+ * terminal — retry is an operator action (reset processed_at on the row).
+ */
 async function resolveCallout(
   envelope: DiscordEnvelope,
   deps: PipelineDeps,
   options: ProcessOptions
 ): Promise<ParsedCallout> {
-  const snapshot = {
-    messageId: envelope.messageId,
-    channelId: envelope.channelId,
-    channelName: options.channelName ?? null,
-    authorId: envelope.authorId,
-    authorName: envelope.authorName,
-    content: envelope.content,
-    timestamp: envelope.timestamp,
-    embeds: envelope.embeds ?? [],
-    parse: null,
-  };
-
   if (options.missed) {
-    await save(deps, { ...snapshot, parseStatus: 'skipped' });
+    await setDisposition(deps, envelope.messageId, 'missed');
     return { status: 'missed', callout: null, parseError: null };
-  }
-
-  const cached = await deps.db.getCallout(envelope.messageId).catch((err: unknown) => {
-    log.warn('could not read cached parse; re-parsing', { error: errMsg(err) });
-    return null;
-  });
-  // A cached failure is worth retrying; a cached success or non-callout is not.
-  if (cached?.parseStatus === 'parsed' || cached?.parseStatus === 'not_callout') {
-    return { status: cached.parseStatus, callout: cached.parse, parseError: null };
   }
 
   let callout: Callout;
   try {
     callout = await deps.parser.parse(envelope);
   } catch (err) {
-    await save(deps, { ...snapshot, parseStatus: 'failed' });
+    await setDisposition(deps, envelope.messageId, 'failed');
     return { status: 'failed', callout: null, parseError: errMsg(err) };
   }
 
   if (!callout.isCallout) {
-    // The parse is dropped on purpose: the callouts row only retains one when
-    // it describes a trade, and nothing downstream reads a non-callout parse.
-    await save(deps, { ...snapshot, parseStatus: 'not_callout' });
+    // The parse is dropped on purpose: a row only retains one when it
+    // describes a trade, and nothing downstream reads a non-callout parse.
+    await setDisposition(deps, envelope.messageId, 'not_callout');
     return { status: 'not_callout', callout: null, parseError: null };
   }
 
-  await save(deps, { ...snapshot, parse: callout, parseStatus: 'parsed' });
-  return { status: 'parsed', callout, parseError: null };
+  await setDisposition(deps, envelope.messageId, 'callout', callout);
+  return { status: 'callout', callout, parseError: null };
 }
 
-async function save(deps: PipelineDeps, callout: StoredCallout): Promise<void> {
-  // A failed write costs the parse cache and the feed entry, not the trade.
-  await deps.db.saveCallout(callout).catch((err: unknown) => {
-    log.error('could not persist callout', {
-      messageId: callout.messageId,
+async function setDisposition(
+  deps: PipelineDeps,
+  messageId: string,
+  disposition: MessageDisposition,
+  parse: Callout | null = null
+): Promise<void> {
+  // A failed write costs the recorded verdict and the feed entry, not the trade.
+  await deps.db.setMessageDisposition(messageId, disposition, parse).catch((err: unknown) => {
+    log.error('could not persist disposition', {
+      messageId,
+      disposition,
       error: errMsg(err),
     });
   });
@@ -468,24 +454,6 @@ async function finalize(userId: string, deps: PipelineDeps, decision: Decision):
     reason: decision.reason,
   });
   return decision;
-}
-
-/**
- * One Discord receipt per message, not per user: the source channel is shared,
- * so posting each account's fill there would both spam it N times and tell
- * everyone else what each user holds.
- */
-async function postFanoutReceipt(
-  envelope: DiscordEnvelope,
-  callout: Callout | null,
-  outcomes: readonly Decision[],
-  deps: PipelineDeps
-): Promise<void> {
-  const text = summarizeFanout(callout, outcomes);
-  if (text === null) return;
-  await deps.postReceipt(envelope.channelId, text).catch((err: unknown) =>
-    log.warn('postReceipt failed', { error: errMsg(err) })
-  );
 }
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));

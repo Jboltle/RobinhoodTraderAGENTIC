@@ -1,4 +1,4 @@
-import { optionLabel, type Callout, type Decision, type SubmittedOrder } from '../../shared/types.js';
+import { optionLabel, type SubmittedOrder } from '../../shared/types.js';
 
 function priceText(order: SubmittedOrder): string {
   if (order.orderType !== 'limit' || order.limitPrice === null) return 'market';
@@ -13,36 +13,6 @@ function describeOrder(order: SubmittedOrder): string {
       ? `${order.quantity}x ${order.symbol} ${optionLabel(order.option)}`
       : `${order.quantity} ${order.symbol}`;
   return `${body} (${priceText(order)})`;
-}
-
-function describeIntent(callout: Callout | null): string {
-  if (!callout || !callout.ticker) return 'Callout';
-  const side = (callout.action ?? 'trade').toUpperCase();
-  if (callout.assetType === 'option' && callout.option) {
-    return `${side} ${callout.ticker} ${optionLabel(callout.option)}`;
-  }
-  return `${side} ${callout.ticker}`;
-}
-
-/**
- * The single Discord receipt for a callout, covering every account at once.
- *
- * Deliberately counts rather than names: the source channel is shared, so a
- * per-account receipt would tell everyone reading it what each user holds.
- * Returns null when there is nothing worth saying (a non-callout, or nobody
- * connected to act on it).
- */
-export function summarizeFanout(callout: Callout | null, outcomes: readonly Decision[]): string | null {
-  if (outcomes.length === 0) return null;
-
-  const counts = new Map<string, number>();
-  for (const outcome of outcomes) {
-    counts.set(outcome.kind, (counts.get(outcome.kind) ?? 0) + 1);
-  }
-
-  const breakdown = [...counts.entries()].map(([kind, count]) => `${count} ${kind}`).join(', ');
-  const accounts = `${outcomes.length} account${outcomes.length === 1 ? '' : 's'}`;
-  return `${describeIntent(callout)} — ${breakdown} across ${accounts}.`;
 }
 
 /**

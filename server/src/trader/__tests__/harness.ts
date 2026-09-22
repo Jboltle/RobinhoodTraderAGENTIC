@@ -10,7 +10,6 @@ import { vi } from 'vitest';
 import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 
 import { TraderEvents } from '../events.js';
-import type { MessageProcessor } from '../pipeline/index.js';
 import type { McpRegistry, UserBroker } from '../rh/mcpRegistry.js';
 import type { RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { RobinhoodTools } from '../rh/tools.js';
@@ -41,7 +40,6 @@ export interface Harness {
   readonly db: FakeDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
-  readonly process: ReturnType<typeof vi.fn>;
   /** Inject a request carrying this user's bearer token. */
   as(accessToken: string, options: InjectOptions): Promise<LightMyRequestResponse>;
   /** The stub session for a user, creating it if the test hasn't configured one. */
@@ -68,19 +66,13 @@ export function makeHarness(): Harness {
     drop: (userId: string) => void stubs.delete(userId),
   };
 
-  const process = vi.fn().mockResolvedValue(undefined);
-  const processor: MessageProcessor = {
-    process: process as MessageProcessor['process'],
-    enqueue: <T>(_userId: string, run: () => Promise<T>) => run(),
-  };
-  const app = buildServer({ db, events, brokers, processor });
+  const app = buildServer({ db, events, brokers });
 
   return {
     app,
     db,
     events,
     brokers,
-    process,
     as: (accessToken, options) =>
       app.inject({
         ...options,

@@ -3,42 +3,26 @@
  * against the in-memory db and stubbed broker sessions.
  *
  * Covers:
- *   - webhook wrapper body ({ envelope }, valid HMAC) handing off to the fan-out
  *   - GET/PUT /api/settings round-trip and validation
  *   - GET /api/decisions ordering and ?limit=
- *   - GET /api/callouts joining shared callouts with the caller's outcomes
+ *   - GET /api/callouts joining judged messages with the caller's outcomes
  *   - GET /api/portfolio and /api/trades/performance, incl. the unavailable path
  *   - the Robinhood connect/callback/disconnect flow
  *   - GET /api/stream SSE framing (snapshot, live push, performance)
  *
  * Auth is covered by auth.test.ts and per-user scoping by isolation.test.ts.
+ * Ingestion has no HTTP surface any more; the poller is tested in poller.test.ts.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { config } from '../../shared/config.js';
 import type { Decision } from '../../shared/types.js';
-import { signWebhookBody } from '../../shared/webhookAuth.js';
 import type { StoredCallout } from '../db.js';
 import { fakeTokens } from './fakeDb.js';
 import { makeHarness, type Harness } from './harness.js';
 
-// Sign with whatever secret the server verifies against: the vitest dummy is
-// only injected when .env doesn't already define BOT_TRADER_SECRET, so a
-// hardcoded 'test-dummy-secret' 401s on machines with a populated .env.
-const SECRET = config.botTraderSecret;
 const USER = { id: 'user-1', email: 'user@example.com' };
 const TOKEN = 'a-valid-token';
-
-const ENVELOPE = {
-  messageId: 'msg-001',
-  channelId: 'chan-001',
-  guildId: null,
-  authorId: 'author-001',
-  authorName: 'Demon Alerts',
-  content: 'BUY $AAPL',
-  timestamp: '2026-07-14T14:30:00.000Z',
-};
 
 const decisionFixture = (messageId: string, overrides: Partial<Decision> = {}): Decision => ({
   at: '2026-07-14T14:30:05.000Z',
@@ -78,35 +62,6 @@ const send = (method: 'PUT' | 'POST', url: string, body: unknown) =>
 beforeEach(() => {
   harness = makeHarness();
   harness.db.addUser(USER, TOKEN);
-});
-
-// ---------------------------------------------------------------------------
-// Webhook
-// ---------------------------------------------------------------------------
-
-describe('POST /webhook/discord', () => {
-  const post = (body: unknown) => {
-    const payload = JSON.stringify(body);
-    return harness.app.inject({
-      method: 'POST',
-      url: '/webhook/discord',
-      headers: { 'content-type': 'application/json', ...signWebhookBody(payload, SECRET) },
-      payload,
-    });
-  };
-
-  it('acknowledges immediately and hands the envelope to the fan-out', async () => {
-    const response = await post({ envelope: ENVELOPE });
-
-    expect(response.statusCode).toBe(202);
-    expect(harness.process).toHaveBeenCalledOnce();
-    expect(harness.process.mock.calls[0]![0]).toMatchObject({ messageId: 'msg-001' });
-  });
-
-  it('rejects a bare envelope (pre-wrapper body shape)', async () => {
-    expect((await post(ENVELOPE)).statusCode).toBe(400);
-    expect(harness.process).not.toHaveBeenCalled();
-  });
 });
 
 // ---------------------------------------------------------------------------

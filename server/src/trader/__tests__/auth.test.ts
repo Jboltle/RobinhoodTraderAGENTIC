@@ -3,18 +3,12 @@
  *
  * Every /api route in this list answered an anonymous request before the
  * multi-tenant refactor. Each one must now 401 without a valid Supabase JWT,
- * while /health and the HMAC-authed webhook stay open.
+ * while /health stays open.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { config } from '../../shared/config.js';
-import { signWebhookBody } from '../../shared/webhookAuth.js';
 import { makeHarness, type Harness } from './harness.js';
 
-// Sign with whatever secret the server verifies against: the vitest dummy is
-// only injected when .env doesn't already define BOT_TRADER_SECRET, so a
-// hardcoded 'test-dummy-secret' 401s on machines with a populated .env.
-const SECRET = config.botTraderSecret;
 const USER = { id: 'user-1', email: 'user@example.com' };
 const TOKEN = 'a-valid-token';
 
@@ -84,35 +78,6 @@ describe('routes that must stay open', () => {
     expect(response.json()).toMatchObject({ ok: true });
   });
 
-  it('POST /webhook/discord is authenticated by HMAC, not by JWT', async () => {
-    const payload = JSON.stringify({
-      envelope: {
-        messageId: 'msg-1',
-        channelId: 'chan-1',
-        guildId: null,
-        authorId: 'author-1',
-        authorName: 'Demon Alerts',
-        content: 'BUY $AAPL',
-        timestamp: '2026-07-20T14:30:00.000Z',
-      },
-    });
-
-    const signed = await harness.app.inject({
-      method: 'POST',
-      url: '/webhook/discord',
-      headers: { 'content-type': 'application/json', ...signWebhookBody(payload, SECRET) },
-      payload,
-    });
-    expect(signed.statusCode).toBe(202);
-
-    const unsigned = await harness.app.inject({
-      method: 'POST',
-      url: '/webhook/discord',
-      headers: { 'content-type': 'application/json' },
-      payload,
-    });
-    expect(unsigned.statusCode).toBe(401);
-  });
 });
 
 describe('POST /api/auth/magic-link', () => {

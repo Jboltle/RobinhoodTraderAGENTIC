@@ -1,3 +1,5 @@
+import { config as loadDotenv } from 'dotenv';
+loadDotenv()
 /**
  * drizzle-kit config, for verification only.
  *
@@ -10,5 +12,5 @@ import { defineConfig } from 'drizzle-kit';
 export default defineConfig({
   dialect: 'postgresql',
   schema: './src/trader/db/schema.ts',
-  dbCredentials: { url: process.env.SUPABASE_DB_URL ?? '' },
+  dbCredentials: { url: process.env.SUPABASE_DB_URL ?? "postgresql://postgres:postgres@127.0.0.1:54332/postgres" },
 });

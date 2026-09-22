@@ -10,9 +10,10 @@ name: rh-discord-trader
 # API_URL is runtime on the client (the proxy target), not a build arg.
 
 services:
-  # Trader + Discord bot in one container, same as production (see
-  # Dockerfile.server and ../render.yaml). All state lives in Supabase, so
-  # nothing is mounted -- the container is disposable.
+  # Trader + Listener in one container, same as production (see
+  # Dockerfile.server). All state lives in Supabase, so nothing is mounted --
+  # the container is disposable; the poller drains whatever the Listener
+  # captured during any gap.
   server:
     build:
       context: .
@@ -23,14 +24,11 @@ services:
       # the ollama service DNS name; override in .env for host Ollama
       # (http://host.docker.internal:11434) or a cloud provider.
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      # Both listeners must bind all interfaces inside the container so the
-      # published ports work regardless of the host-oriented (127.0.0.1) .env
-      # values.
+      # Both HTTP listeners must bind all interfaces inside the container so
+      # the published ports work regardless of the host-oriented (127.0.0.1)
+      # .env values.
       TRADER_HOST: 0.0.0.0
       ROBINHOOD_OAUTH_CALLBACK_HOST: 0.0.0.0
-      # The bot now shares the container with the trader, so the webhook never
-      # leaves loopback. Pinned here because .env is host-oriented.
-      TRADER_WEBHOOK_URL: http://127.0.0.1:${TRADER_PORT:-3000}/webhook/discord
     # SUPABASE_URL is deliberately NOT overridden here -- listing it would
     # clobber the env_file value. With a HOSTED project nothing is needed. With
     # a local Supabase (`npx supabase start`, listening on the host) set

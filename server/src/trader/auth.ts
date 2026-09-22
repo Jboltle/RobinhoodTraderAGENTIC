@@ -23,10 +23,9 @@ declare module 'fastify' {
 /**
  * Routes that must stay reachable without a user session:
  *   /health              uptime pings (an external cron keeps the box awake)
- *   /webhook/discord     the bot, authenticated by HMAC over the raw body
  *   /api/auth/magic-link requesting the sign-in email that supplies the token
  */
-const PUBLIC_ROUTES = new Set(['/health', '/webhook/discord', '/api/auth/magic-link']);
+const PUBLIC_ROUTES = new Set(['/health', '/api/auth/magic-link']);
 
 /** The acting user. Throws rather than returning null so a route cannot forget the check. */
 export function requireUser(request: FastifyRequest): AuthUser {

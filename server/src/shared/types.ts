@@ -30,33 +30,38 @@ export const EXECUTION_MODES = ['immediate', 'approval'] as const;
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
 // =============================================================================
-// Discord envelope
+// Discord envelope — the internal shape between the poller and the pipeline
+//
+// The trader's poller builds one from a raw `messages` row (which the Listener
+// wrote) and hands it to the pipeline. It carries RAW parts — `content` as the
+// message text (attachment URLs appended by the Listener) and `embeds` as raw
+// embed JSON. The pipeline flattens exactly once at its entry (flattenEnvelope
+// in shared/embedText.ts). Nothing external produces envelopes any more: the
+// database is the ingestion boundary, so this is a plain type, not a schema.
 // =============================================================================
 
-export const DiscordEnvelopeSchema = z.object({
-  messageId: z.string().min(1),
-  channelId: z.string().min(1),
-  /** Discord channel name. Webhook envelopes omit it; REST catch-up resolves it. */
-  channelName: z.string().nullable().optional(),
-  guildId: z.string().nullable(),
-  authorId: z.string().min(1),
-  authorName: z.string(),
-  /** Resolved CDN avatar URL (custom or Discord default). Defaulted so envelopes from an older bot still parse. */
-  authorAvatarUrl: z.string().nullable().default(null),
-  content: z.string(),
-  timestamp: z.string(),
-  /** Raw Discord embed JSON, passed through permissively (the bot flattens it into `content` for the LLM). */
-  embeds: z.array(z.record(z.string(), z.unknown())).optional(),
+export interface DiscordEnvelope {
+  readonly messageId: string;
+  readonly channelId: string;
+  /** Discord channel name; null when the Listener could not resolve one. */
+  readonly channelName?: string | null;
+  /** Retained for fixture/test provenance; nothing routes or filters by it. */
+  readonly guildId: string | null;
+  readonly authorId: string;
+  readonly authorName: string;
+  /** Resolved CDN avatar URL, recovered from the raw snapshot; null when absent. */
+  readonly authorAvatarUrl: string | null;
   /**
-   * Trader routing: 'recap' messages are stored for performance analytics and
-   * never enter the trade pipeline. Absent (older bot) means 'callout'.
+   * Raw message text, plus attachment URLs serialized as text. May be empty
+   * for embed-only messages. Contains flattened embed text only after
+   * flattenEnvelope has run.
    */
-  kind: z.enum(['callout', 'recap']).optional(),
-});
-
-export type DiscordEnvelope = z.infer<typeof DiscordEnvelopeSchema>;
-
-export type EnvelopeKind = NonNullable<DiscordEnvelope['kind']>;
+  readonly content: string;
+  /** Original message ISO timestamp — drives expiration parsing and staleness. */
+  readonly timestamp: string;
+  /** Raw Discord embed JSON; flattened into content at the pipeline entry. */
+  readonly embeds?: Record<string, unknown>[];
+}
 
 // =============================================================================
 // Callout — the structured trade signal extracted from a Discord message
@@ -246,12 +251,6 @@ export type RiskCheck =
       /** The options ceiling: no trade may exceed this % of buying power. */
       readonly optionsFullPct: number;
     };
-
-// =============================================================================
-// Delivery callback — post a receipt back to Discord
-// =============================================================================
-
-export type PostReceipt = (channelId: string, content: string) => Promise<void>;
 
 // =============================================================================
 // Decision record

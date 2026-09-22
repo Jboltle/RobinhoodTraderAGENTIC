@@ -1,13 +1,15 @@
 /**
- * Recap channel ingestion.
+ * Recap ingestion.
  *
- * Three paths converge on the same idempotent upsert:
- *   live    — the bot forwards kind:'recap' envelopes (webhook in server.ts)
- *   sweep   — hourly weekday REST sweep: fetches anything newer than the
- *             latest stored post, re-scans the last few days so edited recaps
- *             (services fix their numbers) are caught via content-hash drift,
- *             and re-parses rows whose cached parse predates PARSER_VERSION
- *   backfill— first run with an empty table reaches back a full year
+ * Two paths converge on the same idempotent upsert:
+ *   live     — the poller routes recap-channel `messages` rows here. Edited
+ *              recaps (services fix their numbers) re-enter because the
+ *              Listener resets the row's processing marks on edit, and the
+ *              content-hash check below makes the replay a no-op when nothing
+ *              actually changed.
+ *   reparse  — boot-time pass: parser updated -> PARSER_VERSION bumped ->
+ *              every stored row below it re-parses from raw content. No
+ *              Discord traffic involved.
  *
  * Raw content is the source of truth; the parse is recomputed from it any
  * time the hash or parser version moves. Nothing here can reach the trade
@@ -15,31 +17,15 @@
  */
 import { createHash } from 'node:crypto';
 
-import { config } from '../../shared/config.js';
-import { createLogger, errorFields } from '../../shared/logger.js';
+import { flattenEnvelope } from '../../shared/embedText.js';
+import { createLogger } from '../../shared/logger.js';
 import type { DiscordEnvelope } from '../../shared/types.js';
-import { fetchChannelMessagesSince, flattenRestMessage, USER_MESSAGE_TYPES } from '../callouts.js';
 import type { StoredRecap, TraderDb } from '../db.js';
 import { DEFAULT_RECAP_WINDOW_DAYS } from './analytics.js';
 import { refreshRecapInsights } from './insights.js';
 import { PARSER_VERSION, isDailyRecap, parseRecap } from './parser.js';
 
 const log = createLogger('trader:recaps');
-
-/** Users can reference up to a year of history; the windows filter at query time. */
-export const RECAP_BACKFILL_DAYS = 365;
-/** Recent slice re-fetched every sweep so post-hoc edits get re-parsed. */
-const EDIT_RESCAN_DAYS = 7;
-const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-export interface RecapSweepSummary {
-  readonly fetched: number;
-  readonly inserted: number;
-  readonly updated: number;
-  readonly reparsed: number;
-  readonly changed: boolean;
-}
 
 /** Hash + parse a raw recap-channel message into its storable row. */
 export function buildStoredRecap(input: {
@@ -60,14 +46,17 @@ export function buildStoredRecap(input: {
 }
 
 /**
- * Live-ingest a kind:'recap' envelope. Returns true when the stored row
- * changed (new post, edited content, or newer parser) so the caller knows to
- * refresh the cached insights.
+ * Ingest a recap-channel envelope. Returns true when the stored row changed
+ * (new post, edited content, or newer parser) so the caller knows to refresh
+ * the cached insights.
  */
 export async function ingestRecapEnvelope(
   db: TraderDb,
-  envelope: DiscordEnvelope
+  rawEnvelope: DiscordEnvelope
 ): Promise<boolean> {
+  // The one flatten site on the recap path: recap posts are often embed-only
+  // cards, and `messages` rows carry raw parts.
+  const envelope = flattenEnvelope(rawEnvelope);
   const recap = buildStoredRecap({
     messageId: envelope.messageId,
     channelId: envelope.channelId,
@@ -94,59 +83,13 @@ export async function ingestRecapEnvelope(
   return true;
 }
 
-export async function runRecapSweep(
-  db: TraderDb,
-  fetchImpl: typeof fetch = fetch,
-  now: Date = new Date()
-): Promise<RecapSweepSummary> {
-  let fetched = 0;
-  let inserted = 0;
-  let updated = 0;
+/**
+ * Format drift recovery, run once at trader boot: re-parse every stored row
+ * whose cached parse predates PARSER_VERSION, then refresh the cached
+ * narration when anything moved (or when it has never been generated).
+ */
+export async function reparseStaleRecaps(db: TraderDb): Promise<number> {
   let reparsed = 0;
-
-  // Empty table: reach back the full backfill horizon. Otherwise fetch from
-  // the older of (latest stored post, edit-rescan start) so both gaps from
-  // downtime and recent edits are covered by one window.
-  // ponytail: latest-post watermark is global, not per channel — a channel
-  // added later to DISCORD_RECAP_CHANNEL_IDS won't deep-backfill. Upgrade
-  // path: per-channel watermarks.
-  const latest = await db.latestRecapPostedAt();
-  const since =
-    latest === null
-      ? new Date(now.getTime() - RECAP_BACKFILL_DAYS * DAY_MS)
-      : new Date(Math.min(Date.parse(latest), now.getTime() - EDIT_RESCAN_DAYS * DAY_MS));
-
-  for (const channelId of config.discordRecapChannelIds) {
-    const messages = (await fetchChannelMessagesSince(channelId, since, fetchImpl)).filter((msg) =>
-      USER_MESSAGE_TYPES.has(msg.type)
-    );
-    fetched += messages.length;
-
-    const metas = await db.listRecapMetas(messages.map((msg) => msg.id));
-    for (const msg of messages) {
-      const content = flattenRestMessage(msg);
-      if (!content.trim()) continue;
-
-      const existing = metas.get(msg.id);
-      // Cheap skip before parsing: unchanged content under the current parser
-      // needs no write. Stale-parser rows are handled in the re-parse pass.
-      if (existing && existing.contentHash === sha256(content)) continue;
-
-      await db.saveRecap(
-        buildStoredRecap({
-          messageId: msg.id,
-          channelId: msg.channel_id,
-          postedAt: msg.timestamp,
-          content,
-        })
-      );
-      if (existing) updated += 1;
-      else inserted += 1;
-    }
-  }
-
-  // Format drift recovery: parser updated -> version bumped -> every stored
-  // row below it re-parses from raw content. No Discord traffic involved.
   for (const row of await db.listRecapsWithStaleParse(PARSER_VERSION)) {
     await db.saveRecap(
       buildStoredRecap({
@@ -159,42 +102,12 @@ export async function runRecapSweep(
     reparsed += 1;
   }
 
-  return { fetched, inserted, updated, reparsed, changed: inserted + updated + reparsed > 0 };
-}
+  const needsInsight =
+    reparsed > 0 || (await db.getRecapInsight(DEFAULT_RECAP_WINDOW_DAYS)) === null;
+  if (needsInsight) await refreshRecapInsights(db);
 
-/**
- * Boot sweep (backfill / catch-up) plus an hourly weekday interval. Recaps
- * post Mon–Fri evenings; weekend runs would be pure no-op REST calls. Insight
- * refresh piggybacks on sweeps that changed rows.
- */
-export function startRecapScheduler(db: TraderDb): void {
-  if (config.discordRecapChannelIds.length === 0) {
-    log.info('no recap channels configured; recap sweep disabled');
-    return;
-  }
-
-  const run = async (trigger: string): Promise<void> => {
-    const summary = await runRecapSweep(db);
-    log.info('recap sweep complete', { trigger, ...summary });
-    // Also regenerate when rows exist but narration doesn't (first deploy).
-    const needsInsight =
-      summary.changed || (await db.getRecapInsight(DEFAULT_RECAP_WINDOW_DAYS)) === null;
-    if (needsInsight) await refreshRecapInsights(db);
-  };
-
-  const safeRun = (trigger: string): void => {
-    void run(trigger).catch((err: unknown) =>
-      log.error('recap sweep failed', { trigger, ...errorFields(err) })
-    );
-  };
-
-  safeRun('boot');
-  const timer = setInterval(() => {
-    const day = new Date().getDay();
-    if (day === 0 || day === 6) return;
-    safeRun('interval');
-  }, SWEEP_INTERVAL_MS);
-  timer.unref();
+  if (reparsed > 0) log.info('re-parsed stale recaps', { reparsed });
+  return reparsed;
 }
 
 /**

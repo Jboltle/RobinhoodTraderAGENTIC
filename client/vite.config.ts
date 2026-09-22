@@ -11,6 +11,10 @@ const config = defineConfig({
   // API_URL is optional at build (same-origin /api + server.ts proxy).
   // SUPABASE_SERVICE_ROLE_KEY is deliberately not matched — never in this env.
   envPrefix: ['VITE_', 'API_URL', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'],
+  // Env files live at the repo root, shared with the server: .env (base) plus
+  // .env.development / .env.production picked by mode (`vite dev` = development,
+  // `vite build` and `bun run dev:prod` = production).
+  envDir: '..',
   resolve: { tsconfigPaths: true },
   plugins: [
     devtools(),
