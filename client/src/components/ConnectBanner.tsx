@@ -84,13 +84,16 @@ export function ConnectBanner() {
     if (!connect.isPending) connect.mutate()
   }
 
-  if (!data || data.executionMode !== 'immediate') return null
+  // Prompt whenever this user has no connection on record, regardless of
+  // execution mode: approval-mode trades also need Robinhood to submit, and
+  // the pipeline only fans out to users with a stored connection.
+  if (!data) return null
   if (connected && !dialogOpen) return null
 
   return (
     <>
       {!connected && (
-        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-warn/40 bg-warn/10 px-5 py-4">
+        <div className="mb-6 flex flex-wrap items-center gap-3 rounded-xl border border-warn/40 bg-warn/10 px-5 py-4">
           <span className="size-2 animate-pulse rounded-full bg-warn" />
           <span className="text-sm font-medium text-white">Robinhood not connected</span>
           <button

@@ -124,6 +124,15 @@ test('a pasted redirect URL is submitted to the trader', async () => {
   await waitFor(() => expect(submittedUrls()).toEqual([pasted]))
 })
 
+test('prompts in approval mode too — the default for new users', async () => {
+  fetchBrokerStatus.mockResolvedValue({ ...disconnected, executionMode: 'approval' })
+  const { container } = renderBanner()
+
+  await waitFor(() =>
+    expect(container.textContent).toContain('Robinhood not connected'),
+  )
+})
+
 test('renders nothing once connected', async () => {
   fetchBrokerStatus.mockResolvedValue({ ...disconnected, connected: true })
   const { container } = renderBanner()

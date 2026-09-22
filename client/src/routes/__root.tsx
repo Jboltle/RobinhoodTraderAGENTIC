@@ -12,6 +12,7 @@ import { ChartColumn, LayoutDashboard, LogOut, Search, Settings } from 'lucide-r
 import TanStackQueryDevtools from '../integrations/tanstack-query/devtools'
 
 import { AuthScreen } from '../components/AuthScreen'
+import { ConnectBanner } from '../components/ConnectBanner'
 import { AuthProvider, signOut, useAuth } from '../lib/auth'
 import { useTraderStream } from '../lib/stream'
 
@@ -114,7 +115,13 @@ function AuthGate({ children }: { children: React.ReactNode }) {
       <SideNav />
       <div className="flex min-w-0 flex-1 flex-col">
         <TopHeader />
-        <main className="mx-auto w-full max-w-6xl flex-1 px-8 py-6">{children}</main>
+        <main className="mx-auto w-full max-w-6xl flex-1 px-8 py-6">
+          {/* On every app open with a session, check the user's stored
+              Robinhood connection and prompt to connect when there is none —
+              whichever route they landed on. */}
+          <ConnectBanner />
+          {children}
+        </main>
       </div>
     </div>
   )

@@ -2,7 +2,6 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { CalloutCard } from '../components/CalloutCard'
-import { ConnectBanner } from '../components/ConnectBanner'
 import {
   approveTrade,
   fetchCallers,
@@ -70,7 +69,6 @@ function Dashboard() {
 
   return (
     <div className="flex flex-col gap-8">
-      <ConnectBanner />
       <LiveStageBanner />
       <PortfolioSummaryBar />
       <section>

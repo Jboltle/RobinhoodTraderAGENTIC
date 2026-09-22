@@ -452,7 +452,24 @@ describe('/api/broker', () => {
     expect((await get('/api/broker/status')).json()).toMatchObject({
       connected: false,
       authUrl: null,
+      tokenState: 'missing',
       executionMode: 'approval',
+    });
+  });
+
+  it('status reports the stored database connection when no live session exists', async () => {
+    // Fresh process: tokens in broker_connections, nothing in the registry.
+    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+    expect((await get('/api/broker/status')).json()).toMatchObject({
+      connected: true,
+      tokenState: 'valid',
+    });
+
+    // Refresh-only material still counts: the SDK refreshes on connect.
+    harness.db.seedBrokerTokens(USER.id, fakeTokens('', 'refresh-token'));
+    expect((await get('/api/broker/status')).json()).toMatchObject({
+      connected: true,
+      tokenState: 'refreshable',
     });
   });
 

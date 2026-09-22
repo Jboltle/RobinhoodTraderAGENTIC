@@ -31,6 +31,7 @@ import {
   computeRecapPerformance,
   isoDateDaysAgo,
 } from './recaps/analytics.js';
+import { readTokenStatus } from './rh/mcpClient.js';
 import type { McpRegistry, UserBroker } from './rh/mcpRegistry.js';
 import type { RobinhoodTools } from './rh/tools.js';
 
@@ -118,12 +119,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   fastify.get('/api/broker/status', async (request, reply) => {
     const { id: userId } = requireUser(request);
     const broker = deps.brokers.existing(userId);
-    const tokens = broker ? await broker.mcp.getTokenStatus() : null;
+    // The connection of record is the user's broker_connections row, not the
+    // in-memory session: stored tokens survive restarts and are what the
+    // pipeline fans out over. A user with tokens but no warm session is still
+    // connected — trading recreates the session lazily from those tokens.
+    const stored = await deps.db.getBrokerTokens(userId);
+    const tokens = readTokenStatus(stored?.tokens);
     const settings = await deps.db.getSettings(userId);
     return reply.send({
-      connected: broker?.mcp.isConnected() ?? false,
+      connected:
+        tokens.state === 'valid' ||
+        tokens.state === 'refreshable' ||
+        (broker?.mcp.isConnected() ?? false),
       authUrl: broker?.mcp.getPendingAuthUrl() ?? null,
-      tokenState: tokens?.state ?? null,
+      tokenState: tokens.state,
       executionMode: settings.executionMode,
     });
   });
