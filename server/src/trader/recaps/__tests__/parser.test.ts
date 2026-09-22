@@ -174,6 +174,51 @@ describe('parseRecap on the production sample', () => {
   });
 });
 
+describe('parseRecap on loss-day futures lines', () => {
+  // Futures loss days interleave a second marker mid-line ("🟩 Wins: 1 |
+  // 🟥 Losses: 2 | ..."), verbatim from the 2026-08-21/25 production recaps.
+  // Parser v1 dropped every such line, silently zeroing futures losses.
+  const MIXED_FUTURES_RECAP = ` OPTIONALITY PRO DAILY RECAP | AUGUST 21, 2026
+
+DEMON CALLS:
+🟩 $SPY - 8/21 640C @ 1.00 --> 2.00 | +100.00%
+🟥 $QQQ - 8/21 570P @ 1.00 --> 0.50 | -50.00%
+
+🔥 TODAY'S FUTURES PLAYS:
+
+MITRO CALLS:
+🟩 Wins: 2 | 🟥 Losses: 1 | Avg. Points Per Trade: +58.00 POINTS
+
+STORMZY CALLS:
+🟩 Wins: 1 | 🟥 Losses: 2 | Avg. Points Per Trade: -0.93 POINTS
+
+📊 STATS:
+🎯 Total Trades: 8
+🟢 Winners: 4
+🔴 Losers: 4`;
+
+  const result = parseRecap(MIXED_FUTURES_RECAP);
+  const parse = result.parse!;
+
+  it('parses mixed-marker futures aggregates instead of dropping them', () => {
+    expect(parse.futures).toEqual([
+      { caller: 'Mitro', wins: 2, losses: 1, avgPointsPerTrade: 58 },
+      { caller: 'Stormzy', wins: 1, losses: 2, avgPointsPerTrade: -0.93 },
+    ]);
+    expect(parse.unparsedLines).toEqual([]);
+  });
+
+  it('counts the futures losses in the checksum, so status is parsed', () => {
+    expect(parse.checksum).toMatchObject({
+      parsedTotal: 8,
+      parsedWinners: 4,
+      totalMatches: true,
+      winnersMatch: true,
+    });
+    expect(result.status).toBe('parsed');
+  });
+});
+
 describe('parseRecap degradation', () => {
   it('reports not_recap for non-recap channel posts', () => {
     expect(parseRecap('Morning update: watch $NVDA into earnings.')).toEqual({

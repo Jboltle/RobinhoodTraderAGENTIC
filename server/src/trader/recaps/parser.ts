@@ -15,7 +15,7 @@
  */
 import type { OptionType } from '../../shared/types.js';
 
-export const PARSER_VERSION = 1;
+export const PARSER_VERSION = 2;
 
 // =============================================================================
 // Shapes stored in recaps.parse (jsonb)
@@ -126,9 +126,14 @@ const TRADE_LINE_RE = new RegExp(
   'i'
 );
 
-/** Futures aggregate line: "Wins: 3 | Losses: 0 | Avg. Points Per Trade: +31.00 POINTS". */
+/**
+ * Futures aggregate line: "Wins: 3 | Losses: 0 | Avg. Points Per Trade: +31.00 POINTS".
+ * Loss days interleave a second marker mid-line ("Wins: 1 | 🟥 Losses: 2 | ...") —
+ * the [^|\d]* runs tolerate that junk between a pipe and the next field label
+ * without letting the match skip across fields or digits.
+ */
 const FUTURES_LINE_RE =
-  /^Wins:\s*(\d+)\s*\|\s*Losses:\s*(\d+)(?:\s*\|\s*Avg\.?\s*Points(?:\s+Per\s+Trade)?:\s*([+-]?\d+(?:\.\d+)?))?/i;
+  /^Wins:\s*(\d+)\s*\|[^|\d]*Losses:\s*(\d+)(?:\s*\|[^|\d]*Avg\.?\s*Points(?:\s+Per\s+Trade)?:\s*([+-]?\d+(?:\.\d+)?))?/iu;
 
 /** Note wordings that mean "theoretical result" — excluded from stats. */
 const SOFT_NOTE_RE = /\bif\s+held\b|\balready\s+exited\b|\bno\s+more\s+alerts\b|\bif\s+you\s+held\b/i;
