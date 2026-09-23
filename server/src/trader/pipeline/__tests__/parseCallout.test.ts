@@ -1242,3 +1242,149 @@ describe('parseCallout — multi-message thread context', () => {
     expect(result.isCallout).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 3. Position-lifecycle semantics — expected LLM output (caller-agnostic).
+//    These document the prompt contract for status-shaped alerts: adds carry
+//    isAddition=true at the added fill price, exit status sells at market.
+// ---------------------------------------------------------------------------
+
+describe('parseCallout — position adds and exit status (expected LLM output)', () => {
+  it('averaging-down card parses as an isAddition buy at the added fill, not the average', async () => {
+    const parser = parserWithMock({
+      isCallout: true,
+      isAddition: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'limit',
+      limitPrice: 0.295,   // "Added 25 @ $0.295" — never the $0.39 average
+      sizeHint: null,      // "25 → 50 contracts" is the caller's running total
+      positionSize: null,
+      option: { optionType: 'put', strike: 772, expiration: '2026-09-22' },
+      confidence: 0.9,
+      rationale: 'averaging down on existing SPY 772P — add at the new fill',
+    });
+
+    const result = await parser.parse(makeEnvelope([
+      'SWIFT TRADES · LIVE DESK',
+      '➕ AVERAGING DOWN — SPY 772P · 0DTE',
+      "Averaging down on **SPY Sep22 '26 772 Put**",
+      'Added 25 @ $0.295',
+      'Average $0.485 → $0.39 · 25 → 50 contracts',
+      'New Avg: `$0.39`',
+      'Trim Targets (new avg): 25% $0.488',
+    ].join('\n'), '2026-09-22T16:12:00.000Z'));
+
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      isAddition: true,
+      action: 'buy',
+      limitPrice: 0.295,
+      sizeHint: null,
+    });
+  });
+
+  it('"close or trim" status card parses as a market sell, arrow prices are not limits', async () => {
+    const parser = parserWithMock({
+      isCallout: true,
+      isAddition: false,
+      assetType: 'option',
+      action: 'sell',
+      ticker: 'SPY',
+      orderType: 'market',
+      limitPrice: null,    // "$0.395 → $0.445" is P/L status, not a limit
+      sizeHint: null,
+      positionSize: null,
+      option: { optionType: 'put', strike: 772, expiration: '2026-09-22' },
+      confidence: 0.85,
+      rationale: 'close-or-trim exit status — sell at market',
+    });
+
+    const result = await parser.parse(makeEnvelope([
+      'SWIFT TRADES · LIVE DESK',
+      '🚀 +10% — SPY 772P · 0DTE',
+      '$0.395 → $0.445 · +12.7% (+$5.00/contract)',
+      'Close or trim & set SL to breakeven.',
+    ].join('\n'), '2026-09-22T14:55:00.000Z'));
+
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      action: 'sell',
+      orderType: 'market',
+      limitPrice: null,
+    });
+  });
+
+  it('normalizes a sell limit to a market order (exits are market by design)', async () => {
+    const parser = parserWithMock({
+      isCallout: true,
+      isAddition: false,
+      assetType: 'option',
+      action: 'sell',
+      ticker: 'NVDA',
+      orderType: 'limit',
+      limitPrice: 1.069,   // the card's fill price — noise, not a directive
+      sizeHint: null,
+      positionSize: 'medium',
+      option: { optionType: 'call', strike: 230, expiration: '2026-09-23' },
+      confidence: 0.9,
+      rationale: 'trim exit',
+    });
+
+    const result = await parser.parse(makeEnvelope(
+      'SWIFT TRADES · LIVE DESK\n✂️ TRIM +25% — NVDA 230C · Sep 23\nSold 3 of 15 @ $1.069 · 12 still running.',
+      '2026-09-22T15:02:00.000Z'
+    ));
+
+    expect(result).toMatchObject<Partial<Callout>>({
+      isCallout: true,
+      action: 'sell',
+      orderType: 'market',
+      limitPrice: null,
+    });
+  });
+
+  it('LLM output without the isAddition field defaults to false', async () => {
+    const parser = parserWithMock({
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'market',
+      limitPrice: null,
+      sizeHint: null,
+      positionSize: null,
+      option: { optionType: 'put', strike: 700, expiration: '2026-09-22' },
+      confidence: 0.9,
+      rationale: 'fresh entry',
+    });
+
+    const result = await parser.parse(
+      makeEnvelope('Buying SPY 700 puts here', '2026-09-22T14:55:00.000Z')
+    );
+    expect(result.isAddition).toBe(false);
+  });
+});
+
+describe('parseCallout — daily recap pre-filter', () => {
+  it('recap header blocks the LLM even when directive verbs and contracts appear', async () => {
+    const provider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+    const parser = new LlmCalloutParser(provider);
+
+    const result = await parser.parse(makeEnvelope([
+      '📅 **SWIFT DAILY RECAP - 22 September 2026**',
+      '📈 **TOP PLAY:  $AAPL - 9/25 345C  |  +121.75%**',
+      '**SWIFT CALLS:**',
+      '🟩 $AAPL - 9/25 345C @ 1.77 --> 3.92 | +121.75%',
+      '🟩 $SPX - 9/22 7765P @ 0.53 --> 1.05 | +100.00%',
+      'Closed everything into the bell.',
+    ].join('\n'), '2026-09-22T21:12:00.000Z'));
+
+    expect(provider.callStructured).not.toHaveBeenCalled();
+    expect(result.isCallout).toBe(false);
+    expect(result.rationale).toContain('daily recap');
+  });
+});

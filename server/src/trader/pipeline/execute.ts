@@ -69,6 +69,18 @@ export async function sizeEquityOrder(
       : await tools.getQuote(symbol).then((q) => q.price);
   if (price === null) throw new Error(`could not determine price for ${symbol}`);
 
+  // Same add-gate as the options path: an "averaging down" buy needs shares
+  // already held, otherwise it silently becomes a fresh entry.
+  if (side === 'buy' && callout.isAddition) {
+    const { positions } = await tools.getPositions();
+    const held = positions.find((p) => p.symbol.toUpperCase() === symbol && p.quantity > 0);
+    if (!held) {
+      throw new CapitalConstraintError(
+        `averaging-down add skipped — no open ${symbol} position to add to`
+      );
+    }
+  }
+
   // Sanity: an equity buy limit wildly below the live quote is a misparse
   // (e.g. an option premium taken as a share price), not a bargain order.
   // ponytail: a stale or absent quote skips the check. Upgrade path:
@@ -119,6 +131,19 @@ export async function sizeOptionsOrder(
 
   if (side === 'sell') {
     return sizeOptionExit(symbol, risk, callout, tools);
+  }
+
+  // Adds ("averaging down") extend a position; with none held there is
+  // nothing to add to, and mirroring the caller's add would open a fresh
+  // position off a status update. Mirrors the sell-side "no open position to
+  // trim" guard, so the rule holds for every caller regardless of format.
+  if (callout.isAddition) {
+    const position = await findOpenOptionPosition(tools, symbol, option);
+    if (!position || Math.floor(position.quantity) < 1) {
+      throw new CapitalConstraintError(
+        `averaging-down add skipped — no open ${symbol} ${optionLabel(option)} position to add to`
+      );
+    }
   }
 
   // ---- Resolve premium ----------------------------------------------------

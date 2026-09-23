@@ -30,6 +30,11 @@ const TOOL_SCHEMA: ToolJsonSchema = {
     isCallout: { type: 'boolean' },
     assetType: { type: 'string', enum: ['equity', 'option'] },
     action: { type: ['string', 'null'], enum: ['buy', 'sell', null] },
+    isAddition: {
+      type: 'boolean',
+      description:
+        'True when this buy adds to a position the caller already holds (averaging down) rather than opening a fresh one.',
+    },
     ticker: { type: ['string', 'null'] },
     orderType: { type: 'string', enum: ['market', 'limit'] },
     limitPrice: { type: ['number', 'null'] },
@@ -66,6 +71,7 @@ const TOOL_SCHEMA: ToolJsonSchema = {
     'isCallout',
     'assetType',
     'action',
+    'isAddition',
     'ticker',
     'orderType',
     'limitPrice',
@@ -83,7 +89,7 @@ const TOOL_SCHEMA: ToolJsonSchema = {
 // Everything the old 200-line prompt taught by example now lives in code.
 const SYSTEM_PROMPT = `You classify Discord messages from a trading channel and extract one structured trading callout when — and only when — the message contains one. Machine-formatted alerts are parsed upstream; you only see the leftovers, which are mostly chatter.
 
-A callout is an explicit, forward-looking directive to BUY or SELL a US equity or a single-leg US-listed option. Entry language ("buying", "entering", "I'm in", "adding", "grabbing") is a buy; exit language ("selling", "trimming", "closing", "taking profit") is a sell. Past-tense recaps, holding updates ("still in"), watchlists, hype, fill complaints and P/L status lines are NOT callouts.
+A callout is an explicit, forward-looking directive to BUY or SELL a US equity or a single-leg US-listed option. Entry language ("buying", "entering", "I'm in", "adding", "grabbing") is a buy; exit language ("selling", "trimming", "closing", "taking profit", "fully out", "sold all", "stopped out") is a sell. Adding to an existing position ("averaging down", "added 10 more @ 0.30", "doubling down") is a buy with isAddition=true, priced at the newly added fill — never the resulting average. An already-expired contract is never a callout. Past-tense recaps, holding updates ("still in"), watchlists, hype, fill complaints and P/L status lines are NOT callouts.
 
 A "Candidates" section may follow the message: contracts, prices and dates extracted deterministically from the message text. Prefer them. NEVER invent a ticker, strike, expiration or price that is not grounded in the message; when a required field cannot be grounded, set isCallout=false.
 
@@ -91,7 +97,9 @@ Rules:
 - ticker: 1-6 uppercase letters. assetType is 'option' only for single-leg contracts; multi-leg spreads are NOT callouts.
 - orderType is 'limit' only when an explicit price is stated. For options limitPrice is the per-contract PREMIUM — never the strike, and never a P/L arrow value ("1.59 -> 1.75" is status).
 - option.expiration: ISO YYYY-MM-DD resolved against the Reference timestamp ("now"). If you cannot confidently resolve a future date, set isCallout=false.
-- sizeHint only for explicit counts: shares ("100 shares"), usd ("$500 of AAPL"), contracts ("10 calls", "5x").
+- isAddition: true only when the buy extends a position the caller already says they hold; fresh entries use false.
+- A caller reporting their own single-position exit ("fully out", "sold all +38%", "stopped out") IS a sell callout when the contract is identifiable — followers may still hold it. Multi-trade performance recaps are not.
+- sizeHint only for explicit counts: shares ("100 shares"), usd ("$500 of AAPL"), contracts ("10 calls", "5x"). Never take sizeHint from the caller's own running totals ("10 → 20 contracts").
 - positionSize from qualitative size words: small ("small", "light", "scalp", "starter", "lotto"), medium ("half", "partial"), full ("full size", "max", "load up", "all in"). Null when absent; ignore when sizeHint is present.
 - confidence: 0.0 - 1.0. rationale: <=200 char summary (or why rejected).
 - Always call the report_callout tool exactly once.`;
@@ -174,6 +182,8 @@ const EXPIRATION_TOKEN_SCAN = regex('gi')`
     | WEEKLIES | WEEKLY | MONTHLY | EOY | LEAPS?
     | \d{4}-\d{2}-\d{2}
     | \d{1,2} / \d{1,2} (?: / \d{2,4} )?
+    | (?: JAN | FEB | MAR | APR | MAY | JUN | JUL | AUG | SEP | OCT | NOV | DEC )
+      [A-Za-z]* \.? \s? \d{1,2} (?! \s* / ) (?: \s* ,? \s* '? \d{2,4} )?
   ) \b
 `;
 
@@ -231,6 +241,7 @@ const LlmCalloutInputSchema = z.preprocess((raw) => {
     isCallout: typeof r.isCallout === 'boolean' ? r.isCallout : false,
     assetType: r.assetType ?? (hasOption ? 'option' : 'equity'),
     action: r.action ?? null,
+    isAddition: typeof r.isAddition === 'boolean' ? r.isAddition : false,
     ticker: r.ticker ?? null,
     orderType: r.orderType ?? 'market',
     limitPrice: r.limitPrice ?? null,
@@ -538,6 +549,11 @@ const utcDateOnly = (date: Date): Date =>
 
 const FRIDAY = 5;
 
+const MONTH_NAMES = [
+  'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE',
+  'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER',
+] as const;
+
 function nextFridayOnOrAfter(reference: Date): Date {
   const date = utcDateOnly(reference);
   date.setUTCDate(date.getUTCDate() + ((FRIDAY - date.getUTCDay() + 7) % 7));
@@ -600,6 +616,27 @@ function resolveDeterministicExpiration(raw: string, referenceTimestamp: string)
   }
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+
+  // Month-name dates: "Sep 23", "Sep23", "September 23, 2026", "Dec 19 '25".
+  // Yearless forms resolve to the nearest on-or-after occurrence — callers
+  // only alert live contracts, so a past date this year means next year.
+  const monthDay = upper.match(/^([A-Z]{3,9})\.?\s?(\d{1,2})(?:\s*,?\s*'?(\d{2,4}))?$/);
+  if (monthDay) {
+    const monthIndex = MONTH_NAMES.findIndex(
+      (name) => name.startsWith(monthDay[1]!) && monthDay[1]!.length >= 3
+    );
+    if (monthIndex === -1) return null;
+    const day = Number(monthDay[2]);
+    const year = monthDay[3]
+      ? Number(monthDay[3].length === 2 ? '20' + monthDay[3] : monthDay[3])
+      : reference.getUTCFullYear();
+    let date = new Date(Date.UTC(year, monthIndex, day));
+    if (date.getUTCMonth() !== monthIndex || date.getUTCDate() !== day) return null;
+    if (!monthDay[3] && date.getTime() < utcDateOnly(reference).getTime()) {
+      date = new Date(Date.UTC(year + 1, monthIndex, day));
+    }
+    return toIsoDate(date);
+  }
 
   const parts = raw.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
   if (!parts) return null;
@@ -720,6 +757,12 @@ const LANGUAGE_PREFILTERS: readonly LanguagePrefilter[] = [
   },
 ];
 
+// A recap header marks the whole message as history. It outranks the
+// directive-verb disarm below because recap bodies quote the day's entries
+// and exits verbatim ("$AAPL 345C @ 1.77 --> 3.92 | +121.75%"), which the LLM
+// has misread as a fresh bullish entry.
+const RECAP_HEADER = /\bDAILY\s+RECAP\b/i;
+
 /**
  * Classify obvious non-callout language without the LLM. Runs on the author's
  * own words (quotes/noise stripped). Conservative by construction: any
@@ -727,6 +770,7 @@ const LANGUAGE_PREFILTERS: readonly LanguagePrefilter[] = [
  * but the P/L filter, so a real entry always reaches a parser or the model.
  */
 function matchLanguagePrefilter(languageContent: string): string | null {
+  if (RECAP_HEADER.test(languageContent)) return 'daily recap header';
   if (DIRECTIVE_VERB.test(languageContent)) return null;
   const hasContract = CONTRACT_TEST.test(languageContent);
   for (const filter of LANGUAGE_PREFILTERS) {
@@ -1045,9 +1089,23 @@ export class LlmCalloutParser implements CalloutParser {
     }
 
     const callout = result.data;
-    const normalized: Callout = callout.ticker
+    let normalized: Callout = callout.ticker
       ? { ...callout, ticker: callout.ticker.toUpperCase() }
       : callout;
+
+    // Exits go out as market orders — the same rule the deterministic trim
+    // template enforces. Models lift a status-arrow or fill price into a sell
+    // limit ("Sold 3 of 15 @ $1.069" → limit 1.069); the sell itself is right,
+    // the price is noise, so normalize instead of rejecting. ponytail: this
+    // also flattens a genuine "sell half at 2.50" limit exit to market; the
+    // upgrade path is limiting the rewrite to prices found in arrow/fill lines.
+    if (normalized.isCallout && normalized.action === 'sell' && normalized.orderType === 'limit') {
+      log.debug('normalizing sell limit to market order', {
+        messageId: envelope.messageId,
+        droppedLimitPrice: normalized.limitPrice,
+      });
+      normalized = { ...normalized, orderType: 'market', limitPrice: null };
+    }
 
     if (normalized.isCallout) {
       const groundingError = findLlmGroundingError(normalized, llmContent, cleaned.timestamp);

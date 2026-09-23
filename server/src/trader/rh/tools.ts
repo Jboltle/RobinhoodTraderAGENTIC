@@ -7,6 +7,7 @@ import { assertTokenForTrade } from './mcpClient.js';
 import type {
   BuyingPowerResult,
   CallToolResult,
+  OptionMinTicks,
   OptionOrder,
   OptionOrdersResult,
   OptionPosition,
@@ -44,10 +45,16 @@ export const TOOL_NAMES = {
 // Public client
 // =============================================================================
 
+/** Option instrument UUID plus its price grid, resolved in one lookup. */
+interface OptionInstrumentRef {
+  readonly optionId: string;
+  readonly minTicks: OptionMinTicks | null;
+}
+
 export class RobinhoodTools {
   private accountNumber: string | undefined;
-  /** Contract key → option instrument UUID. Instrument ids never change. */
-  private readonly optionIdCache = new Map<string, string>();
+  /** Contract key → instrument ref. Instrument ids and ticks never change. */
+  private readonly optionIdCache = new Map<string, OptionInstrumentRef>();
 
   constructor(private readonly mcp: RobinhoodMcpClient) {}
 
@@ -75,10 +82,10 @@ export class RobinhoodTools {
       return null;
     }
     try {
-      const optionId = await this.resolveOptionId(symbol, optionType, strike, expiration);
+      const instrument = await this.resolveOptionInstrument(symbol, optionType, strike, expiration);
       return await this.callTool(
         TOOL_NAMES.optionsQuote,
-        { instrument_ids: [optionId] },
+        { instrument_ids: [instrument.optionId] },
         parseOptionsQuote
       );
     } catch {
@@ -189,19 +196,37 @@ export class RobinhoodTools {
     if (args.orderType === 'limit' && typeof args.limitPremium !== 'number') {
       throw new Error('limitPremium (per-contract price) required for limit options orders');
     }
-    const optionId = await this.resolveOptionId(
+    const instrument = await this.resolveOptionInstrument(
       args.symbol,
       args.optionType,
       args.strike,
       args.expiration
     );
+
+    // Callers relay premiums verbatim from callouts, which are often quoted on
+    // another broker's grid (IBKR half-cents like 0.195); Robinhood rejects
+    // off-grid prices with 400 "Price does not satisfy the min tick value".
+    let limitPremium = args.limitPremium;
+    if (args.orderType === 'limit' && typeof limitPremium === 'number') {
+      const rounded = roundPremiumToTick(limitPremium, args.side, instrument.minTicks);
+      if (rounded !== limitPremium) {
+        log.info('rounded limit premium to Robinhood tick grid', {
+          symbol: args.symbol,
+          side: args.side,
+          from: limitPremium,
+          to: rounded,
+        });
+        limitPremium = rounded;
+      }
+    }
+
     return this.callTool(
       TOOL_NAMES.placeOptionsOrder,
       {
         account_number: await this.getDefaultAccountNumber(),
         legs: [
           {
-            option_id: optionId,
+            option_id: instrument.optionId,
             side: args.side,
             // ponytail: single-leg long-only mapping — buys open, sells close.
             // Opening a short (sell/open) needs a new PlaceOptionsOrderArgs
@@ -215,8 +240,8 @@ export class RobinhoodTools {
         time_in_force: toRhTimeInForce(args.timeInForce),
         ref_id: randomUUID(),
         // price is required for limit and must be OMITTED for market orders.
-        ...(args.orderType === 'limit' && args.limitPremium !== undefined
-          ? { price: String(args.limitPremium) }
+        ...(args.orderType === 'limit' && limitPremium !== undefined
+          ? { price: String(limitPremium) }
           : {}),
       },
       parsePlaceOrder
@@ -225,21 +250,21 @@ export class RobinhoodTools {
 
   /**
    * Resolve a (symbol, type, strike, expiration) contract to the option
-   * instrument UUID that order/quote tools require, via get_option_instruments.
+   * instrument UUID (and its min-tick grid) via get_option_instruments.
    */
-  private async resolveOptionId(
+  private async resolveOptionInstrument(
     symbol: string,
     optionType: OptionType,
     strike: number,
     expiration: string
-  ): Promise<string> {
+  ): Promise<OptionInstrumentRef> {
     const key = `${symbol}|${optionType}|${strike}|${expiration}`;
     const cached = this.optionIdCache.get(key);
     if (cached) return cached;
     // Input schema (tools/list) is the source of truth. The empty-match *guide*
     // names response fields (expiration_date); sending that as an argument is
     // rejected with additionalProperties: false (-32602).
-    const optionId = await this.callTool(
+    const instrument = await this.callTool(
       TOOL_NAMES.optionInstruments,
       optionInstrumentLookupArgs(this.optionInstrumentSchema(), {
         symbol,
@@ -247,10 +272,10 @@ export class RobinhoodTools {
         strike,
         expiration,
       }),
-      (raw) => parseOptionInstrumentId(raw, `${symbol} ${strike.toFixed(4)} ${optionType} ${expiration}`)
+      (raw) => parseOptionInstrumentRef(raw, `${symbol} ${strike.toFixed(4)} ${optionType} ${expiration}`)
     );
-    this.optionIdCache.set(key, optionId);
-    return optionId;
+    this.optionIdCache.set(key, instrument);
+    return instrument;
   }
 
   private async requireTokenForTrade(): Promise<void> {
@@ -609,17 +634,66 @@ function parseOptionInstruments(result: CallToolResult): Map<string, OptionInstr
   return byId;
 }
 
-function parseOptionInstrumentId(result: CallToolResult, contract: string): string {
+function parseOptionInstrumentRef(result: CallToolResult, contract: string): OptionInstrumentRef {
   const data = structuredOrJson(result);
   const list =
     deepFind(data, ['instruments', 'results'], (v): v is unknown[] => Array.isArray(v)) ?? [];
   for (const item of list) {
-    const id = asRecord(item)?.id;
-    if (typeof id === 'string' && id.length > 0) return id;
+    const rec = asRecord(item);
+    const id = rec?.id;
+    if (typeof id === 'string' && id.length > 0) {
+      return { optionId: id, minTicks: parseMinTicks(rec?.min_ticks) };
+    }
   }
   throw new Error(
     `no option instrument matched ${contract}: ${extractText(result).slice(0, 200)}`
   );
+}
+
+/** `min_ticks` rows encode the grid as strings ("0.05"); null when absent/partial. */
+function parseMinTicks(value: unknown): OptionMinTicks | null {
+  const rec = asRecord(value);
+  if (!rec) return null;
+  const aboveTick = deepFindNumber(rec, ['above_tick']);
+  const belowTick = deepFindNumber(rec, ['below_tick']);
+  const cutoffPrice = deepFindNumber(rec, ['cutoff_price']);
+  if (aboveTick === null || belowTick === null || cutoffPrice === null) return null;
+  if (aboveTick <= 0 || belowTick <= 0) return null;
+  return { aboveTick, belowTick, cutoffPrice };
+}
+
+// =============================================================================
+// Price grid rounding
+// =============================================================================
+
+/**
+ * The standard US options grid (penny below $3, nickel above), used when the
+ * instrument row carries no `min_ticks`. Exact for penny-program symbols and
+ * never produces sub-penny prices, which is the failure seen in the wild.
+ */
+const DEFAULT_MIN_TICKS: OptionMinTicks = { aboveTick: 0.05, belowTick: 0.01, cutoffPrice: 3 };
+
+const TICK_EPSILON = 1e-9;
+
+/**
+ * Snap a per-contract premium onto the instrument's price grid. Buys round up
+ * and sells round down so the rounded order is always at least as marketable
+ * as the requested one (cost: under one tick per contract).
+ */
+export function roundPremiumToTick(
+  premium: number,
+  side: OrderSide,
+  minTicks: OptionMinTicks | null
+): number {
+  const grid = minTicks ?? DEFAULT_MIN_TICKS;
+  const tick = premium < grid.cutoffPrice ? grid.belowTick : grid.aboveTick;
+  const steps =
+    side === 'buy'
+      ? Math.ceil(premium / tick - TICK_EPSILON)
+      : Math.floor(premium / tick + TICK_EPSILON);
+  // A sell floored to zero is off-grid too; the smallest valid price is one tick.
+  const snapped = Math.max(tick, steps * tick);
+  return Number(snapped.toFixed(4));
 }
 
 function parsePlaceOrder(result: CallToolResult): PlaceOrderResult {

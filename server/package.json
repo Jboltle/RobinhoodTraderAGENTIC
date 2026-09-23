@@ -18,6 +18,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:parse-callout": "bun src/scripts/parseCalloutPlayground.ts",
+    "eval:parse": "bun src/scripts/parseEval.ts",
     "build": "bun build src/trader/index.ts --outdir dist --target bun",
     "typecheck": "tsc -p . --noEmit"
   },

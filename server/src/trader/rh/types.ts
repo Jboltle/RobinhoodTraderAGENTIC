@@ -93,6 +93,18 @@ export interface OptionsQuoteResult {
   readonly raw: unknown;
 }
 
+/**
+ * Robinhood's price increments for one option contract (`min_ticks` on the
+ * option instrument): premiums below `cutoffPrice` move in `belowTick` steps,
+ * at/above it in `aboveTick` steps. A limit price off this grid is rejected
+ * with API error 400 "Price does not satisfy the min tick value."
+ */
+export interface OptionMinTicks {
+  readonly aboveTick: number;
+  readonly belowTick: number;
+  readonly cutoffPrice: number;
+}
+
 export type TimeInForce = 'day' | 'gtc';
 
 /** Ergonomic camelCase shape used by callers (e.g. `executeTrade`). */

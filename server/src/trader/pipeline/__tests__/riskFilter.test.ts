@@ -51,6 +51,7 @@ const checkRisk = (callout: Callout, now?: Date) =>
 
 const BASE_EQUITY: Callout = {
   isCallout: true,
+  isAddition: false,
   assetType: 'equity',
   action: 'buy',
   ticker: 'AAPL',
@@ -65,6 +66,7 @@ const BASE_EQUITY: Callout = {
 
 const BASE_OPTION: Callout = {
   isCallout: true,
+  isAddition: false,
   assetType: 'option',
   action: 'buy',
   ticker: 'SPY',
@@ -345,6 +347,7 @@ describe('riskFilter — options keyword sizing', () => {
   it('TRIM sell callout → market sell allowed with medium sizing', async () => {
     const trimSell: Callout = {
       isCallout: true,
+      isAddition: false,
       assetType: 'option',
       action: 'sell',
       ticker: 'QQQ',

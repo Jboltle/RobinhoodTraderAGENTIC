@@ -24,6 +24,7 @@ const SETTINGS: ResolvedTradeSettings = TradeSettingsSchema.parse({
 
 const CALLOUT: Callout = {
   isCallout: true,
+  isAddition: false,
   assetType: 'equity',
   action: 'buy',
   ticker: 'AAPL',

@@ -9,6 +9,7 @@ import type { Callout, DiscordEnvelope } from '../../../../shared/types.js';
 export type MessageCategory =
   | 'bto_entry'
   | 'trim_exit'
+  | 'position_add'
   | 'lotto_risky'
   | 'commentary'
   | 'hype'
@@ -54,6 +55,7 @@ export const BTO_QQQ_PUT: DiscordMessageFixture = {
   timestamp: '2026-06-09T14:27:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'buy',
     ticker: 'QQQ',
@@ -81,6 +83,7 @@ export const BTO_SPY_0DTE: DiscordMessageFixture = {
   timestamp: '2026-06-15T13:35:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'buy',
     ticker: 'SPY',
@@ -112,6 +115,7 @@ export const BTO_SPY_SMALL_POSITION: DiscordMessageFixture = {
   timestamp: '2026-07-20T14:20:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'buy',
     ticker: 'SPY',
@@ -132,6 +136,7 @@ export const BTO_SBUX_CALL: DiscordMessageFixture = {
   content: 'BTO $SBUX 103c 06/12 @0.55',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'buy',
     ticker: 'SBUX',
@@ -168,6 +173,7 @@ export const TRIM_QQQ_FIRST: DiscordMessageFixture = {
   timestamp: '2026-06-11T14:23:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'sell',
     ticker: 'QQQ',
@@ -200,6 +206,7 @@ export const TRIM_QQQ_DOUBLE: DiscordMessageFixture = {
   timestamp: '2026-06-11T14:24:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'sell',
     ticker: 'QQQ',
@@ -232,6 +239,7 @@ export const RUNNERS_ONLY_QQQ: DiscordMessageFixture = {
   timestamp: '2026-06-11T14:25:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'sell',
     ticker: 'QQQ',
@@ -264,6 +272,7 @@ export const TRIM_SPY_SOME: DiscordMessageFixture = {
   timestamp: '2026-07-20T14:21:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'sell',
     ticker: 'SPY',
@@ -290,6 +299,7 @@ export const TRIM_GOOGLE_MOST: DiscordMessageFixture = {
   ].join('\n'),
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'sell',
     ticker: 'GOOGL',
@@ -300,6 +310,49 @@ export const TRIM_GOOGLE_MOST: DiscordMessageFixture = {
     option: { optionType: 'call', strike: 370, expiration: '2026-06-18' },
     confidence: 0.85,
     rationale: 'Trimming most of GOOGL 370C',
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Position adds (averaging down) — buys that extend an existing position
+// ---------------------------------------------------------------------------
+
+export const AVG_DOWN_SPY_PUT: DiscordMessageFixture = {
+  id: 'avg-down-spy-772p',
+  category: 'position_add',
+  description:
+    'Averaging-down status card (flattened embed, Swift desk shape) — a buy ' +
+    'ONLY for followers already holding; in prod this was misread as a fresh ' +
+    'entry at the resulting average price and submitted (Sep 22, 2026)',
+  content: [
+    'SWIFT TRADES · LIVE DESK',
+    '➕ AVERAGING DOWN — SPY 772P · 0DTE',
+    'Averaging down on **SPY Sep22 \'26 772 Put**',
+    'Added 25 @ $0.295',
+    'Average $0.485 → $0.39 · 25 → 50 contracts',
+    'New Avg: `$0.39`',
+    'Total Contracts: `50`',
+    'Cost: `$1,950`',
+    'Trim Targets (new avg): ```',
+    '25%   $0.488',
+    '50%   $0.585',
+    '```',
+  ].join('\n'),
+  authorName: 'Swift Alerts',
+  timestamp: '2026-09-22T16:12:00.000Z',
+  expectedCallout: {
+    isCallout: true,
+    isAddition: true,
+    assetType: 'option',
+    action: 'buy',
+    ticker: 'SPY',
+    orderType: 'limit',
+    limitPrice: 0.295,   // the newly added fill — never the $0.39 average
+    sizeHint: null,
+    positionSize: null,
+    option: { optionType: 'put', strike: 772, expiration: '2026-09-22' },
+    confidence: 0.9,
+    rationale: 'averaging down on existing SPY 772P — add at the new fill price',
   },
 };
 
@@ -324,6 +377,7 @@ export const LOTTO_SPY_RISKY: DiscordMessageFixture = {
   timestamp: '2026-06-12T15:24:00.000Z',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'buy',
     ticker: 'SPY',
@@ -350,6 +404,7 @@ export const HYPE_BANG: DiscordMessageFixture = {
   timestamp: '2026-06-09T14:27:00.000Z',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -372,6 +427,7 @@ export const HYPE_BANGGGGG: DiscordMessageFixture = {
   timestamp: '2026-06-09T14:45:00.000Z',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -392,6 +448,7 @@ export const HYPE_BANGERERRRRR: DiscordMessageFixture = {
   content: 'BANGERERRRRR! DONT LET IT GO RED @Pro',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -414,6 +471,7 @@ export const COMMENTARY_BTFDD: DiscordMessageFixture = {
   timestamp: '2026-06-05T18:52:00.000Z',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -442,6 +500,7 @@ export const COMMENTARY_PORTFOLIO_RECAP: DiscordMessageFixture = {
   timestamp: '2026-06-05T19:57:00.000Z',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -462,6 +521,7 @@ export const COMMENTARY_FILL_COMPLAINT: DiscordMessageFixture = {
   content: 'everyone had MUCH better fill than me!! This dropped to .8 @Pro',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -482,6 +542,7 @@ export const COMMENTARY_BANK_NEXT_WEEK: DiscordMessageFixture = {
   content: 'LETS BANK NEXT WEEK! @Pro',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -502,6 +563,7 @@ export const STATUS_STILL_IN: DiscordMessageFixture = {
   content: 'Still in $SBUX ! @Pro',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -527,6 +589,7 @@ export const STATUS_PL_ONLY: DiscordMessageFixture = {
   ].join('\n'),
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -547,6 +610,7 @@ export const STATUS_VIBES: DiscordMessageFixture = {
   content: '$SBUX gives me $CVS vibes full transparency @Pro',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -567,6 +631,7 @@ export const REPLY_STILL_IN_AFTER_BTO: DiscordMessageFixture = {
   content: '> ↪️ replying to **Namrood**: BTO $SBUX 103c 06/12 @0.55\nStill in $SBUX ! @Pro',
   expectedCallout: {
     isCallout: false,
+    isAddition: false,
     assetType: 'equity',
     action: null,
     ticker: null,
@@ -593,6 +658,7 @@ export const MESSAGE_WITH_ATTACHMENT_URL: DiscordMessageFixture = {
   authorName: 'Demon Alerts',
   expectedCallout: {
     isCallout: true,
+    isAddition: false,
     assetType: 'option',
     action: 'buy',
     ticker: 'QQQ',
@@ -617,6 +683,7 @@ export const ALL_FIXTURES: readonly DiscordMessageFixture[] = [
   RUNNERS_ONLY_QQQ,
   TRIM_SPY_SOME,
   TRIM_GOOGLE_MOST,
+  AVG_DOWN_SPY_PUT,
   LOTTO_SPY_RISKY,
   HYPE_BANG,
   HYPE_BANGGGGG,

@@ -19,6 +19,7 @@ import type { RobinhoodMcpClient } from '../../rh/mcpClient.js';
 import type { RobinhoodTools } from '../../rh/tools.js';
 import { createMessageProcessor, type PipelineDeps } from '../index.js';
 import {
+  AVG_DOWN_SPY_PUT,
   BTO_QQQ_PUT,
   TRIM_QQQ_DOUBLE,
   TRIM_QQQ_FIRST,
@@ -252,6 +253,44 @@ describe('fan-out — TRIM exit', () => {
   });
 });
 
+describe('fan-out — averaging-down adds', () => {
+  // Real incident (2026-09-22): a desk's "AVERAGING DOWN" status card parsed
+  // as a fresh entry and submitted 20 naked 0DTE puts for users who never
+  // held the position. Adds must require an existing position.
+  it('rejects an add when the user holds no matching position', async () => {
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(AVG_DOWN_SPY_PUT),
+      AVG_DOWN_SPY_PUT.expectedCallout
+      // default tools hold only QQQ 707C — no SPY 772P position
+    );
+
+    expect(decision.kind).toBe('risk_rejected');
+    expect(decision.reason).toMatch(/no open SPY 772P 2026-09-22 position to add to/);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it('executes the add for a user who holds the position', async () => {
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(AVG_DOWN_SPY_PUT),
+      AVG_DOWN_SPY_PUT.expectedCallout,
+      {
+        getOptionPositions: vi.fn().mockResolvedValue({
+          positions: [
+            { symbol: 'SPY', optionType: 'put', strike: 772, expiration: '2026-09-22', quantity: 25, raw: {} },
+          ],
+          raw: {},
+        }),
+      }
+    );
+
+    expect(decision.kind).toBe('submitted');
+    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(call.side).toBe('buy');
+    expect(call.strike).toBe(772);
+    expect(call.limitPremium).toBe(0.295);
+  });
+});
+
 describe('fan-out — parse consistency guardrails', () => {
   // Real incident (2026-07-15): profit brag parsed by the LLM as an equity
   // buy with the current option premium as the limit price.
@@ -268,6 +307,7 @@ describe('fan-out — parse consistency guardrails', () => {
 
   const BAD_EQUITY_PARSE: Callout = {
     isCallout: true,
+    isAddition: false,
     assetType: 'equity',
     action: 'buy',
     ticker: 'AAPL',

@@ -91,6 +91,13 @@ export const CalloutSchema = z
     action: z.enum(ORDER_SIDES).nullable(),
     ticker: z.string().refine(validateTicker, { error: 'Invalid ticker' }).nullable(),
     orderType: z.enum(ORDER_TYPES),
+    /**
+     * True when a buy extends a position the caller already holds
+     * ("averaging down", "added 10 more"). Execution requires an open
+     * position for adds, so a caller's own position management can never
+     * open a fresh position for a follower who missed the entry.
+     */
+    isAddition: z.boolean().default(false),
     /** For options this is the per-contract premium, NOT the strike. */
     limitPrice: z.number().positive().nullable(),
     sizeHint: z
