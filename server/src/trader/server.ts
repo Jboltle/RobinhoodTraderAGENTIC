@@ -22,7 +22,7 @@ import {
 import { registerAuth, requireUser } from './auth.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
-import { findEquityEntry, findOptionEntry } from './maxLoss.js';
+import { resolveEquityEntry, resolveOptionEntry } from './maxLoss.js';
 import { submitOrder } from './pipeline/execute.js';
 import { summarize } from './pipeline/summarize.js';
 import {
@@ -530,10 +530,12 @@ interface PerformanceRow {
   readonly strike?: number;
   readonly expiration?: string;
   /**
-   * Entry from the user's most recent submitted order for the position.
-   * ponytail: uses the order's limitPrice, so market fills report null — the
-   * trades table doesn't capture fill prices. Upgrade path: poll the broker's
-   * order status after submit and record the executed price.
+   * Entry basis matching the Robinhood app: the broker's average cost when
+   * the MCP reports it (equity position rows / filled option orders), else
+   * the limit price of the user's most recent submitted buy. Null when
+   * neither exists (e.g. a market fill on a position with no broker cost
+   * data). Resolution lives in maxLoss.ts and is shared with the max-loss
+   * monitor.
    */
   readonly entryPrice: number | null;
   readonly currentPrice: number | null;
@@ -549,11 +551,17 @@ async function collectPerformance(deps: ServerDeps, userId: string): Promise<Per
   ]);
   // Already newest-first, so find() picks the most recent entry for a position.
   const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);
+  // Real option fills for the entry basis; degrade to the trade log when the
+  // server doesn't advertise the tool or the call fails.
+  const optionOrders =
+    typeof tools.getOptionOrders === 'function'
+      ? await tools.getOptionOrders().catch(() => null)
+      : null;
 
   const equityRows = equity.positions
     .filter((position) => position.quantity > 0)
     .map(async (position): Promise<PerformanceRow> => {
-      const entryPrice = findEquityEntry(submitted, position.symbol);
+      const entryPrice = resolveEquityEntry(submitted, position);
       const currentPrice = await tools.getQuote(position.symbol).then((q) => q.price);
       return {
         assetType: 'equity',
@@ -568,7 +576,6 @@ async function collectPerformance(deps: ServerDeps, userId: string): Promise<Per
   const optionRows = options.positions
     .filter((position) => position.quantity > 0)
     .map(async (position): Promise<PerformanceRow> => {
-      const entryPrice = findOptionEntry(submitted, position);
       const quote = await tools.getOptionsMarkPrice(
         position.symbol,
         position.optionType,
@@ -576,6 +583,12 @@ async function collectPerformance(deps: ServerDeps, userId: string): Promise<Per
         position.expiration
       );
       const currentPrice = quote?.markPrice ?? null;
+      const entryPrice = resolveOptionEntry(
+        submitted,
+        position,
+        optionOrders?.orders ?? null,
+        currentPrice
+      );
       return {
         assetType: 'option',
         symbol: position.symbol,

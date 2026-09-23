@@ -27,6 +27,16 @@ export const MAX_LOSS_INTERVAL_MS = 15_000;
 export const OPTION_MULTIPLIER = 100;
 export const EQUITY_MULTIPLIER = 1;
 
+/**
+ * How long an in-flight close blocks re-selling the same position. A market
+ * sell fills in seconds during regular hours; one still unfilled after this
+ * long died somewhere (cancelled, expired, halted) and must be retried.
+ */
+export const FLATTEN_RETRY_MS = 10 * 60_000;
+
+/** Submit-time statuses that mean the broker did not accept the close. */
+const DEAD_ORDER_STATUSES = new Set(['rejected', 'canceled', 'cancelled', 'failed', 'expired']);
+
 /** How far back we look for the buy that opened a position. Same depth as performance. */
 const ENTRY_HISTORY_LIMIT = 500;
 
@@ -64,12 +74,13 @@ export interface MaxLossDeps {
 
 /**
  * Boot + interval. Returns a stop function for tests.
- * ponytail: one in-memory flattening set per process. A restart can double-fire
- * one more market sell if the first order is still queued; the broker rejects
- * a close against a flat position. Upgrade path: persist in-flight keys.
+ * ponytail: in-flight closes live in one in-memory map (key → submit time)
+ * per process. A restart or the retry TTL can double-fire one more market
+ * sell; the broker rejects a close against a flat position. Upgrade path:
+ * persist in-flight keys and poll order status instead of the TTL.
  */
 export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
-  const flattening = new Set<string>();
+  const flattening = new Map<string, number>();
   const tick = (): void => {
     void sweepMaxLoss(deps, flattening).catch((err: unknown) =>
       log.error('max-loss sweep failed', errorFields(err))
@@ -81,7 +92,10 @@ export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
   return () => clearInterval(timer);
 }
 
-export async function sweepMaxLoss(deps: MaxLossDeps, flattening: Set<string>): Promise<void> {
+export async function sweepMaxLoss(
+  deps: MaxLossDeps,
+  flattening: Map<string, number>
+): Promise<void> {
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
 
@@ -103,7 +117,7 @@ export async function sweepMaxLoss(deps: MaxLossDeps, flattening: Set<string>): 
 async function scanUser(
   userId: string,
   deps: MaxLossDeps,
-  flattening: Set<string>,
+  flattening: Map<string, number>,
   now: Date
 ): Promise<null> {
   const settings = await deps.db.getSettings(userId);
@@ -124,7 +138,11 @@ async function scanUser(
       ? await tools.getOptionOrders().catch(() => null)
       : null;
 
+  const openKeys = new Set<string>();
+
   for (const position of equity.positions) {
+    const key = positionKey('equity', position.symbol);
+    if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
     await considerPosition({
       userId,
       deps,
@@ -132,7 +150,7 @@ async function scanUser(
       now,
       tools,
       settings,
-      key: positionKey('equity', position.symbol),
+      key,
       symbol: position.symbol,
       quantity: position.quantity,
       assetType: 'equity',
@@ -144,6 +162,14 @@ async function scanUser(
   }
 
   for (const position of options.positions) {
+    const key = positionKey(
+      'option',
+      position.symbol,
+      position.optionType,
+      position.strike,
+      position.expiration
+    );
+    if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
     const mark = await tools
       .getOptionsMarkPrice(position.symbol, position.optionType, position.strike, position.expiration)
       .then((q) => q?.markPrice ?? null)
@@ -155,13 +181,7 @@ async function scanUser(
       now,
       tools,
       settings,
-      key: positionKey(
-        'option',
-        position.symbol,
-        position.optionType,
-        position.strike,
-        position.expiration
-      ),
+      key,
       symbol: position.symbol,
       quantity: position.quantity,
       assetType: 'option',
@@ -176,13 +196,23 @@ async function scanUser(
     });
   }
 
+  // A tracked close whose position is gone has completed: prune its key so
+  // the same contract re-entered later is protected again. Without this the
+  // in-flight guard silently disables Max Loss for every re-entry until the
+  // process restarts.
+  for (const inflight of flattening.keys()) {
+    if (inflight.startsWith(`${userId}:`) && !openKeys.has(inflight)) {
+      flattening.delete(inflight);
+    }
+  }
+
   return null;
 }
 
 interface ConsiderArgs {
   readonly userId: string;
   readonly deps: MaxLossDeps;
-  readonly flattening: Set<string>;
+  readonly flattening: Map<string, number>;
   readonly now: Date;
   readonly tools: RobinhoodTools;
   readonly settings: { maxLossPct: number | null; maxLossUsd: number | null };
@@ -200,11 +230,14 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
   const { userId, flattening, key, quantity } = args;
   const inflight = `${userId}:${key}`;
 
-  if (quantity <= 0) {
-    flattening.delete(inflight);
+  if (quantity <= 0) return;
+  // A fresh in-flight close means the broker is still working the order; a
+  // stale one means it died unseen (cancelled, expired, halted), so fall
+  // through and re-sell. Worst case is a duplicate close the broker rejects.
+  const closeSubmittedAtMs = flattening.get(inflight);
+  if (closeSubmittedAtMs !== undefined && args.now.getTime() - closeSubmittedAtMs < FLATTEN_RETRY_MS) {
     return;
   }
-  if (flattening.has(inflight)) return;
   if (args.entry === null || args.mark === null) {
     if (args.entry === null) {
       log.info('max-loss skipped: no entry', { userId, key });
@@ -224,7 +257,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
     return;
   }
 
-  flattening.add(inflight);
+  flattening.set(inflight, args.now.getTime());
   try {
     const sized: SubmittedOrder = {
       symbol: args.symbol,
@@ -238,6 +271,11 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
       status: null,
     };
     const placed = await submitOrder(sized, args.tools);
+    // A dead submit-time status means nothing will fill: surface it as a
+    // failure (no max_loss_exit row) so the next sweep retries the close.
+    if (placed.status !== null && DEAD_ORDER_STATUSES.has(placed.status.toLowerCase())) {
+      throw new Error(`broker returned terminal status "${placed.status}" for the close`);
+    }
     const order: SubmittedOrder = {
       ...sized,
       orderId: placed.orderId,
@@ -281,57 +319,116 @@ function positionKey(
   return `opt:${symbol.toUpperCase()}:${optionType}:${strike}:${expiration}`;
 }
 
+/** One buy lot: unit price paid and units bought. Callers pass lots newest-first. */
+export interface BuyLot {
+  readonly price: number;
+  readonly quantity: number;
+}
+
 /**
- * Entry price from the user's most recent submitted buy for the position.
- * Shared with the dashboard's performance view (server.ts) — `submitted` must
- * be newest-first so find() picks the latest entry.
+ * Weighted-average price of the newest buy lots covering the open quantity.
+ * The latest buy alone misstates the basis once a position is averaged down
+ * (the bot's isAddition buys do exactly that): a cheap add makes the loss look
+ * smaller than it is and the stop fires far below the user's threshold. Lots
+ * older than the covering set are ignored (they were sold), and when history
+ * covers less than the open quantity the average of what exists still beats
+ * the latest lot alone.
+ * ponytail: newest-lots-cover-the-position is LIFO matching; interleaved
+ * partial sells accounted FIFO by the broker can skew the basis by a lot
+ * boundary. Upgrade path: replay the full buy/sell order history.
  */
-export function findEquityEntry(submitted: readonly Decision[], symbol: string): number | null {
-  const match = submitted.find(
-    (d) => d.order!.side === 'buy' && d.order!.assetType === 'equity' && d.order!.symbol === symbol
-  );
-  return match?.order?.limitPrice ?? null;
-}
-
-export function findOptionEntry(
-  submitted: readonly Decision[],
-  position: OptionContract & { symbol: string }
+export function weightedAverageEntry(
+  lots: readonly BuyLot[],
+  openQuantity: number
 ): number | null {
-  const match = submitted.find((d) => {
-    const order = d.order!;
-    return (
-      order.side === 'buy' &&
-      order.assetType === 'option' &&
-      order.symbol === position.symbol &&
-      order.option !== null &&
-      order.option.optionType === position.optionType &&
-      Math.abs(order.option.strike - position.strike) < 0.0001 &&
-      order.option.expiration === position.expiration
-    );
-  });
-  return match?.order?.limitPrice ?? null;
+  let remaining = openQuantity;
+  let cost = 0;
+  let covered = 0;
+  for (const lot of lots) {
+    if (remaining <= 0) break;
+    if (!(lot.price > 0) || !(lot.quantity > 0)) continue;
+    const take = Math.min(lot.quantity, remaining);
+    cost += lot.price * take;
+    covered += take;
+    remaining -= take;
+  }
+  return covered > 0 ? cost / covered : null;
 }
 
-function resolveEquityEntry(submitted: readonly Decision[], position: Position): number | null {
-  return findEquityEntry(submitted, position.symbol) ?? numberFromRaw(position.raw, [
-    'average_buy_price',
-    'average_price',
-    'average_cost',
-    'cost_basis',
-  ]);
+/**
+ * Entry basis from the user's submitted buy limits for the position — the
+ * fallback when the broker reports no cost data. `submitted` must be
+ * newest-first so the covering walk starts from the latest lot.
+ */
+function findEquityEntry(
+  submitted: readonly Decision[],
+  symbol: string,
+  openQuantity: number
+): number | null {
+  const lots = submitted
+    .filter(
+      (d) =>
+        d.order!.side === 'buy' &&
+        d.order!.assetType === 'equity' &&
+        d.order!.symbol === symbol &&
+        d.order!.limitPrice !== null
+    )
+    .map((d) => ({ price: d.order!.limitPrice!, quantity: d.order!.quantity }));
+  return weightedAverageEntry(lots, openQuantity);
 }
 
-function resolveOptionEntry(
+function findOptionEntry(
+  submitted: readonly Decision[],
+  position: OptionContract & { symbol: string },
+  openQuantity: number
+): number | null {
+  const lots = submitted
+    .filter((d) => {
+      const order = d.order!;
+      return (
+        order.side === 'buy' &&
+        order.assetType === 'option' &&
+        order.symbol === position.symbol &&
+        order.limitPrice !== null &&
+        order.option !== null &&
+        order.option.optionType === position.optionType &&
+        Math.abs(order.option.strike - position.strike) < 0.0001 &&
+        order.option.expiration === position.expiration
+      );
+    })
+    .map((d) => ({ price: d.order!.limitPrice!, quantity: d.order!.quantity }));
+  return weightedAverageEntry(lots, openQuantity);
+}
+
+/**
+ * Entry basis for an equity position, matching the Robinhood app: the
+ * broker's per-share average cost from the position row when present (it
+ * already averages every fill, including adds), else the weighted average of
+ * the submitted buy limits covering the open shares. Shared with the
+ * dashboard's performance view (server.ts). `cost_basis` is deliberately not
+ * read — it is a position total, not a per-share price.
+ */
+export function resolveEquityEntry(submitted: readonly Decision[], position: Position): number | null {
+  return (
+    numberFromRaw(position.raw, ['average_buy_price', 'average_price', 'average_cost']) ??
+    findEquityEntry(submitted, position.symbol, position.quantity)
+  );
+}
+
+/**
+ * Entry basis for an option position, matching the Robinhood app: actual
+ * fills first (average_price of filled buys from get_option_orders, newest
+ * lots covering the open contracts), else the submitted limit premiums the
+ * same way. Position rows carry no cost data, so fills are the best source.
+ * Shared with the dashboard (server.ts).
+ */
+export function resolveOptionEntry(
   submitted: readonly Decision[],
   position: OptionPosition,
   orders: readonly OptionOrder[] | null,
   mark: number | null
 ): number | null {
-  const fromTrade = findOptionEntry(submitted, position);
-  if (fromTrade !== null) return fromTrade;
-  if (orders === null) return null;
-
-  const fills = orders
+  const fillLots = (orders ?? [])
     .filter(
       (o) =>
         o.side === 'buy' &&
@@ -342,10 +439,15 @@ function resolveOptionEntry(
         o.expiration === position.expiration &&
         o.averagePrice !== null
     )
-    .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''));
-  const average = fills[0]?.averagePrice ?? null;
-  if (average === null) return null;
-  return normalizeOptionPremium(average, mark);
+    .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+    .map((o) => ({
+      price: normalizeOptionPremium(o.averagePrice!, mark),
+      quantity: o.quantity > 0 ? o.quantity : 1,
+    }));
+  return (
+    weightedAverageEntry(fillLots, position.quantity) ??
+    findOptionEntry(submitted, position, position.quantity)
+  );
 }
 
 /** Robinhood sometimes reports 159 when the premium is 1.59. */

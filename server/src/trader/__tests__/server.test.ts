@@ -384,6 +384,86 @@ describe('GET /api/trades/performance', () => {
     expect(positions.find((p) => p.symbol === 'AAPL')!.entryPrice).toBe(150);
   });
 
+  it('prefers the broker-reported cost basis over the submitted limit price', async () => {
+    harness.configureBroker(USER.id, {
+      // RH string-encodes numerics; the row's average cost must beat the limit.
+      equityPositions: [
+        { symbol: 'AAPL', quantity: 10, raw: { average_buy_price: '148.5000' } },
+      ],
+      optionPositions: [
+        { symbol: 'QQQ', optionType: 'put', strike: 710, expiration: '2026-06-08', quantity: 2, raw: {} },
+      ],
+      quotePrice: 165,
+      markPrice: 1.94,
+      toolsOverrides: {
+        getOptionOrders: vi.fn().mockResolvedValue({
+          orders: [
+            {
+              orderId: 'opt-fill-1',
+              symbol: 'QQQ',
+              optionType: 'put',
+              strike: 710,
+              expiration: '2026-06-08',
+              side: 'buy',
+              state: 'filled',
+              averagePrice: 0.92,
+              quantity: 2,
+              createdAt: '2026-07-14T14:00:00.000Z',
+              raw: {},
+            },
+          ],
+          raw: {},
+        }),
+      },
+    });
+
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('eq', {
+        order: {
+          symbol: 'AAPL',
+          side: 'buy',
+          assetType: 'equity',
+          quantity: 10,
+          orderType: 'limit',
+          limitPrice: 150,
+          option: null,
+          orderId: 'eq-001',
+          status: 'queued',
+        },
+      })
+    );
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('opt', {
+        ticker: 'QQQ',
+        order: {
+          symbol: 'QQQ',
+          side: 'buy',
+          assetType: 'option',
+          quantity: 2,
+          orderType: 'limit',
+          limitPrice: 0.97,
+          option: { optionType: 'put', strike: 710, expiration: '2026-06-08' },
+          orderId: 'opt-001',
+          status: 'queued',
+        },
+      })
+    );
+
+    const { positions } = (await get('/api/trades/performance')).json() as {
+      positions: Array<{ symbol: string; entryPrice: number; pctChange: number }>;
+    };
+
+    const equity = positions.find((p) => p.symbol === 'AAPL')!;
+    expect(equity.entryPrice).toBe(148.5);
+    expect(equity.pctChange).toBeCloseTo(((165 - 148.5) / 148.5) * 100);
+
+    const option = positions.find((p) => p.symbol === 'QQQ')!;
+    expect(option.entryPrice).toBe(0.92);
+    expect(option.pctChange).toBeCloseTo(((1.94 - 0.92) / 0.92) * 100);
+  });
+
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
     harness.configureBroker(USER.id, {
       toolsOverrides: {
