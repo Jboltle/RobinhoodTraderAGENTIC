@@ -46,6 +46,23 @@ export function assertTokenForTrade(status: TokenStatus): void {
   }
 }
 
+/**
+ * The user's Robinhood session cannot serve a call right now: not authorized,
+ * waiting on an interactive OAuth consent, or the connect timed out. Distinct
+ * from a broker that answered — callers must never read this as "bad ticker".
+ */
+export class BrokerUnavailableError extends Error {
+  override readonly name = 'BrokerUnavailableError';
+}
+
+/** A tool call the broker answered with isError — it was reached and said no. */
+export class McpToolError extends Error {
+  override readonly name = 'McpToolError';
+}
+
+/** How long a trade-path call waits for a (re)connect from stored tokens. */
+export const READY_TIMEOUT_MS = 10_000;
+
 interface AuthCodeSubmission {
   readonly code: string;
   readonly state: string | null;
@@ -97,6 +114,52 @@ export class RobinhoodMcpClient {
       });
     }
     await this.connectPromise;
+  }
+
+  /**
+   * Trade-path connect: reuses (or starts) the shared connect from stored
+   * tokens, but never waits on a human. Rejects with BrokerUnavailableError as
+   * soon as the flow needs OAuth consent, or after `timeoutMs`; the connect
+   * itself keeps running, so a later call picks up the finished session.
+   */
+  async ensureReady(timeoutMs: number = READY_TIMEOUT_MS): Promise<void> {
+    if (this.client) return;
+    if (this.pendingAuthUrl) {
+      throw new BrokerUnavailableError(
+        'Robinhood authorization required — reconnect Robinhood in Settings'
+      );
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const connecting = this.ensureConnected().catch((err: unknown) => {
+      throw new BrokerUnavailableError(
+        `Robinhood connect failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    });
+    const blocked = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new BrokerUnavailableError('Robinhood connection timed out')),
+        timeoutMs
+      );
+      poll = setInterval(() => {
+        if (this.pendingAuthUrl && !this.client) {
+          reject(
+            new BrokerUnavailableError(
+              'Robinhood authorization required — reconnect Robinhood in Settings'
+            )
+          );
+        }
+      }, 100);
+    });
+    try {
+      await Promise.race([connecting, blocked]);
+    } finally {
+      clearTimeout(timer);
+      clearInterval(poll);
+      // The losing side of the race must not surface as an unhandled rejection.
+      connecting.catch(() => {});
+    }
   }
 
   /** Stored-token state for this user, for /api/broker/status and logging. */
@@ -287,7 +350,9 @@ export class RobinhoodMcpClient {
       log.info('unauthorized during tool call; reconnecting', { tool: name });
       this.client = undefined;
       this.connectPromise = undefined;
-      await this.ensureConnected();
+      // Bounded: a refresh that fails lands in the OAuth fallback, which only
+      // a human can finish — a trade call must fail fast instead of hanging.
+      await this.ensureReady();
       result = (await this.client!.callTool({ name, arguments: args })) as CallToolResult;
     }
     if (result.isError) {
@@ -296,7 +361,7 @@ export class RobinhoodMcpClient {
         .map((c) => c.text ?? '')
         .join(' ')
         .trim();
-      throw new Error(`Tool ${name} returned error: ${text || '(no message)'}`);
+      throw new McpToolError(`Tool ${name} returned error: ${text || '(no message)'}`);
     }
     return result;
   }

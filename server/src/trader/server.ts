@@ -124,9 +124,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // The connection of record is the user's broker_connections row, not the
     // in-memory session: stored tokens survive restarts and are what the
     // pipeline fans out over. A user with tokens but no warm session is still
-    // connected — trading recreates the session lazily from those tokens. The
-    // reverse is a stale session: when the row is gone the warm session no
-    // longer represents a connection, so it is evicted and status reports
+    // connected — the next broker call (RobinhoodTools → mcp.ensureReady)
+    // recreates the session from those tokens. The reverse is a stale session:
+    // when the row is gone the warm session no longer represents a
+    // connection, so it is evicted and status reports
     // disconnected instead of pretending off in-memory state.
     const stored = await deps.db.getBrokerTokens(userId);
     const tokens = readTokenStatus(stored?.tokens);

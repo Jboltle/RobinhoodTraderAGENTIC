@@ -15,8 +15,8 @@ import type {
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
 import { TraderEvents } from '../../events.js';
 import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
-import type { RobinhoodMcpClient } from '../../rh/mcpClient.js';
-import type { RobinhoodTools } from '../../rh/tools.js';
+import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
+import { SymbolNotFoundError, type RobinhoodTools } from '../../rh/tools.js';
 import { createMessageProcessor, type PipelineDeps } from '../index.js';
 import {
   AVG_DOWN_SPY_PUT,
@@ -430,7 +430,7 @@ describe('fan-out — error paths', () => {
     const { decision, tools } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       mtsla,
-      { getQuote: vi.fn().mockRejectedValue(new Error('could not parse quote price')) }
+      { getQuote: vi.fn().mockRejectedValue(new SymbolNotFoundError('no quote price')) }
     );
 
     expect(decision.kind).toBe('risk_rejected');
@@ -439,6 +439,34 @@ describe('fan-out — error paths', () => {
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
     expect(tools.getOptionsMarkPrice).not.toHaveBeenCalled();
     expect(tools.getBuyingPower).not.toHaveBeenCalled();
+  });
+
+  it('records broker_unavailable, not ticker_invalid, when the Robinhood session is down', async () => {
+    const { decision, tools } = await runWith(
+      envelopeFromFixture(BTO_QQQ_PUT),
+      BTO_QQQ_PUT.expectedCallout,
+      {
+        getQuote: vi
+          .fn()
+          .mockRejectedValue(new BrokerUnavailableError('Robinhood authorization required')),
+      }
+    );
+
+    expect(decision.kind).toBe('execution_failed');
+    expect(decision.code).toBe('broker_unavailable');
+    expect(decision.reason).toMatch(/authorization required/);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it('records execution_error, not ticker_invalid, when the quote call fails in transit', async () => {
+    const { decision } = await runWith(
+      envelopeFromFixture(BTO_QQQ_PUT),
+      BTO_QQQ_PUT.expectedCallout,
+      { getQuote: vi.fn().mockRejectedValue(new Error('fetch failed')) }
+    );
+
+    expect(decision.kind).toBe('execution_failed');
+    expect(decision.code).toBe('execution_error');
   });
 
   it('records execution_failed when placeOptionsOrder throws', async () => {

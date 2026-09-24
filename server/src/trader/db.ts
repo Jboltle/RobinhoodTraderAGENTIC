@@ -31,7 +31,7 @@
  *   allowed_emails      invite gate, independent of the sign-in mechanism
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, ne } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 
@@ -214,6 +214,15 @@ export interface TraderDb {
     disposition: MessageDisposition,
     parse: Callout | null
   ): Promise<void>;
+  /**
+   * Atomically take ownership of an unprocessed row for `instanceId`. True
+   * when this instance may handle it: unclaimed, already ours, or claimed
+   * before `staleBefore` by an instance that never finished. False means
+   * another live instance owns it — do not fan out.
+   */
+  claimMessage(messageId: string, instanceId: string, staleBefore: Date): Promise<boolean>;
+  /** Instance currently holding the claim on a row, for diagnostics. */
+  getMessageClaimant(messageId: string): Promise<string | null>;
   /** Take the row off the work queue once fully handled (fan-out included). */
   markMessageProcessed(messageId: string): Promise<void>;
 
@@ -301,6 +310,8 @@ class DrizzleTraderDb implements TraderDb {
   }
 
   async recordDecision(userId: string, decision: Decision): Promise<void> {
+    // Backstop for the poller claim: one decision per user per message
+    // (trades_user_message_uidx) — a second write for the same pair is dropped.
     await this.db.insert(trades).values({
       userId,
       messageId: decision.messageId,
@@ -311,7 +322,7 @@ class DrizzleTraderDb implements TraderDb {
       action: decision.action,
       orderPayload: decision.order,
       timestamp: new Date(decision.at),
-    });
+    }).onConflictDoNothing({ target: [trades.userId, trades.messageId] });
   }
 
   async resolvePendingApproval(
@@ -430,10 +441,39 @@ class DrizzleTraderDb implements TraderDb {
     await this.db.update(messages).set({ disposition, parse }).where(eq(messages.id, messageId));
   }
 
+  async claimMessage(messageId: string, instanceId: string, staleBefore: Date): Promise<boolean> {
+    const rows = await this.db
+      .update(messages)
+      .set({ claimedAt: new Date(), claimedBy: instanceId })
+      .where(
+        and(
+          eq(messages.id, messageId),
+          isNull(messages.processedAt),
+          or(
+            isNull(messages.claimedAt),
+            eq(messages.claimedBy, instanceId),
+            lt(messages.claimedAt, staleBefore)
+          )
+        )
+      )
+      .returning({ id: messages.id });
+    return rows.length > 0;
+  }
+
+  async getMessageClaimant(messageId: string): Promise<string | null> {
+    const [row] = await this.db
+      .select({ claimedBy: messages.claimedBy })
+      .from(messages)
+      .where(eq(messages.id, messageId));
+    return row?.claimedBy ?? null;
+  }
+
   async markMessageProcessed(messageId: string): Promise<void> {
+    // claimed_at is released so a row the Listener re-opens (recap edits)
+    // can be claimed again; claimed_by stays as the record of who handled it.
     await this.db
       .update(messages)
-      .set({ processedAt: new Date() })
+      .set({ processedAt: new Date(), claimedAt: null })
       .where(eq(messages.id, messageId));
   }
 

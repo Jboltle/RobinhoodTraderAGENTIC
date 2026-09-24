@@ -120,6 +120,10 @@ export const messages = pgTable('messages', {
   disposition: text('disposition').$type<MessageDisposition>(),
   parse: jsonb('parse').$type<Callout>(),
   processedAt: isoTimestamp('processed_at'),
+  /** Poller claim: set by the instance handling the row, cleared once processed. */
+  claimedAt: isoTimestamp('claimed_at'),
+  /** Instance id of the last poller to claim the row (kept after processing). */
+  claimedBy: text('claimed_by'),
 });
 
 /** The Caller roster: one row per Discord author, upserted on ingest. */

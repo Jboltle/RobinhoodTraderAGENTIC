@@ -182,6 +182,7 @@ const broker: UserBroker = {
     isAuthPending: () => false,
     submitAuthCode: () => {},
     ensureConnected: async () => {},
+    ensureReady: async () => {},
     getTokenStatus: async () => ({ state: 'valid', hasRefreshToken: true }),
     getToolNames: () => [],
   } as unknown as RobinhoodMcpClient,

@@ -223,6 +223,7 @@ export type RejectionCode =
   | 'ticker_blocked'        // ticker on the blocklist
   | 'ticker_not_allowed'    // ticker missing from a non-empty allowlist
   | 'ticker_invalid'        // broker has no equity quote for the parsed ticker
+  | 'broker_unavailable'    // user's Robinhood session not connected / needs re-authorization
   | 'outside_market_hours'  // regular-hours gate active
   | 'daily_cap_reached'     // max trades per day hit
   | 'cooldown_active'       // per-ticker cooldown still running

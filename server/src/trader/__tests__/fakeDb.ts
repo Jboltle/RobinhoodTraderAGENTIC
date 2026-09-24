@@ -42,6 +42,8 @@ export interface FakeMessageRow {
   readonly disposition: MessageDisposition | null;
   readonly parse: Callout | null;
   readonly processedAt: string | null;
+  readonly claimedAt?: string | null;
+  readonly claimedBy?: string | null;
 }
 
 /** Seed shape for messages rows; everything optional except identity + time. */
@@ -188,6 +190,10 @@ export function createFakeDb(): FakeDb {
       return record('listDecisions', userId, newestFirst.slice(0, limit));
     },
     async recordDecision(userId, decision) {
+      // Mirrors trades_user_message_uidx + ON CONFLICT DO NOTHING.
+      if (trades.some((r) => r.userId === userId && r.decision.messageId === decision.messageId)) {
+        return;
+      }
       trades.push({ userId, decision });
       record('recordDecision', userId, undefined);
     },
@@ -288,10 +294,33 @@ export function createFakeDb(): FakeDb {
         parse,
       });
     },
+    async claimMessage(messageId, instanceId, staleBefore) {
+      const existing = messages.get(messageId);
+      if (!existing || existing.processedAt !== null) return false;
+      const claimedAt = existing.claimedAt ?? null;
+      const claimable =
+        claimedAt === null ||
+        existing.claimedBy === instanceId ||
+        Date.parse(claimedAt) < staleBefore.getTime();
+      if (!claimable) return false;
+      messages.set(messageId, {
+        ...existing,
+        claimedAt: new Date().toISOString(),
+        claimedBy: instanceId,
+      });
+      return true;
+    },
+    async getMessageClaimant(messageId) {
+      return messages.get(messageId)?.claimedBy ?? null;
+    },
     async markMessageProcessed(messageId) {
       const existing = messages.get(messageId);
       if (existing) {
-        messages.set(messageId, { ...existing, processedAt: new Date().toISOString() });
+        messages.set(messageId, {
+          ...existing,
+          processedAt: new Date().toISOString(),
+          claimedAt: null,
+        });
       }
     },
     async listCallouts(limit) {
