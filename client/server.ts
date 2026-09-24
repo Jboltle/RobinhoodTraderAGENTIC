@@ -25,7 +25,19 @@ function indexHtml(html: string): string {
   return html.includes('<head>') ? html.replace('<head>', `<head>${tag}`) : tag + html
 }
 
-const PROXY_REQUEST_HEADERS = ['accept', 'authorization', 'content-type'] as const
+const PROXY_REQUEST_HEADERS = [
+  'accept',
+  'authorization',
+  'content-type',
+  // Conditional revalidation: the trader answers 304 + empty body when the
+  // payload hash still matches, which is most polls.
+  'if-none-match',
+] as const
+
+/** gzip a response body when the browser accepts it. Egress is billed on this hop. */
+function acceptsGzip(req: Request): boolean {
+  return req.headers.get('accept-encoding')?.includes('gzip') ?? false
+}
 
 async function proxyToTrader(req: Request, url: URL): Promise<Response> {
   if (!TRADER_URL) {
@@ -62,20 +74,51 @@ async function proxyToTrader(req: Request, url: URL): Promise<Response> {
   const out = new Headers()
   const contentType = upstream.headers.get('content-type')
   if (contentType) out.set('content-type', contentType)
+  for (const name of ['etag', 'cache-control'] as const) {
+    const value = upstream.headers.get(name)
+    if (value) out.set(name, value)
+  }
   if (contentType?.includes('text/event-stream')) {
     out.set('cache-control', 'no-cache')
     out.set('connection', 'keep-alive')
+    return new Response(upstream.body, { status: upstream.status, headers: out })
+  }
+
+  // JSON compresses ~85-90%; SSE above keeps its streaming path and 304/204
+  // bodies are already empty.
+  if (upstream.status === 200 && acceptsGzip(req) && contentType?.includes('application/json')) {
+    out.set('content-encoding', 'gzip')
+    out.set('vary', 'accept-encoding')
+    const body = Bun.gzipSync(new Uint8Array(await upstream.arrayBuffer()))
+    return new Response(body, { status: 200, headers: out })
   }
   return new Response(upstream.body, { status: upstream.status, headers: out })
 }
 
-async function serveStatic(pathname: string): Promise<Response | null> {
+const COMPRESSIBLE_ASSET_RE = /\.(js|css|svg|json|txt|map|html)$/
+
+async function serveStatic(req: Request, pathname: string): Promise<Response | null> {
   if (pathname === '/') return null
   const filePath = join(CLIENT_DIR, normalize(pathname))
   if (!filePath.startsWith(CLIENT_DIR)) return null
   const file = Bun.file(filePath)
   if (!(await file.exists())) return null
-  return new Response(file)
+
+  const headers = new Headers({ 'content-type': file.type })
+  // Vite content-hashes everything under /assets, so those never change in
+  // place — cache forever instead of re-shipping the bundle every visit.
+  headers.set(
+    'cache-control',
+    pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+  )
+  if (acceptsGzip(req) && COMPRESSIBLE_ASSET_RE.test(pathname)) {
+    // ponytail: gzip per request; upgrade path is precompressing at build if
+    // CPU ever matters more than the immutable cache already saves.
+    headers.set('content-encoding', 'gzip')
+    headers.set('vary', 'accept-encoding')
+    return new Response(Bun.gzipSync(new Uint8Array(await file.arrayBuffer())), { headers })
+  }
+  return new Response(file, { headers })
 }
 
 Bun.serve({
@@ -93,13 +136,16 @@ Bun.serve({
       return proxyToTrader(req, url)
     }
 
-    const file = await serveStatic(pathname)
+    const file = await serveStatic(req, pathname)
     if (file) return file
 
     const index = Bun.file(INDEX_HTML)
     if (await index.exists()) {
       return new Response(indexHtml(await index.text()), {
-        headers: { 'content-type': 'text/html; charset=utf-8' },
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-cache',
+        },
       })
     }
     return new Response('client build missing — run bun run build', { status: 500 })

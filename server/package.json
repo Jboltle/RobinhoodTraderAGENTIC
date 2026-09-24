@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",
+    "@fastify/etag": "^6.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@supabase/supabase-js": "^2.110.8",
     "@tanstack/ai": "^0.40.0",

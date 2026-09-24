@@ -274,6 +274,36 @@ describe('GET /api/callouts', () => {
     // the callout is simply in the feed with no decision.
     expect(callouts[1]!.decision).toBeNull();
   });
+
+  // The 60s dashboard poll usually finds nothing new; the etag handshake makes
+  // those polls cost a header instead of 100 messages of body.
+  it('revalidates with 304 + empty body when nothing changed', async () => {
+    harness.db.seedCallout(calloutFixture('msg-1', '2026-07-15T14:30:00.000Z'));
+
+    const first = await get('/api/callouts');
+    expect(first.statusCode).toBe(200);
+    expect(first.headers['cache-control']).toBe('private, no-cache');
+    const etag = first.headers.etag as string;
+    expect(etag).toBeTruthy();
+
+    const unchanged = await harness.as(TOKEN, {
+      method: 'GET',
+      url: '/api/callouts',
+      headers: { 'if-none-match': etag },
+    });
+    expect(unchanged.statusCode).toBe(304);
+    expect(unchanged.body).toBe('');
+
+    // New content = new etag = full body again.
+    harness.db.seedCallout(calloutFixture('msg-2', '2026-07-15T15:00:00.000Z'));
+    const changed = await harness.as(TOKEN, {
+      method: 'GET',
+      url: '/api/callouts',
+      headers: { 'if-none-match': etag },
+    });
+    expect(changed.statusCode).toBe(200);
+    expect(changed.headers.etag).not.toBe(etag);
+  });
 });
 
 describe('GET /api/callers', () => {

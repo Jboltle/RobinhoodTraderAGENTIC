@@ -9,6 +9,7 @@
  * mocked deps.
  */
 import fastifyCors from '@fastify/cors';
+import fastifyEtag from '@fastify/etag';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
@@ -75,6 +76,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // filter; /webhook is HMAC-protected and /health is public, so the extra
   // scope is harmless. Upgrade path: move /api routes into a prefixed scope.
   fastify.register(fastifyCors, { origin: true, methods: ['GET', 'PUT', 'POST'] });
+
+  // Egress: hash every response so a poll that changed nothing returns a 304
+  // with an empty body instead of re-sending 100 callouts. `no-cache` means
+  // "store, but revalidate every time" — the browser's HTTP cache then sends
+  // If-None-Match on its own and serves the cached body on 304, so the
+  // dashboard code never sees anything but a normal 200.
+  fastify.register(fastifyEtag);
+  fastify.addHook('onSend', async (request, reply) => {
+    if (request.method === 'GET' && request.url.startsWith('/api/') && !reply.getHeader('cache-control')) {
+      reply.header('cache-control', 'private, no-cache');
+    }
+  });
 
   registerAuth(fastify, deps.db);
 
@@ -434,22 +447,32 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         );
     };
 
+    // Egress: quotes barely move between 5s ticks (and not at all overnight),
+    // so a frame identical to the last one is not worth the bytes.
+    let lastPerformanceFrame = '';
+    const sendPerformance = (data: { positions: unknown; error: string | null }): void => {
+      const frame = JSON.stringify(data);
+      if (frame === lastPerformanceFrame) return;
+      lastPerformanceFrame = frame;
+      reply.raw.write(`event: performance\ndata: ${frame}\n\n`);
+    };
+
     const pushPerformance = async (): Promise<void> => {
       try {
         const tools = await connectedBrokerTools(deps, userId);
         if (tools === null) {
           // No connection of record (disconnected, or the row was removed):
           // an error frame, never data from a session that outlived its row.
-          send('performance', { positions: null, error: 'Robinhood is not connected' });
+          sendPerformance({ positions: null, error: 'Robinhood is not connected' });
           return;
         }
-        send('performance', {
+        sendPerformance({
           positions: await collectPerformance(deps, userId, tools),
           error: null,
         });
       } catch (err) {
         // Robinhood MCP down/unauthed: keep the stream alive with an error shape.
-        send('performance', { positions: null, error: (err as Error).message });
+        sendPerformance({ positions: null, error: (err as Error).message });
       }
     };
 
