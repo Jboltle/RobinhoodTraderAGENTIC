@@ -4,11 +4,12 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { ConnectBanner } from './ConnectBanner'
+import { ConnectDialog } from './ConnectDialog'
 import type { BrokerConnectResult, BrokerStatus } from '../lib/api'
 
 const { fetchBrokerStatus, connectBroker, submitBrokerRedirect } = vi.hoisted(() => ({
   fetchBrokerStatus: vi.fn<() => Promise<BrokerStatus>>(),
-  connectBroker: vi.fn<() => Promise<BrokerConnectResult>>(),
+  connectBroker: vi.fn<(options: { force: boolean }) => Promise<BrokerConnectResult>>(),
   submitBrokerRedirect: vi.fn<(url: string) => Promise<void>>(),
 }))
 vi.mock('../lib/api', () => ({ fetchBrokerStatus, connectBroker, submitBrokerRedirect }))
@@ -183,4 +184,49 @@ test('flashes Connected then closes the dialog', async () => {
   )
 
   await waitFor(() => expect(utils.container.textContent).toBe(''), { timeout: 3000 })
+})
+
+test('the banner connect flow does not force a session teardown', async () => {
+  fetchBrokerStatus.mockResolvedValue(disconnected)
+  const utils = renderBanner()
+
+  await openConnectDialog(utils)
+  await waitFor(() =>
+    expect(connectBroker).toHaveBeenCalledWith({ force: false }, expect.anything()),
+  )
+})
+
+test('the settings Reconnect dialog forces a fresh session', async () => {
+  fetchBrokerStatus.mockResolvedValue({ ...disconnected, connected: true })
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={queryClient}>
+      <ConnectDialog open force onClose={() => {}} />
+    </QueryClientProvider>,
+  )
+
+  await waitFor(() =>
+    expect(connectBroker).toHaveBeenCalledWith({ force: true }, expect.anything()),
+  )
+})
+
+// The client half of the stale-data fix: once the server reports the stored
+// connection gone, account numbers and live prices must vanish rather than
+// freeze at their last-known values.
+test('a disconnected status clears cached portfolio and performance data', async () => {
+  fetchBrokerStatus.mockResolvedValue(disconnected)
+  const utils = renderBanner()
+  utils.queryClient.setQueryData(['portfolio'], {
+    portfolioValueUsd: 2137.2,
+    buyingPowerUsd: 483,
+    openPositions: 2,
+  })
+  utils.queryClient.setQueryData(['performance'], [{ symbol: 'AAPL' }])
+
+  await waitFor(() =>
+    expect(utils.queryClient.getQueryData(['portfolio'])).toBeUndefined(),
+  )
+  expect(utils.queryClient.getQueryData(['performance'])).toBeUndefined()
 })

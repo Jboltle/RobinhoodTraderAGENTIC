@@ -4,13 +4,17 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check } from 'lucide-react'
 
 import {
+  disconnectBroker,
+  fetchBrokerStatus,
   fetchCallers,
   fetchPortfolio,
   fetchSettings,
+  type BrokerStatus,
   type Caller,
   type TradeSettings,
   type TradeSettingsInput,
 } from '../lib/api'
+import { ConnectDialog } from '../components/ConnectDialog'
 import { discordDefaultAvatarUrl, toggleCaller } from '../lib/following'
 import { saveSettings } from '../lib/settingsSync'
 
@@ -41,7 +45,103 @@ function SettingsPage() {
       </div>
     )
   }
-  return <SettingsForm initial={settings.data} defaults={settings.data} />
+  return (
+    <div className="flex max-w-2xl flex-col gap-6">
+      <BrokerSection />
+      <SettingsForm initial={settings.data} defaults={settings.data} />
+    </div>
+  )
+}
+
+// =============================================================================
+// Robinhood connection
+// =============================================================================
+
+/**
+ * Connection status plus the manual recovery actions. Reconnect always forces
+ * a fresh session server-side, so it also unwedges a connection the status
+ * still calls healthy: saved authorization is retried first, and the
+ * authorize-and-paste dialog only appears when Robinhood no longer accepts it.
+ */
+function BrokerSection() {
+  const queryClient = useQueryClient()
+  // Kept fresh by ConnectBanner's poll (mounted on every page); this query
+  // just subscribes to the same cache entry.
+  const status = useQuery<BrokerStatus>({
+    queryKey: ['broker-status'],
+    queryFn: fetchBrokerStatus,
+    retry: false,
+  })
+  const [dialogOpen, setDialogOpen] = useState(false)
+
+  const disconnect = useMutation({
+    mutationFn: disconnectBroker,
+    onSuccess: () =>
+      void queryClient.invalidateQueries({ queryKey: ['broker-status'] }),
+  })
+
+  const connected = status.data?.connected === true
+
+  return (
+    <FormSection title="Robinhood connection">
+      <div className="flex items-center gap-2.5">
+        <span
+          className={`size-2 rounded-full ${connected ? 'bg-gain' : 'animate-pulse bg-warn'}`}
+        />
+        <span className="text-sm font-medium text-white">
+          {status.isPending
+            ? 'Checking…'
+            : connected
+              ? 'Connected'
+              : 'Not connected'}
+        </span>
+      </div>
+
+      <p className="-mt-1 text-xs leading-relaxed text-ink-400">
+        Trading and live account data stop when this connection breaks.
+        Reconnect retries with your saved authorization and only asks you to
+        authorize again when Robinhood no longer accepts it.
+      </p>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={() => setDialogOpen(true)}
+          className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-brand/80"
+        >
+          {connected ? 'Reconnect' : 'Connect'}
+        </button>
+        {connected && (
+          <button
+            type="button"
+            disabled={disconnect.isPending}
+            onClick={() => {
+              if (
+                window.confirm(
+                  'Disconnect Robinhood? Trading stops until you connect again.',
+                )
+              )
+                disconnect.mutate()
+            }}
+            className="rounded-lg border border-ink-600 px-4 py-2 text-sm text-ink-400 transition-colors hover:border-loss/40 hover:text-loss disabled:opacity-50"
+          >
+            {disconnect.isPending ? 'Disconnecting…' : 'Disconnect'}
+          </button>
+        )}
+        {disconnect.isError && (
+          <span className="text-xs text-loss">
+            {(disconnect.error as Error).message}
+          </span>
+        )}
+      </div>
+
+      <ConnectDialog
+        open={dialogOpen}
+        force
+        onClose={() => setDialogOpen(false)}
+      />
+    </FormSection>
+  )
 }
 
 function SettingsForm({

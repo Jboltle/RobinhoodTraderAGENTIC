@@ -82,6 +82,10 @@ beforeEach(() => {
   harness.db.seedDecision(USER_A.id, A_TRADE);
   harness.db.seedDecision(USER_A.id, A_PENDING);
   harness.db.seedBrokerTokens(USER_A.id, fakeTokens('a-access-token', 'a-refresh-token'));
+  // B holds their own connection: broker data only serves with a stored
+  // connection of record, and a disconnected B would turn the portfolio and
+  // performance checks below into vacuous 409s.
+  harness.db.seedBrokerTokens(USER_B.id, fakeTokens('b-access-token'));
   harness.db.seedCallout(SHARED_CALLOUT);
 
   harness.configureBroker(USER_A.id, {
@@ -218,9 +222,10 @@ describe('user B cannot see user A', () => {
     expect(pending!.kind).toBe('pending_approval');
   });
 
-  it("B's broker status reports B's session, not A's live connection", async () => {
+  it("B's broker status reports B's own connection, not A's pending auth URL", async () => {
     const response = await harness.as(TOKEN_B, { method: 'GET', url: '/api/broker/status' });
-    expect(response.json()).toMatchObject({ connected: false, authUrl: null });
+    // Connected via B's own stored tokens; A's pending consent URL must not leak.
+    expect(response.json()).toMatchObject({ connected: true, authUrl: null });
 
     const asA = await harness.as(TOKEN_A, { method: 'GET', url: '/api/broker/status' });
     expect(asA.json()).toMatchObject({ connected: true });

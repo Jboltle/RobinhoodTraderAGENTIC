@@ -13,7 +13,7 @@
  */
 import { createLogger } from '../shared/logger.js';
 import type { Decision, SubmittedOrder } from '../shared/types.js';
-import { createFakeDb } from '../trader/__tests__/fakeDb.js';
+import { createFakeDb, fakeTokens } from '../trader/__tests__/fakeDb.js';
 import { TraderEvents } from '../trader/events.js';
 import type { McpRegistry, UserBroker } from '../trader/rh/mcpRegistry.js';
 import type { RobinhoodMcpClient } from '../trader/rh/mcpClient.js';
@@ -32,6 +32,9 @@ const db = createFakeDb();
 // The browser's session is hand-made, so its token is whatever we say it is.
 db.addUser(USER, 'dev-token');
 db.allowEmail(USER.email);
+// Broker data now serves only with a stored connection of record; without
+// this the sandbox portfolio/performance would answer 409 "not connected".
+db.seedBrokerTokens(USER.id, fakeTokens('dev-access-token', 'dev-refresh-token'));
 
 // A roster to exercise the Following picker. Deliberately more than a handful:
 // the bug this sandbox exists to check is a fresh account copying everyone.

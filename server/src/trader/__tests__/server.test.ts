@@ -93,6 +93,12 @@ describe('/api/trades/:messageId/approve|reject', () => {
     return messageId;
   };
 
+  // Approving submits over the broker, which serves only with a stored
+  // connection of record.
+  beforeEach(() => {
+    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+  });
+
   it('approve submits the sized order and flips the row to submitted', async () => {
     const messageId = seedPending();
 
@@ -156,6 +162,20 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(decision.reason).toContain('MCP transport closed');
   });
 
+  // A stale warm session must not spend money; the row must survive so the
+  // user can reconnect and approve the same trade.
+  it('approve 409s and keeps the trade pending when no stored connection exists', async () => {
+    const messageId = seedPending();
+    await harness.db.deleteBrokerTokens(USER.id);
+    harness.configureBroker(USER.id, { connected: true });
+
+    const response = await send('POST', `/api/trades/${messageId}/approve`, {});
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
+    expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+    expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -290,6 +310,23 @@ describe('GET /api/callers', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/trades/performance', () => {
+  // Broker data serves only with a stored connection of record.
+  beforeEach(() => {
+    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+  });
+
+  it('409s instead of serving when no stored connection exists', async () => {
+    await harness.db.deleteBrokerTokens(USER.id);
+    harness.configureBroker(USER.id, {
+      connected: true,
+      equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+    });
+
+    const response = await get('/api/trades/performance');
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
+  });
+
   it('joins open positions with the caller\u2019s submitted orders and live quotes', async () => {
     harness.configureBroker(USER.id, {
       equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
@@ -478,6 +515,23 @@ describe('GET /api/trades/performance', () => {
 });
 
 describe('GET /api/portfolio', () => {
+  beforeEach(() => {
+    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+  });
+
+  // The regression this guards: the broker_connections row was removed but a
+  // warm in-memory session kept feeding the dashboard that user's account.
+  it('409s and evicts the stale warm session when the stored connection is gone', async () => {
+    await harness.db.deleteBrokerTokens(USER.id);
+    harness.configureBroker(USER.id, { connected: true, portfolioValueUsd: 25_431.5 });
+    harness.brokerFor(USER.id);
+
+    const response = await get('/api/portfolio');
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
+    expect(harness.brokers.existing(USER.id)).toBeUndefined();
+  });
+
   it('returns portfolio value and counts only open positions', async () => {
     harness.configureBroker(USER.id, {
       portfolioValueUsd: 25_431.5,
@@ -551,6 +605,49 @@ describe('/api/broker', () => {
       connected: true,
       tokenState: 'refreshable',
     });
+  });
+
+  it('status reports disconnected and evicts the warm session when the row is gone', async () => {
+    // A session that outlived its broker_connections row (operator reset,
+    // disconnect made elsewhere) must not keep the dashboard looking healthy.
+    harness.configureBroker(USER.id, { connected: true });
+    harness.brokerFor(USER.id);
+
+    const response = await get('/api/broker/status');
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ connected: false, tokenState: 'missing' });
+    expect(harness.brokers.existing(USER.id)).toBeUndefined();
+  });
+
+  it('status leaves a pending OAuth session alone even though no tokens are stored', async () => {
+    harness.configureBroker(USER.id, {
+      connected: false,
+      authPending: true,
+      authUrl: 'https://robinhood.com/mcp/trading?state=abc',
+    });
+    harness.brokerFor(USER.id);
+
+    const response = await get('/api/broker/status');
+    expect(response.json()).toMatchObject({
+      connected: false,
+      authUrl: 'https://robinhood.com/mcp/trading?state=abc',
+    });
+    expect(harness.brokers.existing(USER.id)).toBeDefined();
+  });
+
+  it('connect with force tears down the current session and starts fresh', async () => {
+    harness.configureBroker(USER.id, { connected: true });
+    const before = harness.brokerFor(USER.id);
+
+    const response = await send('POST', '/api/broker/connect', { force: true });
+
+    expect(response.statusCode).toBe(200);
+    expect(harness.brokers.existing(USER.id)).toBeDefined();
+    expect(harness.brokers.existing(USER.id)).not.toBe(before);
+  });
+
+  it('connect 400s on a malformed force flag', async () => {
+    expect((await send('POST', '/api/broker/connect', { force: 'yes' })).statusCode).toBe(400);
   });
 
   it('connect returns the authorization URL to open', async () => {
@@ -628,6 +725,7 @@ describe('GET /api/stream', () => {
   // inject() can't consume a never-ending hijacked stream, so listen on an
   // ephemeral port and read real SSE frames over http.
   it('streams a decisions snapshot, live pushes, and performance frames', async () => {
+    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
     harness.db.seedDecision(USER.id, decisionFixture('seed', { reason: 'seed' }));
 
     await harness.app.listen({ port: 0, host: '127.0.0.1' });
@@ -669,6 +767,40 @@ describe('GET /api/stream', () => {
         stage: 'executing',
       });
       await readUntil((t) => t.includes('event: stage') && t.includes('"stage":"executing"'));
+    } finally {
+      abort.abort();
+      await harness.app.close();
+    }
+  }, 10_000);
+
+  // The stale-data regression over SSE: with no stored connection the first
+  // performance frame must be the not-connected error, never account data
+  // from a leftover warm session.
+  it('performance frames report not-connected instead of serving a stale session', async () => {
+    harness.configureBroker(USER.id, {
+      connected: true,
+      equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+    });
+    harness.brokerFor(USER.id);
+
+    await harness.app.listen({ port: 0, host: '127.0.0.1' });
+    const { port } = harness.app.server.address() as { port: number };
+    const abort = new AbortController();
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/stream`, {
+        signal: abort.signal,
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      const reader = response.body!.getReader();
+      let buffer = '';
+      while (!buffer.includes('event: performance')) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error('stream ended early');
+        buffer += new TextDecoder().decode(value);
+      }
+      expect(buffer).toContain('"error":"Robinhood is not connected"');
+      expect(buffer).not.toContain('AAPL');
     } finally {
       abort.abort();
       await harness.app.close();

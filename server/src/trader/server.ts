@@ -56,6 +56,9 @@ const AUTH_URL_POLL_MS = 100;
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
 const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 
+/** `force` tears down the current session first — the settings Reconnect. */
+const BrokerConnectBodySchema = z.object({ force: z.boolean().optional() });
+
 const MagicLinkBodySchema = z.object({ email: z.email() });
 
 export interface ServerDeps {
@@ -118,20 +121,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   fastify.get('/api/broker/status', async (request, reply) => {
     const { id: userId } = requireUser(request);
-    const broker = deps.brokers.existing(userId);
     // The connection of record is the user's broker_connections row, not the
     // in-memory session: stored tokens survive restarts and are what the
     // pipeline fans out over. A user with tokens but no warm session is still
-    // connected — trading recreates the session lazily from those tokens.
+    // connected — trading recreates the session lazily from those tokens. The
+    // reverse is a stale session: when the row is gone the warm session no
+    // longer represents a connection, so it is evicted and status reports
+    // disconnected instead of pretending off in-memory state.
     const stored = await deps.db.getBrokerTokens(userId);
     const tokens = readTokenStatus(stored?.tokens);
+    if (tokens.state === 'missing') dropStaleBrokerSession(deps, userId);
     const settings = await deps.db.getSettings(userId);
     return reply.send({
-      connected:
-        tokens.state === 'valid' ||
-        tokens.state === 'refreshable' ||
-        (broker?.mcp.isConnected() ?? false),
-      authUrl: broker?.mcp.getPendingAuthUrl() ?? null,
+      connected: tokens.state === 'valid' || tokens.state === 'refreshable',
+      authUrl: deps.brokers.existing(userId)?.mcp.getPendingAuthUrl() ?? null,
       tokenState: tokens.state,
       executionMode: settings.executionMode,
     });
@@ -143,6 +146,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // redirect URL into POST /api/broker/callback.
   fastify.post('/api/broker/connect', async (request, reply) => {
     const { id: userId } = requireUser(request);
+    const parsed = BrokerConnectBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'body must be { force?: boolean }' });
+    }
+    // Reconnect (settings page): drop the current session — connected but
+    // wedged, or holding an abandoned OAuth flow — and run the flow again.
+    // Stored tokens are kept: when they still refresh this reconnects with no
+    // consent step, else the browser OAuth fallback issues a fresh auth URL.
+    if (parsed.data.force === true) deps.brokers.drop(userId);
     const broker = deps.brokers.for(userId);
     if (broker.mcp.isConnected()) {
       return reply.send({ connected: true, authUrl: null });
@@ -238,8 +250,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.status(409).send({ error: 'that trade has no sized order to submit' });
     }
 
+    // Approving spends money over the user's broker session, so it must not
+    // run against a stale one. The row stays pending — reconnect, then approve.
+    const tools = await connectedBrokerTools(deps, userId);
+    if (tools === null) {
+      return reply.status(409).send({ error: 'Robinhood is not connected' });
+    }
+
     const approvedAt = new Date().toISOString();
-    const tools = deps.brokers.for(userId).tools;
     let outcome: ApprovalOutcome;
     try {
       const placed = await submitOrder(pending.order, tools);
@@ -339,8 +357,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // count of open (quantity > 0) equity + option positions.
   fastify.get('/api/portfolio', async (request, reply) => {
     const { id: userId } = requireUser(request);
+    const tools = await connectedBrokerTools(deps, userId);
+    if (tools === null) {
+      return reply.status(409).send({ error: 'Robinhood is not connected' });
+    }
     try {
-      const tools = deps.brokers.for(userId).tools;
       const [buyingPower, equity, options] = await Promise.all([
         tools.getBuyingPower(),
         tools.getPositions(),
@@ -363,8 +384,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   fastify.get('/api/trades/performance', async (request, reply) => {
     const { id: userId } = requireUser(request);
+    const tools = await connectedBrokerTools(deps, userId);
+    if (tools === null) {
+      return reply.status(409).send({ error: 'Robinhood is not connected' });
+    }
     try {
-      return reply.send({ positions: await collectPerformance(deps, userId) });
+      return reply.send({ positions: await collectPerformance(deps, userId, tools) });
     } catch (err) {
       return reply
         .status(503)
@@ -410,7 +435,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     const pushPerformance = async (): Promise<void> => {
       try {
-        send('performance', { positions: await collectPerformance(deps, userId), error: null });
+        const tools = await connectedBrokerTools(deps, userId);
+        if (tools === null) {
+          // No connection of record (disconnected, or the row was removed):
+          // an error frame, never data from a session that outlived its row.
+          send('performance', { positions: null, error: 'Robinhood is not connected' });
+          return;
+        }
+        send('performance', {
+          positions: await collectPerformance(deps, userId, tools),
+          error: null,
+        });
       } catch (err) {
         // Robinhood MCP down/unauthed: keep the stream alive with an error shape.
         send('performance', { positions: null, error: (err as Error).message });
@@ -506,6 +541,38 @@ async function loadFeed(deps: ServerDeps, userId: string): Promise<CalloutFeedIt
   }));
 }
 
+// =============================================================================
+// Broker connection guard
+// =============================================================================
+
+/**
+ * The user's broker tools, gated on the connection of record (their
+ * broker_connections row). Every route that reads or trades the user's
+ * Robinhood account goes through here, so none of them can serve from a warm
+ * in-memory session whose stored connection no longer exists. Null means
+ * "not connected" — callers answer 409, distinct from the 503 "broker down".
+ */
+async function connectedBrokerTools(
+  deps: ServerDeps,
+  userId: string
+): Promise<RobinhoodTools | null> {
+  const stored = await deps.db.getBrokerTokens(userId);
+  if (readTokenStatus(stored?.tokens).state !== 'missing') {
+    return deps.brokers.for(userId).tools;
+  }
+  dropStaleBrokerSession(deps, userId);
+  return null;
+}
+
+/**
+ * Evict a warm session that outlived its broker_connections row (removed by
+ * an operator reset or a disconnect made elsewhere). Sessions mid-OAuth are
+ * not connected yet and are left alone so the flow they hold can finish.
+ */
+function dropStaleBrokerSession(deps: ServerDeps, userId: string): void {
+  if (deps.brokers.existing(userId)?.mcp.isConnected()) deps.brokers.drop(userId);
+}
+
 async function waitForAuthUrl(broker: UserBroker): Promise<string | null> {
   const deadline = Date.now() + AUTH_URL_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -542,8 +609,11 @@ interface PerformanceRow {
   readonly pctChange: number | null;
 }
 
-async function collectPerformance(deps: ServerDeps, userId: string): Promise<PerformanceRow[]> {
-  const tools: RobinhoodTools = deps.brokers.for(userId).tools;
+async function collectPerformance(
+  deps: ServerDeps,
+  userId: string,
+  tools: RobinhoodTools
+): Promise<PerformanceRow[]> {
   const [equity, options, decisions] = await Promise.all([
     tools.getPositions(),
     tools.getOptionPositions(),

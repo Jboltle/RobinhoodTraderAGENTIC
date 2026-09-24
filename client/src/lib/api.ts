@@ -368,9 +368,18 @@ export const rejectTrade = (messageId: string): Promise<Decision> =>
     {},
   ).then((r) => r.decision)
 
-/** Start the Robinhood OAuth flow and get the URL the user must approve. */
-export const connectBroker = (): Promise<BrokerConnectResult> =>
-  postJson<BrokerConnectResult>('/api/broker/connect', {})
+/**
+ * Start the Robinhood OAuth flow and get the URL the user must approve.
+ * `force` tears down the current session first (the settings Reconnect):
+ * stored tokens that still refresh reconnect silently, anything else falls
+ * back to a fresh consent URL.
+ */
+export const connectBroker = (options: { force: boolean }): Promise<BrokerConnectResult> =>
+  postJson<BrokerConnectResult>('/api/broker/connect', options)
+
+/** Sever the stored Robinhood connection. Trading stops until reconnected. */
+export const disconnectBroker = (): Promise<void> =>
+  postJson<{ ok: true }>('/api/broker/disconnect', {}).then(() => undefined)
 
 /** POST the dead-end 127.0.0.1 redirect URL the user pasted after approving. */
 export const submitBrokerRedirect = (redirectUrl: string): Promise<void> =>
