@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createLogger } from '../../shared/logger.js';
 import type { OptionContract, OptionType, OrderSide } from '../../shared/types.js';
 import type { RobinhoodMcpClient } from './mcpClient.js';
-import { assertTokenForTrade } from './mcpClient.js';
+import { BrokerUnavailableError, McpToolError, assertTokenForTrade } from './mcpClient.js';
 import type {
   BuyingPowerResult,
   CallToolResult,
@@ -41,6 +41,14 @@ export const TOOL_NAMES = {
   placeOptionsOrder: 'place_option_order',
 } as const;
 
+/**
+ * The broker was reached and has no usable quote for the symbol — the one
+ * failure that really means "not a tradable ticker".
+ */
+export class SymbolNotFoundError extends Error {
+  override readonly name = 'SymbolNotFoundError';
+}
+
 // =============================================================================
 // Public client
 // =============================================================================
@@ -58,8 +66,17 @@ export class RobinhoodTools {
 
   constructor(private readonly mcp: RobinhoodMcpClient) {}
 
-  getQuote(symbol: string): Promise<QuoteResult> {
-    return this.callTool(TOOL_NAMES.quote, { symbols: [symbol] }, parseQuote);
+  async getQuote(symbol: string): Promise<QuoteResult> {
+    try {
+      return await this.callTool(TOOL_NAMES.quote, { symbols: [symbol] }, parseQuote);
+    } catch (err) {
+      // The broker answered with a tool error for this symbol: it was reached,
+      // so this is the ticker's fault, not the session's.
+      if (err instanceof Error && err.cause instanceof McpToolError) {
+        throw new SymbolNotFoundError(err.message, { cause: err });
+      }
+      throw err;
+    }
   }
 
   /**
@@ -74,7 +91,7 @@ export class RobinhoodTools {
     strike: number,
     expiration: string
   ): Promise<OptionsQuoteResult | null> {
-    const advertised = this.mcp.getToolNames();
+    const advertised = await this.advertisedTools();
     if (
       !advertised.includes(TOOL_NAMES.optionsQuote) ||
       !advertised.includes(TOOL_NAMES.optionInstruments)
@@ -94,7 +111,7 @@ export class RobinhoodTools {
   }
 
   async getBuyingPower(): Promise<BuyingPowerResult> {
-    if (!this.mcp.getToolNames().includes(TOOL_NAMES.portfolio)) {
+    if (!(await this.advertisedTools()).includes(TOOL_NAMES.portfolio)) {
       // ponytail: older MCP versions don't advertise get_portfolio; fall back
       // to deep-finding dollar fields on get_accounts rows (current servers
       // omit them, yielding amountUsd 0 / portfolioValueUsd null).
@@ -155,7 +172,7 @@ export class RobinhoodTools {
    * doesn't advertise the tool, so callers degrade instead of throwing.
    */
   async getOptionOrders(): Promise<OptionOrdersResult | null> {
-    if (!this.mcp.getToolNames().includes(TOOL_NAMES.optionOrders)) return null;
+    if (!(await this.advertisedTools()).includes(TOOL_NAMES.optionOrders)) return null;
     return this.callTool(
       TOOL_NAMES.optionOrders,
       { account_number: await this.getDefaultAccountNumber() },
@@ -291,21 +308,22 @@ export class RobinhoodTools {
     args: Record<string, unknown>,
     parse: (raw: CallToolResult) => T
   ): Promise<T> {
-    // Distinguish "not connected yet" (startup/OAuth pending) from a server
-    // that is connected but genuinely lacks the tool — the empty-list error
-    // ("Available: ") sent users hunting for the wrong problem.
-    if (!this.mcp.isConnected()) {
-      throw new Error(
-        'Robinhood MCP not connected yet (startup or OAuth authorization pending)'
-      );
-    }
-    const advertised = this.mcp.getToolNames();
+    // A dropped or never-restored session reconnects here from stored tokens,
+    // so trading self-heals instead of failing every callout until restart.
+    // Throws BrokerUnavailableError when that needs a human (OAuth consent).
+    const advertised = await this.advertisedTools();
     if (!advertised.includes(name)) {
       throw new Error(
         `Robinhood MCP does not advertise "${name}". Available: ${advertised.join(', ')}`
       );
     }
     return withRetry(name, async () => parse(await this.mcp.callTool(name, args)));
+  }
+
+  /** The live tool list, connecting first — empty before connect otherwise. */
+  private async advertisedTools(): Promise<readonly string[]> {
+    await this.mcp.ensureReady();
+    return this.mcp.getToolNames();
   }
 
   /**
@@ -431,7 +449,7 @@ function parseQuote(result: CallToolResult): QuoteResult {
     deepFindNumber(data, ['price', 'last_trade_price', 'last_price', 'mark_price', 'ask_price']) ??
     deepFindNumber(data, ['close', 'previous_close']);
   if (price === null || price <= 0) {
-    throw new Error(`could not parse quote price: ${extractText(result).slice(0, 200)}`);
+    throw new SymbolNotFoundError(`no quote price: ${extractText(result).slice(0, 200)}`);
   }
   return { price, raw: data ?? result };
 }
@@ -721,6 +739,8 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (err) {
+      // Deterministic answers: retrying cannot change them, only delay them.
+      if (err instanceof BrokerUnavailableError || err instanceof SymbolNotFoundError) throw err;
       lastErr = err;
       log.warn('tool call failed, will retry', {
         label,
@@ -734,7 +754,9 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
     }
   }
   throw lastErr instanceof Error
-    ? new Error(`${label} failed after ${RETRY_ATTEMPTS} attempts: ${lastErr.message}`)
+    ? new Error(`${label} failed after ${RETRY_ATTEMPTS} attempts: ${lastErr.message}`, {
+        cause: lastErr,
+      })
     : new Error(`${label} failed after ${RETRY_ATTEMPTS} attempts`);
 }
 

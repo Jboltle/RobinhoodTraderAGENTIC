@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { DiscordEnvelope } from '../../shared/types.js';
 import type { MessageProcessor, ProcessOptions } from '../pipeline/index.js';
-import { STALENESS_WINDOW_MS, buildEnvelope, drainOnce } from '../poller.js';
+import { CLAIM_STALE_MS, STALENESS_WINDOW_MS, buildEnvelope, drainOnce } from '../poller.js';
 import { buildStoredRecap } from '../recaps/sweep.js';
 import { createFakeDb, type FakeDb } from './fakeDb.js';
 
@@ -213,5 +213,49 @@ describe('buildEnvelope', () => {
       timestamp: FRESH_AT,
       embeds: [],
     });
+  });
+
+  it('skips a row another live instance has claimed, without processing or marking it', async () => {
+    const { db, processed, drain } = makeSetup();
+    db.seedMessage({
+      messageId: 'owned',
+      sentAt: FRESH_AT,
+      claimedAt: new Date(NOW.getTime() - 5_000).toISOString(),
+      claimedBy: 'other-host:1:abcd',
+    });
+
+    await drain();
+
+    expect(processed).toHaveLength(0);
+    expect(db.getMessage('owned')?.processedAt).toBeNull();
+    expect(db.getMessage('owned')?.claimedBy).toBe('other-host:1:abcd');
+  });
+
+  it('two instances draining the same row fan it out exactly once', async () => {
+    const { db, processor, processed } = makeSetup();
+    db.seedMessage({ messageId: 'shared', sentAt: FRESH_AT });
+    const drainAs = (instanceId: string) =>
+      drainOnce({ db, processor, recapChannelIds: [RECAP_CHANNEL], now: () => NOW, instanceId });
+
+    await Promise.all([drainAs('a:1:x'), drainAs('b:2:y')]);
+
+    expect(processed).toHaveLength(1);
+    expect(db.getMessage('shared')?.processedAt).not.toBeNull();
+  });
+
+  it('re-claims an abandoned claim; the stale row lands as missed', async () => {
+    const { db, processed, drain } = makeSetup();
+    db.seedMessage({
+      messageId: 'abandoned',
+      sentAt: STALE_AT,
+      claimedAt: new Date(NOW.getTime() - CLAIM_STALE_MS - 1_000).toISOString(),
+      claimedBy: 'dead-host:1:abcd',
+    });
+
+    await drain();
+
+    expect(processed).toHaveLength(1);
+    expect(processed[0]!.options).toMatchObject({ missed: true });
+    expect(db.getMessage('abandoned')?.processedAt).not.toBeNull();
   });
 });

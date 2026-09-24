@@ -5,7 +5,7 @@ import { TraderEvents } from './events.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { createMessageProcessor } from './pipeline/index.js';
 import { startMaxLossMonitor } from './maxLoss.js';
-import { startPoller } from './poller.js';
+import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
 import { createMcpRegistry } from './rh/mcpRegistry.js';
 import { buildServer } from './server.js';
@@ -32,7 +32,11 @@ async function main(): Promise<void> {
   // complete via the dashboard hitting /api/broker/*, so the port must be open
   // while auth is pending. No fail-fast — a deployed server must stay up.
   await fastify.listen({ port: config.traderPort, host: config.traderHost });
-  log.info('trader listening', { host: config.traderHost, port: config.traderPort });
+  log.info('trader listening', {
+    host: config.traderHost,
+    port: config.traderPort,
+    instanceId: INSTANCE_ID,
+  });
 
   // Reconnect everyone who was connected before the restart, so their stored
   // tokens are refreshed and their MCP session is warm before the first

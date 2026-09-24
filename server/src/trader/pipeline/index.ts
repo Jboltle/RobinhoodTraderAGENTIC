@@ -10,7 +10,9 @@ import type {
 } from '../../shared/types.js';
 import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
+import { BrokerUnavailableError } from '../rh/mcpClient.js';
 import type { McpRegistry } from '../rh/mcpRegistry.js';
+import { SymbolNotFoundError } from '../rh/tools.js';
 import {
   CapitalConstraintError,
   ParseInconsistencyError,
@@ -316,12 +318,23 @@ export async function runForUser(
       });
     }
   } catch (err) {
+    // Only a broker that answered can call the ticker invalid. A session that
+    // is down or a transport failure says nothing about the symbol.
+    if (err instanceof SymbolNotFoundError) {
+      return finalize(userId, deps, {
+        ...base,
+        ...identity,
+        kind: 'risk_rejected',
+        code: 'ticker_invalid',
+        reason: `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`,
+      });
+    }
     return finalize(userId, deps, {
       ...base,
       ...identity,
-      kind: 'risk_rejected',
-      code: 'ticker_invalid',
-      reason: `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`,
+      kind: 'execution_failed',
+      code: brokerErrorCode(err),
+      reason: `quote fetch for ${symbol} failed: ${errMsg(err)}`,
     });
   }
 
@@ -345,7 +358,7 @@ export async function runForUser(
         ...base,
         ...identity,
         kind: 'execution_failed',
-        code: 'execution_error',
+        code: brokerErrorCode(err),
         reason: `buying power fetch failed: ${errMsg(err)}`,
       });
     }
@@ -419,7 +432,11 @@ export async function runForUser(
       ...base,
       ...identity,
       kind: capital || inconsistent ? 'risk_rejected' : 'execution_failed',
-      code: capital ? 'insufficient_capital' : inconsistent ? 'parse_inconsistent' : 'execution_error',
+      code: capital
+        ? 'insufficient_capital'
+        : inconsistent
+          ? 'parse_inconsistent'
+          : brokerErrorCode(err),
       reason: errMsg(err),
     });
   }
@@ -455,5 +472,8 @@ async function finalize(userId: string, deps: PipelineDeps, decision: Decision):
   });
   return decision;
 }
+
+const brokerErrorCode = (err: unknown): 'broker_unavailable' | 'execution_error' =>
+  err instanceof BrokerUnavailableError ? 'broker_unavailable' : 'execution_error';
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));

@@ -15,7 +15,7 @@ import {
   type MaxLossDeps,
 } from '../maxLoss.js';
 import type { McpRegistry, UserBroker } from '../rh/mcpRegistry.js';
-import type { RobinhoodMcpClient } from '../rh/mcpClient.js';
+import { BrokerUnavailableError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { RobinhoodTools } from '../rh/tools.js';
 import { createFakeDb, fakeTokens } from './fakeDb.js';
 
@@ -116,6 +116,36 @@ describe('weightedAverageEntry', () => {
 });
 
 describe('sweepMaxLoss', () => {
+  it('reconnects a cold session from stored tokens before scanning', async () => {
+    const ensureReady = vi.fn().mockResolvedValue(undefined);
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+      ],
+      markFor: () => 0.75,
+      ensureReady,
+    });
+    db.seedDecision(USER, submittedBuy('QQQ', 1.5, { optionType: 'call', strike: 707, expiration: '2026-06-11' }));
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(ensureReady).toHaveBeenCalled();
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+  });
+
+  it('skips a user whose session needs OAuth consent', async () => {
+    const { tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      ensureReady: vi.fn().mockRejectedValue(new BrokerUnavailableError('authorization required')),
+    });
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(tools.getOptionPositions).not.toHaveBeenCalled();
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
   it('market-sells a 50% down option and leaves a sibling position untouched', async () => {
     const { db, tools, enqueue, flattening, deps } = setupMonitor({
       maxLossPct: 50,
@@ -344,6 +374,7 @@ function setupMonitor(opts: {
   }>;
   markFor?: (symbol: string) => number;
   quoteFor?: (symbol: string) => number;
+  ensureReady?: () => Promise<void>;
 }) {
   const db = createFakeDb();
   db.seedBrokerTokens(USER, fakeTokens('tok'));
@@ -378,7 +409,10 @@ function setupMonitor(opts: {
     getOptionOrders: vi.fn().mockResolvedValue(null),
   } as unknown as RobinhoodTools;
 
-  const mcp = { isConnected: vi.fn().mockReturnValue(true) } as unknown as RobinhoodMcpClient;
+  const mcp = {
+    isConnected: vi.fn().mockReturnValue(true),
+    ensureReady: opts.ensureReady ?? vi.fn().mockResolvedValue(undefined),
+  } as unknown as RobinhoodMcpClient;
   const brokers: McpRegistry = {
     for: (): UserBroker => ({ mcp, tools }),
     existing: () => ({ mcp, tools }),

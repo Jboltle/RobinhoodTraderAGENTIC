@@ -85,6 +85,7 @@ export type RejectionCode =
   | 'ticker_blocked'
   | 'ticker_not_allowed'
   | 'ticker_invalid'
+  | 'broker_unavailable'
   | 'outside_market_hours'
   | 'daily_cap_reached'
   | 'cooldown_active'

@@ -17,6 +17,7 @@ import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
+import { BrokerUnavailableError } from './rh/mcpClient.js';
 import type { McpRegistry } from './rh/mcpRegistry.js';
 import type { RobinhoodTools } from './rh/tools.js';
 import type { OptionOrder, OptionPosition, Position } from './rh/types.js';
@@ -124,7 +125,14 @@ async function scanUser(
   if (!lossEnabled(settings.maxLossPct, settings.maxLossUsd)) return null;
 
   const broker = deps.brokers.for(userId);
-  if (!broker.mcp.isConnected()) return null;
+  // Reconnect from stored tokens so a dropped session does not silently turn
+  // Max Loss off; a session that needs OAuth consent is skipped this sweep.
+  try {
+    await broker.mcp.ensureReady();
+  } catch (err) {
+    if (err instanceof BrokerUnavailableError) return null;
+    throw err;
+  }
 
   const tools = broker.tools;
   const [equity, options, decisions] = await Promise.all([

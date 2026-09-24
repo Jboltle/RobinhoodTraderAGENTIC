@@ -93,6 +93,7 @@ function makeBrokerStub(userId: string, options: BrokerStubOptions): UserBroker 
     isAuthPending: vi.fn().mockReturnValue(options.authPending ?? false),
     submitAuthCode: vi.fn(),
     ensureConnected: vi.fn().mockResolvedValue(undefined),
+    ensureReady: vi.fn().mockResolvedValue(undefined),
     getTokenStatus: vi
       .fn()
       .mockResolvedValue({ state: 'missing', hasRefreshToken: false }),
