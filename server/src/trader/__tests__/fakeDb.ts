@@ -352,6 +352,20 @@ export function createFakeDb(): FakeDb {
           })
         );
     },
+    async listCallerEntries(authorId, ticker, before, limit) {
+      return [...messages.values()]
+        .filter(
+          (row) =>
+            row.authorId === authorId &&
+            row.disposition === 'callout' &&
+            row.parse?.action === 'buy' &&
+            row.parse.ticker === ticker.toUpperCase() &&
+            Date.parse(row.sentAt) < before.getTime()
+        )
+        .sort((a, b) => b.sentAt.localeCompare(a.sentAt))
+        .slice(0, limit)
+        .flatMap((row) => (row.parse ? [row.parse] : []));
+    },
     async upsertCaller(caller) {
       // Mirrors the real upsert: a null avatar never overwrites a stored one.
       const avatarUrl = caller.avatarUrl ?? callers.get(caller.authorId)?.avatarUrl ?? null;

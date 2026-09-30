@@ -1,12 +1,14 @@
 import { flattenEnvelope } from '../../shared/embedText.js';
 import { createLogger } from '../../shared/logger.js';
-import type {
-  Callout,
-  CalloutParser,
-  Decision,
-  DiscordEnvelope,
-  ResolvedTradeSettings,
-  SubmittedOrder,
+import {
+  optionLabel,
+  type Callout,
+  type CalloutParser,
+  type Decision,
+  type DiscordEnvelope,
+  type OptionContract,
+  type ResolvedTradeSettings,
+  type SubmittedOrder,
 } from '../../shared/types.js';
 import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
@@ -184,8 +186,71 @@ async function resolveCallout(
     return { status: 'not_callout', callout: null, parseError: null };
   }
 
+  if (callout.tickerOnlyExit && callout.ticker !== null) {
+    callout = await resolveCallerContract(callout, callout.ticker, envelope, deps);
+  }
+
   await setDisposition(deps, envelope.messageId, 'callout', callout);
   return { status: 'callout', callout, parseError: null };
+}
+
+/** Recent entries a ticker-only exit may be closing; far more than one Caller holds at once. */
+const CALLER_ENTRY_LOOKBACK = 20;
+
+/**
+ * "Out of NBIS" names no contract and can only mean the Caller's own position,
+ * never another Caller's NBIS entry that followers also hold. Unresolved, the
+ * exit keeps option null and checkRisk rejects it per user as missing_contract:
+ * a visible miss instead of a guessed order.
+ */
+async function resolveCallerContract(
+  callout: Callout,
+  ticker: string,
+  envelope: DiscordEnvelope,
+  deps: PipelineDeps
+): Promise<Callout> {
+  const entries = await deps.db
+    .listCallerEntries(envelope.authorId, ticker, new Date(envelope.timestamp), CALLER_ENTRY_LOOKBACK)
+    .catch((err: unknown) => {
+      log.error('could not load caller entries for a ticker-only exit', {
+        messageId: envelope.messageId,
+        error: errMsg(err),
+      });
+      return [];
+    });
+
+  const option = pickCallerContract(entries, envelope.timestamp);
+  if (!option) {
+    log.warn('ticker-only exit matched no open entry from its caller', {
+      messageId: envelope.messageId,
+      authorId: envelope.authorId,
+      ticker,
+    });
+    return callout;
+  }
+
+  return {
+    ...callout,
+    assetType: 'option',
+    option,
+    rationale: `${callout.rationale} (contract ${optionLabel(option)} from ${envelope.authorName}'s entry)`,
+  };
+}
+
+/**
+ * The contract of the Caller's newest entry still live on the exit's day.
+ * `entries` arrive newest first.
+ *
+ * ponytail: one contract per exit. A Caller holding two strikes in the same
+ * ticker keeps the older one open, and equity entries never match. Upgrade
+ * path: one decision per open contract.
+ */
+export function pickCallerContract(
+  entries: readonly Callout[],
+  exitTimestamp: string
+): OptionContract | null {
+  const exitDay = new Date(exitTimestamp).toISOString().slice(0, 10);
+  return entries.find((entry) => entry.option !== null && entry.option.expiration >= exitDay)?.option ?? null;
 }
 
 async function setDisposition(

@@ -323,6 +323,8 @@ async function findOpenOptionPosition(
 }
 
 function resolveExitContracts(callout: Callout, risk: RiskAllow, heldContracts: number): number {
+  // "Out of NBIS" is a full exit, whatever count the model also extracted.
+  if (callout.tickerOnlyExit) return heldContracts;
   if (risk.quantityHint !== null) return Math.floor(risk.quantityHint);
 
   switch (callout.positionSize) {

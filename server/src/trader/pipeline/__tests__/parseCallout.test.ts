@@ -629,6 +629,93 @@ describe('parseCallout — invalid model output repair', () => {
     });
   });
 });
+describe('parseCallout — ticker-only exits', () => {
+  const OUT_OF_NBIS = {
+    isCallout: true,
+    assetType: 'option',
+    action: 'sell',
+    isAddition: false,
+    tickerOnlyExit: true,
+    ticker: 'NBIS',
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: null,
+    option: null,
+    confidence: 0.9,
+    rationale: 'caller is out of NBIS',
+  };
+
+  it.each([
+    ['Lmao okay, out of NBIS', "Bishop's Ideas\nLmao okay, out of NBIS\n\nHow I Trade\n\nThe Market Bishop Trade Idea's Disclaimer\nTwitter: @TheMarketBishop | I want to be the greatest", 'NBIS'],
+    ['** Out of IBIT **', "<@&1531935483880542229>\nBishop's Ideas\n** Out of IBIT **\n\n[How I Trade](https://docs.google.com/document/d/x/edit)", 'IBIT'],
+    ['Out of IREN at -10%', "Bishop's Ideas\n** Out of IREN at -10%, I have to head out **", 'IREN'],
+    ['out of with a P/L arrow', 'Out of NBIS 7.55 -> 6.80', 'NBIS'],
+  ])('parses Bishop-style "%s" as a ticker-only exit without the LLM', async (_label, content, ticker) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    };
+
+    const result = await new LlmCalloutParser(mockProvider).parse(makeEnvelope(content));
+
+    expect(mockProvider.callStructured).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      isCallout: true,
+      action: 'sell',
+      ticker,
+      option: null,
+      tickerOnlyExit: true,
+      confidence: 0.99,
+    });
+  });
+
+  it.each([
+    ['a negated exit', 'Not out of NBIS yet, holding for 9'],
+    ['a hypothetical exit', 'might get out of IREN if it loses 40'],
+    ['options prose', 'these calls are out of the money now'],
+  ])('leaves %s to the model', async (_label, content) => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue({ ...OUT_OF_NBIS, isCallout: false, action: null, ticker: null }),
+    };
+
+    await new LlmCalloutParser(mockProvider).parse(makeEnvelope(content));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a contract-less exit the model found for the pipeline to resolve', async () => {
+    const result = await parserWithMock(OUT_OF_NBIS).parse(makeEnvelope('Closed NBIS here, solid scalp'));
+
+    expect(result).toMatchObject({
+      isCallout: true,
+      action: 'sell',
+      ticker: 'NBIS',
+      option: null,
+      tickerOnlyExit: true,
+    });
+  });
+
+  it('drops the flag when the model also names the contract', async () => {
+    const result = await parserWithMock({
+      ...OUT_OF_NBIS,
+      option: { optionType: 'call', strike: 250, expiration: '2026-10-02' },
+    }).parse(makeEnvelope('Out of NBIS 250 C 10/2', '2026-09-30T13:35:00.000Z'));
+
+    expect(result.option?.strike).toBe(250);
+    expect(result.tickerOnlyExit).toBe(false);
+  });
+
+  it('sends a past-tense exit with a P/L arrow to the model instead of prefiltering it', async () => {
+    const mockProvider: LlmProvider = {
+      callStructured: vi.fn().mockResolvedValue(OUT_OF_NBIS),
+    };
+
+    await new LlmCalloutParser(mockProvider).parse(makeEnvelope('Sold NBIS 7.55 -> 6.80'));
+
+    expect(mockProvider.callStructured).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('parseCallout — pre-LLM chatter gate', () => {
   it('skips the LLM for a bare P/L line (no ticker or verb)', async () => {
     const mockProvider: LlmProvider = {

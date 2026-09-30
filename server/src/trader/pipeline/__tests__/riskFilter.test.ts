@@ -187,6 +187,15 @@ describe('riskFilter — rejection codes', () => {
       })
     ).toBe('cooldown_active');
   });
+
+  it('lets an exit through right after an entry on the same ticker', () => {
+    const now = new Date('2026-06-15T14:00:00Z');
+    const exit = checkRiskWithSettings({ ...BASE_EQUITY, action: 'sell' }, SETTINGS, {
+      submittedToday: 1,
+      lastSubmittedForTicker: new Date(now.getTime() - 30_000),
+    }, now);
+    expect(exit.allow).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

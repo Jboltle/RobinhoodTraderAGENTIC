@@ -17,7 +17,7 @@ import { TraderEvents } from '../../events.js';
 import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
 import { SymbolNotFoundError, type RobinhoodTools } from '../../rh/tools.js';
-import { createMessageProcessor, type PipelineDeps } from '../index.js';
+import { createMessageProcessor, pickCallerContract, type PipelineDeps } from '../index.js';
 import {
   AVG_DOWN_SPY_PUT,
   BTO_QQQ_PUT,
@@ -250,6 +250,109 @@ describe('fan-out — TRIM exit', () => {
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.reason).toMatch(/no open QQQ 707C 2026-06-11 position/);
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+});
+
+describe('fan-out — ticker-only exits ("out of QQQ")', () => {
+  const EXIT_AT = '2026-09-30T13:35:00.000Z';
+
+  const exitFrom = (authorId: string): DiscordEnvelope => ({
+    messageId: 'exit-001',
+    channelId: 'chan-001',
+    guildId: null,
+    authorId,
+    authorName: 'Bishop',
+    authorAvatarUrl: null,
+    content: "Bishop's Ideas\nLmao okay, out of QQQ",
+    timestamp: EXIT_AT,
+  });
+
+  const TICKER_ONLY_EXIT: Callout = {
+    isCallout: true,
+    assetType: 'option',
+    action: 'sell',
+    isAddition: false,
+    tickerOnlyExit: true,
+    ticker: 'QQQ',
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: null,
+    option: null,
+    confidence: 0.9,
+    rationale: 'caller is out of QQQ',
+  };
+
+  const entry = (strike: number, expiration = '2026-10-02'): Callout => ({
+    ...TICKER_ONLY_EXIT,
+    action: 'buy',
+    tickerOnlyExit: false,
+    orderType: 'limit',
+    limitPrice: 1.2,
+    option: { optionType: 'call', strike, expiration },
+    rationale: `BTO QQQ ${strike}C`,
+  });
+
+  const seedEntry = (
+    db: FakeDb,
+    messageId: string,
+    authorId: string,
+    callout: Callout,
+    sentAt = '2026-09-30T13:34:00.000Z'
+  ): void =>
+    db.seedMessage({ messageId, sentAt, authorId, disposition: 'callout', parse: callout, processedAt: sentAt });
+
+  const holdsBothStrikes = {
+    getOptionPositions: vi.fn().mockResolvedValue({
+      positions: [
+        { symbol: 'QQQ', optionType: 'call', strike: 234, expiration: '2026-10-02', quantity: 3, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 255, expiration: '2026-10-02', quantity: 2, raw: {} },
+      ],
+      raw: {},
+    }),
+  };
+
+  it("sells the whole position in the Caller's own contract, never another Caller's", async () => {
+    const { db, deps, tools } = setup(TICKER_ONLY_EXIT, holdsBothStrikes);
+    seedEntry(db, 'entry-a', 'caller-a', entry(234));
+    seedEntry(db, 'entry-b', 'caller-b', entry(255), '2026-09-30T13:34:30.000Z');
+
+    await createMessageProcessor(deps).process(exitFrom('caller-a'));
+
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision?.kind).toBe('submitted');
+    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(call).toMatchObject({ side: 'sell', strike: 234, contracts: 3 });
+    expect(db.getMessage('exit-001')?.parse?.option).toEqual({
+      optionType: 'call',
+      strike: 234,
+      expiration: '2026-10-02',
+    });
+  });
+
+  it('rejects instead of guessing when the Caller has no open entry in the ticker', async () => {
+    const { db, deps, tools } = setup(TICKER_ONLY_EXIT, holdsBothStrikes);
+    seedEntry(db, 'entry-b', 'caller-b', entry(255));
+
+    await createMessageProcessor(deps).process(exitFrom('caller-a'));
+
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision).toMatchObject({ kind: 'risk_rejected', code: 'missing_contract' });
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it('picks the newest entry still live on the exit day', () => {
+    const newestFirst = [entry(240, '2026-09-29'), entry(236), entry(234)];
+    expect(pickCallerContract(newestFirst, EXIT_AT)?.strike).toBe(236);
+  });
+
+  it('treats a contract expiring on the exit day as still live', () => {
+    expect(pickCallerContract([entry(234, '2026-09-30')], EXIT_AT)?.strike).toBe(234);
+  });
+
+  it('matches nothing when only expired or equity entries remain', () => {
+    const equity: Callout = { ...entry(1), assetType: 'equity', option: null };
+    expect(pickCallerContract([equity, entry(234, '2026-09-29')], EXIT_AT)).toBeNull();
   });
 });
 

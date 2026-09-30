@@ -129,6 +129,14 @@ export function checkRisk(
   if (!callout.isCallout || !callout.action || !callout.ticker) {
     return { allow: false, code: 'not_callout', reason: 'not a callout' };
   }
+  // An exit no entry of the Caller's could be matched to: never guess the contract.
+  if (callout.tickerOnlyExit && !callout.option) {
+    return {
+      allow: false,
+      code: 'missing_contract',
+      reason: `exit names only ${callout.ticker} and matched no open entry from this Caller`,
+    };
+  }
   if (callout.assetType === 'option' && !callout.option) {
     return { allow: false, code: 'missing_contract', reason: 'option callout missing contract details' };
   }
@@ -162,7 +170,9 @@ export function checkRisk(
     return { allow: false, code: 'daily_cap_reached', reason: `daily trade cap reached (${settings.maxTradesPerDay})` };
   }
 
-  if (state.lastSubmittedForTicker !== null) {
+  // Entries only: the cooldown stops repeated entries, and an exit right after
+  // an entry is the one order that cannot wait.
+  if (callout.action === 'buy' && state.lastSubmittedForTicker !== null) {
     const elapsed = now.getTime() - state.lastSubmittedForTicker.getTime();
     if (elapsed < settings.cooldownSeconds * 1000) {
       const secs = Math.ceil((settings.cooldownSeconds * 1000 - elapsed) / 1000);

@@ -31,7 +31,7 @@
  *   allowed_emails      invite gate, independent of the sign-in mechanism
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 
@@ -228,6 +228,11 @@ export interface TraderDb {
 
   /** The feed: judged messages (recaps excluded), newest first. */
   listCallouts(limit: number): Promise<StoredCallout[]>;
+  /**
+   * The Caller's buy callouts in `ticker` sent before `before`, newest first:
+   * the entries a ticker-only exit ("out of NBIS") can be closing.
+   */
+  listCallerEntries(authorId: string, ticker: string, before: Date, limit: number): Promise<Callout[]>;
 
   /** Insert a Caller or refresh their display name/avatar/last-seen. */
   upsertCaller(caller: Caller): Promise<void>;
@@ -485,6 +490,31 @@ class DrizzleTraderDb implements TraderDb {
       .orderBy(desc(messages.sentAt))
       .limit(limit);
     return rows.map(toStoredCallout);
+  }
+
+  async listCallerEntries(
+    authorId: string,
+    ticker: string,
+    before: Date,
+    limit: number
+  ): Promise<Callout[]> {
+    // ponytail: filters parse jsonb without an index, fine at a few thousand
+    // rows. Upgrade path: an index on (author_id, sent_at).
+    const rows = await this.db
+      .select({ parse: messages.parse })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.authorId, authorId),
+          eq(messages.disposition, 'callout'),
+          lt(messages.sentAt, before),
+          sql`${messages.parse}->>'action' = 'buy'`,
+          sql`${messages.parse}->>'ticker' = ${ticker.toUpperCase()}`
+        )
+      )
+      .orderBy(desc(messages.sentAt))
+      .limit(limit);
+    return rows.flatMap((row) => (row.parse ? [row.parse] : []));
   }
 
   async upsertCaller(caller: Caller): Promise<void> {

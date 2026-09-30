@@ -98,6 +98,12 @@ export const CalloutSchema = z
      * open a fresh position for a follower who missed the entry.
      */
     isAddition: z.boolean().default(false),
+    /**
+     * True when a sell names only the ticker ("out of NBIS"): the Caller is
+     * fully out of their own position and did not restate the contract. The
+     * pipeline fills `option` from that Caller's entry before anyone trades.
+     */
+    tickerOnlyExit: z.boolean().optional(),
     /** For options this is the per-contract premium, NOT the strike. */
     limitPrice: z.number().positive().nullable(),
     sizeHint: z
@@ -114,7 +120,7 @@ export const CalloutSchema = z
   })
   .refine(
     (c) =>
-      (c.assetType === 'option' && c.option !== null) ||
+      (c.assetType === 'option' && (c.option !== null || c.tickerOnlyExit === true)) ||
       (c.assetType === 'equity' && c.option === null),
     { error: 'option fields must be present iff assetType=option' }
   );

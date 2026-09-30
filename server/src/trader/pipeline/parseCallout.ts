@@ -35,6 +35,11 @@ const TOOL_SCHEMA: ToolJsonSchema = {
       description:
         'True when this buy adds to a position the caller already holds (averaging down) rather than opening a fresh one.',
     },
+    tickerOnlyExit: {
+      type: 'boolean',
+      description:
+        'True when the caller says they are out of a position naming only the ticker ("out of NBIS"), with no strike or expiration. Leave option null.',
+    },
     ticker: { type: ['string', 'null'] },
     orderType: { type: 'string', enum: ['market', 'limit'] },
     limitPrice: { type: ['number', 'null'] },
@@ -72,6 +77,7 @@ const TOOL_SCHEMA: ToolJsonSchema = {
     'assetType',
     'action',
     'isAddition',
+    'tickerOnlyExit',
     'ticker',
     'orderType',
     'limitPrice',
@@ -89,16 +95,17 @@ const TOOL_SCHEMA: ToolJsonSchema = {
 // Everything the old 200-line prompt taught by example now lives in code.
 const SYSTEM_PROMPT = `You classify Discord messages from a trading channel and extract one structured trading callout when — and only when — the message contains one. Machine-formatted alerts are parsed upstream; you only see the leftovers, which are mostly chatter.
 
-A callout is an explicit, forward-looking directive to BUY or SELL a US equity or a single-leg US-listed option. Entry language ("buying", "entering", "I'm in", "adding", "grabbing") is a buy; exit language ("selling", "trimming", "closing", "taking profit", "fully out", "sold all", "stopped out") is a sell. Adding to an existing position ("averaging down", "added 10 more @ 0.30", "doubling down") is a buy with isAddition=true, priced at the newly added fill — never the resulting average. An already-expired contract is never a callout. Past-tense recaps, holding updates ("still in"), watchlists, hype, fill complaints and P/L status lines are NOT callouts.
+A callout is an explicit, forward-looking directive to BUY or SELL a US equity or a single-leg US-listed option. Entry language ("buying", "entering", "I'm in", "adding", "grabbing") is a buy; exit language ("selling", "trimming", "closing", "taking profit", "out of", "I'm out", "fully out", "sold all", "stopped out") is a sell. Adding to an existing position ("averaging down", "added 10 more @ 0.30", "doubling down") is a buy with isAddition=true, priced at the newly added fill — never the resulting average. An already-expired contract is never a callout. Past-tense recaps, holding updates ("still in"), watchlists, hype, fill complaints and P/L status lines are NOT callouts.
 
-A "Candidates" section may follow the message: contracts, prices and dates extracted deterministically from the message text. Prefer them. NEVER invent a ticker, strike, expiration or price that is not grounded in the message; when a required field cannot be grounded, set isCallout=false.
+A "Candidates" section may follow the message: contracts, prices and dates extracted deterministically from the message text. Prefer them. NEVER invent a ticker, strike, expiration or price that is not grounded in the message; when a required field cannot be grounded, set isCallout=false. The one exception is a ticker-only exit (see tickerOnlyExit below).
 
 Rules:
 - ticker: 1-6 uppercase letters. assetType is 'option' only for single-leg contracts; multi-leg spreads are NOT callouts.
 - orderType is 'limit' only when an explicit price is stated. For options limitPrice is the per-contract PREMIUM — never the strike, and never a P/L arrow value ("1.59 -> 1.75" is status).
 - option.expiration: ISO YYYY-MM-DD resolved against the Reference timestamp ("now"). If you cannot confidently resolve a future date, set isCallout=false.
 - isAddition: true only when the buy extends a position the caller already says they hold; fresh entries use false.
-- A caller reporting their own single-position exit ("fully out", "sold all +38%", "stopped out") IS a sell callout when the contract is identifiable — followers may still hold it. Multi-trade performance recaps are not.
+- A caller reporting their own single-position exit ("fully out", "sold all +38%", "stopped out") IS a sell callout — followers may still hold it. Multi-trade performance recaps are not.
+- tickerOnlyExit: true when the caller says they are out of a position but names only the ticker ("out of NBIS", "closed SPY here", "I'm out of IREN at -10%"). Set action='sell', option=null and never guess the contract: it is resolved from the caller's own entry. The missing contract is expected and must not lower confidence. False whenever the message states the strike or expiration.
 - sizeHint only for explicit counts: shares ("100 shares"), usd ("$500 of AAPL"), contracts ("10 calls", "5x"). Never take sizeHint from the caller's own running totals ("10 → 20 contracts").
 - positionSize from qualitative size words: small ("small", "light", "scalp", "starter", "lotto"), medium ("half", "partial"), full ("full size", "max", "load up", "all in"). Null when absent; ignore when sizeHint is present.
 - confidence: 0.0 - 1.0. rationale: <=200 char summary (or why rejected).
@@ -242,6 +249,7 @@ const LlmCalloutInputSchema = z.preprocess((raw) => {
     assetType: r.assetType ?? (hasOption ? 'option' : 'equity'),
     action: r.action ?? null,
     isAddition: typeof r.isAddition === 'boolean' ? r.isAddition : false,
+    tickerOnlyExit: typeof r.tickerOnlyExit === 'boolean' ? r.tickerOnlyExit : false,
     ticker: r.ticker ?? null,
     orderType: r.orderType ?? 'market',
     limitPrice: r.limitPrice ?? null,
@@ -349,7 +357,8 @@ function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null
     parseCompactOptionLine(ownContent, envelope.timestamp) ??
     parseLabeledEntryOption(ownContent, envelope.timestamp) ??
     parseLottoOption(ownContent, envelope.timestamp) ??
-    parseTrimExitOption(ownContent, envelope.timestamp)
+    parseTrimExitOption(ownContent, envelope.timestamp) ??
+    parseTickerOnlyExit(ownContent)
   );
 }
 
@@ -491,6 +500,41 @@ function parseTrimExitOption(content: string, timestamp: string): Callout | null
   };
 
   const parsed = CalloutSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
+
+// "Out of NBIS", "I'm out of IREN at -10%", "fully out of $DELL": the Caller
+// names only the ticker, so the pipeline takes the contract from their entry.
+const TICKER_ONLY_EXIT = /\bout\s+of\s+\$?([A-Za-z]{1,5})\b(?!\s+money\b)/i;
+// Negated, hypothetical or advisory exits stay with the model.
+const HEDGED_EXIT = /(?:\b(?:not|never|might|may|would|could|if|stay)\b|n't\b)[^.!?\n]{0,25}\bout\s+of\b/i;
+
+/**
+ * ponytail: an all-caps "OUT OF HERE" reads as ticker HERE. Harmless: with no
+ * HERE entry from the Caller the exit resolves to nothing and trades nothing.
+ * Upgrade path: check the token against the Caller's open tickers here.
+ */
+function parseTickerOnlyExit(content: string): Callout | null {
+  if (CONTRACT_TEST.test(content) || HEDGED_EXIT.test(content)) return null;
+  const ticker = content.match(TICKER_ONLY_EXIT)?.[1];
+  // Only an uppercase token is a ticker: "out of the money" is prose.
+  if (!ticker || ticker !== ticker.toUpperCase()) return null;
+
+  const parsed = CalloutSchema.safeParse({
+    isCallout: true,
+    assetType: 'option',
+    action: 'sell',
+    isAddition: false,
+    tickerOnlyExit: true,
+    ticker,
+    orderType: 'market',
+    limitPrice: null,
+    sizeHint: null,
+    positionSize: null,
+    option: null,
+    confidence: 0.99,
+    rationale: `out of ${ticker}; contract from the Caller's own entry`,
+  });
   return parsed.success ? parsed.data : null;
 }
 
@@ -691,10 +735,10 @@ const BOLD_PCT_START = /^\s*\*\*\s*\+?\d+(?:\.\d+)?\s*%\s*\*\*/;
 const PRICE_TO_PRICE_NOW = /\b\d+(?:\.\d+)?\s+to\s+\d+(?:\.\d+)?\s+now\b/i;
 
 // Words that signal an actual directive. Narrower than TRADE_VERB on purpose:
-// brags say "calls"/"puts" without any of these, while real entries always
-// carry one. Presence of any directive word sends the message to the LLM.
+// brags say "calls"/"puts" without any of these, while real entries and exits
+// always carry one. Presence of any directive word sends the message to the LLM.
 const DIRECTIVE_VERB =
-  /\b(?:bto|btc|sto|stc|buy|buying|sell|selling|enter|entering|entered|entry|add|adding|trim|trimming|close|closing|long|short|grab|grabbing|chase|chasing|load|loading|scale|scaling|take|taking)\b/i;
+  /\b(?:bto|btc|sto|stc|buy|buying|sell|selling|sold|enter|entering|entered|entry|add|adding|trim|trimming|trimmed|close|closing|closed|exited|stopped|out\s+of|long|short|grab|grabbing|chase|chasing|load|loading|scale|scaling|take|taking)\b/i;
 
 /**
  * Detect profit-brag / P/L-update messages ("**130%** 🔥aapl calls 3.38 to
@@ -1105,6 +1149,15 @@ export class LlmCalloutParser implements CalloutParser {
         droppedLimitPrice: normalized.limitPrice,
       });
       normalized = { ...normalized, orderType: 'market', limitPrice: null };
+    }
+
+    // The ticker-only path sells the Caller's whole position, so it is only for
+    // contract-less sells: a stated contract always wins over the lookup.
+    if (
+      normalized.tickerOnlyExit &&
+      !(normalized.isCallout && normalized.action === 'sell' && normalized.option === null)
+    ) {
+      normalized = { ...normalized, tickerOnlyExit: false };
     }
 
     if (normalized.isCallout) {
