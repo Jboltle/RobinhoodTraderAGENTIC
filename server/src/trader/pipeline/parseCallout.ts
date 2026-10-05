@@ -5,10 +5,13 @@ import { createLlmProvider } from '../../shared/llm.js';
 import { createLogger } from '../../shared/logger.js';
 import {
   CalloutSchema,
+  OptionContractSchema,
   type Callout,
   type CalloutParser,
   type DiscordEnvelope,
+  type ExitPortion,
   type LlmProvider,
+  type OptionContract,
   type OptionType,
   type PositionSize,
   type ToolJsonSchema,
@@ -340,7 +343,14 @@ function stripNoiseLinesForLlm(content: string): string {
 // Deterministic templates
 // =============================================================================
 
-function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null {
+interface TemplateMatch {
+  /** Template name, as the pattern pass reports it to Jev. */
+  readonly name: string;
+  readonly callout: Callout;
+}
+
+/** The first deterministic template that reads the message, in priority order. */
+function matchDeterministicTemplate(envelope: DiscordEnvelope): TemplateMatch | null {
   const contentLines = stripNoiseLines(envelope.content);
   const ownContent = contentLines.join('\n');
   const collapse = (text: string): string =>
@@ -351,15 +361,25 @@ function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null
   const btoContent =
     btoLineIndex === -1 ? normalized : collapse(contentLines.slice(btoLineIndex).join('\n'));
 
-  return (
-    parseBtoOption(btoContent, envelope.timestamp) ??
-    parseChaseOption(normalized, envelope.timestamp) ??
-    parseCompactOptionLine(ownContent, envelope.timestamp) ??
-    parseLabeledEntryOption(ownContent, envelope.timestamp) ??
-    parseLottoOption(ownContent, envelope.timestamp) ??
-    parseTrimExitOption(ownContent, envelope.timestamp) ??
-    parseTickerOnlyExit(ownContent)
-  );
+  // Names as the Oct 4 Jev test saw them in pattern_match.
+  const templates: readonly (readonly [string, () => Callout | null])[] = [
+    ['repo_bto', () => parseBtoOption(btoContent, envelope.timestamp)],
+    ['repo_chase', () => parseChaseOption(normalized, envelope.timestamp)],
+    ['repo_labeled_or_compact_entry', () => parseCompactOptionLine(ownContent, envelope.timestamp)],
+    ['repo_labeled_or_compact_entry', () => parseLabeledEntryOption(ownContent, envelope.timestamp)],
+    ['repo_lotto', () => parseLottoOption(ownContent, envelope.timestamp)],
+    ['repo_close_or_trim', () => parseTrimExitOption(ownContent, envelope.timestamp)],
+    ['repo_out_of_ticker', () => parseTickerOnlyExit(ownContent)],
+  ];
+  for (const [name, parse] of templates) {
+    const callout = parse();
+    if (callout) return { name, callout };
+  }
+  return null;
+}
+
+function tryParseDeterministicCallout(envelope: DiscordEnvelope): Callout | null {
+  return matchDeterministicTemplate(envelope)?.callout ?? null;
 }
 
 function parseBtoOption(content: string, timestamp: string): Callout | null {
@@ -972,6 +992,371 @@ function findLlmGroundingError(
     }
   }
   return null;
+}
+
+// =============================================================================
+// Pattern pass — the Jev decider's evidence (decide.ts)
+//
+// Never calls the LLM. It reports what the templates and filters saw; Jev
+// decides the Action, and the contract and exit size come from here.
+// =============================================================================
+
+export type PatternAction = 'BUY' | 'AVERAGE' | 'TRIM' | 'SELL';
+
+export interface PatternRead {
+  /** The matching template's reading; null when only flags (or nothing) matched. */
+  readonly read: PatternAction | null;
+  /** Which template matched. */
+  readonly pattern: string | null;
+  /** The template's contract as the hint shows it to Jev ("SPX 7735C 10/02"). */
+  readonly contractLabel: string | null;
+  readonly ticker: string | null;
+  /** The tradable contract; set only when every part of it is read from the message. */
+  readonly option: OptionContract | null;
+  readonly limitPrice: number | null;
+  readonly positionSize: PositionSize | null;
+  /** How much an exit says it sells; null when it doesn't say. */
+  readonly exitPortion: ExitPortion | null;
+  readonly flags: readonly string[];
+}
+
+/** The `pattern_match` object Jev reads next to the message: evidence, never a verdict. */
+export interface PatternHint {
+  readonly read: PatternAction | null;
+  readonly pattern: string | null;
+  readonly contract?: string;
+  readonly flags?: readonly string[];
+}
+
+const NUM = String.raw`\d*\.?\d+`;
+const STRIKE_GROUP = String.raw`(?<strike>\d+(?:\.\d+)?)`;
+const SLASH_DATE_GROUP = String.raw`(?<date>\d{1,2}[/.]\d{1,2})`;
+const CARD_DATE_GROUP = String.raw`(?<date>0DTE|[A-Z][a-z]{2}\s+\d{1,2})`;
+
+interface FormatTemplate {
+  readonly name: string;
+  readonly read: PatternAction;
+  readonly test: RegExp;
+  /** A dateless contract is same-day, as the repo's chase template assumes. */
+  readonly impliedSameDay?: boolean;
+}
+
+/**
+ * Callers' fixed formats the repo templates don't read, first match wins.
+ * Ported verbatim from the Oct 4 test (docs/adr/0002) and run on the author's
+ * own words with markdown stripped.
+ */
+const FORMAT_TEMPLATES: readonly FormatTemplate[] = [
+  {
+    name: 'waxui_reload',
+    read: 'BUY',
+    test: new RegExp(
+      String.raw`\bRe-?loading\b.*?\b(?<ticker>[A-Z]{1,6})\s+here\s*\|?\s*${SLASH_DATE_GROUP}\s+${STRIKE_GROUP}(?<cp>[CP])\b\s*\|?\s*Avg[.,]\s*(?<price>${NUM})`,
+      'si'
+    ),
+  },
+  {
+    name: 'waxui_entry',
+    read: 'BUY',
+    test: new RegExp(
+      String.raw`\b(?<ticker>[A-Z]{1,6})\s+here\s*\|?\s*${SLASH_DATE_GROUP}\s+${STRIKE_GROUP}(?<cp>[CP])\b\s*\|?\s*Avg[.,]\s*(?<price>${NUM})`,
+      's'
+    ),
+  },
+  {
+    name: 'bishop_entering',
+    read: 'BUY',
+    test: new RegExp(
+      String.raw`I'?m Entering\s*\|?\s*Option:\s*(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}\s*(?<cp>[CP])\s+${SLASH_DATE_GROUP}\s*\|?\s*Entry:(?:\s*\$?(?<price>${NUM}))?`,
+      'si'
+    ),
+  },
+  {
+    name: 'bishop_trimming',
+    read: 'TRIM',
+    test: new RegExp(
+      String.raw`(?:^|\|)\s*Trimming\s+(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}\s*(?<cp>[CP])\s+${SLASH_DATE_GROUP}\s*\|?\s*Value:`,
+      'sm'
+    ),
+  },
+  {
+    name: 'swift_buy_card',
+    read: 'BUY',
+    test: new RegExp(
+      String.raw`🟢\s*BUY\s*—\s*(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}(?<cp>[CP])\s*·\s*${CARD_DATE_GROUP}`,
+      'u'
+    ),
+  },
+  {
+    name: 'swift_trim_card',
+    read: 'TRIM',
+    test: new RegExp(
+      String.raw`✂️?\s*TRIM\b[^—]*—\s*(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}(?<cp>[CP])\s*·\s*${CARD_DATE_GROUP}.*?Sold\s+\d+\s+of\s+\d+`,
+      'su'
+    ),
+  },
+  {
+    name: 'swift_sold_all_card',
+    read: 'SELL',
+    test: new RegExp(
+      String.raw`🏁\s*SOLD ALL\b[^—]*—\s*(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}(?<cp>[CP])\s*·\s*${CARD_DATE_GROUP}`,
+      'u'
+    ),
+  },
+  {
+    name: 'swift_averaging_card',
+    read: 'AVERAGE',
+    test: new RegExp(
+      String.raw`➕\s*AVERAGING DOWN\s*—\s*(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}(?<cp>[CP])\s*·\s*${CARD_DATE_GROUP}`,
+      'u'
+    ),
+  },
+  {
+    name: 'reentered',
+    read: 'BUY',
+    test: new RegExp(String.raw`\bRE-?N?ENTERED\s+\$?(?<ticker>[A-Z]{1,6})\s+${STRIKE_GROUP}\s*(?<cp>[CP])\b`, 'i'),
+  },
+  {
+    name: 'ticker_strike_dash_price',
+    read: 'BUY',
+    impliedSameDay: true,
+    test: new RegExp(
+      String.raw`^\s*\$?(?<ticker>[A-Za-z]{1,6})\s+${STRIKE_GROUP}\s*(?<cp>[CPcp])\s*-\s*(?<price>${NUM})`,
+      'm'
+    ),
+  },
+];
+
+// "<contract> @ <price>" lines (Rowdy, Demon). Tried after every fixed format.
+const CONTRACT_AT_PRICE = new RegExp(
+  String.raw`^.*?(?:\$?(?<ticker>[A-Z]{1,6})\s+)?${STRIKE_GROUP}(?<cp>[CPcp])\b(?:\s+${SLASH_DATE_GROUP})?\s*@\s*(?<price>${NUM})`,
+  'm'
+);
+// Status words anywhere, quoted "> $100 gain" lines included, disarm the "@ price" shape.
+const AT_PRICE_STATUS = /%|\btrim\w*|\bgain\b|-->|→|\bfrom\b|\bclosed?\b|\bcut\b|\bloss\b|\bsold\b|\bstopped\b/i;
+// Only explicit averaging words read as AVERAGE: Rowdy's "Added 765P @ 27" is a new entry.
+const AVERAGING_WORDS =
+  /\baverag(?:ing|ed|e)\s+(?:down|up)\b|➕\s*AVERAGING|\badding\s+(?:to|into)\b|\badded\s+more\b|\bdoubl(?:ing|ed|e)\s+down\b|\b(?:new|cost)\s+av(?:g|erage)\b/iu;
+const SWIFT_SOLD = /Sold\s+(\d+)\s+of\s+(\d+)/;
+const POSITION_CLOSED = /\bposition closed\b/i;
+const SWIFT_CARD_ENTRY = /\bEntry:\s*\$?(?<price>\d*\.?\d+)/;
+const CASHTAG = /\$(?<ticker>[A-Z]{1,6})\b/;
+
+const WATCHLIST_SHAPES: readonly RegExp[] = [
+  /(?:^|\|)\s*I'?m looking at\b/im,
+  /\bidea\b.*?(?:Will alert any entry|Stay posted for any entry)/is,
+];
+
+/** Pre-filter names as hint flags. */
+const PREFILTER_FLAGS: Readonly<Record<string, string>> = {
+  'daily recap header': 'recap',
+  'P/L status update': 'pl_update',
+  'hype/commentary': 'hype',
+  'holding update': 'holding_update',
+  'watchlist mention': 'watchlist',
+  'opinion/comparison': 'opinion',
+  'fill complaint': 'fill_complaint',
+  'past-tense recap': 'recap',
+};
+
+/** The author's own words as the format templates read them: reply quotes dropped, emphasis removed. */
+function stripMarkdown(text: string): string {
+  const own = text
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('>'))
+    .join('\n');
+  return own.replace(/\*\*|__|`|(?<!\w)\*|\*(?!\w)/g, '');
+}
+
+// Exit size, read only from what the caller says they sold. Profit figures
+// such as "+25%" in a Swift title are never a fraction.
+const CLOSES_EVERYTHING =
+  /\bposition\s+closed\b|\bsold\s+all\b|\ball\s+out\b|\bfully\s+out\b|\bclos(?:e|ed|ing)\s+(?:all|everything|it\s+all)\b/i;
+const SOLD_X_OF_Y = /\bsold\s+(\d+)\s+of\s+(\d+)\b/i;
+const KEEPS_A_RUNNER = /\brunners?\s+only\b|\btrim(?:ming)?\s+most\b|\btrim\s+trim\b/i;
+
+/** "Sold 4 of 20" is a fifth; "Sold 20 of 20" or "position closed" is everything; "runners only" keeps one. */
+export function readExitPortion(text: string): ExitPortion | null {
+  if (CLOSES_EVERYTHING.test(text)) return { kind: 'all' };
+  const sold = text.match(SOLD_X_OF_Y);
+  if (sold) {
+    const count = Number(sold[1]);
+    const held = Number(sold[2]);
+    if (count > 0 && count <= held) {
+      return count === held ? { kind: 'all' } : { kind: 'fraction', value: count / held };
+    }
+  }
+  if (KEEPS_A_RUNNER.test(text)) return { kind: 'all_but_one' };
+  return null;
+}
+
+/** The message's one expiration date, when it names exactly one. */
+function soleExpiration(text: string, timestamp: string): string | null {
+  const dates = new Set(extractExpirationTokens(text, timestamp).values());
+  return dates.size === 1 ? [...dates][0]! : null;
+}
+
+const positivePrice = (raw: string | undefined): number | null => {
+  const price = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(price) && price > 0 ? price : null;
+};
+
+/** The one contract the generic scanner finds; several different ones are ambiguous and trade nothing. */
+function readCandidateContract(
+  text: string,
+  timestamp: string
+): { ticker: string | null; option: OptionContract | null } {
+  const candidates = extractContractCandidates(text, timestamp);
+  const first = candidates[0];
+  if (!first) return { ticker: null, option: null };
+  const ticker = candidates.every((candidate) => candidate.ticker === first.ticker) ? first.ticker : null;
+  const distinct = new Set(candidates.map((c) => `${c.ticker} ${c.strike} ${c.optionType} ${c.expiration}`));
+  if (ticker === null || distinct.size > 1) return { ticker, option: null };
+  const expiration = first.expiration ?? soleExpiration(text, timestamp);
+  return {
+    ticker,
+    option: expiration ? { optionType: first.optionType, strike: first.strike, expiration } : null,
+  };
+}
+
+function prefilterFlag(content: string, languageContent: string): string | null {
+  if (isProfitBrag(content)) return 'profit_brag';
+  const language = matchLanguagePrefilter(languageContent);
+  if (language) return PREFILTER_FLAGS[language] ?? language;
+  if (!messageHasTradeSignal(content)) return 'no_ticker_or_trade_verb';
+  return null;
+}
+
+type PatternFields = Omit<PatternRead, 'exitPortion' | 'flags'>;
+
+function fromRepoTemplate({ name, callout }: TemplateMatch): PatternFields {
+  const { option } = callout;
+  return {
+    read:
+      callout.action === 'buy'
+        ? 'BUY'
+        : name === 'repo_close_or_trim' || callout.positionSize
+          ? 'TRIM'
+          : 'SELL',
+    pattern: name,
+    contractLabel: option
+      ? `${callout.ticker} ${option.strike}${option.optionType[0]!.toUpperCase()} ${option.expiration}`
+      : null,
+    ticker: callout.ticker,
+    option,
+    limitPrice: callout.limitPrice,
+    positionSize: callout.positionSize,
+  };
+}
+
+function fromFormatGroups(
+  read: PatternAction,
+  pattern: string,
+  groups: Record<string, string | undefined>,
+  opts: { ownWords: string; timestamp: string; impliedSameDay: boolean; price: number | null }
+): PatternFields {
+  const cp = (groups.cp ?? '').toUpperCase();
+  const ticker = groups.ticker ? groups.ticker.toUpperCase() : null;
+  const dateToken = groups.date?.replace('.', '/');
+  const expiration = dateToken
+    ? resolveDeterministicExpiration(dateToken, opts.timestamp)
+    : opts.impliedSameDay
+      ? resolveDeterministicExpiration('0DTE', opts.timestamp)
+      : soleExpiration(opts.ownWords, opts.timestamp);
+  const option =
+    ticker && expiration
+      ? OptionContractSchema.safeParse({
+          optionType: cp === 'C' ? 'call' : 'put',
+          strike: Number(groups.strike),
+          expiration,
+        })
+      : null;
+  return {
+    read,
+    pattern,
+    contractLabel: [groups.ticker, `${groups.strike}${cp}`, groups.date].filter(Boolean).join(' '),
+    ticker,
+    option: option?.success ? option.data : null,
+    limitPrice: read === 'BUY' ? opts.price : null,
+    positionSize: classifyPositionSize(opts.ownWords),
+  };
+}
+
+function matchFormatTemplate(ownWords: string, rawText: string, timestamp: string): PatternFields | null {
+  for (const template of FORMAT_TEMPLATES) {
+    const groups = ownWords.match(template.test)?.groups;
+    if (!groups) continue;
+    // The user's rule: a TRIM-headed card that sells the whole position is a Sell.
+    const sold = ownWords.match(SWIFT_SOLD);
+    const closes =
+      template.name === 'swift_trim_card' &&
+      (POSITION_CLOSED.test(ownWords) || (sold !== null && sold[1] === sold[2]));
+    const price =
+      template.name === 'swift_buy_card'
+        ? positivePrice(ownWords.match(SWIFT_CARD_ENTRY)?.groups?.price)
+        : positivePrice(groups.price);
+    return fromFormatGroups(
+      closes ? 'SELL' : template.read,
+      closes ? 'swift_trim_closes_position' : template.name,
+      groups,
+      { ownWords, timestamp, impliedSameDay: template.impliedSameDay === true, price }
+    );
+  }
+  if (AT_PRICE_STATUS.test(rawText)) return null;
+  const groups = ownWords.match(CONTRACT_AT_PRICE)?.groups;
+  if (!groups) return null;
+  // ponytail: "@ 52" is Rowdy's 52 cents, so a whole-number price of 10 or more
+  // is ambiguous and the entry goes out at market. Upgrade: per-caller price units.
+  const rawPrice = groups.price ?? '';
+  const price = !rawPrice.includes('.') && Number(rawPrice) >= 10 ? null : positivePrice(rawPrice);
+  return fromFormatGroups(AVERAGING_WORDS.test(ownWords) ? 'AVERAGE' : 'BUY', 'contract_at_price', groups, {
+    ownWords,
+    timestamp,
+    impliedSameDay: false,
+    price,
+  });
+}
+
+/** What the templates and filters read in a (flattened) message. Never calls the LLM. */
+export function readPatterns(envelope: DiscordEnvelope): PatternRead {
+  // Discord ANSI color codes end in `m` (`\u001b[1;32mTSLA` → `mTSLA`).
+  const content = envelope.content.replace(/\u001b\[[0-9;]*m/g, '');
+  const languageContent = stripNoiseLines(content).join('\n');
+  const ownWords = stripMarkdown(envelope.content);
+
+  const template = matchDeterministicTemplate({ ...envelope, content });
+  const flags = new Set<string>();
+  const prefilter = template ? null : prefilterFlag(content, languageContent);
+  if (prefilter) flags.add(prefilter);
+  if (WATCHLIST_SHAPES.some((shape) => shape.test(ownWords))) flags.add('watchlist');
+
+  const fields: PatternFields = template
+    ? fromRepoTemplate(template)
+    : (matchFormatTemplate(ownWords, envelope.content, envelope.timestamp) ?? {
+        read: null,
+        pattern: null,
+        contractLabel: null,
+        ...readCandidateContract(languageContent, envelope.timestamp),
+        limitPrice: null,
+        positionSize: classifyPositionSize(languageContent),
+      });
+  const ticker = fields.ticker ?? languageContent.match(CASHTAG)?.groups?.ticker ?? null;
+  // "Out of NBIS" closes the Caller's whole position.
+  const exitPortion: ExitPortion | null = template?.callout.tickerOnlyExit
+    ? { kind: 'all' }
+    : readExitPortion(ownWords);
+  return { ...fields, ticker, exitPortion, flags: [...flags].sort() };
+}
+
+/** The hint Jev reads as `pattern_match`; null when no template or filter fired. */
+export function patternHint(read: PatternRead): PatternHint | null {
+  if (read.pattern === null && read.flags.length === 0) return null;
+  return {
+    read: read.read,
+    pattern: read.pattern,
+    ...(read.contractLabel ? { contract: read.contractLabel } : {}),
+    ...(read.flags.length > 0 ? { flags: read.flags } : {}),
+  };
 }
 
 // =============================================================================

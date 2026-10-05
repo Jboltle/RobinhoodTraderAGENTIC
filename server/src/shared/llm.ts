@@ -62,6 +62,10 @@ function isOpenaiReasoningModel(model: string): boolean {
   return /^o\d/.test(model) || model.startsWith('gpt-5');
 }
 
+// Parsing and recap summaries need no deliberation, and the default (medium on
+// most reasoning models) costs seconds per call.
+const OPENAI_REASONING_OPTIONS = { reasoning: { effort: 'low' } } as const;
+
 const chatAdapters: {
   [K in LlmBackend]: (model: string, params: LlmAdapterParams) => AdapterSetup;
 } = {
@@ -76,7 +80,7 @@ const chatAdapters: {
       model as Parameters<typeof createOpenaiChat>[0],
       params.openaiApiKey
     ),
-    modelOptions: isOpenaiReasoningModel(model) ? {} : { temperature: 0 },
+    modelOptions: isOpenaiReasoningModel(model) ? OPENAI_REASONING_OPTIONS : { temperature: 0 },
   }),
   anthropic: (model, params) => ({
     adapter: createAnthropicChat(

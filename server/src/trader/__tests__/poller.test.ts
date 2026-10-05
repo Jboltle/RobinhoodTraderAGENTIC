@@ -200,6 +200,7 @@ describe('buildEnvelope', () => {
       sentAt: FRESH_AT,
       deletedAt: null,
       disposition: null,
+      replyToMessageId: null,
     });
     expect(envelope).toEqual({
       messageId: 'm',
@@ -212,6 +213,7 @@ describe('buildEnvelope', () => {
       content: '',
       timestamp: FRESH_AT,
       embeds: [],
+      replyToMessageId: null,
     });
   });
 

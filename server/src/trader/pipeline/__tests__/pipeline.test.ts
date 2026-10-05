@@ -17,7 +17,10 @@ import { TraderEvents } from '../../events.js';
 import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
 import { SymbolNotFoundError, type RobinhoodTools } from '../../rh/tools.js';
-import { createMessageProcessor, pickCallerContract, type PipelineDeps } from '../index.js';
+import { JevCalloutDecider } from '../decide.js';
+import { contractsForPortion } from '../execute.js';
+import { createMessageProcessor, liveCallerContracts, type PipelineDeps } from '../index.js';
+import { ACTIONS, JevError, type Action, type JevVerdict } from '../jev.js';
 import {
   AVG_DOWN_SPY_PUT,
   BTO_QQQ_PUT,
@@ -341,18 +344,26 @@ describe('fan-out — ticker-only exits ("out of QQQ")', () => {
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 
-  it('picks the newest entry still live on the exit day', () => {
-    const newestFirst = [entry(240, '2026-09-29'), entry(236), entry(234)];
-    expect(pickCallerContract(newestFirst, EXIT_AT)?.strike).toBe(236);
+  it('lists the live entries newest first, each contract once', () => {
+    const newestFirst = [entry(240, '2026-09-29'), entry(236), entry(234), entry(236)];
+    expect(liveCallerContracts(newestFirst, EXIT_AT).map((option) => option.strike)).toEqual([236, 234]);
   });
 
   it('treats a contract expiring on the exit day as still live', () => {
-    expect(pickCallerContract([entry(234, '2026-09-30')], EXIT_AT)?.strike).toBe(234);
+    expect(liveCallerContracts([entry(234, '2026-09-30')], EXIT_AT).map((option) => option.strike)).toEqual([234]);
   });
 
   it('matches nothing when only expired or equity entries remain', () => {
     const equity: Callout = { ...entry(1), assetType: 'equity', option: null };
-    expect(pickCallerContract([equity, entry(234, '2026-09-29')], EXIT_AT)).toBeNull();
+    expect(liveCallerContracts([equity, entry(234, '2026-09-29')], EXIT_AT)).toEqual([]);
+  });
+
+  it("counts only the Caller's Jev entries once there are any, and never an add", () => {
+    const parserWatchlist = entry(250);
+    const jevEntry: Callout = { ...entry(245), engine: 'jev' };
+    expect(liveCallerContracts([parserWatchlist, jevEntry], EXIT_AT).map((option) => option.strike)).toEqual([245]);
+    const add: Callout = { ...entry(240), isAddition: true };
+    expect(liveCallerContracts([add, entry(236)], EXIT_AT).map((option) => option.strike)).toEqual([236]);
   });
 });
 
@@ -821,6 +832,174 @@ describe('fan-out — missed callouts', () => {
     expect(deps.parser.parse).not.toHaveBeenCalled();
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
     expect(db.getMessage(envelopeFromFixture(BTO_QQQ_PUT).messageId)?.disposition).toBe('missed');
+  });
+});
+
+describe('Jev engine — decider through the fan-out, with a mocked Jev', () => {
+  const AT = '2026-06-10T14:00:00.000Z';
+  const CALLER = 'caller-a';
+
+  const verdict = (choice: Action, probability: number, actingNow = 0.9): JevVerdict => ({
+    model: 'jev-1.13.0',
+    choice,
+    probabilities: Object.fromEntries(
+      ACTIONS.map((action) => [action, action === choice ? probability : (1 - probability) / 5])
+    ) as Record<Action, number>,
+    answerConfidence: probability,
+    confidence: null,
+    inputTokens: 600,
+    actingNow,
+  });
+
+  const message = (content: string, extra: Partial<DiscordEnvelope> = {}): DiscordEnvelope => ({
+    messageId: 'jev-msg-1',
+    channelId: 'chan-001',
+    guildId: null,
+    authorId: CALLER,
+    authorName: 'Bishop',
+    authorAvatarUrl: null,
+    content,
+    timestamp: AT,
+    ...extra,
+  });
+
+  /** setup() with the real decider in front of a Jev that answers `answer`. */
+  function setupJev(
+    answer: JevVerdict | Error,
+    toolsOverrides: Partial<RobinhoodTools> = {},
+    settings: TradeSettings = {}
+  ): Setup {
+    const base = setup(BTO_QQQ_PUT.expectedCallout, toolsOverrides);
+    if (Object.keys(settings).length > 0) base.db.seedSettings(USER, { ...TRADING_SETTINGS, ...settings });
+    const jev = {
+      ask: answer instanceof Error ? vi.fn().mockRejectedValue(answer) : vi.fn().mockResolvedValue(answer),
+    };
+    return { ...base, deps: { ...base.deps, parser: new JevCalloutDecider(jev) } };
+  }
+
+  const holding = (strike: number, quantity: number, expiration = '2026-06-11') => ({
+    getOptionPositions: vi.fn().mockResolvedValue({
+      positions: [{ symbol: 'QQQ', optionType: 'call', strike, expiration, quantity, raw: {} }],
+      raw: {},
+    }),
+  });
+
+  const ENTRY = "I'm Entering\n**Option:** QQQ 707 C 6/11\n**Entry:** 0.97";
+
+  it('trades a confident Buy at the template price, and parks a 0.6-0.8 one even in immediate mode', async () => {
+    const confident = setupJev(verdict('BUY', 0.9));
+    await createMessageProcessor(confident.deps).process(message(ENTRY));
+    expect((await confident.db.listDecisions(USER, 10))[0]).toMatchObject({
+      kind: 'submitted',
+      order: { symbol: 'QQQ', side: 'buy', orderType: 'limit', limitPrice: 0.97 },
+    });
+
+    const unsure = setupJev(verdict('BUY', 0.75));
+    await createMessageProcessor(unsure.deps).process(message(ENTRY));
+    const [parked] = await unsure.db.listDecisions(USER, 10);
+    expect(parked).toMatchObject({ kind: 'pending_approval' });
+    expect(parked!.reason).toMatch(/^Jev BUY 0\.75 .* is below 0\.8\. Approval required: BUY/);
+    expect(unsure.tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it("uses Jev's cutoffs instead of the user's minConfidence", async () => {
+    const { db, deps } = setupJev(verdict('BUY', 0.85), {}, { minConfidence: 0.9 });
+    await createMessageProcessor(deps).process(message(ENTRY));
+    expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('submitted');
+  });
+
+  it('never trades an Average and writes no trade rows', async () => {
+    const { db, deps, tools } = setupJev(verdict('AVERAGE', 1));
+    await createMessageProcessor(deps).process(message('➕ AVERAGING DOWN — QQQ 707C · Jun 11\nAdded 10 @ $0.325'));
+    expect(db.getMessage('jev-msg-1')?.disposition).toBe('not_callout');
+    expect(await db.listDecisions(USER, 10)).toEqual([]);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it("sells the caller's stated fraction of the held position, rounding down", async () => {
+    const card = '✂️ TRIM +25% — QQQ 707C · Jun 11\nSold **4 of 20** @ **$0.906** · **16** still running.';
+    const { db, deps, tools } = setupJev(verdict('TRIM', 0.95), holding(707, 12));
+    await createMessageProcessor(deps).process(message(card));
+    expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('submitted');
+    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(call).toMatchObject({ side: 'sell', strike: 707, contracts: 2 });
+  });
+
+  it("takes a contract-less exit's contract from the Caller's card it replies to", async () => {
+    const { db, deps, tools } = setupJev(verdict('TRIM', 0.9), holding(707, 5));
+    db.seedMessage({
+      messageId: 'card-1',
+      sentAt: '2026-06-10T13:00:00.000Z',
+      authorId: CALLER,
+      disposition: 'callout',
+      parse: { ...BTO_QQQ_PUT.expectedCallout, ticker: 'QQQ', option: { optionType: 'call', strike: 707, expiration: '2026-06-11' } },
+      processedAt: '2026-06-10T13:00:00.000Z',
+    });
+    await createMessageProcessor(deps).process(message('Trimming here', { replyToMessageId: 'card-1' }));
+    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(call).toMatchObject({ side: 'sell', strike: 707, contracts: 2 });
+  });
+
+  it('ignores a card from another Caller, and skips quietly when nothing matches', async () => {
+    const { db, deps, tools } = setupJev(verdict('SELL', 0.95), holding(707, 5));
+    db.seedMessage({
+      messageId: 'card-b',
+      sentAt: '2026-06-10T13:00:00.000Z',
+      authorId: 'caller-b',
+      disposition: 'callout',
+      parse: { ...BTO_QQQ_PUT.expectedCallout, ticker: 'QQQ', option: { optionType: 'call', strike: 707, expiration: '2026-06-11' } },
+      processedAt: '2026-06-10T13:00:00.000Z',
+    });
+    await createMessageProcessor(deps).process(message('Out of QQQ', { replyToMessageId: 'card-b' }));
+    expect(db.getMessage('jev-msg-1')?.disposition).toBe('not_callout');
+    expect(await db.listDecisions(USER, 10)).toEqual([]);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it("sends an exit to approval when the Caller has several live entries in the ticker", async () => {
+    const { db, deps, tools } = setupJev(verdict('SELL', 0.95), holding(710, 3));
+    const entryAt = (strike: number, sentAt: string) =>
+      db.seedMessage({
+        messageId: `entry-${strike}`,
+        sentAt,
+        authorId: CALLER,
+        disposition: 'callout',
+        parse: {
+          ...BTO_QQQ_PUT.expectedCallout,
+          ticker: 'QQQ',
+          option: { optionType: 'call', strike, expiration: '2026-06-11' },
+          engine: 'jev',
+        },
+        processedAt: sentAt,
+      });
+    entryAt(707, '2026-06-10T13:00:00.000Z');
+    entryAt(710, '2026-06-10T13:30:00.000Z');
+
+    await createMessageProcessor(deps).process(message('Out of QQQ'));
+
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision).toMatchObject({ kind: 'pending_approval', order: { option: { strike: 710 }, quantity: 3 } });
+    expect(decision!.reason).toMatch(/Bishop has 2 open QQQ entries; picked the newest, 710C 2026-06-11/);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ kind: 'all' } as const, 5, 5],
+    [{ kind: 'all_but_one' } as const, 5, 4],
+    [{ kind: 'all_but_one' } as const, 1, 0],
+    [{ kind: 'fraction', value: 0.5 } as const, 1, 0],
+    [{ kind: 'fraction', value: 1 / 3 } as const, 3, 1],
+    [{ kind: 'fraction', value: 0.2 } as const, 12, 2],
+  ])('sizes %j of %i held contracts as %i, rounding down', (portion, held, sold) => {
+    expect(contractsForPortion(portion, held)).toBe(sold);
+  });
+
+  it('records failed and a parse_failed row per user when Jev does not answer', async () => {
+    const { db, deps, tools } = setupJev(new JevError('no answer within 1500 ms', 'timeout'));
+    await createMessageProcessor(deps).process(message(ENTRY));
+    expect(db.getMessage('jev-msg-1')?.disposition).toBe('failed');
+    expect((await db.listDecisions(USER, 10))[0]).toMatchObject({ kind: 'parser_error', code: 'parse_failed' });
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 });
 

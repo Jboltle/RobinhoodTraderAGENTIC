@@ -116,6 +116,14 @@ export interface PendingMessage {
   readonly deletedAt: string | null;
   /** Non-null only on crash replay: the verdict was written but the row was never marked processed. */
   readonly disposition: MessageDisposition | null;
+  /** The message this one replies to (raw.reference_id); null when it is not a reply. */
+  readonly replyToMessageId: string | null;
+}
+
+/** A judged callout and who posted it: the card a reply can point at. */
+export interface CalloutCard {
+  readonly authorId: string;
+  readonly parse: Callout;
 }
 
 /** A row in the shared `callers` table: one Caller (Discord author) in the roster. */
@@ -233,6 +241,8 @@ export interface TraderDb {
    * the entries a ticker-only exit ("out of NBIS") can be closing.
    */
   listCallerEntries(authorId: string, ticker: string, before: Date, limit: number): Promise<Callout[]>;
+  /** The stored callout for one message, with its author; null unless it was judged a callout. */
+  getMessageParse(messageId: string): Promise<CalloutCard | null>;
 
   /** Insert a Caller or refresh their display name/avatar/last-seen. */
   upsertCaller(caller: Caller): Promise<void>;
@@ -517,6 +527,14 @@ class DrizzleTraderDb implements TraderDb {
     return rows.flatMap((row) => (row.parse ? [row.parse] : []));
   }
 
+  async getMessageParse(messageId: string): Promise<CalloutCard | null> {
+    const [row] = await this.db
+      .select({ authorId: messages.authorId, parse: messages.parse })
+      .from(messages)
+      .where(and(eq(messages.id, messageId), eq(messages.disposition, 'callout')));
+    return row?.parse ? { authorId: row.authorId, parse: row.parse } : null;
+  }
+
   async upsertCaller(caller: Caller): Promise<void> {
     await this.db
       .insert(callers)
@@ -754,7 +772,8 @@ function toStoredCallout(row: typeof messages.$inferSelect): StoredCallout {
 }
 
 function toPendingMessage(row: typeof messages.$inferSelect): PendingMessage {
-  const author = (row.raw as { author?: { avatar_url?: string | null } }).author;
+  const raw = row.raw as { author?: { avatar_url?: string | null }; reference_id?: string | null };
+  const author = raw.author;
   return {
     messageId: row.id,
     channelId: row.channelId,
@@ -767,6 +786,7 @@ function toPendingMessage(row: typeof messages.$inferSelect): PendingMessage {
     sentAt: row.sentAt.toISOString(),
     deletedAt: row.deletedAt?.toISOString() ?? null,
     disposition: row.disposition,
+    replyToMessageId: raw.reference_id ?? null,
   };
 }
 

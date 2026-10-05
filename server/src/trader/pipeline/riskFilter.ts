@@ -143,7 +143,9 @@ export function checkRisk(
   if (callout.assetType === 'equity' && callout.sizeHint?.kind === 'contracts') {
     return { allow: false, code: 'invalid_sizing', reason: 'contracts sizing is not valid for equity orders' };
   }
-  if (callout.confidence < settings.minConfidence) {
+  // On the Jev path the decider's cutoffs replace minConfidence: below 0.6
+  // never gets here, and 0.6 to 0.8 already waits for approval.
+  if (callout.engine !== 'jev' && callout.confidence < settings.minConfidence) {
     return {
       allow: false,
       code: 'low_confidence',

@@ -79,6 +79,7 @@ export function buildEnvelope(row: PendingMessage): DiscordEnvelope {
     content: row.content,
     timestamp: row.sentAt,
     embeds: [...row.embeds],
+    replyToMessageId: row.replyToMessageId,
   };
 }
 

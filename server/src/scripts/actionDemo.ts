@@ -7,10 +7,15 @@
  *
  *   bun src/scripts/actionDemo.ts sample [--size all] [--seed 42] [--force]
  *   bun src/scripts/actionDemo.ts label [--dry-run] [--relabel]
- *   bun src/scripts/actionDemo.ts laya [--tag ft] [--limit N] [--model english]
+ *   bun src/scripts/actionDemo.ts laya [--tag ft] [--limit N] [--model english] [--gate]
  *   bun src/scripts/actionDemo.ts parser [--live] [--limit N]
  *   bun src/scripts/actionDemo.ts export-train
  *   bun src/scripts/actionDemo.ts report
+ *   bun src/scripts/actionDemo.ts decide [--source export.jsonl] [--since ISO]
+ *
+ * decide is the pre-deploy replay: the production Jev decider (patterns, then
+ * hosted Jev) over the labeled set or a messages export, scored against the
+ * ship bars in docs/adr/0002. It calls Jev, so it needs JEV_API_KEY.
  *
  * Every command takes --dir (default server/state/action-demo/, gitignored
  * with the rest of state/). labels.jsonl, split.jsonl, laya*.jsonl and
@@ -50,6 +55,23 @@ import { config as loadDotenv } from 'dotenv';
 
 import { flattenEnvelope } from '../shared/embedText.js';
 import type { DiscordEnvelope, OrderSide, PositionSize } from '../shared/types.js';
+import {
+  ACTING_NOW_QUESTION,
+  ACTING_NOW_QUESTION_ID,
+  ACTION_CRITERIA,
+  ACTION_INSTRUCTIONS,
+  ACTION_QUESTION_ID,
+  ACTIONS,
+  JevError,
+  postSystemOne,
+  readJevResponse,
+  SYSTEMONE_PATH,
+  TYPESAFE_API_HOST,
+  typesafeKeyFor,
+  type Action,
+  type JevVerdict,
+  type SystemOneCall,
+} from '../trader/pipeline/jev.js';
 import type { LlmCalloutParser } from '../trader/pipeline/parseCallout.js';
 import {
   ALL_FIXTURES,
@@ -57,12 +79,11 @@ import {
 } from '../trader/pipeline/__tests__/fixtures/discordMessages.js';
 
 // ---------------------------------------------------------------------------
-// Actions — the question and criteria LAYA answers, verbatim
+// Actions — the question and criteria LAYA answers live in jev.ts
 // ---------------------------------------------------------------------------
 
-/** Every class a message can be labeled: four Actions, then INFO and NONE, the two no-trade classes. */
-export const ACTIONS = ['BUY', 'AVERAGE', 'TRIM', 'SELL', 'INFO', 'NONE'] as const;
-export type Action = (typeof ACTIONS)[number];
+export { ACTIONS };
+export type { Action };
 
 /** INFO and NONE merged: the parser's not_callout means "no trade" and cannot tell them apart. */
 export const MERGED_ACTIONS = ['BUY', 'AVERAGE', 'TRIM', 'SELL', 'NO_TRADE'] as const;
@@ -73,23 +94,6 @@ export const COARSE_ACTIONS = ['BUY', 'AVERAGE', 'EXIT', 'NO_TRADE'] as const;
 export type CoarseAction = (typeof COARSE_ACTIONS)[number];
 
 export type Label = Action | 'UNSURE';
-
-const ACTION_INSTRUCTIONS = 'Which Action does this Discord options-trading message announce?';
-
-// Measured with LAYA's own tokenizer (laya-ts, English checkpoint) against
-// laya/common.py build_sequence: question head 16 + options 137 = 153 of
-// head_max_len 192; the longest option (INFO) is 38 of the 48-token per-option
-// cap. Past either limit LAYA silently truncates, so re-measure after edits.
-const ACTION_CRITERIA: Readonly<Record<Action, string>> = {
-  BUY: 'Opens a new position.',
-  AVERAGE: 'Buys more of a position the caller already holds.',
-  TRIM: 'Sells part of a position and keeps the rest.',
-  SELL: "Closes the whole position, even if headed TRIM. A sale that doesn't say how much is a SELL.",
-  INFO:
-    'News or a plan about a position the caller still holds, with no trade now: ' +
-    "'still in', P/L updates, targets, stops, 'not trimming yet'.",
-  NONE: "Anything else that isn't a trade: commentary, hype, watchlists, questions, or recaps of closed trades.",
-};
 
 /** An exit read as an entry: followers buy more of what the Caller is getting out of. */
 const COSTLY_TRUTHS: ReadonlySet<Action> = new Set<Action>(['TRIM', 'SELL']);
@@ -150,22 +154,11 @@ export interface LabelRecord {
   readonly relabeled?: true;
 }
 
-interface LayaVerdict {
-  /** Checkpoint that answered (LAYA's routing.model), else the response's model id. */
-  readonly model: string;
-  readonly choice: Action;
-  readonly probabilities: Readonly<Record<Action, number>>;
-  /**
-   * Calibrated top probability: LAYA's answer_confidence (laya/common.py), or
-   * probabilities[choice] when absent, as on hosted Jev; the same quantity.
-   */
-  readonly answerConfidence: number;
-  /** LAYA: 1 − normalized entropy, NOT calibrated. Hosted Jev: (n·p_max − 1)/(n − 1). */
-  readonly confidence: number | null;
-  /** LAYA: tokens in the whole sequence (question + options + state), capped at max_len. */
-  readonly inputTokens: number | null;
+interface LayaVerdict extends Omit<JevVerdict, 'actingNow'> {
   /** The state was cut to fit max_len, so LAYA never saw the end of the message. */
   readonly truncated: boolean;
+  /** `--gate` runs only: probability the caller is telling followers to trade now. */
+  readonly actingNow?: number | null;
 }
 
 type LayaSuccess = LayaVerdict & {
@@ -593,167 +586,99 @@ async function labelCommand(dir: string, dryRun: boolean, relabel: boolean): Pro
 }
 
 // ---------------------------------------------------------------------------
-// LAYA wire mapping — the only code that knows the /v1/systemone shape.
-// LAYA serves Jev's protocol (laya/serve.py; README "Three things differ from
-// Jev"), and docs.typesafe.ai/api documents the same request and response, so
-// hosted Jev is a base URL, a key and --model jev-latest away.
+// LAYA requests. The /v1/systemone wire shape lives in jev.ts: LAYA serves
+// Jev's protocol (laya/serve.py; README "Three things differ from Jev"), so
+// hosted Jev is a base URL, a key and --model jev-1.13.0 away.
 // ---------------------------------------------------------------------------
 
 const LAYA_DEFAULT_BASE_URL = 'http://127.0.0.1:8765';
-const SYSTEMONE_PATH = '/v1/systemone';
 /**
  * LAYA honours a checkpoint name and auto-routes anything else (emoji-heavy
  * text can land on the multilingual checkpoint); pinning keeps every message on
- * the checkpoint the token budget above was measured against.
+ * the checkpoint the token budget below was measured against.
  */
 const LAYA_DEFAULT_MODEL = 'english';
 /** English checkpoint's max_len: the state is silently cut so the sequence fits (~377 state tokens here). */
 const LAYA_MAX_LEN = 512;
-const QUESTION_ID = 'action';
 
 /** Exactly what LAYA reads as `state`; export-train writes the same string. */
 export function layaState(row: Pick<CorpusRow, 'text'>): string {
   return row.text;
 }
 
+// The criteria were measured with LAYA's own tokenizer (laya-ts, English
+// checkpoint) against laya/common.py build_sequence: question head 16 + options
+// 137 = 153 of head_max_len 192; the longest option (INFO) is 38 of the 48-token
+// per-option cap. Past either limit LAYA silently truncates, so re-measure after edits.
 /** The questions map every request sends; export-train writes it verbatim as question.json. */
 const LAYA_QUESTIONS = {
-  [QUESTION_ID]: {
+  [ACTION_QUESTION_ID]: {
     type: 'choice',
     instructions: ACTION_INSTRUCTIONS,
     criteria: ACTION_CRITERIA,
   },
 };
 
-export function buildLayaRequest(state: string, model: string): unknown {
-  return { model, state, questions: LAYA_QUESTIONS };
+/** Below this act-now probability the gate turns a trade into NONE. */
+export const ACTING_NOW_MIN = 0.5;
+
+const TRADE_ACTIONS: ReadonlySet<Action> = new Set<Action>(['BUY', 'AVERAGE', 'TRIM', 'SELL']);
+
+export function buildLayaRequest(state: string, model: string, gate = false): unknown {
+  return {
+    model,
+    state,
+    questions: gate ? { ...LAYA_QUESTIONS, [ACTING_NOW_QUESTION_ID]: ACTING_NOW_QUESTION } : LAYA_QUESTIONS,
+  };
+}
+
+/** The verdict a system acts on: a trade the gate says is not being called now is NONE. */
+export function gatedChoice(verdict: Pick<LayaVerdict, 'choice' | 'actingNow'>): Action {
+  const { choice, actingNow } = verdict;
+  return actingNow != null && actingNow < ACTING_NOW_MIN && TRADE_ACTIONS.has(choice) ? 'NONE' : choice;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const isAction = (value: unknown): value is Action => ACTIONS.includes(value as Action);
-
-const numberOrNull = (value: unknown): number | null => (typeof value === 'number' ? value : null);
-
-/** Map a /v1/systemone response to a verdict; throws on any shape it does not expect. */
+/** jev.ts's verdict, plus whether LAYA cut the state to fit its 512-token window. */
 export function readLayaResponse(json: unknown): LayaVerdict {
-  const body = isRecord(json) ? json : {};
-  const answer = isRecord(body.answers) ? body.answers[QUESTION_ID] : undefined;
-  const choice = isRecord(answer) ? answer.choice : undefined;
-  const probabilities =
-    isRecord(answer) && isRecord(answer.probabilities) ? answer.probabilities : undefined;
-  if (
-    !isRecord(answer) ||
-    !isAction(choice) ||
-    !probabilities ||
-    !ACTIONS.every((action) => typeof probabilities[action] === 'number')
-  ) {
-    throw new Error(`unexpected LAYA response: ${String(JSON.stringify(json)).slice(0, 300)}`);
-  }
-  const probabilityOf = (action: Action): number => probabilities[action] as number;
-  const routing = isRecord(body.routing) ? body.routing : {};
-  const inputTokens = isRecord(body.usage) ? numberOrNull(body.usage.input_tokens) : null;
+  const verdict = readJevResponse(json);
+  // Only LAYA cuts the state at 512 tokens (its answers carry `routing`); hosted Jev reads 32k.
+  const routed = isRecord(json) && isRecord(json.routing);
   return {
-    model:
-      typeof routing.model === 'string'
-        ? routing.model
-        : typeof body.model === 'string'
-          ? body.model
-          : 'unknown',
-    choice,
-    probabilities: Object.fromEntries(
-      ACTIONS.map((action) => [action, probabilityOf(action)])
-    ) as Record<Action, number>,
-    answerConfidence: numberOrNull(answer.answer_confidence) ?? probabilityOf(choice),
-    confidence: numberOrNull(answer.confidence),
-    inputTokens,
-    truncated: inputTokens !== null && inputTokens >= LAYA_MAX_LEN,
+    ...verdict,
+    truncated: routed && verdict.inputTokens !== null && verdict.inputTokens >= LAYA_MAX_LEN,
   };
 }
 
 /** Generous: a lazily loaded checkpoint takes 7-10 s on its first request (LAYA README). */
 const REQUEST_TIMEOUT_MS = 60_000;
-/** TypeSafe SDK retry defaults: 2 retries, 0.5 s backoff doubling to 5 s, on 408/429/5xx. */
-const MAX_RETRIES = 2;
-const BACKOFF_INITIAL_MS = 500;
-const BACKOFF_MAX_MS = 5_000;
-const RETRYABLE_CLIENT_STATUSES = new Set([408, 429]);
-const FIRST_SERVER_ERROR_STATUS = 500;
 const AUTH_FAILURE_STATUSES = new Set([401, 403]);
-
-class SystemOneHttpError extends Error {
-  constructor(
-    readonly status: number,
-    detail: string
-  ) {
-    super(`HTTP ${status}${detail ? `: ${detail}` : ''}`);
-    this.name = 'SystemOneHttpError';
-  }
-}
-
-const isRetryableStatus = (status: number): boolean =>
-  RETRYABLE_CLIENT_STATUSES.has(status) || status >= FIRST_SERVER_ERROR_STATUS;
-
-function backoffMs(attempt: number, retryAfterSeconds: string | null): number {
-  const wanted = retryAfterSeconds
-    ? Number(retryAfterSeconds) * 1000
-    : BACKOFF_INITIAL_MS * 2 ** (attempt - 1);
-  return Math.min(Number.isFinite(wanted) ? wanted : BACKOFF_MAX_MS, BACKOFF_MAX_MS);
-}
-
-interface SystemOneCall {
-  readonly json: unknown;
-  readonly latencyMs: number;
-  readonly attempts: number;
-}
-
-// ponytail: honours Retry-After in seconds only (not retry-after-ms) and adds no
-// jitter, which is fine for one sequential client. Upgrade: the SDK's RetryPolicy.
-async function callSystemOne(
-  url: string,
-  apiKey: string | undefined,
-  body: unknown
-): Promise<SystemOneCall> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
-    const startedAt = performance.now();
-    let retryAfter: string | null = null;
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (response.ok) {
-        const json: unknown = await response.json();
-        return { json, latencyMs: Math.round(performance.now() - startedAt), attempts: attempt };
-      }
-      const detail = (await response.text().catch(() => '')).slice(0, 300);
-      lastError = new SystemOneHttpError(response.status, detail);
-      if (!isRetryableStatus(response.status)) break;
-      retryAfter = response.headers.get('retry-after');
-    } catch (err) {
-      lastError = err; // network failure or timeout: retryable
-    }
-    if (attempt <= MAX_RETRIES) await sleep(backoffMs(attempt, retryAfter));
-  }
-  throw lastError;
-}
 
 const TAG_PATTERN = /^[a-z0-9-]+$/i;
 
+/**
+ * LAYA_API_KEY goes to whatever server LAYA_BASE_URL names. JEV_API_KEY is a
+ * TypeSafe credential, so it is attached only when that server is TypeSafe's.
+ */
+export function pickApiKey(baseUrl: string, env: Record<string, string | undefined>): string | undefined {
+  return env.LAYA_API_KEY?.trim() || typesafeKeyFor(baseUrl, env.JEV_API_KEY);
+}
+
 // ponytail: one request at a time keeps per-call latency clean and a single GPU
 // busy; ceiling ≈ one forward pass per call. Upgrade: LAYA's batch endpoint.
-async function layaCommand(dir: string, limit: number, model: string, tag?: string): Promise<void> {
+async function layaCommand(
+  dir: string,
+  limit: number,
+  model: string,
+  tag: string | undefined,
+  gate: boolean
+): Promise<void> {
   if (tag !== undefined && !TAG_PATTERN.test(tag)) fail(`--tag must be letters, digits or dashes, got "${tag}"`);
-  const apiKey = process.env.LAYA_API_KEY?.trim() || undefined;
-  const redact = (text: string): string => (apiKey ? text.replaceAll(apiKey, '[redacted]') : text);
   const baseUrl = (process.env.LAYA_BASE_URL?.trim() || LAYA_DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const apiKey = pickApiKey(baseUrl, process.env);
+  const redact = (text: string): string => (apiKey ? text.replaceAll(apiKey, '[redacted]') : text);
   const url = `${baseUrl}${SYSTEMONE_PATH}`;
   const file = layaFile(dir, tag);
   const corpus = readCorpus(dir);
@@ -763,7 +688,10 @@ async function layaCommand(dir: string, limit: number, model: string, tag?: stri
       .map((record) => record.id)
   );
   const pending = corpus.filter((row) => !answered.has(row.id)).slice(0, limit);
-  console.log(`laya: ${pending.length} to call, ${answered.size} already answered → ${url} (model ${model}) → ${file}`);
+  console.log(
+    `laya: ${pending.length} to call, ${answered.size} already answered → ${url} (model ${model}` +
+      `${gate ? ', act-now gate' : ''}) → ${file}`
+  );
 
   let failures = 0;
   const recordFailure = (id: string, at: string, progress: string, error: string): void => {
@@ -777,14 +705,21 @@ async function layaCommand(dir: string, limit: number, model: string, tag?: stri
     const progress = `${index + 1}/${pending.length}`;
     let call: SystemOneCall;
     try {
-      call = await callSystemOne(url, apiKey, buildLayaRequest(layaState(row), model));
+      call = await postSystemOne(url, buildLayaRequest(layaState(row), model, gate), {
+        apiKey,
+        budgetMs: Infinity,
+        attemptTimeoutMs: REQUEST_TIMEOUT_MS,
+      });
     } catch (err) {
-      if (!(err instanceof SystemOneHttpError)) {
+      if (!(err instanceof JevError) || err.kind !== 'http') {
         // Unreachable or timing out: stop instead of writing an error per message; a re-run resumes.
         fail(`could not reach LAYA at ${url} (${redact(errorMessage(err))}); stopped without recording this message. Is the server running?`);
       }
-      if (AUTH_FAILURE_STATUSES.has(err.status)) {
-        fail(`LAYA refused the request (HTTP ${err.status}); set LAYA_API_KEY to the server's bearer token.`);
+      if (err.status !== null && AUTH_FAILURE_STATUSES.has(err.status)) {
+        fail(
+          `LAYA refused the request (HTTP ${err.status}); set LAYA_API_KEY to the server's bearer token ` +
+            `(JEV_API_KEY is used for ${TYPESAFE_API_HOST}).`
+        );
       }
       recordFailure(row.id, at, progress, err.message);
       continue;
@@ -1057,6 +992,10 @@ export function confidenceBand(p: number): ConfidenceBand {
 
 /** The results file `laya --tag ft` writes when pointed at the fine-tuned server. */
 const FINE_TUNED_TAG = 'ft';
+/** The results file `laya --tag jev` writes when pointed at hosted Jev. */
+const JEV_TAG = 'jev';
+/** The same, run with `--gate`. */
+const JEV_GATED_TAG = 'jev-gated';
 
 function percentile(values: readonly number[], p: number): number | null {
   if (values.length === 0) return null;
@@ -1161,12 +1100,14 @@ function layaSystem(name: string, records: ReadonlyMap<string, LayaRecord>): Sys
     sixWay: true,
     verdictOf: (id) => {
       const record = records.get(id);
-      return record === undefined ? undefined : record.ok ? record.choice : null;
+      return record === undefined ? undefined : record.ok ? gatedChoice(record) : null;
     },
     describe: (id) => {
       const record = records.get(id);
       if (!record) return '—';
-      return record.ok ? `${record.choice} (p ${record.answerConfidence.toFixed(2)})` : 'error';
+      if (!record.ok) return 'error';
+      const gate = record.actingNow != null ? `, act-now ${record.actingNow.toFixed(2)}` : '';
+      return `${gatedChoice(record)} (p ${record.answerConfidence.toFixed(2)}${gate})`;
     },
   };
 }
@@ -1255,9 +1196,13 @@ function reportCommand(dir: string, seed: number): void {
 
   const untrained = latestLayaById(readJsonl<LayaRecord>(layaFile(dir)));
   const fineTuned = latestLayaById(readJsonl<LayaRecord>(layaFile(dir, FINE_TUNED_TAG)));
+  const jev = latestLayaById(readJsonl<LayaRecord>(layaFile(dir, JEV_TAG)));
+  const jevGated = latestLayaById(readJsonl<LayaRecord>(layaFile(dir, JEV_GATED_TAG)));
   const parser = latestParserById(readJsonl<ParserRecord>(paths.parser));
   const untrainedSystem = layaSystem('LAYA untrained', untrained);
   const fineTunedSystem = layaSystem('LAYA fine-tuned', fineTuned);
+  const jevSystem = layaSystem('Jev (hosted)', jev);
+  const jevGatedSystem = layaSystem('Jev (hosted), act-now gate', jevGated);
   const parserSystem: System = {
     name: 'parser',
     sixWay: false,
@@ -1268,7 +1213,7 @@ function reportCommand(dir: string, seed: number): void {
       return record.action ? mergedAction(record.action) : 'no verdict';
     },
   };
-  const systems = [untrainedSystem, fineTunedSystem, parserSystem];
+  const systems = [untrainedSystem, fineTunedSystem, jevSystem, jevGatedSystem, parserSystem];
 
   // Head-to-head only over test messages every system that ran has a verdict for.
   const ran = systems.filter((system) => [...test.keys()].some((id) => system.verdictOf(id)));
@@ -1318,6 +1263,22 @@ function reportCommand(dir: string, seed: number): void {
       test,
       `No answers yet: run \`laya --tag ${FINE_TUNED_TAG}\` against the fine-tuned server.`
     ),
+    '## Jev (hosted)',
+    '',
+    ...layaLines(
+      jevSystem,
+      jev,
+      test,
+      `No answers yet: run \`laya --tag ${JEV_TAG} --model jev-1.13.0\` with LAYA_BASE_URL=https://${TYPESAFE_API_HOST}.`
+    ),
+    '## Jev (hosted), act-now gate',
+    '',
+    ...layaLines(
+      jevGatedSystem,
+      jevGated,
+      test,
+      `No answers yet: run \`laya --tag ${JEV_GATED_TAG} --model jev-1.13.0 --gate\` with LAYA_BASE_URL=https://${TYPESAFE_API_HOST}.`
+    ),
     '## Current parser',
     '',
     ...parserLines(parserSystem, parser, test),
@@ -1348,6 +1309,310 @@ function reportCommand(dir: string, seed: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// decide — replay the production Jev decider before deploy (docs/adr/0002)
+// ---------------------------------------------------------------------------
+
+/** One replayed message: what Jev answered and what the decider would trade. */
+type DecideRecord =
+  | {
+      readonly ok: true;
+      readonly id: string;
+      readonly at: string;
+      /** Null for an empty message, which never reaches Jev. */
+      readonly choice: Action | null;
+      readonly probability: number | null;
+      readonly actingNow: number | null;
+      readonly patternRead: string | null;
+      readonly pattern: string | null;
+      readonly trade: 'BUY' | 'TRIM' | 'SELL' | null;
+      readonly route: 'automatic' | 'approval' | null;
+      /** Null on a contract-less exit, which the pipeline resolves or skips. */
+      readonly contract: string | null;
+      readonly rationale: string;
+    }
+  | { readonly ok: false; readonly id: string; readonly at: string; readonly error: string };
+
+type DecideSuccess = Extract<DecideRecord, { ok: true }>;
+
+/** A row of a `messages` export: the psql query `decide --source` reads (see USAGE). */
+interface ExportRow {
+  readonly id: string;
+  readonly ts: string;
+  readonly author: string;
+  readonly author_id: string;
+  readonly channel_id?: string;
+  readonly content: string | null;
+  readonly embeds: Record<string, unknown>[] | null;
+  readonly reply_to?: string | null;
+  readonly disposition: string | null;
+  readonly parse: ParsedCallout | null;
+}
+
+/** Reference ids from the Oct 4 test: state/action-demo-db/replay-gates.json. */
+interface ReplayGates {
+  readonly followedMissedEntries: readonly string[];
+  readonly averagingPosts: readonly string[];
+  readonly bishopExits: readonly string[];
+}
+
+// The plan's ship bars: the Oct 4 test's numbers, within run-to-run noise.
+const GATE_ACCURACY_MIN = 0.84;
+const GATE_WRONG_ENTRIES_MAX = 1;
+const GATE_EXITS_CAUGHT_MIN = 60;
+const GATE_FOLLOWED_ENTRIES_MIN = 20;
+/** TypeSafe allows 1,200 requests a minute; one start every 60 ms stays under it. */
+const DECIDE_START_INTERVAL_MS = 60;
+const DECIDE_CONCURRENCY = 4;
+const DEFAULT_GATES_FILE = fileURLToPath(new URL('../../state/action-demo-db/replay-gates.json', import.meta.url));
+
+type Decider = InstanceType<typeof import('../trader/pipeline/decide.js').JevCalloutDecider>;
+
+const EXIT_TRADES: ReadonlySet<string> = new Set(['TRIM', 'SELL']);
+
+/** Variant A's gate as the test scored it: a Buy or Average not called now is NONE, unless a template read Buy. */
+function replayedChoice(record: DecideSuccess): Action {
+  const choice = record.choice ?? 'NONE';
+  const gated = (choice === 'BUY' || choice === 'AVERAGE') && (record.actingNow ?? 0) < 0.3;
+  return gated && !(choice === 'BUY' && record.patternRead === 'BUY') ? 'NONE' : choice;
+}
+
+async function replayOne(decider: Decider, envelope: DiscordEnvelope): Promise<DecideRecord> {
+  const at = new Date().toISOString();
+  try {
+    const { callout, patterns, verdict } = await decider.decideTraced(envelope);
+    const trade = !callout.isCallout
+      ? null
+      : callout.action === 'buy'
+        ? 'BUY'
+        : verdict?.choice === 'TRIM'
+          ? 'TRIM'
+          : 'SELL';
+    return {
+      ok: true,
+      id: envelope.messageId,
+      at,
+      choice: verdict?.choice ?? null,
+      probability: verdict ? verdict.probabilities[verdict.choice] : null,
+      actingNow: verdict?.actingNow ?? null,
+      patternRead: patterns.read,
+      pattern: patterns.pattern,
+      trade,
+      route: trade ? (callout.reviewReason ? 'approval' : 'automatic') : null,
+      contract: callout.option
+        ? `${callout.ticker} ${callout.option.strike}${callout.option.optionType[0]!.toUpperCase()} ${callout.option.expiration}`
+        : null,
+      rationale: callout.rationale,
+    };
+  } catch (err) {
+    return { ok: false, id: envelope.messageId, at, error: errorMessage(err) };
+  }
+}
+
+/** A few requests in flight, starts paced under TypeSafe's rate limit. */
+async function replayAll(decider: Decider, envelopes: readonly DiscordEnvelope[], file: string): Promise<void> {
+  let next = 0;
+  let nextStartAt = 0;
+  let done = 0;
+  const worker = async (): Promise<void> => {
+    while (next < envelopes.length) {
+      const envelope = envelopes[next++]!;
+      const startAt = Math.max(Date.now(), nextStartAt);
+      nextStartAt = startAt + DECIDE_START_INTERVAL_MS;
+      await sleep(startAt - Date.now());
+      const record = await replayOne(decider, envelope);
+      appendJsonl(file, record);
+      done += 1;
+      if (!record.ok) console.log(`${record.id} error ${record.error}`);
+      if (done % 100 === 0) console.log(`${done}/${envelopes.length}`);
+    }
+  };
+  await Promise.all(Array.from({ length: DECIDE_CONCURRENCY }, worker));
+}
+
+function labeledEnvelopes(dir: string): DiscordEnvelope[] {
+  const corpus = readCorpus(dir);
+  const { truths } = readTruths(dir, corpus);
+  return corpus
+    .filter((row) => truths.has(row.id))
+    .map((row) =>
+      flattenEnvelope({
+        messageId: row.id,
+        channelId: 'replay',
+        guildId: null,
+        authorId: 'replay',
+        authorName: row.caller ?? 'replay',
+        authorAvatarUrl: null,
+        content: row.text,
+        timestamp: row.ts ?? new Date().toISOString(),
+      })
+    );
+}
+
+function exportEnvelopes(rows: readonly ExportRow[]): DiscordEnvelope[] {
+  return rows.map((row) =>
+    flattenEnvelope({
+      messageId: row.id,
+      channelId: row.channel_id ?? 'replay',
+      guildId: null,
+      authorId: row.author_id,
+      authorName: row.author,
+      authorAvatarUrl: null,
+      content: row.content ?? '',
+      embeds: row.embeds ?? [],
+      timestamp: row.ts,
+      replyToMessageId: row.reply_to ?? null,
+    })
+  );
+}
+
+const verdictLine = (pass: boolean, text: string): string => `${pass ? 'PASS' : 'FAIL'}  ${text}`;
+
+function bishopLine(records: ReadonlyMap<string, DecideSuccess>, gates: ReplayGates | null): string[] {
+  const exits = (gates?.bishopExits ?? []).filter((id) => records.has(id));
+  if (exits.length === 0) return [];
+  const sells = exits.filter((id) => records.get(id)!.trade === 'SELL').length;
+  return [verdictLine(sells === exits.length, `Bishop exits back as Sell: ${sells} of ${exits.length}`)];
+}
+
+function averagingLine(records: ReadonlyMap<string, DecideSuccess>, gates: ReplayGates | null): string[] {
+  const posts = (gates?.averagingPosts ?? []).filter((id) => records.has(id));
+  if (posts.length === 0) return [];
+  const traded = posts.filter((id) => records.get(id)!.trade === 'BUY');
+  return [verdictLine(traded.length === 0, `averaging posts traded: ${traded.length} of ${posts.length} ${traded.join(' ')}`)];
+}
+
+function routingLine(records: readonly DecideSuccess[]): string {
+  return `trades: ${JSON.stringify(countBy(records.filter((r) => r.trade), (r) => `${r.trade} ${r.route}`))}`;
+}
+
+function reportLabeledReplay(dir: string, records: ReadonlyMap<string, DecideSuccess>, gates: ReplayGates | null): void {
+  const { truths } = readTruths(dir, readCorpus(dir));
+  const scored = [...truths].filter(([id]) => records.has(id));
+  const merged = (action: Action): MergedAction => mergedAction(action);
+  let right = 0;
+  let wrongEntries = 0;
+  let falseExits = 0;
+  let exitsCaught = 0;
+  let exitsExact = 0;
+  const nonTradesTraded: string[] = [];
+  for (const [id, truth] of scored) {
+    const record = records.get(id)!;
+    right += merged(replayedChoice(record)) === merged(truth) ? 1 : 0;
+    if (record.trade === 'BUY' && truth !== 'BUY') wrongEntries += 1;
+    if (record.trade && EXIT_TRADES.has(record.trade)) {
+      if (EXIT_TRADES.has(truth)) exitsCaught += 1;
+      else falseExits += 1;
+      if (record.trade === truth) exitsExact += 1;
+    }
+    if (record.trade && (truth === 'INFO' || truth === 'NONE')) nonTradesTraded.push(`${id} ${record.trade} ${record.route}`);
+  }
+  const exitLabels = scored.filter(([, truth]) => EXIT_TRADES.has(truth)).length;
+  const accuracy = scored.length ? right / scored.length : 0;
+  console.log(
+    [
+      `labeled replay: ${scored.length} of ${truths.size} labeled messages answered`,
+      verdictLine(accuracy >= GATE_ACCURACY_MIN, `5-way accuracy ${pct(accuracy)} (bar ${pct(GATE_ACCURACY_MIN)}; test 85.4%)`),
+      verdictLine(wrongEntries <= GATE_WRONG_ENTRIES_MAX, `wrong entries ${wrongEntries} (bar ${GATE_WRONG_ENTRIES_MAX}; test 0)`),
+      verdictLine(exitsCaught >= GATE_EXITS_CAUGHT_MIN, `exits caught ${exitsCaught} of ${exitLabels} (bar ${GATE_EXITS_CAUGHT_MIN}; test 61), ${exitsExact} as the exact kind`),
+      `false exits ${falseExits} (test 7)`,
+      `non-trades that would trade: ${nonTradesTraded.length}${nonTradesTraded.length ? ` — ${nonTradesTraded.join('; ')}` : ''}`,
+      ...bishopLine(records, gates),
+      ...averagingLine(records, gates),
+      routingLine([...records.values()]),
+    ].join('\n')
+  );
+}
+
+/** The parser's verdict on an exported row, as a direction. */
+function parserDirection(row: ExportRow): 'entry' | 'exit' | 'none' {
+  if (row.disposition !== 'callout') return 'none';
+  const action = parserAction(row.parse);
+  return action === 'BUY' || action === 'AVERAGE' ? 'entry' : action === 'TRIM' || action === 'SELL' ? 'exit' : 'none';
+}
+
+function reportExportReplay(
+  rows: readonly ExportRow[],
+  records: ReadonlyMap<string, DecideSuccess>,
+  gates: ReplayGates | null,
+  since: string | undefined
+): void {
+  const answered = rows.filter((row) => records.has(row.id));
+  const direction = (record: DecideSuccess): 'entry' | 'exit' | 'none' =>
+    record.trade === 'BUY' ? 'entry' : record.trade ? 'exit' : 'none';
+  const matrix = countBy(answered, (row) => `parser ${parserDirection(row)} → jev ${direction(records.get(row.id)!)}`);
+  const targets = (gates?.followedMissedEntries ?? []).filter((id) => records.has(id));
+  const recovered = targets.filter((id) => records.get(id)!.trade === 'BUY');
+  const lines = [
+    `export replay: ${answered.length} of ${rows.length} messages answered${since ? ` (sent on or after ${since})` : ''}`,
+    `parser vs decider: ${JSON.stringify(matrix)}`,
+    ...(targets.length
+      ? [
+          verdictLine(
+            recovered.length >= GATE_FOLLOWED_ENTRIES_MIN,
+            `followed missed entries traded: ${recovered.length} of ${targets.length} (bar ${GATE_FOLLOWED_ENTRIES_MIN}; test 22) ${JSON.stringify(countBy(recovered, (id) => records.get(id)!.route ?? ''))}`
+          ),
+        ]
+      : []),
+    ...bishopLine(records, gates),
+    ...averagingLine(records, gates),
+    routingLine([...records.values()]),
+  ];
+  // Messages the templates were never written against: every disagreement gets a human look.
+  if (since) {
+    const disagreements = answered.filter((row) => parserDirection(row) !== direction(records.get(row.id)!));
+    lines.push(`disagreements to review: ${disagreements.length}`);
+    for (const row of disagreements) {
+      const record = records.get(row.id)!;
+      const text = (row.content || JSON.stringify(row.embeds ?? [])).replace(/\s+/g, ' ').slice(0, 160);
+      lines.push(
+        `  ${row.ts} ${row.author} | parser ${parserDirection(row)} | jev ${record.choice} ${record.probability?.toFixed(2)} → ${record.trade ?? 'no trade'} ${record.route ?? ''} | ${text}`
+      );
+    }
+  }
+  console.log(lines.join('\n'));
+}
+
+async function decideCommand(
+  dir: string,
+  opts: { source?: string; since?: string; gates: string; limit: number }
+): Promise<void> {
+  const apiKey = process.env.JEV_API_KEY?.trim();
+  if (!apiKey) fail('JEV_API_KEY is not set (repo-root .env); it is sent to api.typesafe.ai only');
+  let decider: Decider;
+  try {
+    // Imported here: decide.ts loads parseCallout, whose shared/config requires LLM_MODEL.
+    const [{ JevCalloutDecider }, { JevClient }] = await Promise.all([
+      import('../trader/pipeline/decide.js'),
+      import('../trader/pipeline/jev.js'),
+    ]);
+    decider = new JevCalloutDecider(new JevClient({ apiKey, model: process.env.JEV_MODEL?.trim() || undefined }));
+  } catch (err) {
+    fail(`decider unavailable: ${errorMessage(err)}`);
+  }
+
+  const rows = opts.source
+    ? readJsonl<ExportRow>(resolve(opts.source)).filter((row) => !opts.since || row.ts >= opts.since)
+    : [];
+  const envelopes = opts.source ? exportEnvelopes(rows) : labeledEnvelopes(dir);
+  const file = join(dir, `decide-${opts.source ? basename(opts.source, '.jsonl') : 'labeled'}.jsonl`);
+  const answered = new Set(
+    readJsonl<DecideRecord>(file)
+      .filter((record) => record.ok)
+      .map((record) => record.id)
+  );
+  const pending = envelopes.filter((envelope) => !answered.has(envelope.messageId)).slice(0, opts.limit);
+  console.log(`decide: ${pending.length} to replay, ${answered.size} already answered → ${file}`);
+  await replayAll(decider, pending, file);
+
+  const records = new Map(
+    readJsonl<DecideRecord>(file).flatMap((record): [string, DecideSuccess][] => (record.ok ? [[record.id, record]] : []))
+  );
+  const gates = existsSync(opts.gates) ? (JSON.parse(readFileSync(opts.gates, 'utf8')) as ReplayGates) : null;
+  if (opts.source) reportExportReplay(rows, records, gates, opts.since);
+  else reportLabeledReplay(dir, records, gates);
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -1355,11 +1620,18 @@ const USAGE = `usage: bun src/scripts/actionDemo.ts <command> [options]
   sample        [--size all] [--seed 42] [--force]   build corpus.jsonl from local sources
   label         [--dry-run] [--relabel]              blind keyboard labeler (B A T S I N U K Q);
                                                      --relabel re-shows your NONE/UNSURE labels
-  laya          [--tag ft] [--limit N] [--model english]  one LAYA choice call per message
+  laya          [--tag ft] [--limit N] [--model english] [--gate]  one LAYA choice call per message (--gate adds the act-now yes/no)
   parser        [--live] [--limit N]                 saved verdicts; --live re-runs the parser (LLM cost)
   export-train  [--seed 42]                          train split → train.jsonl {id, text, label} + question.json
   report        [--seed 42]                          test split: LAYA untrained vs fine-tuned vs parser
-  every command: --dir <path> (default server/state/action-demo)`;
+  decide        [--source export.jsonl] [--since ISO] [--gates file] [--limit N]
+                                                     replay the production Jev decider (JEV_API_KEY, cents);
+                                                     labeled set by default, or a messages export scored
+                                                     against the parser; --since lists every disagreement
+  every command: --dir <path> (default server/state/action-demo)
+
+A messages export for decide --source, run read-only from server/:
+  PGOPTIONS='-c default_transaction_read_only=on' psql "$SUPABASE_DB_URL" -X -q -t -A -c "SELECT json_build_object('id', id, 'ts', sent_at, 'channel_id', channel_id, 'author', author_name, 'author_id', author_id, 'content', content, 'embeds', embeds, 'reply_to', raw->>'reference_id', 'disposition', disposition, 'parse', parse)::text FROM messages WHERE deleted_at IS NULL AND sent_at >= '2026-10-05' AND disposition IN ('callout', 'not_callout', 'failed') ORDER BY sent_at" > state/action-demo-db/messages-new.jsonl`;
 
 function numberFlag(name: string, raw: string): number {
   const value = Number(raw);
@@ -1382,7 +1654,11 @@ async function main(argv: readonly string[]): Promise<void> {
       limit: { type: 'string' },
       model: { type: 'string', default: LAYA_DEFAULT_MODEL },
       tag: { type: 'string' },
+      gate: { type: 'boolean', default: false },
       live: { type: 'boolean', default: false },
+      source: { type: 'string' },
+      since: { type: 'string' },
+      gates: { type: 'string', default: DEFAULT_GATES_FILE },
     },
   });
   const dir = resolve(values.dir);
@@ -1400,13 +1676,20 @@ async function main(argv: readonly string[]): Promise<void> {
     case 'label':
       return labelCommand(dir, values['dry-run'], values.relabel);
     case 'laya':
-      return layaCommand(dir, limit, values.model, values.tag);
+      return layaCommand(dir, limit, values.model, values.tag, values.gate);
     case 'parser':
       return parserCommand(dir, values.live, limit);
     case 'export-train':
       return exportTrainCommand(dir, seed);
     case 'report':
       return reportCommand(dir, seed);
+    case 'decide':
+      return decideCommand(dir, {
+        source: values.source,
+        since: values.since,
+        gates: resolve(values.gates),
+        limit,
+      });
     default:
       fail(USAGE);
   }

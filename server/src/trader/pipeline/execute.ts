@@ -12,6 +12,7 @@ import { createLogger } from '../../shared/logger.js';
 import {
   optionLabel,
   type Callout,
+  type ExitPortion,
   type OptionContract,
   type OrderSide,
   type RiskCheck,
@@ -323,6 +324,7 @@ async function findOpenOptionPosition(
 }
 
 function resolveExitContracts(callout: Callout, risk: RiskAllow, heldContracts: number): number {
+  if (callout.exitPortion) return contractsForPortion(callout.exitPortion, heldContracts);
   // "Out of NBIS" is a full exit, whatever count the model also extracted.
   if (callout.tickerOnlyExit) return heldContracts;
   if (risk.quantityHint !== null) return Math.floor(risk.quantityHint);
@@ -334,5 +336,23 @@ function resolveExitContracts(callout: Callout, risk: RiskAllow, heldContracts: 
     case 'small':
     case null:
       return 1;
+  }
+}
+
+/** Absorbs float error: 3 × (1/3) must sell 1, not 0. */
+const FRACTION_EPSILON = 1e-9;
+
+/**
+ * The caller's portion of a held position, always rounded down: a half of one
+ * contract sells nothing, and "runners only" on one contract keeps it.
+ */
+export function contractsForPortion(portion: ExitPortion, heldContracts: number): number {
+  switch (portion.kind) {
+    case 'all':
+      return heldContracts;
+    case 'all_but_one':
+      return Math.max(heldContracts - 1, 0);
+    case 'fraction':
+      return Math.floor(heldContracts * portion.value + FRACTION_EPSILON);
   }
 }

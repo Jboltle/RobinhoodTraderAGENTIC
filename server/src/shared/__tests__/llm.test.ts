@@ -124,7 +124,7 @@ describe('createLlmProvider', () => {
     expect(vi.mocked(createOpenaiChat)).not.toHaveBeenCalled();
   });
 
-  it('openai reasoning model: temperature is omitted from model options', async () => {
+  it('openai reasoning model: no temperature, and low reasoning effort', async () => {
     mockConfig.llmModel = 'gpt-5-mini';
     const raw = JSON.stringify({ ticker: 'MSFT', confidence: 0.8 });
     const { adapter, structuredOutput } = fakeAdapter(raw);
@@ -132,7 +132,9 @@ describe('createLlmProvider', () => {
 
     await createLlmProvider().callStructured(CALL_OPTS);
 
-    expect(JSON.stringify(structuredOutput.mock.calls[0]?.[0])).not.toContain('"temperature"');
+    const sent = JSON.stringify(structuredOutput.mock.calls[0]?.[0]);
+    expect(sent).not.toContain('"temperature"');
+    expect(sent).toContain('"reasoning":{"effort":"low"}');
   });
 
   it('strips an explicit backend prefix before constructing the adapter', async () => {

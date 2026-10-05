@@ -1,5 +1,7 @@
 import { config as loadDotenv } from 'dotenv';
 
+import { DECISION_ENGINES, type DecisionEngine } from './types.js';
+
 // Env files live at the repo root (one level above server/). Resolve them
 // relative to this file, not cwd, so env loads no matter where the process
 // starts. In Docker the files don't exist (compose env_file injects vars) and
@@ -37,6 +39,15 @@ const requiredString = (name: string): string => {
   return value;
 };
 
+/** Unset means Jev; `parser` is the one-setting rollback to the LLM parser. */
+const decisionEngine = (raw: string | undefined): DecisionEngine => {
+  const value = raw?.trim() || 'jev';
+  if (!(DECISION_ENGINES as readonly string[]).includes(value)) {
+    throw new Error(`DECISION_ENGINE must be one of ${DECISION_ENGINES.join(', ')}, got "${value}".`);
+  }
+  return value as DecisionEngine;
+};
+
 // OAuth: the browser is redirected to `redirectUri`; the local listener binds
 // `callbackHost:callbackPort`. `redirectUri` defaults to the redirect host so
 // it need not be set explicitly, but stays overridable for WSL/remote setups.
@@ -59,9 +70,18 @@ export const config = {
    */
   discordRecapChannelIds: list(env.DISCORD_RECAP_CHANNEL_IDS),
 
+  // ---- Decision engine ---------------------------------------------------------
+  /** Who decides whether a message is a trade: hosted Jev, or the LLM parser it replaced. */
+  decisionEngine: decisionEngine(env.DECISION_ENGINE),
+  /** TypeSafe key; sent to api.typesafe.ai only. Required when the engine is jev. */
+  jevApiKey: env.JEV_API_KEY?.trim() ?? '',
+  /** Unset keeps the pinned jev-1.13.0 the cutoffs were measured on. */
+  jevModel: env.JEV_MODEL?.trim() || undefined,
+
   // ---- LLM -------------------------------------------------------------------
   // Backend is inferred from this id in llm.ts. Optional `openai/`,
-  // `anthropic/`, or `ollama/` prefix overrides the heuristic.
+  // `anthropic/`, or `ollama/` prefix overrides the heuristic. Still required
+  // on the Jev engine: recap insights and the rollback parser use it.
   llmModel: requiredString('LLM_MODEL'),
   ollamaBaseUrl: env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
   anthropicApiKey: env.ANTHROPIC_API_KEY ?? '',
@@ -129,6 +149,7 @@ export function assertConfigValid(): void {
   if (!config.supabaseServiceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
   if (!config.supabaseDbUrl) missing.push('SUPABASE_DB_URL');
   if (!config.rhTokensVaultKey) missing.push('RH_TOKENS_VAULT_KEY');
+  if (config.decisionEngine === 'jev' && !config.jevApiKey) missing.push('JEV_API_KEY');
 
   if (missing.length > 0) {
     throw new Error(

@@ -107,6 +107,11 @@ describe('riskFilter — guards', () => {
     expect((result as { reason: string }).reason).toMatch(/confidence/);
   });
 
+  it("leaves a Jev callout's confidence to the decider's cutoffs", async () => {
+    // 0.65 is under the user's 0.7 minimum but inside Jev's approval band.
+    expect((await checkRisk({ ...BASE_OPTION, confidence: 0.65, engine: 'jev' })).allow).toBe(true);
+  });
+
   it('rejects option callout missing contract details', async () => {
     const result = await checkRisk({ ...BASE_OPTION, option: null });
     expect(result.allow).toBe(false);

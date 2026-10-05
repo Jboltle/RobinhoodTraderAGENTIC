@@ -7,8 +7,10 @@ import {
   confidenceBand,
   confusionMatrix,
   labelQueue,
+  gatedChoice,
   mergedAction,
   parserAction,
+  pickApiKey,
   readLayaResponse,
   wilson,
   type Action,
@@ -144,10 +146,52 @@ describe('readLayaResponse', () => {
     expect(readLayaResponse({ ...live, answers: { action: jevAnswer } }).answerConfidence).toBe(0.3781);
   });
 
+  it('reads the act-now gate when the request asked for it, and null otherwise', () => {
+    const gated = { ...live, answers: { ...live.answers, acting_now: { type: 'noul', noul: 0.12 } } };
+    expect(readLayaResponse(gated).actingNow).toBe(0.12);
+    expect(readLayaResponse(live).actingNow).toBeNull();
+  });
+
+  it('never flags a long hosted-Jev state as truncated', () => {
+    const { routing: _laya, ...jev } = live;
+    expect(readLayaResponse({ ...jev, usage: { input_tokens: 900, output_tokens: 0 } }).truncated).toBe(false);
+  });
+
   it('throws on a shape it cannot map', () => {
     expect(() => readLayaResponse({ answers: { action: { choice: 'HOLD', probabilities: {} } } })).toThrow(
-      /unexpected LAYA response/
+      /unexpected System One response/
     );
+  });
+});
+
+describe('gatedChoice', () => {
+  it('turns a trade the caller is not calling now into NONE', () => {
+    expect(gatedChoice({ choice: 'SELL', actingNow: 0.2 })).toBe('NONE');
+  });
+
+  it('keeps a trade the caller is calling now, and any non-trade', () => {
+    expect(gatedChoice({ choice: 'SELL', actingNow: 0.9 })).toBe('SELL');
+    expect(gatedChoice({ choice: 'INFO', actingNow: 0.1 })).toBe('INFO');
+  });
+
+  it('leaves ungated answers alone', () => {
+    expect(gatedChoice({ choice: 'BUY', actingNow: null })).toBe('BUY');
+    expect(gatedChoice({ choice: 'BUY' })).toBe('BUY');
+  });
+});
+
+describe('pickApiKey', () => {
+  it('sends the TypeSafe key to api.typesafe.ai', () => {
+    expect(pickApiKey('https://api.typesafe.ai', { JEV_API_KEY: 'jev-key' })).toBe('jev-key');
+  });
+
+  it('never sends the TypeSafe key to any other server', () => {
+    expect(pickApiKey('https://thejevai.com', { JEV_API_KEY: 'jev-key' })).toBeUndefined();
+    expect(pickApiKey('http://127.0.0.1:8765', { JEV_API_KEY: 'jev-key' })).toBeUndefined();
+  });
+
+  it('uses an explicit LAYA_API_KEY for whatever server is configured', () => {
+    expect(pickApiKey('http://127.0.0.1:8766', { LAYA_API_KEY: 'laya-key', JEV_API_KEY: 'jev-key' })).toBe('laya-key');
   });
 });
 

@@ -17,11 +17,11 @@ The pipeline's verdict on a Message: `callout`, `not_callout`, `failed`, `missed
 _Avoid_: parse status, state
 
 **Callout**:
-A Message the LLM parsed into a trade instruction — Disposition `callout`, parse attached. One verdict is recorded once and serves every user, regardless of who acts on it.
+A Message judged to be a trade instruction — Disposition `callout`, parse attached. One verdict is recorded once and serves every user, regardless of who acts on it. Callouts are options only: a trade with no options contract is not a Callout.
 _Avoid_: signal, alert, message
 
 **Action**:
-What a Callout tells followers to do: Buy, Average, Trim, or Sell. Read from the Caller's words alone, never from any User's holdings; a Message with no Action is not a Callout.
+What a Caller's Message announces: Buy, Average, Trim, or Sell. Read from the Caller's words alone, never from any User's holdings. A Message with no Action, or whose Action is Average, is not a Callout.
 _Avoid_: signal, intent
 
 **Buy**:
@@ -29,11 +29,11 @@ An Action that opens a new position.
 _Avoid_: entry, open
 
 **Average**:
-An Action that buys more of a position the Caller already holds. A User holding that position buys more too; a User who doesn't does nothing.
+An Action that buys more of a position the Caller already holds. Followers never copy it: an Average trades nothing for anyone.
 _Avoid_: add, addition, averaging down
 
 **Trim**:
-An Action that sells part of a position and keeps the rest. A Message headed "TRIM" that sells the whole position is a Sell.
+An Action that sells part of a position and keeps the rest. Each User sells the Caller's stated fraction of their own position ("Sold 4 of 20" is a fifth), rounded down; "runners only" keeps one contract, and no stated fraction means half. A Message headed "TRIM" that sells the whole position is a Sell.
 _Avoid_: partial exit, scale out
 
 **Sell**:

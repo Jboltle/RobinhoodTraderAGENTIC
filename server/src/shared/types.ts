@@ -29,6 +29,10 @@ export type SizeHintKind = (typeof SIZE_HINT_KINDS)[number];
 export const EXECUTION_MODES = ['immediate', 'approval'] as const;
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
+/** Who decides whether a message is a trade: hosted Jev, or the LLM parser it replaced. */
+export const DECISION_ENGINES = ['jev', 'parser'] as const;
+export type DecisionEngine = (typeof DECISION_ENGINES)[number];
+
 // =============================================================================
 // Discord envelope — the internal shape between the poller and the pipeline
 //
@@ -61,6 +65,8 @@ export interface DiscordEnvelope {
   readonly timestamp: string;
   /** Raw Discord embed JSON; flattened into content at the pipeline entry. */
   readonly embeds?: Record<string, unknown>[];
+  /** The message this one replies to (raw.reference_id); null or absent when it is not a reply. */
+  readonly replyToMessageId?: string | null;
 }
 
 // =============================================================================
@@ -83,6 +89,18 @@ export type OptionContract = z.infer<typeof OptionContractSchema>;
 export function optionLabel(option: OptionContract): string {
   return `${option.strike}${option.optionType[0]?.toUpperCase()} ${option.expiration}`;
 }
+
+/**
+ * How much of a held position an exit sells: the caller's stated fraction
+ * ("Sold 4 of 20", "half"), everything but one runner, or all of it.
+ */
+export const ExitPortionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('fraction'), value: z.number().gt(0).lt(1) }),
+  z.object({ kind: z.literal('all_but_one') }),
+  z.object({ kind: z.literal('all') }),
+]);
+
+export type ExitPortion = z.infer<typeof ExitPortionSchema>;
 
 export const CalloutSchema = z
   .object({
@@ -117,10 +135,19 @@ export const CalloutSchema = z
     option: OptionContractSchema.nullable(),
     confidence: z.number().min(0).max(1),
     rationale: z.string(),
+    /** Set by the Jev decider; absent on the parser path. */
+    engine: z.enum(DECISION_ENGINES).optional(),
+    /** Jev path: how much of the held position an exit sells. */
+    exitPortion: ExitPortionSchema.optional(),
+    /** Why this trade waits for the user's approval, whatever their execution mode. */
+    reviewReason: z.string().optional(),
   })
   .refine(
     (c) =>
-      (c.assetType === 'option' && (c.option !== null || c.tickerOnlyExit === true)) ||
+      (c.assetType === 'option' &&
+        // A Jev exit may name no contract: resolveCallout fills it from the
+        // replied-to card or the Caller's open entry, or drops the message.
+        (c.option !== null || c.tickerOnlyExit === true || (c.engine === 'jev' && c.action === 'sell'))) ||
       (c.assetType === 'equity' && c.option === null),
     { error: 'option fields must be present iff assetType=option' }
   );

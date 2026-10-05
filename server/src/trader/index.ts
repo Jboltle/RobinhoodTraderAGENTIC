@@ -2,6 +2,8 @@ import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger, errorFields } from '../shared/logger.js';
 import { createTraderDb } from './db.js';
 import { TraderEvents } from './events.js';
+import { JevCalloutDecider } from './pipeline/decide.js';
+import { JevClient } from './pipeline/jev.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { createMessageProcessor } from './pipeline/index.js';
 import { startMaxLossMonitor } from './maxLoss.js';
@@ -19,8 +21,15 @@ async function main(): Promise<void> {
   const events = new TraderEvents();
   const brokers = createMcpRegistry(db);
 
+  // DECISION_ENGINE=parser rolls the trade path back to the LLM parser.
+  const parser =
+    config.decisionEngine === 'jev'
+      ? new JevCalloutDecider(new JevClient({ apiKey: config.jevApiKey, model: config.jevModel }))
+      : new LlmCalloutParser();
+  log.info('decision engine', { engine: config.decisionEngine });
+
   const processor = createMessageProcessor({
-    parser: new LlmCalloutParser(),
+    parser,
     db,
     events,
     brokers,

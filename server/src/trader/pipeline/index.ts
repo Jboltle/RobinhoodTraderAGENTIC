@@ -186,42 +186,64 @@ async function resolveCallout(
     return { status: 'not_callout', callout: null, parseError: null };
   }
 
-  if (callout.tickerOnlyExit && callout.ticker !== null) {
-    callout = await resolveCallerContract(callout, callout.ticker, envelope, deps);
+  // A sell that names no contract: "out of NBIS", or a Jev Trim/Sell.
+  if (callout.action === 'sell' && callout.option === null && (callout.engine === 'jev' || callout.tickerOnlyExit)) {
+    callout = await resolveCallerContract(callout, envelope, deps);
+  }
+
+  // Options only on the Jev path: a trade still without a contract is skipped
+  // here, quietly, before anyone's trade row is written.
+  if (callout.engine === 'jev' && callout.option === null) {
+    log.info('jev trade has no options contract; skipped', {
+      messageId: envelope.messageId,
+      ticker: callout.ticker,
+      rationale: callout.rationale,
+    });
+    await setDisposition(deps, envelope.messageId, 'not_callout');
+    return { status: 'not_callout', callout: null, parseError: null };
   }
 
   await setDisposition(deps, envelope.messageId, 'callout', callout);
   return { status: 'callout', callout, parseError: null };
 }
 
-/** Recent entries a ticker-only exit may be closing; far more than one Caller holds at once. */
+/** Recent entries a contract-less exit may be closing; far more than one Caller holds at once. */
 const CALLER_ENTRY_LOOKBACK = 20;
 
 /**
- * "Out of NBIS" names no contract and can only mean the Caller's own position,
- * never another Caller's NBIS entry that followers also hold. Unresolved, the
- * exit keeps option null and checkRisk rejects it per user as missing_contract:
- * a visible miss instead of a guessed order.
+ * An exit that names no contract can only mean the Caller's own position,
+ * never another Caller's entry that followers also hold. In order: the
+ * Caller's card the exit replies to, then the Caller's one live entry in the
+ * ticker; several live entries pick the newest and wait for approval. With
+ * none, option stays null: the Jev path skips the message, and the parser path
+ * rejects it per user as missing_contract — a visible miss, never a guess.
  */
 async function resolveCallerContract(
   callout: Callout,
-  ticker: string,
   envelope: DiscordEnvelope,
   deps: PipelineDeps
 ): Promise<Callout> {
+  const card = await replyCard(envelope, deps);
+  if (card && (callout.ticker === null || card.ticker === callout.ticker)) {
+    return withContract(callout, card.ticker, card.option, 'the card it replies to');
+  }
+  const { ticker } = callout;
+  if (ticker === null) return callout;
+
   const entries = await deps.db
     .listCallerEntries(envelope.authorId, ticker, new Date(envelope.timestamp), CALLER_ENTRY_LOOKBACK)
     .catch((err: unknown) => {
-      log.error('could not load caller entries for a ticker-only exit', {
+      log.error('could not load caller entries for a contract-less exit', {
         messageId: envelope.messageId,
         error: errMsg(err),
       });
       return [];
     });
 
-  const option = pickCallerContract(entries, envelope.timestamp);
-  if (!option) {
-    log.warn('ticker-only exit matched no open entry from its caller', {
+  const live = liveCallerContracts(entries, envelope.timestamp);
+  const [newest] = live;
+  if (!newest) {
+    log.warn('contract-less exit matched no open entry from its caller', {
       messageId: envelope.messageId,
       authorId: envelope.authorId,
       ticker,
@@ -229,28 +251,57 @@ async function resolveCallerContract(
     return callout;
   }
 
+  const resolved = withContract(callout, ticker, newest, `${envelope.authorName}'s entry`);
+  if (live.length === 1) return resolved;
+  const several = `${envelope.authorName} has ${live.length} open ${ticker} entries; picked the newest, ${optionLabel(newest)}`;
+  return { ...resolved, reviewReason: [callout.reviewReason, several].filter(Boolean).join('; ') };
+}
+
+/** The Caller's own card this message replies to, when it names a contract. */
+async function replyCard(
+  envelope: DiscordEnvelope,
+  deps: PipelineDeps
+): Promise<{ ticker: string; option: OptionContract } | null> {
+  if (!envelope.replyToMessageId) return null;
+  const card = await deps.db.getMessageParse(envelope.replyToMessageId).catch((err: unknown) => {
+    log.error('could not load the replied-to card', { messageId: envelope.messageId, error: errMsg(err) });
+    return null;
+  });
+  if (!card || card.authorId !== envelope.authorId) return null;
+  const { ticker, option } = card.parse;
+  return ticker && option ? { ticker, option } : null;
+}
+
+function withContract(callout: Callout, ticker: string, option: OptionContract, source: string): Callout {
   return {
     ...callout,
+    ticker,
     assetType: 'option',
     option,
-    rationale: `${callout.rationale} (contract ${optionLabel(option)} from ${envelope.authorName}'s entry)`,
+    rationale: `${callout.rationale} (contract ${optionLabel(option)} from ${source})`,
   };
 }
 
 /**
- * The contract of the Caller's newest entry still live on the exit's day.
- * `entries` arrive newest first.
+ * The distinct contracts of the Caller's entries still live on the exit's
+ * day, newest first. `entries` arrive newest first. Once the Caller has Jev
+ * entries in the ticker only those count, so a watchlist post the old parser
+ * stored as a buy no longer competes; until then the parser's own entries
+ * (adds excluded) carry positions opened before the switch.
  *
- * ponytail: one contract per exit. A Caller holding two strikes in the same
- * ticker keeps the older one open, and equity entries never match. Upgrade
- * path: one decision per open contract.
+ * ponytail: an entry the Caller already sold in full still counts until it
+ * expires, which at worst sends an exit to approval. Upgrade path: subtract
+ * the Caller's full Sells.
  */
-export function pickCallerContract(
-  entries: readonly Callout[],
-  exitTimestamp: string
-): OptionContract | null {
+export function liveCallerContracts(entries: readonly Callout[], exitTimestamp: string): OptionContract[] {
   const exitDay = new Date(exitTimestamp).toISOString().slice(0, 10);
-  return entries.find((entry) => entry.option !== null && entry.option.expiration >= exitDay)?.option ?? null;
+  const jevEntries = entries.filter((entry) => entry.engine === 'jev');
+  const pool = jevEntries.length > 0 ? jevEntries : entries.filter((entry) => !entry.isAddition);
+  const live = new Map<string, OptionContract>();
+  for (const { option } of pool) {
+    if (option && option.expiration >= exitDay && !live.has(optionLabel(option))) live.set(optionLabel(option), option);
+  }
+  return [...live.values()];
 }
 
 async function setDisposition(
@@ -463,13 +514,16 @@ export async function runForUser(
 
     // Approval is the last gate: everything above has already passed, and the
     // row carries the sized order so the dashboard can show what is at stake.
-    if (settings.executionMode === 'approval') {
+    // A review reason (Jev unsure, or an ambiguous contract) parks the trade
+    // even for accounts that otherwise trade immediately.
+    if (settings.executionMode === 'approval' || callout.reviewReason) {
+      const receipt = summarizePendingApproval(sized);
       return finalize(userId, deps, {
         ...base,
         ...identity,
         kind: 'pending_approval',
         code: null,
-        reason: summarizePendingApproval(sized),
+        reason: callout.reviewReason ? `${callout.reviewReason}. ${receipt}` : receipt,
         order: sized,
       });
     }

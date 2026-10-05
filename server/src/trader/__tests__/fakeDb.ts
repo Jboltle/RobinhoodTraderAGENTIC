@@ -44,6 +44,7 @@ export interface FakeMessageRow {
   readonly processedAt: string | null;
   readonly claimedAt?: string | null;
   readonly claimedBy?: string | null;
+  readonly replyToMessageId?: string | null;
 }
 
 /** Seed shape for messages rows; everything optional except identity + time. */
@@ -270,6 +271,7 @@ export function createFakeDb(): FakeDb {
             sentAt: row.sentAt,
             deletedAt: row.deletedAt,
             disposition: row.disposition,
+            replyToMessageId: row.replyToMessageId ?? null,
           })
         );
     },
@@ -365,6 +367,10 @@ export function createFakeDb(): FakeDb {
         .sort((a, b) => b.sentAt.localeCompare(a.sentAt))
         .slice(0, limit)
         .flatMap((row) => (row.parse ? [row.parse] : []));
+    },
+    async getMessageParse(messageId) {
+      const row = messages.get(messageId);
+      return row?.disposition === 'callout' && row.parse ? { authorId: row.authorId, parse: row.parse } : null;
     },
     async upsertCaller(caller) {
       // Mirrors the real upsert: a null avatar never overwrites a stored one.
