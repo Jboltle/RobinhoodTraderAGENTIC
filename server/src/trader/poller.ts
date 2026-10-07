@@ -26,7 +26,10 @@
  * two orders) per callout. A claim held past CLAIM_STALE_MS by an instance
  * that never finished is treated as abandoned; by then the message is past
  * the staleness window, so the re-claimer records it as missed, never trades.
- * LISTEN/NOTIFY is the upgrade path if sub-second reaction ever matters.
+ *
+ * Waking: the Listener's insert NOTIFYs, so a row drains the moment it
+ * commits. The notification carries no data — the query is still the
+ * transport — and the interval is only the safety net for one that is lost.
  */
 import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -42,6 +45,11 @@ import { ingestRecapEnvelope } from './recaps/sweep.js';
 const log = createLogger('trader:poller');
 
 export const POLL_INTERVAL_MS = 1000;
+/**
+ * Idle cadence once notifications are confirmed. They do the waking, so this
+ * only bounds how late a row is seen if one is ever lost.
+ */
+export const NOTIFIED_POLL_INTERVAL_MS = 5000;
 /** Per-tick cap; a deep backlog drains across consecutive ticks. */
 export const POLL_BATCH_SIZE = 50;
 /** Past this age a missed callout is recorded, not executed. */
@@ -165,25 +173,69 @@ async function warnRivalInstance(deps: PollerDeps, messageId: string, now: Date)
   });
 }
 
-/** Start the loop (immediate first drain = boot catch-up). Returns a stopper. */
+/**
+ * Start the loop (immediate first drain = boot catch-up). Returns a stopper.
+ * Polls every second until a probe proves notifications arrive, then idles at
+ * NOTIFIED_POLL_INTERVAL_MS.
+ */
 export function startPoller(deps: PollerDeps): () => void {
   let draining = false;
+  let drainAgain = false;
+  let stopped = false;
+  let idleIntervalMs = POLL_INTERVAL_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const schedule = (ms: number): void => {
+    clearTimeout(timer);
+    if (stopped) return;
+    timer = setTimeout(tick, ms);
+    timer.unref();
+  };
 
   const tick = (): void => {
-    if (draining) return; // a slow batch must not overlap the next interval
+    if (stopped) return;
+    // A batch must not overlap another, and a wake-up during one must not be
+    // lost: it re-drains as soon as the batch finishes.
+    if (draining) {
+      drainAgain = true;
+      return;
+    }
     draining = true;
+    drainAgain = false;
+    // A failed or full batch comes back on the fast cadence.
+    let retrySoon = true;
     void drainOnce(deps)
       .then((handled) => {
         if (handled > 0) log.info('drained messages', { handled });
+        retrySoon = handled === POLL_BATCH_SIZE;
       })
       .catch((err: unknown) => log.error('drain failed', errorFields(err)))
       .finally(() => {
         draining = false;
+        if (drainAgain) tick();
+        else schedule(retrySoon ? POLL_INTERVAL_MS : idleIntervalMs);
       });
   };
 
+  void deps.db
+    .listenForMessages(tick)
+    .then((delivered) => {
+      if (delivered) {
+        idleIntervalMs = NOTIFIED_POLL_INTERVAL_MS;
+        log.info('waking on database notifications', { fallbackPollMs: idleIntervalMs });
+      } else {
+        log.warn('database notifications are not arriving; polling every second', {
+          hint: 'a transaction-mode pooler (port 6543) accepts LISTEN but never delivers',
+        });
+      }
+    })
+    .catch((err: unknown) =>
+      log.warn('could not listen for database notifications; polling every second', errorFields(err))
+    );
+
   tick();
-  const timer = setInterval(tick, POLL_INTERVAL_MS);
-  timer.unref();
-  return () => clearInterval(timer);
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
 }

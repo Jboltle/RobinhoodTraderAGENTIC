@@ -325,6 +325,9 @@ export function createFakeDb(): FakeDb {
         });
       }
     },
+    async listenForMessages() {
+      return false;
+    },
     async listCallouts(limit) {
       return [...messages.values()]
         .filter((row) => row.disposition !== null && row.disposition !== 'recap')

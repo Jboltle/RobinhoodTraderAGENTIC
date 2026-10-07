@@ -33,7 +33,14 @@ class MessageListener(discord.Client):
     def __init__(self, settings: Settings, database: Database, **options: Any) -> None:
         # Guild member chunking on connect is a large burst of traffic that this
         # service has no use for: everything needed is on the message itself.
+        # The same goes for the member and message caches, which otherwise grow
+        # with every server the account belongs to. Blanket guild subscriptions
+        # stream presence and member updates from all of those servers, so
+        # on_ready subscribes only the ones holding watched channels.
         options.setdefault("chunk_guilds_at_startup", False)
+        options.setdefault("member_cache_flags", discord.MemberCacheFlags.none())
+        options.setdefault("max_messages", None)
+        options.setdefault("guild_subscriptions", False)
         super().__init__(**options)
         self._settings = settings
         self._db = database
@@ -80,6 +87,7 @@ class MessageListener(discord.Client):
                 "DISCORD_RECAP_CHANNEL_IDS); the Listener will capture nothing"
             )
 
+        guilds: dict[int, Any] = {}
         for channel_id in sorted(watched):
             channel = self.get_channel(int(channel_id))
             if channel is None:
@@ -89,6 +97,10 @@ class MessageListener(discord.Client):
                     channel_id,
                 )
                 continue
+
+            guild = getattr(channel, "guild", None)
+            if guild is not None:
+                guilds[guild.id] = guild
 
             kind = getattr(getattr(channel, "type", None), "name", "")
             log.info("  #%s (%s)", getattr(channel, "name", channel_id), kind or "unknown")
@@ -103,6 +115,14 @@ class MessageListener(discord.Client):
                     "automation.",
                     getattr(channel, "name", channel_id),
                 )
+
+        for guild in guilds.values():
+            # A server over 75,000 members may deliver no messages unless it is
+            # subscribed, and that subscription requires typing. threads keeps
+            # the thread cache, which is how a thread message finds its watched
+            # parent channel.
+            await guild.subscribe(typing=True, activities=False, threads=True, member_updates=False)
+            log.info("subscribed to %s", getattr(guild, "name", guild.id))
 
     async def on_message(self, message: discord.Message) -> None:
         kind = self._classify(message)
@@ -123,9 +143,12 @@ class MessageListener(discord.Client):
                 len(captured.embeds),
             )
 
-    async def on_message_edit(self, _before: discord.Message, after: discord.Message) -> None:
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         # Alerts get corrected, and the correction is the signal. No author
-        # gate: the UPDATE only matches rows the create already stored.
+        # gate: the UPDATE only matches rows the create already stored. Raw
+        # rather than on_message_edit, which only fires for cached messages,
+        # and the message cache is off.
+        after = payload.message
         channel_id, parent_id = self._channel_ids(after)
         if not (self._watched(channel_id) or (parent_id and self._watched(parent_id))):
             return

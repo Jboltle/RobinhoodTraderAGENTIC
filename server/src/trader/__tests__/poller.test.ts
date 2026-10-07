@@ -3,11 +3,17 @@
  * order, staleness lands as missed, recap channels route to the recaps table,
  * and a crash replay never re-runs the fan-out.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { DiscordEnvelope } from '../../shared/types.js';
 import type { MessageProcessor, ProcessOptions } from '../pipeline/index.js';
-import { CLAIM_STALE_MS, STALENESS_WINDOW_MS, buildEnvelope, drainOnce } from '../poller.js';
+import {
+  CLAIM_STALE_MS,
+  STALENESS_WINDOW_MS,
+  buildEnvelope,
+  drainOnce,
+  startPoller,
+} from '../poller.js';
 import { buildStoredRecap } from '../recaps/sweep.js';
 import { createFakeDb, type FakeDb } from './fakeDb.js';
 
@@ -259,5 +265,49 @@ describe('buildEnvelope', () => {
     expect(processed).toHaveLength(1);
     expect(processed[0]!.options).toMatchObject({ missed: true });
     expect(db.getMessage('abandoned')?.processedAt).not.toBeNull();
+  });
+});
+
+describe('startPoller', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('drains on a database notification, even one that lands mid-drain', async () => {
+    vi.useFakeTimers();
+    const db = createFakeDb();
+    let notify = (): void => {};
+    db.listenForMessages = async (onMessage) => {
+      notify = onMessage;
+      return true;
+    };
+    const processed: string[] = [];
+    let finishFirst = (): void => {};
+    const processor: MessageProcessor = {
+      async process(envelope) {
+        processed.push(envelope.messageId);
+        if (envelope.messageId === 'first') {
+          await new Promise<void>((resolve) => {
+            finishFirst = resolve;
+          });
+        }
+        await db.setMessageDisposition(envelope.messageId, 'not_callout', null);
+      },
+      enqueue: (_userId, run) => run(),
+    };
+    db.seedMessage({ messageId: 'first', sentAt: FRESH_AT });
+
+    const stop = startPoller({ db, processor, recapChannelIds: [], now: () => NOW });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(processed).toEqual(['first']);
+
+    db.seedMessage({ messageId: 'second', sentAt: FRESH_AT });
+    notify();
+    finishFirst();
+    // The clock never moves, so no poll can have picked 'second' up.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(processed).toEqual(['first', 'second']);
+
+    stop();
   });
 });

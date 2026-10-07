@@ -8,6 +8,7 @@ gate), callout channel + author allowlist, thread parent matching.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -80,23 +81,52 @@ async def test_unreadable_message_is_dropped():
 # ---- Edits -----------------------------------------------------------------------
 
 
+def edit_payload(**message) -> SimpleNamespace:
+    """A stub shaped like discord.RawMessageUpdateEvent."""
+    return SimpleNamespace(message=make_discord_message(**message))
+
+
 async def test_edit_in_callout_channel_does_not_reset_processing():
     listener, db = make_listener()
-    await listener.on_message_edit(None, make_discord_message())
+    await listener.on_raw_message_edit(edit_payload())
     assert db.calls == [("edit", "900", False)]
 
 
 async def test_edit_in_recap_channel_resets_processing():
     settings = make_settings(recap_channels={"300"})
     listener, db = make_listener(settings)
-    await listener.on_message_edit(None, make_discord_message(channel_id=300))
+    await listener.on_raw_message_edit(edit_payload(channel_id=300))
     assert db.calls == [("edit", "900", True)]
 
 
 async def test_edit_in_unwatched_channel_is_ignored():
     listener, db = make_listener()
-    await listener.on_message_edit(None, make_discord_message(channel_id=999))
+    await listener.on_raw_message_edit(edit_payload(channel_id=999))
     assert db.calls == []
+
+
+# ---- Subscriptions -----------------------------------------------------------------
+
+
+async def test_ready_subscribes_each_watched_server_once_without_member_updates():
+    settings = make_settings(allowed_channels={"200", "201", "404"}, recap_channels={"300"})
+    listener, _ = make_listener(settings)
+    alpha = SimpleNamespace(id=100, name="Alpha Server", subscribe=AsyncMock())
+    beta = SimpleNamespace(id=101, name="Beta Server", subscribe=AsyncMock())
+    text = SimpleNamespace(name="text")
+    channels = {
+        200: SimpleNamespace(id=200, name="signals", type=text, guild=alpha),
+        201: SimpleNamespace(id=201, name="trades", type=text, guild=alpha),
+        300: SimpleNamespace(id=300, name="recaps", type=text, guild=beta),
+    }
+    listener.get_channel = channels.get  # 404 stays invisible
+
+    await listener.on_ready()
+
+    for guild in (alpha, beta):
+        guild.subscribe.assert_awaited_once_with(
+            typing=True, activities=False, threads=True, member_updates=False
+        )
 
 
 # ---- Deletes ---------------------------------------------------------------------

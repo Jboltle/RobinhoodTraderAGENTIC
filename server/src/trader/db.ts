@@ -233,6 +233,13 @@ export interface TraderDb {
   getMessageClaimant(messageId: string): Promise<string | null>;
   /** Take the row off the work queue once fully handled (fan-out included). */
   markMessageProcessed(messageId: string): Promise<void>;
+  /**
+   * Call `onMessage` whenever the Listener commits a row, and again after the
+   * listening connection reconnects, since rows committed during the gap
+   * notified nobody. Resolves whether a probe sent through the pool came
+   * back: transaction-mode pooling accepts LISTEN but never delivers.
+   */
+  listenForMessages(onMessage: () => void): Promise<boolean>;
 
   /** The feed: judged messages (recaps excluded), newest first. */
   listCallouts(limit: number): Promise<StoredCallout[]>;
@@ -272,6 +279,11 @@ export interface TraderDb {
   verifyAccessToken(token: string): Promise<AuthUser | null>;
 }
 
+/** Notified by the Listener's insert (server/listener/src/listener/db.py). */
+const MESSAGES_CHANNEL = 'messages_captured';
+/** How long the startup probe gets to come back before notifications are written off. */
+const LISTEN_PROBE_TIMEOUT_MS = 5000;
+
 export function createTraderDb(): TraderDb {
   // prepare: false keeps the connection compatible with Supabase's transaction
   // pooler too, should the env ever point at port 6543 instead of session mode.
@@ -288,7 +300,7 @@ export function createTraderDb(): TraderDb {
   const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
-  return new DrizzleTraderDb(drizzle(client), supabase);
+  return new DrizzleTraderDb(drizzle(client), supabase, client);
 }
 
 // =============================================================================
@@ -298,7 +310,8 @@ export function createTraderDb(): TraderDb {
 class DrizzleTraderDb implements TraderDb {
   constructor(
     private readonly db: PostgresJsDatabase,
-    private readonly supabase: SupabaseClient
+    private readonly supabase: SupabaseClient,
+    private readonly client: postgres.Sql
   ) {}
 
   async getSettings(userId: string): Promise<ResolvedTradeSettings> {
@@ -490,6 +503,26 @@ class DrizzleTraderDb implements TraderDb {
       .update(messages)
       .set({ processedAt: new Date(), claimedAt: null })
       .where(eq(messages.id, messageId));
+  }
+
+  async listenForMessages(onMessage: () => void): Promise<boolean> {
+    let heard = (): void => {};
+    const delivered = new Promise<boolean>((resolve) => {
+      heard = () => resolve(true);
+    });
+    await this.client.listen(
+      MESSAGES_CHANNEL,
+      () => {
+        heard();
+        onMessage();
+      },
+      onMessage
+    );
+    await this.client.notify(MESSAGES_CHANNEL, 'probe');
+    const timedOut = new Promise<boolean>((resolve) => {
+      setTimeout(() => resolve(false), LISTEN_PROBE_TIMEOUT_MS).unref();
+    });
+    return Promise.race([delivered, timedOut]);
   }
 
   async listCallouts(limit: number): Promise<StoredCallout[]> {

@@ -20,13 +20,19 @@ from .models import CapturedMessage
 
 log = logging.getLogger(__name__)
 
+# The trader LISTENs on messages_captured (server/src/trader/db.ts) and drains
+# the moment this commits. A replayed event hits ON CONFLICT, inserts nothing,
+# and so notifies nothing.
 _INSERT_MESSAGE = """
-INSERT INTO messages (
-    id, channel_id, channel_name, author_id, author_name, author_is_bot,
-    content, embeds, attachments, raw, sent_at, edited_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-ON CONFLICT (id) DO NOTHING
-RETURNING id
+WITH inserted AS (
+    INSERT INTO messages (
+        id, channel_id, channel_name, author_id, author_name, author_is_bot,
+        content, embeds, attachments, raw, sent_at, edited_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    ON CONFLICT (id) DO NOTHING
+    RETURNING id
+)
+SELECT id, pg_notify('messages_captured', id) FROM inserted
 """
 
 _UPDATE_MESSAGE = """
