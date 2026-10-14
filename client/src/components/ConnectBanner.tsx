@@ -5,7 +5,10 @@ import { fetchBrokerStatus } from '../lib/api'
 import type { BrokerStatus } from '../lib/api'
 import { ConnectDialog } from './ConnectDialog'
 
-const STATUS_POLL_MS = 5000
+// Idle watchdog cadence. A disconnect made in this app invalidates the query
+// at once, and ConnectDialog polls fast while a connect is in flight, so this
+// only bounds how late a disconnect made elsewhere shows.
+const STATUS_POLL_MS = 30_000
 
 /**
  * The app's Robinhood connection watchdog, mounted on every signed-in page.

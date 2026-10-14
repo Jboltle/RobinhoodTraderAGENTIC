@@ -7,6 +7,8 @@
  * every per-user call, which is what isolation.test.ts asserts against: no
  * endpoint may query a user id other than the caller's.
  */
+import { createHash } from 'node:crypto';
+
 import {
   EmbedLike,
   MAX_CONTENT_LENGTH,
@@ -118,6 +120,11 @@ export function createFakeDb(): FakeDb {
   };
   const decisionsFor = (userId: string): Decision[] =>
     trades.filter((row) => row.userId === userId).map((row) => row.decision);
+  const feedRows = (limit: number): FakeMessageRow[] =>
+    [...messages.values()]
+      .filter((row) => row.disposition !== null && row.disposition !== 'recap')
+      .sort((a, b) => b.sentAt.localeCompare(a.sentAt))
+      .slice(0, limit);
 
   return {
     calls,
@@ -224,6 +231,15 @@ export function createFakeDb(): FakeDb {
       }
       return record('decisionsByMessageId', userId, found);
     },
+    async feedVersion(userId, limit) {
+      const rows = feedRows(limit);
+      const ids = new Set(rows.map((row) => row.messageId));
+      const decisions = decisionsFor(userId).filter((d) => ids.has(d.messageId));
+      const version = createHash('md5')
+        .update(JSON.stringify([userId, rows, decisions]))
+        .digest('hex');
+      return record('feedVersion', userId, version);
+    },
     async countSubmittedSince(userId, since) {
       const count = decisionsFor(userId).filter(
         (d) => d.kind === 'submitted' && Date.parse(d.at) >= since.getTime()
@@ -329,33 +345,29 @@ export function createFakeDb(): FakeDb {
       return false;
     },
     async listCallouts(limit) {
-      return [...messages.values()]
-        .filter((row) => row.disposition !== null && row.disposition !== 'recap')
-        .sort((a, b) => b.sentAt.localeCompare(a.sentAt))
-        .slice(0, limit)
-        .map(
-          (row): StoredCallout => ({
-            messageId: row.messageId,
-            channelId: row.channelId,
-            channelName: row.channelName,
-            authorId: row.authorId,
-            authorName: row.authorName,
-            // Same read-time flatten the real listCallouts performs.
-            content: truncateSafe(
-              assembleMessageText({
-                body: row.content,
-                stickerNames: [],
-                attachmentUrls: [],
-                embeds: row.embeds as readonly EmbedLike[],
-              }),
-              MAX_CONTENT_LENGTH
-            ),
-            timestamp: row.sentAt,
-            embeds: row.embeds,
-            parse: row.parse,
-            parseStatus: FEED_STATUS[row.disposition as Exclude<MessageDisposition, 'recap'>],
-          })
-        );
+      return feedRows(limit).map(
+        (row): StoredCallout => ({
+          messageId: row.messageId,
+          channelId: row.channelId,
+          channelName: row.channelName,
+          authorId: row.authorId,
+          authorName: row.authorName,
+          // Same read-time flatten the real listCallouts performs.
+          content: truncateSafe(
+            assembleMessageText({
+              body: row.content,
+              stickerNames: [],
+              attachmentUrls: [],
+              embeds: row.embeds as readonly EmbedLike[],
+            }),
+            MAX_CONTENT_LENGTH
+          ),
+          timestamp: row.sentAt,
+          embeds: row.embeds,
+          parse: row.parse,
+          parseStatus: FEED_STATUS[row.disposition as Exclude<MessageDisposition, 'recap'>],
+        })
+      );
     },
     async listCallerEntries(authorId, ticker, before, limit) {
       return [...messages.values()]

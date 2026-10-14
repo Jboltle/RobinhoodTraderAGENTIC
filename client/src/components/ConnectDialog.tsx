@@ -38,10 +38,12 @@ export function ConnectDialog({
   onClose: () => void
 }) {
   const queryClient = useQueryClient()
+  // Mounted closed on every page via ConnectBanner, so it polls only while
+  // open: that is when `connected` flipping after the paste closes the flow.
   const status = useQuery<BrokerStatus>({
     queryKey: ['broker-status'],
     queryFn: fetchBrokerStatus,
-    refetchInterval: STATUS_POLL_MS,
+    refetchInterval: open ? STATUS_POLL_MS : false,
     retry: false,
   })
 

@@ -199,6 +199,12 @@ export interface TraderDb {
   ): Promise<boolean>;
   /** Decisions for the given callouts, keyed by message id. */
   decisionsByMessageId(userId: string, messageIds: readonly string[]): Promise<Map<string, Decision>>;
+  /**
+   * A hash of everything this user's feed page (listCallouts(limit) joined
+   * with their decisions) is built from: equal versions mean an identical
+   * page. Computed in the database, so only the hash crosses the wire.
+   */
+  feedVersion(userId: string, limit: number): Promise<string>;
 
   /** Submitted orders since `since` — the daily cap counter. */
   countSubmittedSince(userId: string, since: Date): Promise<number>;
@@ -393,6 +399,30 @@ class DrizzleTraderDb implements TraderDb {
     return new Map(rows.map((row) => [row.messageId, toDecision(row)]));
   }
 
+  async feedVersion(userId: string, limit: number): Promise<string> {
+    // Same rows, filter and order as listCallouts, hashing every column the
+    // feed shows (content and embeds change on Discord embed unfurls without
+    // edited_at moving), plus the user's trades rows for those messages.
+    const [row] = await this.db.execute<{ version: string }>(sql`
+      with feed as (
+        select id, channel_id, channel_name, author_id, author_name, content, embeds,
+               sent_at, disposition, parse
+          from messages
+         where disposition is not null and disposition <> 'recap'
+         order by sent_at desc
+         limit ${limit}
+      )
+      select md5(concat_ws('#',
+        ${userId}::text,
+        (select string_agg(md5(feed::text), ',' order by sent_at desc, id) from feed),
+        (select string_agg(md5(t::text), ',' order by t.timestamp, t.id)
+           from trades t
+          where t.user_id = ${userId} and t.message_id in (select id from feed))
+      )) as version
+    `);
+    return row!.version;
+  }
+
   async countSubmittedSince(userId: string, since: Date): Promise<number> {
     const [row] = await this.db
       .select({ value: count() })
@@ -526,8 +556,20 @@ class DrizzleTraderDb implements TraderDb {
   }
 
   async listCallouts(limit: number): Promise<StoredCallout[]> {
+    // Egress: only what the feed shows — never raw, the full Discord payload.
     const rows = await this.db
-      .select()
+      .select({
+        id: messages.id,
+        channelId: messages.channelId,
+        channelName: messages.channelName,
+        authorId: messages.authorId,
+        authorName: messages.authorName,
+        content: messages.content,
+        embeds: messages.embeds,
+        sentAt: messages.sentAt,
+        disposition: messages.disposition,
+        parse: messages.parse,
+      })
       .from(messages)
       .where(and(isNotNull(messages.disposition), ne(messages.disposition, 'recap')))
       .orderBy(desc(messages.sentAt))
@@ -788,7 +830,21 @@ function flattenRowContent(content: string, embeds: readonly Record<string, unkn
   );
 }
 
-function toStoredCallout(row: typeof messages.$inferSelect): StoredCallout {
+function toStoredCallout(
+  row: Pick<
+    typeof messages.$inferSelect,
+    | 'id'
+    | 'channelId'
+    | 'channelName'
+    | 'authorId'
+    | 'authorName'
+    | 'content'
+    | 'embeds'
+    | 'sentAt'
+    | 'disposition'
+    | 'parse'
+  >
+): StoredCallout {
   return {
     messageId: row.id,
     channelId: row.channelId,

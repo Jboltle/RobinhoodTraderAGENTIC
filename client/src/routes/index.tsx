@@ -161,7 +161,7 @@ const USD = new Intl.NumberFormat(undefined, {
 })
 
 function PortfolioSummaryBar() {
-  // Polled: totals aren't on the SSE stream and don't need 5s freshness.
+  // Polled: totals aren't on the SSE stream, and a minute is fresh enough.
   const portfolio = useQuery<PortfolioSummary>({
     queryKey: ['portfolio'],
     queryFn: fetchPortfolio,

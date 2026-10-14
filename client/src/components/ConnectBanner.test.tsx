@@ -212,6 +212,31 @@ test('the settings Reconnect dialog forces a fresh session', async () => {
   )
 })
 
+test('status polls slowly while idle and fast while a connect is in flight', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  try {
+    fetchBrokerStatus.mockResolvedValue(disconnected)
+    const utils = renderBanner()
+    // The closed dialog mounts once the banner has data, and fetches on mount.
+    await waitFor(() => expect(utils.container.querySelector('dialog')).not.toBeNull())
+    await waitFor(() => expect(fetchBrokerStatus).toHaveBeenCalledTimes(2))
+
+    // ...but must not keep a 5s cadence alive while closed.
+    await vi.advanceTimersByTimeAsync(25_000)
+    expect(fetchBrokerStatus).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(fetchBrokerStatus).toHaveBeenCalledTimes(3)
+
+    await openConnectDialog(utils)
+    await waitFor(() => expect(connectBroker).toHaveBeenCalled())
+    const beforePolls = fetchBrokerStatus.mock.calls.length
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(fetchBrokerStatus.mock.calls.length - beforePolls).toBeGreaterThanOrEqual(2)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
 // The client half of the stale-data fix: once the server reports the stored
 // connection gone, account numbers and live prices must vanish rather than
 // freeze at their last-known values.

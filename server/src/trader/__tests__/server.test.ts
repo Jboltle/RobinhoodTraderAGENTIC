@@ -304,6 +304,47 @@ describe('GET /api/callouts', () => {
     expect(changed.statusCode).toBe(200);
     expect(changed.headers.etag).not.toBe(etag);
   });
+
+  it('a 304 reads no message or trade rows', async () => {
+    harness.db.seedCallout(calloutFixture('msg-1', '2026-07-15T14:30:00.000Z'));
+    const etag = (await get('/api/callouts')).headers.etag as string;
+    const listCallouts = vi.spyOn(harness.db, 'listCallouts');
+    harness.db.calls.length = 0;
+
+    const unchanged = await harness.as(TOKEN, {
+      method: 'GET',
+      url: '/api/callouts',
+      headers: { 'if-none-match': etag },
+    });
+    expect(unchanged.statusCode).toBe(304);
+    expect(listCallouts).not.toHaveBeenCalled();
+    expect(harness.db.calls.map((call) => call.method)).toEqual(['feedVersion']);
+  });
+
+  it('the etag moves with the caller\u2019s own decisions only', async () => {
+    const OTHER = { id: 'user-2', email: 'other@example.com' };
+    harness.db.addUser(OTHER, 'other-token');
+    harness.db.seedCallout(calloutFixture('msg-1', '2026-07-15T14:30:00.000Z'));
+    const etag = (await get('/api/callouts')).headers.etag as string;
+
+    // Same shared rows, different user: never a 304 off someone else's page.
+    const theirs = await harness.as('other-token', {
+      method: 'GET',
+      url: '/api/callouts',
+      headers: { 'if-none-match': etag },
+    });
+    expect(theirs.statusCode).toBe(200);
+
+    harness.db.seedDecision(OTHER.id, decisionFixture('msg-1'));
+    const revalidate = () =>
+      harness.as(TOKEN, { method: 'GET', url: '/api/callouts', headers: { 'if-none-match': etag } });
+    expect((await revalidate()).statusCode).toBe(304);
+
+    harness.db.seedDecision(USER.id, decisionFixture('msg-1'));
+    const changed = await revalidate();
+    expect(changed.statusCode).toBe(200);
+    expect(changed.json()).toMatchObject({ callouts: [{ decision: { kind: 'submitted' } }] });
+  });
 });
 
 describe('GET /api/callers', () => {
@@ -630,6 +671,8 @@ describe('/api/broker', () => {
     });
 
     // Refresh-only material still counts: the SDK refreshes on connect.
+    harness = makeHarness();
+    harness.db.addUser(USER, TOKEN);
     harness.db.seedBrokerTokens(USER.id, fakeTokens('', 'refresh-token'));
     expect((await get('/api/broker/status')).json()).toMatchObject({
       connected: true,
@@ -744,6 +787,109 @@ describe('/api/broker', () => {
     expect(response.statusCode).toBe(200);
     expect(await harness.db.getBrokerTokens(USER.id)).toBeNull();
     expect(harness.brokers.existing(USER.id)).toBeUndefined();
+  });
+
+  // The banner polls status on every page and the dashboard polls portfolio:
+  // neither may cost a token-row read + decrypt per poll, and neither may
+  // outlive the row.
+  describe('polling', () => {
+    const CONNECTION_CHECK_MS = 60_000;
+    const reads = (method: string): number =>
+      harness.db.calls.filter((call) => call.method === method).length;
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const connect = () => {
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.configureBroker(USER.id, { connected: true, portfolioValueUsd: 25_431.5 });
+    };
+
+    it('repeat polls read the row and the settings once', async () => {
+      connect();
+      for (let i = 0; i < 3; i++) {
+        expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
+        expect((await get('/api/portfolio')).statusCode).toBe(200);
+      }
+      expect(reads('getBrokerTokens')).toBe(1);
+      expect(reads('getSettings')).toBe(1);
+    });
+
+    it('a disconnect shows on the very next poll', async () => {
+      connect();
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
+      expect((await get('/api/portfolio')).statusCode).toBe(200);
+
+      await send('POST', '/api/broker/disconnect', {});
+      expect((await get('/api/broker/status')).json()).toMatchObject({
+        connected: false,
+        tokenState: 'missing',
+      });
+      expect((await get('/api/portfolio')).statusCode).toBe(409);
+    });
+
+    it('a disconnect shows on the next poll even with no warm session to drop', async () => {
+      // Fresh process: the row is known, nothing in the registry changes.
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
+
+      await send('POST', '/api/broker/disconnect', {});
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
+    });
+
+    it('a finished OAuth flow shows on the next poll without a new session object', async () => {
+      harness.configureBroker(USER.id, { authPending: true, authUrl: 'https://robinhood.com/a' });
+      const broker = harness.brokerFor(USER.id);
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
+      expect(reads('getBrokerTokens')).toBe(1);
+
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      vi.mocked(broker.mcp.isAuthPending).mockReturnValue(false);
+      vi.mocked(broker.mcp.isConnected).mockReturnValue(true);
+      expect((await get('/api/broker/status')).json()).toMatchObject({
+        connected: true,
+        tokenState: 'valid',
+      });
+      expect((await get('/api/portfolio')).statusCode).toBe(200);
+    });
+
+    it('a row removed out of process stops serving after the connection check', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      connect();
+      expect((await get('/api/portfolio')).statusCode).toBe(200);
+
+      // auth:reset deletes the row from another process; the registry never hears of it.
+      await harness.db.deleteBrokerTokens(USER.id);
+      vi.advanceTimersByTime(CONNECTION_CHECK_MS);
+      expect((await get('/api/portfolio')).statusCode).toBe(409);
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
+      expect(harness.brokers.existing(USER.id)).toBeUndefined();
+    });
+
+    it('the connection check alone does not re-read an unchanged row', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      connect();
+      await get('/api/broker/status');
+      vi.advanceTimersByTime(CONNECTION_CHECK_MS);
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
+      expect(reads('getBrokerTokens')).toBe(1);
+    });
+
+    it('a failed row read is not cached', async () => {
+      connect();
+      vi.spyOn(harness.db, 'getBrokerTokens').mockRejectedValueOnce(new Error('db down'));
+      expect((await get('/api/broker/status')).statusCode).toBe(500);
+      expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
+    });
+
+    it('status reports the execution mode a settings save just set', async () => {
+      expect((await get('/api/broker/status')).json()).toMatchObject({ executionMode: 'approval' });
+      await send('PUT', '/api/settings', { executionMode: 'immediate' });
+      expect((await get('/api/broker/status')).json()).toMatchObject({ executionMode: 'immediate' });
+      expect(reads('getSettings')).toBe(1);
+    });
   });
 });
 
