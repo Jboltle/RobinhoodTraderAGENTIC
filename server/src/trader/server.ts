@@ -19,7 +19,6 @@ import {
   type AssetType,
   type Decision,
   type OptionType,
-  type ResolvedTradeSettings,
 } from '../shared/types.js';
 import { registerAuth, requireUser } from './auth.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
@@ -100,22 +99,6 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerAuth(fastify, deps.db);
 
   const connections = createConnectionCache(deps);
-  // Egress: the status poll's executionMode, re-read only after PUT
-  // /api/settings changes it.
-  // ponytail: a users row edited straight in the database shows here only
-  // after a restart (the settings page reads GET /api/settings, which is
-  // uncached). Upgrade path: an updated_at check on the users row.
-  const executionModes = new Map<string, Promise<ResolvedTradeSettings['executionMode']>>();
-  const executionMode = (userId: string): Promise<ResolvedTradeSettings['executionMode']> => {
-    const cached = executionModes.get(userId);
-    if (cached) return cached;
-    const mode = deps.db.getSettings(userId).then((settings) => settings.executionMode);
-    executionModes.set(userId, mode);
-    mode.catch(() => {
-      if (executionModes.get(userId) === mode) executionModes.delete(userId);
-    });
-    return mode;
-  };
 
   // ---- Public -----------------------------------------------------------------
 
@@ -173,7 +156,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       connected: tokenState === 'valid' || tokenState === 'refreshable',
       authUrl: deps.brokers.existing(userId)?.mcp.getPendingAuthUrl() ?? null,
       tokenState,
-      executionMode: await executionMode(userId),
+      executionMode: (await deps.db.getSettings(userId)).executionMode,
     });
   });
 
@@ -393,9 +376,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!parsed.success) {
       return reply.status(400).send({ error: 'invalid settings', detail: parsed.error.message });
     }
-    const settings = await deps.db.saveSettings(userId, parsed.data);
-    executionModes.set(userId, Promise.resolve(settings.executionMode));
-    return reply.send({ settings });
+    return reply.send({ settings: await deps.db.saveSettings(userId, parsed.data) });
   });
 
   // ---- Portfolio ------------------------------------------------------------------

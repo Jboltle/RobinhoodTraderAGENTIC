@@ -806,14 +806,13 @@ describe('/api/broker', () => {
       harness.configureBroker(USER.id, { connected: true, portfolioValueUsd: 25_431.5 });
     };
 
-    it('repeat polls read the row and the settings once', async () => {
+    it('repeat polls read the row once', async () => {
       connect();
       for (let i = 0; i < 3; i++) {
         expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
         expect((await get('/api/portfolio')).statusCode).toBe(200);
       }
       expect(reads('getBrokerTokens')).toBe(1);
-      expect(reads('getSettings')).toBe(1);
     });
 
     it('a disconnect shows on the very next poll', async () => {
@@ -884,11 +883,11 @@ describe('/api/broker', () => {
       expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
     });
 
-    it('status reports the execution mode a settings save just set', async () => {
+    // Operators pause trading by editing users.execution_mode in SQL.
+    it('status reports an execution mode edited straight in the database', async () => {
       expect((await get('/api/broker/status')).json()).toMatchObject({ executionMode: 'approval' });
-      await send('PUT', '/api/settings', { executionMode: 'immediate' });
+      harness.db.seedSettings(USER.id, { executionMode: 'immediate' });
       expect((await get('/api/broker/status')).json()).toMatchObject({ executionMode: 'immediate' });
-      expect(reads('getSettings')).toBe(1);
     });
   });
 });
