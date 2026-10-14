@@ -14,7 +14,7 @@
  * Ingestion has no HTTP surface any more; the poller is tested in poller.test.ts.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision } from '../../shared/types.js';
 import type { StoredCallout } from '../db.js';
@@ -836,5 +836,147 @@ describe('GET /api/stream', () => {
       await harness.app.close();
     }
   }, 10_000);
+
+  describe('performance ticks', () => {
+    // setInterval is faked once the server listens, so each test fires the
+    // 10s performance timer and the 60s connection check by hand.
+    const TICK_MS = 10_000;
+    const CONNECTION_CHECK_MS = 60_000;
+    const reads = (method: string): number =>
+      harness.db.calls.filter((call) => call.method === method).length;
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const openStream = async () => {
+      await harness.app.listen({ port: 0, host: '127.0.0.1' });
+      const { port } = harness.app.server.address() as { port: number };
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      const abort = new AbortController();
+      const response = await fetch(`http://127.0.0.1:${port}/api/stream`, {
+        signal: abort.signal,
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      const reader = response.body!.getReader();
+      let buffer = '';
+      return {
+        async readUntil(text: string): Promise<void> {
+          while (!buffer.includes(text)) {
+            const { value, done } = await reader.read();
+            if (done) throw new Error('stream ended early');
+            buffer += new TextDecoder().decode(value);
+          }
+        },
+        async close(): Promise<void> {
+          abort.abort();
+          vi.useRealTimers();
+          await harness.app.close();
+        },
+      };
+    };
+
+    it('a tick re-fetches only live prices; connect and decisions read history and the row', async () => {
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      let price = 150;
+      const getQuote = vi.fn().mockImplementation(async () => ({ price: price++ }));
+      harness.configureBroker(USER.id, {
+        equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+        toolsOverrides: { getQuote },
+      });
+      const stream = await openStream();
+      try {
+        // Connect: the decisions snapshot plus one history read and one row read.
+        await stream.readUntil('"currentPrice":150');
+        await stream.readUntil('event: decisions');
+        expect(reads('getBrokerTokens')).toBe(1);
+        expect(reads('listDecisions')).toBe(2);
+
+        for (const next of [151, 152, 153]) {
+          await vi.advanceTimersByTimeAsync(TICK_MS);
+          await stream.readUntil(`"currentPrice":${next}`);
+        }
+        expect(getQuote).toHaveBeenCalledTimes(4);
+        expect(reads('getBrokerTokens')).toBe(1);
+        expect(reads('listDecisions')).toBe(2);
+
+        // A logged decision pushes its snapshot now and re-reads both on the next tick.
+        harness.db.seedDecision(USER.id, decisionFixture('live', { reason: 'live-push' }));
+        harness.events.emitDecision(USER.id, decisionFixture('live', { reason: 'live-push' }));
+        await stream.readUntil('"reason":"live-push"');
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"currentPrice":154');
+        expect(reads('getBrokerTokens')).toBe(2);
+        expect(reads('listDecisions')).toBe(4);
+      } finally {
+        await stream.close();
+      }
+    }, 10_000);
+
+    it('a disconnect stops performance data on the very next tick', async () => {
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.configureBroker(USER.id, {
+        connected: true,
+        equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+      });
+      const tools = harness.brokerFor(USER.id).tools;
+      const stream = await openStream();
+      try {
+        await stream.readUntil('"symbol":"AAPL"');
+
+        await send('POST', '/api/broker/disconnect', {});
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"error":"Robinhood is not connected"');
+
+        // The dropped session was never read again after the disconnect.
+        expect(tools.getPositions).toHaveBeenCalledOnce();
+      } finally {
+        await stream.close();
+      }
+    }, 10_000);
+
+    it('a row removed out of process stops performance data after the connection check', async () => {
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.configureBroker(USER.id, {
+        connected: true,
+        equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+      });
+      const stream = await openStream();
+      try {
+        await stream.readUntil('"symbol":"AAPL"');
+
+        // auth:reset deletes the row from another process; the registry never hears of it.
+        await harness.db.deleteBrokerTokens(USER.id);
+        await vi.advanceTimersByTimeAsync(CONNECTION_CHECK_MS);
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"error":"Robinhood is not connected"');
+        expect(harness.brokers.existing(USER.id)).toBeUndefined();
+      } finally {
+        await stream.close();
+      }
+    }, 10_000);
+
+    it('a stream opened before connecting shows positions once Robinhood connects', async () => {
+      harness.configureBroker(USER.id, { authPending: true });
+      const stream = await openStream();
+      try {
+        await stream.readUntil('"error":"Robinhood is not connected"');
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        // A pending OAuth session is not a reason to re-read the row.
+        expect(reads('getBrokerTokens')).toBe(1);
+
+        // OAuth finishes: tokens stored and the session connected.
+        harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+        harness.configureBroker(USER.id, {
+          connected: true,
+          equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+        });
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"symbol":"AAPL"');
+      } finally {
+        await stream.close();
+      }
+    }, 10_000);
+  });
 });
 

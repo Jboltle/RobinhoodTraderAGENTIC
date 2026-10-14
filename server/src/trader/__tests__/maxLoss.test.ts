@@ -17,7 +17,7 @@ import {
 import type { McpRegistry, UserBroker } from '../rh/mcpRegistry.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { RobinhoodTools } from '../rh/tools.js';
-import { createFakeDb, fakeTokens } from './fakeDb.js';
+import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
 
 const USER = 'user-1';
 
@@ -326,6 +326,120 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening); // guard went stale → close re-sent
 
     expect(tools.placeOptionsOrder).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('sweepMaxLoss entry history', () => {
+  const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+  const historyReads = (db: FakeDb): number =>
+    db.calls.filter((call) => call.method === 'listDecisions').length;
+
+  it('reads the history once and still stops out from the cached basis', async () => {
+    let mark = 1.2;
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [
+        { symbol: 'QQQ', ...contract, quantity: 2, raw: {} },
+        // Opened by hand: no history prices it, which must not re-read every sweep.
+        { symbol: 'NVDA', optionType: 'call', strike: 180, expiration: '2026-06-20', quantity: 1, raw: {} },
+      ],
+      markFor: () => mark,
+    });
+    db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
+    const entries = new Map();
+
+    await sweepMaxLoss(deps, flattening, entries);
+    await sweepMaxLoss(deps, flattening, entries);
+    mark = 0.75;
+    await sweepMaxLoss(deps, flattening, entries);
+
+    expect(historyReads(db)).toBe(1);
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(tools.placeOptionsOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ symbol: 'QQQ', contracts: 2, side: 'sell', orderType: 'market' })
+    );
+  });
+
+  it('re-reads after a decision, so an add re-averages the stop', async () => {
+    const position = { symbol: 'QQQ', ...contract, raw: {} };
+    let mark = 1.1;
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [{ ...position, quantity: 2 }],
+      markFor: () => mark,
+    });
+    db.seedDecision(
+      USER,
+      submittedBuy('QQQ', 2.0, contract, { messageId: 'buy-QQQ-entry', at: '2026-09-08T13:00:00.000Z' })
+    );
+    const entries = new Map();
+    await sweepMaxLoss(deps, flattening, entries); // $2.00 basis, mark $1.10: −45%, held
+
+    const add = submittedBuy('QQQ', 0.6, contract, {
+      messageId: 'buy-QQQ-add',
+      at: '2026-09-08T14:00:00.000Z',
+    });
+    await db.recordDecision(USER, add);
+    deps.events.emitDecision(USER, add);
+    asMock(tools.getOptionPositions).mockResolvedValue({
+      positions: [{ ...position, quantity: 4 }],
+      raw: {},
+    });
+    mark = 0.9;
+    await sweepMaxLoss(deps, flattening, entries);
+
+    // Same position, so only the event can refresh it. The basis is now
+    // (2×$0.60 + 2×$2.00)/4 = $1.30, and $0.90 is −31%: held. The cached
+    // $2.00 basis would read −55% and sell at a loss the user never set.
+    expect(historyReads(db)).toBe(2);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it('re-reads for a newly held position even when no decision event arrives', async () => {
+    const nvda = { optionType: 'call' as const, strike: 180, expiration: '2026-06-20' };
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      markFor: (symbol) => (symbol === 'QQQ' ? 1.4 : 2.0),
+    });
+    db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
+    const entries = new Map();
+    await sweepMaxLoss(deps, flattening, entries);
+
+    // NVDA was bought and logged, but no event reached the monitor.
+    db.seedDecision(USER, submittedBuy('NVDA', 5, nvda));
+    asMock(tools.getOptionPositions).mockResolvedValue({
+      positions: [
+        { symbol: 'QQQ', ...contract, quantity: 2, raw: {} },
+        { symbol: 'NVDA', ...nvda, quantity: 2, raw: {} },
+      ],
+      raw: {},
+    });
+    await sweepMaxLoss(deps, flattening, entries);
+
+    expect(historyReads(db)).toBe(2);
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(tools.placeOptionsOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ symbol: 'NVDA', strike: 180, contracts: 2, side: 'sell' })
+    );
+  });
+
+  it('does not keep a failed read: the next sweep reads again and stops out', async () => {
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      markFor: () => 0.75,
+    });
+    db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
+    const listDecisions = vi.spyOn(db, 'listDecisions').mockRejectedValueOnce(new Error('db down'));
+    const entries = new Map();
+
+    await sweepMaxLoss(deps, flattening, entries);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+
+    await sweepMaxLoss(deps, flattening, entries);
+    expect(listDecisions).toHaveBeenCalledTimes(2);
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
   });
 });
 

@@ -46,10 +46,15 @@ const DEFAULT_CALLOUTS_LIMIT = 100;
  * its entry price, and the feed's 50 rows would lose it.
  */
 const PERFORMANCE_HISTORY_LIMIT = 500;
-// ponytail: fixed cadences — matches the old client poll rate; make these
-// settings if anyone ever needs to tune them.
-const SSE_PERFORMANCE_INTERVAL_MS = 5000;
+// ponytail: fixed cadences; make these settings if anyone ever needs to
+// tune them.
+const SSE_PERFORMANCE_INTERVAL_MS = 10_000;
 const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
+/**
+ * How often an open stream confirms its user's broker_connections row still
+ * exists: the backstop for a row removed outside this process (auth:reset).
+ */
+const SSE_CONNECTION_CHECK_INTERVAL_MS = 60_000;
 /** How long POST /api/broker/connect waits for Robinhood to hand us a URL. */
 const AUTH_URL_TIMEOUT_MS = 15_000;
 const AUTH_URL_POLL_MS = 100;
@@ -403,7 +408,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.status(409).send({ error: 'Robinhood is not connected' });
     }
     try {
-      return reply.send({ positions: await collectPerformance(deps, userId, tools) });
+      const history = deps.db.listDecisions(userId, PERFORMANCE_HISTORY_LIMIT);
+      return reply.send({ positions: await collectPerformance(tools, history) });
     } catch (err) {
       return reply
         .status(503)
@@ -416,7 +422,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // SSE stream for the dashboard: replaces client-side polling of
   // /api/decisions and /api/trades/performance (both kept for curl/fallback).
   // Events: `decisions` (snapshot on connect + on every append, newest-first),
-  // `performance` ({ positions, error } every 5s while connected), and `stage`
+  // `performance` ({ positions, error } every 10s while connected), and `stage`
   // (live trade lifecycle: received → parsing → risk_check → executing → done).
   //
   // Read with fetch, not EventSource, so it carries the same Authorization
@@ -447,7 +453,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         );
     };
 
-    // Egress: quotes barely move between 5s ticks (and not at all overnight),
+    // Egress: quotes barely move between 10s ticks (and not at all overnight),
     // so a frame identical to the last one is not worth the bytes.
     let lastPerformanceFrame = '';
     const sendPerformance = (data: { positions: unknown; error: string | null }): void => {
@@ -457,17 +463,43 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       reply.raw.write(`event: performance\ndata: ${frame}\n\n`);
     };
 
+    // Egress: the connection row and the trade history only change on a
+    // (dis)connect or a logged decision, so both are read on connect and after
+    // each decision, and a tick re-fetches only live broker data. Undefined =
+    // read on the next tick.
+    let connection: RobinhoodTools | null | undefined;
+    let history: Promise<Decision[]> | undefined;
+
+    // The registry is the in-memory disconnect signal: disconnect, Reconnect
+    // and stale-session eviction drop or replace the session, and a finished
+    // OAuth adds a connected one. Any of those re-checks the row.
+    const sessionChanged = (cached: RobinhoodTools | null): boolean => {
+      const live = deps.brokers.existing(userId);
+      return cached === null ? live?.mcp.isConnected() === true : live?.tools !== cached;
+    };
+
     const pushPerformance = async (): Promise<void> => {
       try {
-        const tools = await connectedBrokerTools(deps, userId);
+        let tools = connection;
+        if (tools === undefined || sessionChanged(tools)) {
+          tools = await connectedBrokerTools(deps, userId);
+          connection = tools;
+        }
         if (tools === null) {
           // No connection of record (disconnected, or the row was removed):
           // an error frame, never data from a session that outlived its row.
           sendPerformance({ positions: null, error: 'Robinhood is not connected' });
           return;
         }
+        // A failed read is not kept: the next tick tries again.
+        history ??= deps.db
+          .listDecisions(userId, PERFORMANCE_HISTORY_LIMIT)
+          .catch((err: unknown) => {
+            history = undefined;
+            throw err;
+          });
         sendPerformance({
-          positions: await collectPerformance(deps, userId, tools),
+          positions: await collectPerformance(tools, history),
           error: null,
         });
       } catch (err) {
@@ -479,7 +511,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     pushDecisions();
     void pushPerformance();
     const unsubscribe = deps.events.subscribe(userId, {
-      onDecision: pushDecisions,
+      onDecision: () => {
+        pushDecisions();
+        connection = undefined;
+        history = undefined;
+      },
       onStage: (event) => send('stage', event),
     });
 
@@ -491,10 +527,27 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       () => reply.raw.write(': heartbeat\n\n'),
       SSE_HEARTBEAT_INTERVAL_MS
     );
+    // A row removed out of process (auth:reset) leaves the registry alone, so
+    // an id-only existence check, which never fetches the token blob, backs
+    // the in-memory signal up at a slower cadence.
+    // ponytail: lists every connected user's id to test one; fine at
+    // invite-only scale. Upgrade path: a per-user existence query.
+    const connectionTimer = setInterval(() => {
+      if (!connection) return;
+      void deps.db
+        .listBrokerUserIds()
+        .then((userIds) => {
+          if (!userIds.includes(userId)) connection = undefined;
+        })
+        .catch((err: unknown) =>
+          log.warn('could not check broker connection', { error: (err as Error).message })
+        );
+    }, SSE_CONNECTION_CHECK_INTERVAL_MS);
 
     request.raw.on('close', () => {
       clearInterval(performanceTimer);
       clearInterval(heartbeatTimer);
+      clearInterval(connectionTimer);
       unsubscribe();
       reply.raw.end();
     });
@@ -634,14 +687,13 @@ interface PerformanceRow {
 }
 
 async function collectPerformance(
-  deps: ServerDeps,
-  userId: string,
-  tools: RobinhoodTools
+  tools: RobinhoodTools,
+  history: Promise<Decision[]>
 ): Promise<PerformanceRow[]> {
   const [equity, options, decisions] = await Promise.all([
     tools.getPositions(),
     tools.getOptionPositions(),
-    deps.db.listDecisions(userId, PERFORMANCE_HISTORY_LIMIT),
+    history,
   ]);
   // Already newest-first, so find() picks the most recent entry for a position.
   const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);

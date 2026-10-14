@@ -41,6 +41,14 @@ const DEAD_ORDER_STATUSES = new Set(['rejected', 'canceled', 'cancelled', 'faile
 /** How far back we look for the buy that opened a position. Same depth as performance. */
 const ENTRY_HISTORY_LIMIT = 500;
 
+/** One user's entry history, kept across sweeps; see entryHistory for when it is re-read. */
+interface EntryHistory {
+  /** Submitted orders from the last trades read; null = read on the next sweep. */
+  submitted: Promise<readonly Decision[]> | null;
+  /** Keys of the positions held at the last sweep. */
+  held: ReadonlySet<string>;
+}
+
 export interface LossInput {
   readonly entry: number;
   readonly mark: number;
@@ -82,8 +90,9 @@ export interface MaxLossDeps {
  */
 export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
   const flattening = new Map<string, number>();
+  const entries = new Map<string, EntryHistory>();
   const tick = (): void => {
-    void sweepMaxLoss(deps, flattening).catch((err: unknown) =>
+    void sweepMaxLoss(deps, flattening, entries).catch((err: unknown) =>
       log.error('max-loss sweep failed', errorFields(err))
     );
   };
@@ -95,7 +104,8 @@ export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
 
 export async function sweepMaxLoss(
   deps: MaxLossDeps,
-  flattening: Map<string, number>
+  flattening: Map<string, number>,
+  entries: Map<string, EntryHistory> = new Map()
 ): Promise<void> {
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
@@ -104,7 +114,7 @@ export async function sweepMaxLoss(
   await Promise.all(
     userIds.map((userId) =>
       deps
-        .enqueue(userId, () => scanUser(userId, deps, flattening, now))
+        .enqueue(userId, () => scanUser(userId, deps, flattening, now, entries))
         .catch((err: unknown) =>
           log.warn('max-loss user scan failed', {
             userId,
@@ -119,7 +129,8 @@ async function scanUser(
   userId: string,
   deps: MaxLossDeps,
   flattening: Map<string, number>,
-  now: Date
+  now: Date,
+  entries: Map<string, EntryHistory>
 ): Promise<null> {
   const settings = await deps.db.getSettings(userId);
   if (!lossEnabled(settings.maxLossPct, settings.maxLossUsd)) return null;
@@ -135,12 +146,14 @@ async function scanUser(
   }
 
   const tools = broker.tools;
-  const [equity, options, decisions] = await Promise.all([
-    tools.getPositions(),
-    tools.getOptionPositions(),
-    deps.db.listDecisions(userId, ENTRY_HISTORY_LIMIT),
+  const [equity, options] = await Promise.all([tools.getPositions(), tools.getOptionPositions()]);
+  const held = new Set([
+    ...equity.positions.filter((p) => p.quantity > 0).map((p) => positionKey('equity', p.symbol)),
+    ...options.positions
+      .filter((p) => p.quantity > 0)
+      .map((p) => positionKey('option', p.symbol, p.optionType, p.strike, p.expiration)),
   ]);
-  const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);
+  const submitted = await entryHistory(userId, deps, entries, held);
   const optionOrders =
     typeof tools.getOptionOrders === 'function'
       ? await tools.getOptionOrders().catch(() => null)
@@ -215,6 +228,49 @@ async function scanUser(
   }
 
   return null;
+}
+
+/**
+ * The user's submitted orders, re-read from the trades table only when the
+ * cached copy may be stale: the first sweep, the sweep after any decision is
+ * logged for the user (a buy opens a position, an add re-averages one), and a
+ * sweep holding a position the previous one did not, so a new position never
+ * waits on that event alone.
+ * ponytail: one history and one decision subscription per user, never
+ * dropped; fine at invite-only scale. Events reach only this process, so an
+ * add logged by another instance goes unseen until a local decision. Upgrade
+ * path: invalidate from a Postgres NOTIFY on trades writes.
+ */
+function entryHistory(
+  userId: string,
+  deps: MaxLossDeps,
+  entries: Map<string, EntryHistory>,
+  held: ReadonlySet<string>
+): Promise<readonly Decision[]> {
+  const history: EntryHistory = entries.get(userId) ?? { submitted: null, held };
+  if (!entries.has(userId)) {
+    entries.set(userId, history);
+    deps.events.subscribe(userId, {
+      onDecision: () => {
+        history.submitted = null;
+      },
+    });
+  }
+  const previouslyHeld = history.held;
+  history.held = held;
+  if (history.submitted !== null && [...held].every((key) => previouslyHeld.has(key))) {
+    return history.submitted;
+  }
+  // Cached while still in flight, so a decision logged mid-read voids it too.
+  const read = deps.db
+    .listDecisions(userId, ENTRY_HISTORY_LIMIT)
+    .then((decisions) => decisions.filter((d) => d.kind === 'submitted' && d.order));
+  history.submitted = read;
+  // A failed read is not kept: the next sweep tries again.
+  read.catch(() => {
+    if (history.submitted === read) history.submitted = null;
+  });
+  return read;
 }
 
 interface ConsiderArgs {
