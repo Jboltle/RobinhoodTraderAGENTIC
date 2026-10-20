@@ -298,11 +298,16 @@ export function createTraderDb(): TraderDb {
   // pooler, should one ever sit in front of the database.
   // Remote URLs often omit sslmode; TLS is required anyway, and 'require' does
   // not verify the certificate (Railway's Postgres serves a self-signed one).
-  // Local CLI / host.docker.internal Postgres has no TLS.
-  const local = /localhost|127\.0\.0\.1|host\.docker\.internal/i.test(config.supabaseDbUrl);
+  // TLS stays off for local Postgres, which has none, and on Railway's private
+  // network, which WireGuard already encrypts. It has to: on Bun, postgres.js
+  // over TLS never frees what it reads (about 240 KB per 500-row query).
+  const { hostname } = new URL(config.supabaseDbUrl);
+  const plaintext =
+    /^(localhost|127\.0\.0\.1|host\.docker\.internal)$/i.test(hostname) ||
+    hostname.endsWith('.railway.internal');
   const client = postgres(config.supabaseDbUrl, {
     prepare: false,
-    ssl: local ? false : 'require',
+    ssl: plaintext ? false : 'require',
     // Pooler startups can omit public; unqualified "broker_connections" then
     // fails as relation-not-exist and Drizzle reports only the SQL.
     connection: { options: '-c search_path=public' },
