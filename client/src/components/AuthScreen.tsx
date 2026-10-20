@@ -1,21 +1,19 @@
 /**
  * Sign in, shown in place of the dashboard when there is no session.
  *
- * Passwordless: the user asks for a one-time sign-in link by email. The
- * request goes to the trader rather than to Supabase directly, because the
- * invite allowlist lives server-side — an address that was never invited gets
- * a 403 and no email, and there is no self-serve signup path at all.
+ * The email alone: an invited address signs straight in. The invite list is
+ * checked server-side, so an address that was never invited gets a 403.
  */
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 
-import { requestMagicLink } from '../lib/api'
+import { signIn } from '../lib/auth'
 
 export function AuthScreen() {
   const [email, setEmail] = useState('')
 
   const submit = useMutation({
-    mutationFn: () => requestMagicLink(email),
+    mutationFn: () => signIn(email.trim()),
   })
 
   const canSubmit = email.trim().length > 0 && !submit.isPending
@@ -32,62 +30,42 @@ export function AuthScreen() {
           </span>
         </div>
 
-        {submit.isSuccess ? (
-          <>
-            <h1 className="text-2xl font-semibold text-white">Check your email</h1>
-            <p className="mt-2 text-sm text-ink-400">
-              We sent a sign-in link to <span className="text-white">{email}</span>.
-              Open it on this device to land on the dashboard.
-            </p>
-            <button
-              type="button"
-              onClick={() => submit.reset()}
-              className="mt-6 text-sm text-brand hover:underline"
-            >
-              Use a different email
-            </button>
-          </>
-        ) : (
-          <>
-            <h1 className="text-2xl font-semibold text-white">Sign in</h1>
-            <p className="mt-2 text-sm text-ink-400">
-              This dashboard is invite-only. Enter your invited email and we&apos;ll
-              send you a sign-in link.
-            </p>
+        <h1 className="text-2xl font-semibold text-white">Sign in</h1>
+        <p className="mt-2 text-sm text-ink-400">
+          This dashboard is invite-only. Enter your invited email to sign in.
+        </p>
 
-            <form
-              className="mt-6 flex flex-col gap-4"
-              onSubmit={(e) => {
-                e.preventDefault()
-                if (canSubmit) submit.mutate()
-              }}
-            >
-              <label className="flex flex-col gap-1.5 text-xs text-ink-400">
-                Email
-                <input
-                  type="email"
-                  autoComplete="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className={inputClass}
-                  required
-                />
-              </label>
+        <form
+          className="mt-6 flex flex-col gap-4"
+          onSubmit={(e) => {
+            e.preventDefault()
+            if (canSubmit) submit.mutate()
+          }}
+        >
+          <label className="flex flex-col gap-1.5 text-xs text-ink-400">
+            Email
+            <input
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className={inputClass}
+              required
+            />
+          </label>
 
-              <button
-                type="submit"
-                disabled={!canSubmit}
-                className="mt-2 rounded-lg bg-brand px-4 py-2.5 text-sm font-medium text-ink-900 transition-opacity hover:bg-brand/80 disabled:opacity-50"
-              >
-                {submit.isPending ? 'Sending…' : 'Email me a sign-in link'}
-              </button>
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            className="mt-2 rounded-lg bg-brand px-4 py-2.5 text-sm font-medium text-ink-900 transition-opacity hover:bg-brand/80 disabled:opacity-50"
+          >
+            {submit.isPending ? 'Signing in…' : 'Sign in'}
+          </button>
 
-              {submit.isError && (
-                <p className="text-sm text-loss">{(submit.error as Error).message}</p>
-              )}
-            </form>
-          </>
-        )}
+          {submit.isError && (
+            <p className="text-sm text-loss">{(submit.error as Error).message}</p>
+          )}
+        </form>
       </div>
     </main>
   )

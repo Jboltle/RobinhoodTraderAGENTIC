@@ -84,9 +84,7 @@ export const fakeTokens = (accessToken: string, refreshToken?: string): Persiste
 export interface FakeDb extends TraderDb {
   /** Every per-user query this db has served, in order. */
   readonly calls: ScopedCall[];
-  /** Emails a magic link was "sent" to, in order. */
-  readonly magicLinksSent: string[];
-  /** Register a bearer token that resolves to a user. */
+  /** Register a user with a never-expiring session for `accessToken`. */
   addUser(user: AuthUser, accessToken: string): void;
   seedSettings(userId: string, settings: TradeSettings): void;
   seedDecision(userId: string, decision: Decision): void;
@@ -97,12 +95,12 @@ export interface FakeDb extends TraderDb {
   seedMessage(row: SeedMessage): void;
   /** Inspect a messages row (verdict marks included); null when unknown. */
   getMessage(messageId: string): FakeMessageRow | null;
+  /** Put an email on the invite list. */
   allowEmail(email: string): void;
 }
 
 export function createFakeDb(): FakeDb {
   const calls: ScopedCall[] = [];
-  const magicLinksSent: string[] = [];
   const settings = new Map<string, ResolvedTradeSettings>();
   const trades: Array<{ userId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
@@ -110,9 +108,10 @@ export function createFakeDb(): FakeDb {
   const callers = new Map<string, Caller>();
   const recaps = new Map<string, StoredRecap>();
   const recapInsights = new Map<number, StoredRecapInsight>();
-  const allowedEmails = new Set<string>();
-  const usersByToken = new Map<string, AuthUser>();
   const usersByEmail = new Map<string, AuthUser>();
+  const allowedEmails = new Set<string>();
+  /** Bearer token -> session; a null expiry never ends (addUser's tokens). */
+  const sessions = new Map<string, { user: AuthUser; expiresAt: Date | null }>();
 
   const record = <T>(method: string, userId: string, value: T): T => {
     calls.push({ method, userId });
@@ -128,10 +127,9 @@ export function createFakeDb(): FakeDb {
 
   return {
     calls,
-    magicLinksSent,
 
     addUser(user, accessToken) {
-      usersByToken.set(accessToken, user);
+      sessions.set(accessToken, { user, expiresAt: null });
       if (user.email) usersByEmail.set(user.email.toLowerCase(), user);
     },
     seedSettings(userId, value) {
@@ -433,25 +431,30 @@ export function createFakeDb(): FakeDb {
 
     // ---- Auth ----------------------------------------------------------------
 
-    async isEmailAllowed(email) {
-      return allowedEmails.has(email.trim().toLowerCase());
-    },
-    async ensureUser(email) {
+    async userForSignIn(email) {
       const normalized = email.trim().toLowerCase();
-      if (usersByEmail.has(normalized)) return;
-      const user: AuthUser = { id: `user-${usersByEmail.size + 1}`, email: normalized };
-      usersByEmail.set(normalized, user);
+      const existing = usersByEmail.get(normalized);
+      if (existing) return existing;
+      if (!allowedEmails.has(normalized)) return null;
+      const created: AuthUser = { id: `user-${usersByEmail.size + 1}`, email: normalized };
+      usersByEmail.set(normalized, created);
+      return created;
     },
-    async sendMagicLink(email) {
-      const normalized = email.trim().toLowerCase();
-      if (!usersByEmail.has(normalized)) throw new Error('no user to send a link to');
-      magicLinksSent.push(normalized);
+    async createSession(userId, token, expiresAt) {
+      const user = [...usersByEmail.values()].find((candidate) => candidate.id === userId);
+      if (!user) throw new Error(`no user ${userId}`);
+      sessions.set(token, { user, expiresAt });
+    },
+    async deleteSession(token) {
+      sessions.delete(token);
     },
     async findUserByEmail(email) {
       return usersByEmail.get(email.trim().toLowerCase()) ?? null;
     },
     async verifyAccessToken(token) {
-      return usersByToken.get(token) ?? null;
+      const session = sessions.get(token);
+      if (!session) return null;
+      return session.expiresAt === null || session.expiresAt > new Date() ? session.user : null;
     },
   };
 }

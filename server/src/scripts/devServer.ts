@@ -5,11 +5,10 @@
  *
  *   bun src/scripts/devServer.ts
  *
- * That means no Supabase project, no Docker and no broker credentials are
- * needed to click through the UI, and no order can ever reach a real account.
- * Any bearer token resolves to the one seeded user, so the browser can hold a
- * hand-made session instead of signing in. Never import this from the deployed
- * entrypoints — it is dev-only and trusts every caller.
+ * That means no database, no Docker and no broker credentials are needed to
+ * click through the UI, and no order can ever reach a real account. Sign in
+ * with the email logged at startup. Never import this from the deployed
+ * entrypoints — it is dev-only.
  */
 import { createLogger } from '../shared/logger.js';
 import type { Decision, SubmittedOrder } from '../shared/types.js';
@@ -23,15 +22,14 @@ import { buildServer } from '../trader/server.js';
 const log = createLogger('dev-server');
 
 const PORT = 3000;
-const USER = { id: 'dev-user', email: 'dev@localhost' };
+const USER = { id: 'dev-user', email: 'dev@example.com' };
 const BUYING_POWER_USD = 25_000;
 const PORTFOLIO_VALUE_USD = 31_480;
 
 const db = createFakeDb();
 
-// The browser's session is hand-made, so its token is whatever we say it is.
+// The account the seeded decisions below belong to; sign in with its email.
 db.addUser(USER, 'dev-token');
-db.allowEmail(USER.email);
 // Broker data now serves only with a stored connection of record; without
 // this the sandbox portfolio/performance would answer 409 "not connected".
 db.seedBrokerTokens(USER.id, fakeTokens('dev-access-token', 'dev-refresh-token'));
@@ -210,4 +208,7 @@ const brokers: McpRegistry = {
 const fastify = buildServer({ db, events: new TraderEvents(), brokers });
 
 await fastify.listen({ port: PORT, host: '127.0.0.1' });
-log.info('dev trader listening', { url: `http://127.0.0.1:${PORT}`, user: USER.id });
+log.info('dev trader listening', {
+  url: `http://127.0.0.1:${PORT}`,
+  signIn: USER.email,
+});

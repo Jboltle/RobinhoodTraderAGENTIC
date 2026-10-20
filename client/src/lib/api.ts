@@ -2,8 +2,8 @@
  * Trader REST API client. Response shapes mirror src/trader/server.ts and
  * src/shared/types.ts in the parent repo.
  *
- * Every request carries the caller's Supabase access token; the server derives
- * the acting user from it, so no request ever names a user.
+ * Every request carries the caller's session token; the server derives the
+ * acting user from it, so no request ever names a user.
  *
  * ponytail: types are hand-copied, not imported from ../src (the client is a
  * standalone package with its own tsconfig). Upgrade path: extract a shared
@@ -30,12 +30,18 @@ function resolveTraderUrl(): string {
 // Empty = same origin. `bun server.ts` proxies /api to the trader.
 export const TRADER_URL: string = resolveTraderUrl()
 
-// Set once by AuthProvider (lib/auth.tsx). A getter rather than a value so a
-// refreshed token is picked up without re-wiring anything.
+// Both set once by lib/auth.tsx. A getter rather than a value so a new
+// session is picked up without re-wiring anything.
 let accessToken: () => string | null = () => null
+let onUnauthorized: () => void = () => {}
 
 export function setAccessTokenSource(source: () => string | null): void {
   accessToken = source
+}
+
+/** Called on any 401: the server no longer accepts this browser's session. */
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler
 }
 
 /** Authorization header for the current session; throws when signed out. */
@@ -319,6 +325,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers: { ...authHeaders(), ...init.headers },
   })
   if (!res.ok) {
+    if (res.status === 401) onUnauthorized()
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `${init.method ?? 'GET'} ${path} failed: ${res.status}`)
   }
@@ -386,13 +393,18 @@ export const disconnectBroker = (): Promise<void> =>
 export const submitBrokerRedirect = (redirectUrl: string): Promise<void> =>
   postJson<{ ok: true }>('/api/broker/callback', { redirectUrl }).then(() => undefined)
 
+/** What POST /api/auth/login issues, and what lib/auth.tsx keeps. */
+export interface Session {
+  token: string
+  email: string
+}
+
 /**
- * Ask the server to email a one-time sign-in link. Unauthenticated on purpose —
- * this is where the session comes from — and gated server-side against the
- * invite allowlist.
+ * Exchange an invited email for a session token. Unauthenticated on purpose:
+ * this is where the session comes from.
  */
-export async function requestMagicLink(email: string): Promise<void> {
-  const res = await fetch(`${TRADER_URL}/api/auth/magic-link`, {
+export async function login(email: string): Promise<Session> {
+  const res = await fetch(`${TRADER_URL}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ email }),
@@ -401,4 +413,9 @@ export async function requestMagicLink(email: string): Promise<void> {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `sign in failed: ${res.status}`)
   }
+  return res.json() as Promise<Session>
 }
+
+/** End this browser's session on the server. */
+export const logout = (): Promise<void> =>
+  postJson<{ ok: true }>('/api/auth/logout', {}).then(() => undefined)

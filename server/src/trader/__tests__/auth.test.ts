@@ -2,8 +2,8 @@
  * The auth gate.
  *
  * Every /api route in this list answered an anonymous request before the
- * multi-tenant refactor. Each one must now 401 without a valid Supabase JWT,
- * while /health stays open.
+ * multi-tenant refactor. Each one must now 401 without a live session token,
+ * while /health and the sign-in route stay open.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 
@@ -80,47 +80,58 @@ describe('routes that must stay open', () => {
 
 });
 
-describe('POST /api/auth/magic-link', () => {
-  const requestLink = (email: string) =>
-    harness.app.inject({
-      method: 'POST',
-      url: '/api/auth/magic-link',
-      headers: { 'content-type': 'application/json' },
-      payload: JSON.stringify({ email }),
-    });
-
-  it('is open, but only emails a link to an allowlisted address', async () => {
-    const uninvited = await requestLink('stranger@example.com');
-    expect(uninvited.statusCode).toBe(403);
-    expect(await harness.db.findUserByEmail('stranger@example.com')).toBeNull();
-    expect(harness.db.magicLinksSent).toHaveLength(0);
-
-    harness.db.allowEmail('invited@example.com');
-    const invited = await requestLink('invited@example.com');
-    expect(invited.statusCode).toBe(200);
-    expect(await harness.db.findUserByEmail('invited@example.com')).not.toBeNull();
-    expect(harness.db.magicLinksSent).toEqual(['invited@example.com']);
+const signIn = (body: Record<string, unknown>) =>
+  harness.app.inject({
+    method: 'POST',
+    url: '/api/auth/login',
+    headers: { 'content-type': 'application/json' },
+    payload: JSON.stringify(body),
   });
 
-  it('sends to an existing account without creating a duplicate', async () => {
+describe('POST /api/auth/login', () => {
+  it('is open, and trades an existing account email for a working token', async () => {
+    const response = await signIn({ email: 'User@Example.com' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ email: USER.email });
+
+    const settings = await harness.as(response.json().token, { method: 'GET', url: '/api/settings' });
+    expect(settings.statusCode).toBe(200);
+  });
+
+  it('creates the account at an invited email first sign-in, and reuses it after', async () => {
     harness.db.allowEmail('invited@example.com');
-    await requestLink('invited@example.com');
-    const again = await requestLink('invited@example.com');
+    expect(await harness.db.findUserByEmail('invited@example.com')).toBeNull();
+
+    const first = await signIn({ email: 'invited@example.com' });
+    expect(first.statusCode).toBe(200);
+    const account = await harness.db.findUserByEmail('invited@example.com');
+    expect(account).not.toBeNull();
+
+    const again = await signIn({ email: 'invited@example.com' });
     expect(again.statusCode).toBe(200);
-    expect(harness.db.magicLinksSent).toEqual([
-      'invited@example.com',
-      'invited@example.com',
-    ]);
+    expect(await harness.db.findUserByEmail('invited@example.com')).toEqual(account);
+  });
+
+  it('refuses an email that is neither an account nor invited, and creates nothing', async () => {
+    const response = await signIn({ email: 'stranger@example.com' });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: 'this email is not invited' });
+    expect(await harness.db.findUserByEmail('stranger@example.com')).toBeNull();
   });
 
   it('rejects a body without a valid email', async () => {
-    const response = await harness.app.inject({
-      method: 'POST',
-      url: '/api/auth/magic-link',
-      headers: { 'content-type': 'application/json' },
-      payload: JSON.stringify({ email: 'not-an-email' }),
-    });
-    expect(response.statusCode).toBe(400);
-    expect(harness.db.magicLinksSent).toHaveLength(0);
+    expect((await signIn({})).statusCode).toBe(400);
+    expect((await signIn({ email: 'not-an-email' })).statusCode).toBe(400);
+  });
+});
+
+describe('POST /api/auth/logout', () => {
+  it('makes that token stop working', async () => {
+    const token = (await signIn({ email: USER.email })).json().token;
+    const loggedOut = await harness.as(token, { method: 'POST', url: '/api/auth/logout' });
+    expect(loggedOut.statusCode).toBe(200);
+
+    const after = await harness.as(token, { method: 'GET', url: '/api/settings' });
+    expect(after.statusCode).toBe(401);
   });
 });

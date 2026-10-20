@@ -13,7 +13,7 @@ import TanStackQueryDevtools from '../integrations/tanstack-query/devtools'
 
 import { AuthScreen } from '../components/AuthScreen'
 import { ConnectBanner } from '../components/ConnectBanner'
-import { AuthProvider, signOut, useAuth } from '../lib/auth'
+import { signOut, useAuth } from '../lib/auth'
 import { useTraderStream } from '../lib/stream'
 
 import appCss from '../styles.css?url'
@@ -69,9 +69,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <HeadContent />
       </head>
       <body className="min-h-screen bg-ink-900 font-sans text-white antialiased">
-        <AuthProvider>
-          <AuthGate>{children}</AuthGate>
-        </AuthProvider>
+        <AuthGate>{children}</AuthGate>
         <TanStackDevtools
           config={{
             position: 'bottom-right',

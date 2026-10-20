@@ -1,25 +1,22 @@
 /**
  * The only place in the codebase that talks to the database.
  *
- * Table queries run through Drizzle over a direct Postgres connection
- * (SUPABASE_DB_URL — session pooler), skipping the PostgREST HTTP hop.
- * supabase-js remains for exactly three things, all Supabase Auth:
- * ensureUser, sendMagicLink, verifyAccessToken.
+ * Every query runs through Drizzle over one direct Postgres connection
+ * (SUPABASE_DB_URL), sign-in included: accounts, invites and sessions are rows
+ * here like everything else.
  *
  * Every method that touches per-user data takes `userId` as its first
  * argument, so a caller cannot forget to scope a query. The shared-data and
  * auth methods are grouped separately below and are the only ones without it.
  *
- * The direct connection authenticates as the database owner and is not subject
- * to RLS — RLS still matters because the anon key ships in the browser bundle
- * and PostgREST is public, but it is not what scopes these queries. This
- * module is.
+ * The connection authenticates as the database owner and is not subject to
+ * RLS, so RLS is not what scopes these queries. This module is.
  *
  * Schema is owned by supabase/migrations/ and mirrored for the type system in
  * ./db/schema.ts — reconcile all three when it changes. Notable shape:
- *   users               id/email synced from auth.users by trigger; trade
- *                       settings as typed columns (defaults mirror
- *                       TradeSettingsSchema)
+ *   users               the account: id, email and trade settings as typed
+ *                       columns (defaults mirror TradeSettingsSchema)
+ *   sessions            signed-in browsers by token hash, fk -> users
  *   trades              per-user decision audit log, fk -> users
  *   broker_connections  user_id pk (exactly one Robinhood connection per user),
  *                       fk -> users, ciphertext only
@@ -28,10 +25,10 @@
  *                       (disposition/parse/processed_at); the poller's work
  *                       queue AND the feed source
  *   callers / recaps / recap_insights   shared, no user scope
- *   allowed_emails      invite gate, independent of the sign-in mechanism
+ *   allowed_emails      invite list: an email here gets its users row at first
+ *                       sign-in
  */
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 
@@ -50,6 +47,7 @@ import {
   assembleMessageText,
   truncateSafe,
 } from '../shared/embedText.js';
+import { hashSessionToken } from './credentials.js';
 import {
   allowedEmails,
   brokerConnections,
@@ -57,6 +55,7 @@ import {
   messages,
   recapInsights,
   recaps,
+  sessions,
   trades,
   users,
 } from './db/schema.js';
@@ -171,7 +170,7 @@ export interface ApprovalOutcome {
   readonly approvedAt: string;
 }
 
-/** A user identified by a verified Supabase access token. */
+/** A user identified by a live session token. */
 export interface AuthUser {
   readonly id: string;
   readonly email: string | null;
@@ -275,13 +274,17 @@ export interface TraderDb {
 
   // ---- Auth ------------------------------------------------------------------
 
-  isEmailAllowed(email: string): Promise<boolean>;
-  /** Create the passwordless auth user if it does not exist yet. */
-  ensureUser(email: string): Promise<void>;
-  /** Email a one-time sign-in link. The user must already exist. */
-  sendMagicLink(email: string): Promise<void>;
+  /**
+   * The account a sign-in names: the user with this email, created on the
+   * spot when the email is on the invite list. Null when it is neither.
+   */
+  userForSignIn(email: string): Promise<AuthUser | null>;
+  /** Start a session for `token` (only its hash is stored), ending at `expiresAt`. */
+  createSession(userId: string, token: string, expiresAt: Date): Promise<void>;
+  /** End the session for `token`, if it exists. */
+  deleteSession(token: string): Promise<void>;
   findUserByEmail(email: string): Promise<AuthUser | null>;
-  /** Resolve a bearer token to its user; null when absent, expired or forged. */
+  /** Resolve a bearer token to its user; null when unknown or expired. */
   verifyAccessToken(token: string): Promise<AuthUser | null>;
 }
 
@@ -291,10 +294,11 @@ const MESSAGES_CHANNEL = 'messages_captured';
 const LISTEN_PROBE_TIMEOUT_MS = 5000;
 
 export function createTraderDb(): TraderDb {
-  // prepare: false keeps the connection compatible with Supabase's transaction
-  // pooler too, should the env ever point at port 6543 instead of session mode.
-  // Remote URLs often omit sslmode=require; Supabase still demands TLS. Local
-  // CLI / host.docker.internal Postgres does not.
+  // prepare: false keeps the connection usable behind a transaction-mode
+  // pooler, should one ever sit in front of the database.
+  // Remote URLs often omit sslmode; TLS is required anyway, and 'require' does
+  // not verify the certificate (Railway's Postgres serves a self-signed one).
+  // Local CLI / host.docker.internal Postgres has no TLS.
   const local = /localhost|127\.0\.0\.1|host\.docker\.internal/i.test(config.supabaseDbUrl);
   const client = postgres(config.supabaseDbUrl, {
     prepare: false,
@@ -303,10 +307,7 @@ export function createTraderDb(): TraderDb {
     // fails as relation-not-exist and Drizzle reports only the SQL.
     connection: { options: '-c search_path=public' },
   });
-  const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
-  return new DrizzleTraderDb(drizzle(client), supabase, client);
+  return new DrizzleTraderDb(drizzle(client), client);
 }
 
 // =============================================================================
@@ -316,7 +317,6 @@ export function createTraderDb(): TraderDb {
 class DrizzleTraderDb implements TraderDb {
   constructor(
     private readonly db: PostgresJsDatabase,
-    private readonly supabase: SupabaseClient,
     private readonly client: postgres.Sql
   ) {}
 
@@ -723,37 +723,37 @@ class DrizzleTraderDb implements TraderDb {
       .onConflictDoUpdate({ target: recapInsights.windowDays, set: values });
   }
 
-  async isEmailAllowed(email: string): Promise<boolean> {
-    const [row] = await this.db
+  async userForSignIn(email: string): Promise<AuthUser | null> {
+    const normalized = email.trim().toLowerCase();
+    const existing = await this.findUserByEmail(normalized);
+    if (existing) return existing;
+
+    const [invite] = await this.db
       .select({ email: allowedEmails.email })
       .from(allowedEmails)
-      .where(eq(allowedEmails.email, email.trim().toLowerCase()))
+      .where(eq(allowedEmails.email, normalized))
       .limit(1);
-    return row !== undefined;
+    if (!invite) return null;
+
+    // Two first sign-ins racing: the loser inserts nothing and reads the winner's row.
+    const [created] = await this.db
+      .insert(users)
+      .values({ email: normalized })
+      .onConflictDoNothing({ target: users.email })
+      .returning({ id: users.id, email: users.email });
+    return created ?? this.findUserByEmail(normalized);
   }
 
-  async ensureUser(email: string): Promise<void> {
-    // Passwordless: the only way in is the emailed link. The admin API works
-    // even with self-serve signups disabled on the Supabase project. The
-    // sync_user_from_auth trigger creates the public.users row — no follow-up
-    // write needed here.
-    const { error } = await this.supabase.auth.admin.createUser({
-      email: email.trim().toLowerCase(),
-      email_confirm: true,
-    });
-    if (error && error.code !== 'email_exists') {
-      throw new Error(`could not create user: ${error.message}`);
-    }
+  async createSession(userId: string, token: string, expiresAt: Date): Promise<void> {
+    // A new sign-in is also when the user's expired sessions are cleared out.
+    await this.db
+      .delete(sessions)
+      .where(and(eq(sessions.userId, userId), lt(sessions.expiresAt, new Date())));
+    await this.db.insert(sessions).values({ tokenHash: hashSessionToken(token), userId, expiresAt });
   }
 
-  async sendMagicLink(email: string): Promise<void> {
-    // shouldCreateUser false keeps this a pure sign-in: account creation only
-    // ever happens through ensureUser, behind the allowlist check.
-    const { error } = await this.supabase.auth.signInWithOtp({
-      email: email.trim().toLowerCase(),
-      options: { shouldCreateUser: false },
-    });
-    if (error) throw new Error(`could not send sign-in link: ${error.message}`);
+  async deleteSession(token: string): Promise<void> {
+    await this.db.delete(sessions).where(eq(sessions.tokenHash, hashSessionToken(token)));
   }
 
   async findUserByEmail(email: string): Promise<AuthUser | null> {
@@ -766,9 +766,13 @@ class DrizzleTraderDb implements TraderDb {
   }
 
   async verifyAccessToken(token: string): Promise<AuthUser | null> {
-    const { data, error } = await this.supabase.auth.getUser(token);
-    if (error || !data.user) return null;
-    return { id: data.user.id, email: data.user.email ?? null };
+    const [row] = await this.db
+      .select({ id: users.id, email: users.email })
+      .from(sessions)
+      .innerJoin(users, eq(users.id, sessions.userId))
+      .where(and(eq(sessions.tokenHash, hashSessionToken(token)), gt(sessions.expiresAt, new Date())))
+      .limit(1);
+    return row ?? null;
   }
 }
 

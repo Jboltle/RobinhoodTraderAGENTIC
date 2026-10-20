@@ -1,64 +1,74 @@
 /**
  * Session state for the dashboard.
  *
- * Supabase persists the session in localStorage and refreshes it in the
- * background; this exposes the current one to React and, more importantly,
- * hands the live access token to the API layer (api.ts) so every request the
- * app makes is signed with whatever token is valid right now rather than one
- * captured at mount.
+ * The session is the bearer token POST /api/auth/login returned, kept in
+ * localStorage so a reload stays signed in. The API layer (api.ts) reads the
+ * live token on every request, and any 401 signs this browser out: it means
+ * the server ended the session (sign-out elsewhere, password reset, expiry).
  */
-import { createContext, useContext, useEffect, useState } from 'react'
-import type { Session } from '@supabase/supabase-js'
+import { useSyncExternalStore } from 'react'
 
-import { setAccessTokenSource } from './api'
-import { supabase } from './supabase'
+import {
+  login,
+  logout,
+  setAccessTokenSource,
+  setUnauthorizedHandler,
+  type Session,
+} from './api'
+
+const STORAGE_KEY = 'rh-trader-session'
 
 export interface AuthState {
   readonly session: Session | null
-  /** True until Supabase has restored (or ruled out) a stored session. */
+  /** True until the browser has read its stored session (always, in the prerendered shell). */
   readonly isLoading: boolean
   readonly email: string | null
 }
 
-const AuthContext = createContext<AuthState>({
-  session: null,
-  isLoading: true,
-  email: null,
-})
+let current: Session | null = readStoredSession()
+const listeners = new Set<() => void>()
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
+setAccessTokenSource(() => current?.token ?? null)
+setUnauthorizedHandler(() => setSession(null))
 
-  useEffect(() => {
-    let current: Session | null = null
-    setAccessTokenSource(() => current?.access_token ?? null)
-
-    void supabase.auth.getSession().then(({ data }) => {
-      current = data.session
-      setSession(data.session)
-      setIsLoading(false)
-    })
-
-    const { data } = supabase.auth.onAuthStateChange((_event, next) => {
-      current = next
-      setSession(next)
-      setIsLoading(false)
-    })
-    return () => data.subscription.unsubscribe()
-  }, [])
-
-  return (
-    <AuthContext.Provider
-      value={{ session, isLoading, email: session?.user.email ?? null }}
-    >
-      {children}
-    </AuthContext.Provider>
-  )
+function readStoredSession(): Session | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? 'null') as Session | null
+    return stored?.token && stored.email ? stored : null
+  } catch {
+    return null
+  }
 }
 
-export const useAuth = (): AuthState => useContext(AuthContext)
+function setSession(next: Session | null): void {
+  current = next
+  if (next) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+  else window.localStorage.removeItem(STORAGE_KEY)
+  for (const listener of listeners) listener()
+}
 
-export const signOut = async (): Promise<void> => {
-  await supabase.auth.signOut()
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener)
+  return () => listeners.delete(listener)
+}
+
+export function useAuth(): AuthState {
+  // undefined = still the prerendered shell, before the browser has looked.
+  const session = useSyncExternalStore(subscribe, () => current, () => undefined)
+  return {
+    session: session ?? null,
+    isLoading: session === undefined,
+    email: session?.email ?? null,
+  }
+}
+
+export async function signIn(email: string): Promise<void> {
+  setSession(await login(email))
+}
+
+export async function signOut(): Promise<void> {
+  // Ending the server-side session is best effort; this browser forgets it regardless.
+  await logout().catch(() => {})
+  setSession(null)
 }

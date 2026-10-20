@@ -28,7 +28,7 @@ describe('stack supervisor', () => {
         // Enough for the supervisor's own config import to succeed...
         LLM_MODEL: 'qwen3:8b',
         // ...and guaranteed to fail assertConfigValid('trader') in the child.
-        SUPABASE_SERVICE_ROLE_KEY: '',
+        RH_TOKENS_VAULT_KEY: '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

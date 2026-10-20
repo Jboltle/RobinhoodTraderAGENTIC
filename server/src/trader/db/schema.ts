@@ -34,12 +34,12 @@ const numericAsNumber = (name: string) => numeric(name, { mode: 'number' });
 // ---- Per-user -----------------------------------------------------------------
 
 /**
- * Identity + resolved trade settings, one row per account. id/email are synced
- * from auth.users by the sync_user_from_auth trigger; the app writes only the
- * settings columns. Defaults mirror TradeSettingsSchema (shared/types.ts).
+ * The account + resolved trade settings, one row per user. Created at an
+ * invited email's first sign-in; the app writes only the settings columns
+ * after that. Defaults mirror TradeSettingsSchema (shared/types.ts).
  */
 export const users = pgTable('users', {
-  id: uuid('id').primaryKey(),
+  id: uuid('id').primaryKey().defaultRandom(),
   email: text('email').notNull(),
   executionMode: text('execution_mode').$type<ExecutionMode>().notNull().default('approval'),
   equitySmallPct: numericAsNumber('equity_small_pct').notNull().default(1.25),
@@ -89,6 +89,16 @@ export const brokerConnections = pgTable('broker_connections', {
     .references(() => users.id, { onDelete: 'cascade' }),
   encryptedTokens: text('encrypted_tokens').notNull(),
   updatedAt: isoTimestamp('updated_at').notNull().defaultNow(),
+});
+
+/** One signed-in browser, keyed by the SHA-256 of its bearer token. */
+export const sessions = pgTable('sessions', {
+  tokenHash: text('token_hash').primaryKey(),
+  userId: uuid('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: isoTimestamp('created_at').notNull().defaultNow(),
+  expiresAt: isoTimestamp('expires_at').notNull(),
 });
 
 // ---- Shared data ----------------------------------------------------------------
@@ -155,7 +165,7 @@ export const recapInsights = pgTable('recap_insights', {
   content: text('content').notNull(),
 });
 
-/** Invite-only signup gate; independent of the sign-in mechanism. */
+/** The invite list: an email here gets its users row at its first sign-in. */
 export const allowedEmails = pgTable('allowed_emails', {
   email: text('email').primaryKey(),
   addedAt: isoTimestamp('added_at').notNull().defaultNow(),

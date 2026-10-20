@@ -3,7 +3,7 @@
  * trade settings, Robinhood connection). Message ingestion does not pass
  * through HTTP any more — the poller reads the `messages` table directly.
  *
- * Every /api route runs behind the Supabase JWT hook in auth.ts and reads or
+ * Every /api route runs behind the session-token hook in auth.ts and reads or
  * writes only the acting user's rows. Kept separate from index.ts (which
  * auto-runs main() on import) so routes can be tested with fastify.inject and
  * mocked deps.
@@ -13,7 +13,7 @@ import fastifyEtag from '@fastify/etag';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
-import { createLogger, errorFields } from '../shared/logger.js';
+import { createLogger } from '../shared/logger.js';
 import {
   TradeSettingsSchema,
   type AssetType,
@@ -67,8 +67,6 @@ const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 /** `force` tears down the current session first — the settings Reconnect. */
 const BrokerConnectBodySchema = z.object({ force: z.boolean().optional() });
 
-const MagicLinkBodySchema = z.object({ email: z.email() });
-
 export interface ServerDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
@@ -108,34 +106,6 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // and tears the tree down if it dies, so a dead Gateway means this stops
   // responding. executionMode is per-user (settings.payload), not process-wide.
   fastify.get('/health', async (_request, reply) => {
-    return reply.send({ ok: true });
-  });
-
-  // Sign-in is an emailed magic link; there are no passwords. The allowlist is
-  // checked here rather than in the browser so the client can't skip it, and
-  // accounts are only ever created here (via the admin API) — self-serve
-  // Supabase signups stay disabled.
-  fastify.post('/api/auth/magic-link', async (request, reply) => {
-    const parsed = MagicLinkBodySchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: 'body must be { email: string }' });
-    }
-    const { email } = parsed.data;
-    let step = 'allowlist';
-    try {
-      if (!(await deps.db.isEmailAllowed(email))) {
-        log.warn('magic link rejected: email not on the allowlist', { email });
-        return reply.status(403).send({ error: 'this email is not invited' });
-      }
-      step = 'ensureUser';
-      await deps.db.ensureUser(email);
-      step = 'sendMagicLink';
-      await deps.db.sendMagicLink(email);
-    } catch (err) {
-      log.error('magic-link failed', { email, step, ...errorFields(err) });
-      return reply.status(500).send({ error: 'could not send sign-in link' });
-    }
-    log.info('sent sign-in link', { email });
     return reply.send({ ok: true });
   });
 

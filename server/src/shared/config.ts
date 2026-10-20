@@ -111,23 +111,18 @@ export const config = {
   robinhoodOAuthCallbackHost: env.ROBINHOOD_OAUTH_CALLBACK_HOST ?? '0.0.0.0',
 
   // ---- HTTP ------------------------------------------------------------------
-  // 127.0.0.1 by default; every /api route verifies a Supabase JWT, but a
+  // 127.0.0.1 by default; every /api route verifies a session token, but a
   // loopback bind keeps a misconfigured box off the local network anyway.
   // ponytail: a set PORT env var (Render/PaaS convention) flips the default
   // to 0.0.0.0 so the platform proxy can reach us; explicit TRADER_HOST wins.
   traderHost: env.TRADER_HOST ?? (env.PORT ? '0.0.0.0' : '127.0.0.1'),
   traderPort,
 
-  // ---- Supabase ---------------------------------------------------------------
-  supabaseUrl: env.SUPABASE_URL?.trim() ?? '',
-  /** Browser-safe key; the server uses it only to verify user JWTs. */
-  supabaseAnonKey: env.SUPABASE_ANON_KEY?.trim() ?? '',
-  /** Bypasses RLS. Server-only, never sent to a browser. */
-  supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? '',
+  // ---- Database ---------------------------------------------------------------
   /**
-   * Direct Postgres connection string (Supabase session pooler, port 5432).
-   * All table queries go through Drizzle on this connection; supabase-js keeps
-   * only the auth methods (see server/src/trader/db.ts).
+   * Direct Postgres connection string; on Railway, the Postgres service's
+   * private DATABASE_URL. Every query, sign-in included, goes through Drizzle
+   * on this connection (see server/src/trader/db.ts).
    */
   supabaseDbUrl: env.SUPABASE_DB_URL?.trim() ?? '',
   /** AES-256-GCM key material for broker tokens at rest. */
@@ -144,9 +139,6 @@ export const isAllowed = (v: string, allowlist: readonly string[]): boolean =>
  */
 export function assertConfigValid(): void {
   const missing: string[] = [];
-  if (!config.supabaseUrl) missing.push('SUPABASE_URL');
-  if (!config.supabaseAnonKey) missing.push('SUPABASE_ANON_KEY');
-  if (!config.supabaseServiceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
   if (!config.supabaseDbUrl) missing.push('SUPABASE_DB_URL');
   if (!config.rhTokensVaultKey) missing.push('RH_TOKENS_VAULT_KEY');
   if (config.decisionEngine === 'jev' && !config.jevApiKey) missing.push('JEV_API_KEY');

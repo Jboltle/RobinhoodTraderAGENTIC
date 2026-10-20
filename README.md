@@ -4,9 +4,9 @@ An invite-only, multi-tenant system. One Discord ingest fans out to each signed-
 
 - **`server/listener/`** — the **Listener**: a Python Discord gateway client (`discord.py-self`) that reads watched channels **as a member with your own user token** and writes every captured message raw into the `messages` table. Capture only — it never parses, trades, or posts.
 - **`server/src/trader/`** — a Fastify HTTP service whose poller drains unprocessed `messages` rows, uses an LLM to extract a structured trade callout **once** per message, then runs it per connected user: their settings, their risk state, their [Robinhood Trading MCP](https://agent.robinhood.com/mcp/trading) session (Streamable HTTP + OAuth).
-- **`client/`** — a TanStack Start dashboard. Users sign in with Supabase Auth, connect their own Robinhood account, edit their own limits, and watch their own feed.
+- **`client/`** — a TanStack Start dashboard. Users sign in with their invited email, connect their own Robinhood account, edit their own limits, and watch their own feed.
 
-All state lives in Supabase (Postgres). Users, per-user trades, per-user settings, encrypted per-user broker tokens — and now the raw Discord archive — are rows, not files. **The database is the entire interface between capture and trading** ([ADR-0001](docs/adr/0001-database-as-integration-boundary.md)): the Listener only writes, the trader only polls, and nothing forwards anything anywhere.
+All state lives in Postgres (Railway in production). Users, per-user trades, per-user settings, encrypted per-user broker tokens — and now the raw Discord archive — are rows, not files. **The database is the entire interface between capture and trading** ([ADR-0001](docs/adr/0001-database-as-integration-boundary.md)): the Listener only writes, the trader only polls, and nothing forwards anything anywhere.
 
 ## Self-bot risk — read before setting DISCORD_USER_TOKEN
 
@@ -30,17 +30,17 @@ Discord Gateway ──▶ Listener (Python, user token) ──INSERT──▶ me
                                                                   ▼
                                                           decisions in `trades`
 
-browser (client/) ──Supabase JWT──▶ /api/* ──service_role──▶ Supabase Postgres
+browser (client/) ──session token──▶ /api/* ──owner connection──▶ Postgres
 ```
 
 One parse serves everyone, which is the cost saving that matters as users are added. Users then run concurrently — separate Robinhood sessions — while each user's own messages stay serialized so no account ever has two orders in flight. Every message gets a **disposition** (`callout`, `not_callout`, `failed`, `missed`, `recap`) recorded on its row; a Callout is simply a message whose disposition says so, with its parse attached. If the trader is down, messages pile up unprocessed and the poller's first drain on boot is the catch-up — anything older than the **2-minute** staleness window is recorded as *missed* rather than executed at a price that has since moved. The system is Discord-read-only: the dashboard is the only output surface.
 
 ### Access model
 
-- Every route is behind a Fastify `preHandler` that verifies the Supabase JWT. The only public ones are `/health` and `/api/auth/magic-link`.
-- Sign-in is passwordless: `/api/auth/magic-link` checks the email against the `allowed_emails` table server-side, creates the account if needed (admin API), and has Supabase email a one-time sign-in link. Self-serve Supabase signups are disabled, so the anon key in the browser bundle cannot create accounts around the invite gate.
-- [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that constructs a Supabase client. It uses the service-role key, and every per-user method takes `userId` as its first argument so a caller cannot forget to scope a query.
-- RLS is on with **default-deny** (no policies, grants revoked) for all five tables. This is mandatory, not defense in depth: the anon key ships in the JS bundle and PostgREST is publicly reachable, so without it `GET /rest/v1/trades?select=*` is a full data leak. The browser's anon key is used **only** for auth, never for data. [`supabaseRls.test.ts`](server/src/shared/__tests__/supabaseRls.test.ts) is the guard on that.
+- Every route is behind a Fastify `preHandler` that resolves the bearer token to a live row in `sessions`. The only public ones are `/health` and `/api/auth/login`.
+- Sign-in is the email alone, and nothing is ever emailed. `POST /api/auth/login` takes an email; if it belongs to an account, or is on the `allowed_emails` invite list (the account is created at that first sign-in), it returns a random session token that lasts 30 days, and only the token's SHA-256 is stored. Any other email gets a 403. **The email is the whole credential: anyone who knows a user's email can sign in as them, trades included**, so treat each user's email as the key to their account.
+- [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that talks to the database, and every per-user method takes `userId` as its first argument so a caller cannot forget to scope a query.
+- RLS stays on with default-deny for every table, but nothing is exposed through a public data API: the browser only ever talks to the trader, which connects as the table owner.
 
 ### Schema (`supabase/migrations/`)
 
@@ -84,9 +84,7 @@ From the **repo root**. The CLI is not installed globally on purpose — `npx` f
 npx supabase start
 ```
 
-First run pulls the Docker images and applies everything in `supabase/migrations/`, which takes a few minutes. Ports are shifted off the CLI defaults in `supabase/config.toml` so this stack can run beside another local Supabase: API `54331`, DB `54332`, Studio `54333`, Mailpit `54334`.
-
-`npx supabase status` prints the keys you need. Re-run it any time — if `SUPABASE_ANON_KEY` in `.env` ever drifts from what it reports, PostgREST rejects the key before it reaches a table and the RLS test fails with `PGRST301` instead of the `42501` it asserts.
+First run pulls the Docker images and applies everything in `supabase/migrations/`, which takes a few minutes. Locally the stack is only a Postgres for the trader; its auth service is unused. Ports are shifted off the CLI defaults in `supabase/config.toml` so this stack can run beside another local Supabase: API `54331`, DB `54332`, Studio `54333`.
 
 ### 3. Configure
 
@@ -104,13 +102,10 @@ Fill in:
 | `DISCORD_ALLOWED_AUTHOR_IDS` | authors captured in callout channels (empty = everyone) |
 | `LLM_MODEL` | Model id. Backend is inferred (`qwen3:8b` → Ollama, `gpt-4o` → OpenAI, `claude-*` → Anthropic). Optional `openai/` / `anthropic/` / `ollama/` prefix. Startup fails if unset. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | only for the matching cloud provider |
-| `SUPABASE_URL` | `API_URL` from `npx supabase status` |
-| `SUPABASE_ANON_KEY` | `ANON_KEY` from the same output |
-| `SUPABASE_SERVICE_ROLE_KEY` | `SERVICE_ROLE_KEY` — bypasses RLS, server-side only, never in the client bundle |
-| `SUPABASE_DB_URL` | direct Postgres connection string (session pooler); both the trader and the Listener write over it |
+| `SUPABASE_DB_URL` | Postgres connection string; both the trader and the Listener write over it. Local stack: `postgresql://postgres:postgres@127.0.0.1:54332/postgres`. Railway: `${{Postgres.DATABASE_URL}}` |
 | `RH_TOKENS_VAULT_KEY` | any long random string (e.g. from a password manager, or `openssl rand -hex 32`). Encrypts Robinhood tokens at rest; losing it means everyone reconnects. |
 
-The trader refuses to boot without the four Supabase/vault values; the Listener refuses without the user token and `SUPABASE_DB_URL`.
+The trader refuses to boot without `SUPABASE_DB_URL` and `RH_TOKENS_VAULT_KEY`; the Listener refuses without the user token and `SUPABASE_DB_URL`.
 
 Then the dashboard's own build-time config:
 
@@ -118,21 +113,17 @@ Then the dashboard's own build-time config:
 cp client/.env.example client/.env
 ```
 
-`API_URL` points at the trader (`http://localhost:3000` by default); `SUPABASE_URL` and `SUPABASE_ANON_KEY` are the same two values as above. Never put the service-role key here — this file is baked into a public bundle.
+`API_URL` points at the trader (`http://localhost:3000` by default). It is the dashboard's only setting: sign-in goes through the trader too.
 
 ### 4. Invite yourself
 
-**Signup is allowlist-gated, and the allowlist starts empty — until you add a row, nobody can create an account and the sign-up form just returns "this email is not invited".**
-
-Open Studio at http://127.0.0.1:54333, go to the SQL editor, and run:
+An email can sign in once it has an account or is on the `allowed_emails` invite list, and the list starts empty. Add yourself — locally in Studio's SQL editor at http://127.0.0.1:54333, in production with `psql` against the Railway Postgres service:
 
 ```sql
 insert into public.allowed_emails (email) values ('you@example.com');
 ```
 
-The email must be lowercase (there is a check constraint). Sign-in links from the local stack are not actually delivered — they land in Mailpit at http://127.0.0.1:54334, so open that inbox and click the link there.
-
-To have the allowlist survive a `npx supabase db reset`, put the same statement in `supabase/seed.sql`; `[db.seed]` in `config.toml` is already enabled and pointed at that path.
+The email must be lowercase (there is a check constraint). The account is created the first time that email signs in. To have the invite survive a `npx supabase db reset`, put the same statement in `supabase/seed.sql`; `[db.seed]` in `config.toml` is already enabled and pointed at that path.
 
 ## Run
 
@@ -152,7 +143,7 @@ cd client
 bun run dev      # http://localhost:3001
 ```
 
-On the sign-in screen, enter the address you added to `allowed_emails` — a sign-in link is emailed to you (locally it lands in Mailpit at http://127.0.0.1:54334). Click it, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per user. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
+On the sign-in screen, enter that email, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per user. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
 
 On restart the trader reconnects every user who already had stored tokens, so their MCP session is warm before the first callout rather than during it.
 
@@ -190,7 +181,7 @@ bun run test        # unit tests
 bun run typecheck   # tsc -p . --noEmit
 ```
 
-Most of the suite is hermetic. [`supabaseRls.test.ts`](server/src/shared/__tests__/supabaseRls.test.ts) is the exception: it talks to the live local stack and proves every table is unreadable both by the anon key and by a real logged-in user's JWT, while `service_role` still works. It skips itself when the `SUPABASE_*` vars are unset, and fails with an explicit message if the anon key is stale — a denial caused by an unusable key would prove nothing about RLS.
+The suite is hermetic: routes run against an in-memory database, so no Postgres or Robinhood account is needed.
 
 The dashboard has its own suite:
 
@@ -292,13 +283,7 @@ One thing that surprises people: the pipeline fans out to users who have a `brok
 
 ## Deployment
 
-Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries bun for the trader and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a static site (a UI deploy must never restart the gateway session or warm broker sessions), and Supabase moves from the local CLI stack to a hosted project with `npx supabase db push`. Nothing in `supabase/migrations/` is local-only. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
-
-Magic-link sign-in needs three things configured on the hosted Supabase project (dashboard, not code):
-
-1. **Auth → URL Configuration → Site URL** = the deployed dashboard URL, so the emailed link redirects there instead of localhost.
-2. **Auth → Sign In / Up → "Allow new users to sign up" = off.** Accounts are created only by the trader after the allowlist check; leaving this on lets anyone with the (public) anon key create an account directly.
-3. **Auth → SMTP**: the built-in email service is rate-limited to a few emails per hour and only reliably delivers to your own project team's addresses. Before inviting anyone else, plug in a custom SMTP provider (Resend, Postmark, SES — free tiers are fine at this scale).
+Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries bun for the trader and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -f <file>`; the files are guarded to run on both that database and the local stack. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
 
 ## Risk controls
 
