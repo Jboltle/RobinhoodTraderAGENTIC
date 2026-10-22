@@ -24,6 +24,7 @@ import type {
   Decision,
   DecisionKind,
   PerformanceRow,
+  SubmittedOrder,
 } from '../lib/api'
 import { resolveTradeCaller, type TradeCallerFace } from '../lib/following'
 
@@ -96,6 +97,43 @@ const SHORT_TIME: Intl.DateTimeFormatOptions = {
   minute: '2-digit',
 }
 
+/** Broker states after which an order will never change again. */
+const DEAD_ORDER_STATES = new Set(['cancelled', 'canceled', 'rejected', 'failed', 'expired'])
+
+export interface OrderStateLabel {
+  text: string
+  tone: 'gain' | 'loss' | 'muted'
+}
+
+/**
+ * What a placed order's broker state reads as on a chip. `submitted` only
+ * ever meant "sent"; the fill monitor now keeps `status` current, and the
+ * chip follows it: a fill shows its price, a dead order shows why, and
+ * anything in between is still working at the broker.
+ */
+export function orderStateLabel(order: SubmittedOrder | null): OrderStateLabel {
+  const status = order?.status?.toLowerCase() ?? null
+  if (status === 'filled') {
+    const price = order?.averageFillPrice
+    return { text: price != null ? `filled @ $${price.toFixed(2)}` : 'filled', tone: 'gain' }
+  }
+  if (status === 'partially_filled') {
+    const filled = order?.filledQuantity
+    return {
+      text: filled != null && order ? `partial ${filled}/${order.quantity}` : 'partial fill',
+      tone: 'gain',
+    }
+  }
+  if (status !== null && DEAD_ORDER_STATES.has(status)) return { text: status, tone: 'loss' }
+  return { text: 'working', tone: 'muted' }
+}
+
+const TONE_CLASS: Record<OrderStateLabel['tone'], string> = {
+  gain: 'bg-gain/10 text-gain',
+  loss: 'bg-loss/10 text-loss',
+  muted: 'bg-ink-700 text-ink-400',
+}
+
 /** "AAPL $150 call 9/26" for options, plain ticker for equities. */
 function contractText(decision: Decision): string {
   const ticker = decision.order?.symbol ?? decision.ticker
@@ -139,12 +177,19 @@ const columns = helper.columns([
     header: 'Qty',
     cell: ({ getValue }) => getValue() ?? '—',
   }),
-  helper.accessor((r) => r.decision.order?.limitPrice, {
+  // The real fill once the monitor has seen it; the limit we asked for until then.
+  helper.accessor((r) => r.decision.order?.averageFillPrice ?? r.decision.order?.limitPrice, {
     id: 'entry',
     header: 'Entry',
-    cell: ({ getValue }) => {
+    cell: ({ getValue, row }) => {
       const entry = getValue()
-      return entry != null ? `$${entry.toFixed(2)}` : '—'
+      if (entry == null) return '—'
+      const isFill = row.original.decision.order?.averageFillPrice != null
+      return (
+        <span title={isFill ? 'average fill price' : 'limit price asked'}>
+          ${entry.toFixed(2)}
+        </span>
+      )
     },
   }),
   helper.accessor((r) => r.position?.pctChange, {
@@ -422,6 +467,16 @@ function DetailRow({ data }: { data: TradeRowData }) {
                   value={order.status + (order.orderId ? ` · ${order.orderId}` : '')}
                 />
               )}
+              {order.filledQuantity != null && (
+                <Detail
+                  label="Fill"
+                  value={
+                    `${order.filledQuantity} of ${order.quantity}` +
+                    (order.averageFillPrice != null ? ` @ $${order.averageFillPrice.toFixed(2)}` : '') +
+                    (order.filledAt ? ` · ${new Date(order.filledAt).toLocaleString(undefined, SHORT_TIME)}` : '')
+                  }
+                />
+              )}
             </>
           )}
           {position && (
@@ -573,8 +628,14 @@ export function Outcome({ decision }: { decision: Decision }) {
   // Machine code from the trader (e.g. cooldown_active); older log entries predate it.
   const code = decision.code ? ` [${decision.code}]` : ''
   switch (decision.kind) {
-    case 'submitted':
-      return <span className={`${chipClass} bg-gain/10 text-gain`}>executed</span>
+    case 'submitted': {
+      const state = orderStateLabel(decision.order)
+      return (
+        <span className={`${chipClass} ${TONE_CLASS[state.tone]}`} title={decision.order?.status ?? undefined}>
+          {state.text}
+        </span>
+      )
+    }
     case 'pending_approval':
       return <ApprovalControls decision={decision} />
     case 'rejected':
@@ -608,12 +669,14 @@ export function Outcome({ decision }: { decision: Decision }) {
           missed: too old to trade when the trader woke up
         </span>
       )
-    case 'max_loss_exit':
+    case 'max_loss_exit': {
+      const fill = decision.order?.averageFillPrice
       return (
         <span className={`${chipClass} bg-loss/10 text-loss`} title={decision.reason}>
-          max loss
+          max loss{fill != null ? ` · filled @ $${fill.toFixed(2)}` : ''}
         </span>
       )
+    }
     default:
       return (
         <span className={`${chipClass} bg-ink-700 text-ink-400`}>

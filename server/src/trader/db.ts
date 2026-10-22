@@ -34,11 +34,13 @@ import postgres from 'postgres';
 
 import { config } from '../shared/config.js';
 import {
+  TERMINAL_ORDER_STATES,
   TradeSettingsSchema,
   defaultSettings,
   type Callout,
   type Decision,
   type ResolvedTradeSettings,
+  type SubmittedOrder,
   type TradeSettings,
 } from '../shared/types.js';
 import {
@@ -176,6 +178,12 @@ export interface AuthUser {
   readonly email: string | null;
 }
 
+/** A placed order whose broker state is not yet terminal, with its owner. */
+export interface OpenOrderRow {
+  readonly userId: string;
+  readonly decision: Decision;
+}
+
 export interface TraderDb {
   // ---- Per-user: userId always first ----------------------------------------
 
@@ -199,6 +207,12 @@ export interface TraderDb {
   /** Decisions for the given callouts, keyed by message id. */
   decisionsByMessageId(userId: string, messageIds: readonly string[]): Promise<Map<string, Decision>>;
   /**
+   * Replace the stored order on one decision row: the fill monitor's write.
+   * Keyed like recordDecision's uniqueness, so it reaches synthetic rows
+   * (max_loss_exit) as well as callout-driven ones.
+   */
+  updateOrder(userId: string, messageId: string, order: SubmittedOrder): Promise<void>;
+  /**
    * A hash of everything this user's feed page (listCallouts(limit) joined
    * with their decisions) is built from: equal versions mean an identical
    * page. Computed in the database, so only the hash crosses the wire.
@@ -218,6 +232,12 @@ export interface TraderDb {
 
   /** Users with a broker connection — the pipeline's fan-out set. */
   listBrokerUserIds(): Promise<string[]>;
+  /**
+   * Every user's placed orders since `since` whose broker state is not yet
+   * terminal: the fill monitor's work list. Cross-user by design (one sweep
+   * serves everyone); each row carries its owner.
+   */
+  listOpenOrders(since: Date): Promise<OpenOrderRow[]>;
 
   /** The poller's work queue: unjudged rows, oldest first. */
   listUnprocessedMessages(limit: number): Promise<PendingMessage[]>;
@@ -387,6 +407,32 @@ class DrizzleTraderDb implements TraderDb {
       )
       .returning({ messageId: trades.messageId });
     return updated.length > 0;
+  }
+
+  async updateOrder(userId: string, messageId: string, order: SubmittedOrder): Promise<void> {
+    await this.db
+      .update(trades)
+      .set({ orderPayload: order })
+      .where(and(eq(trades.userId, userId), eq(trades.messageId, messageId)));
+  }
+
+  async listOpenOrders(since: Date): Promise<OpenOrderRow[]> {
+    // Placed orders only (an orderId exists), state not terminal. The jsonb
+    // reads stay in SQL so a thousand historical rows never cross the wire.
+    const terminal = [...TERMINAL_ORDER_STATES];
+    const rows = await this.db
+      .select()
+      .from(trades)
+      .where(
+        and(
+          inArray(trades.kind, ['submitted', 'max_loss_exit']),
+          gte(trades.timestamp, since),
+          sql`${trades.orderPayload} ->> 'orderId' is not null`,
+          sql`lower(coalesce(${trades.orderPayload} ->> 'status', '')) not in ${terminal}`
+        )
+      )
+      .orderBy(asc(trades.timestamp));
+    return rows.map((row) => ({ userId: row.userId, decision: toDecision(row) }));
   }
 
   async decisionsByMessageId(

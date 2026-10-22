@@ -1,7 +1,45 @@
 import { describe, expect, it } from 'vitest'
 
-import type { DecisionKind } from '../lib/api'
-import { isCompactKind, matchesTradeFilter } from './TradesTable'
+import type { DecisionKind, SubmittedOrder } from '../lib/api'
+import { isCompactKind, matchesTradeFilter, orderStateLabel } from './TradesTable'
+
+const placed = (overrides: Partial<SubmittedOrder>): SubmittedOrder => ({
+  symbol: 'SPY',
+  side: 'buy',
+  assetType: 'option',
+  quantity: 3,
+  orderType: 'limit',
+  limitPrice: 0.865,
+  option: { optionType: 'call', strike: 772, expiration: '2026-10-21' },
+  orderId: 'ord-1',
+  status: 'unconfirmed',
+  ...overrides,
+})
+
+describe('orderStateLabel', () => {
+  it('reads a fresh or in-flight order as working, whatever the broker calls it', () => {
+    for (const status of ['unconfirmed', 'confirmed', 'queued', 'submitted', null]) {
+      expect(orderStateLabel(placed({ status })), String(status)).toEqual({ text: 'working', tone: 'muted' })
+    }
+  })
+
+  it('shows the fill price once the monitor has recorded one', () => {
+    expect(orderStateLabel(placed({ status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }))).toEqual({
+      text: 'filled @ $0.86',
+      tone: 'gain',
+    })
+    expect(orderStateLabel(placed({ status: 'partially_filled', filledQuantity: 1 }))).toEqual({
+      text: 'partial 1/3',
+      tone: 'gain',
+    })
+  })
+
+  it('names a dead order for what it is', () => {
+    for (const status of ['cancelled', 'rejected', 'expired']) {
+      expect(orderStateLabel(placed({ status }))).toEqual({ text: status, tone: 'loss' })
+    }
+  })
+})
 
 describe('isCompactKind', () => {
   it('collapses only the kinds that never carried an order', () => {

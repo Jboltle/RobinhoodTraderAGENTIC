@@ -66,7 +66,13 @@ export interface SubmittedOrder {
   limitPrice: number | null
   option: OptionContract | null
   orderId: string | null
+  /** Broker order state, kept current by the server's fill monitor until terminal. */
   status: string | null
+  /** Filled units; present once the monitor has seen a (partial) fill. */
+  filledQuantity?: number | null
+  /** Per-unit fill price (premium scale for options). */
+  averageFillPrice?: number | null
+  filledAt?: string | null
 }
 
 export type DecisionKind =

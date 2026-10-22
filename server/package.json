@@ -20,6 +20,7 @@
     "test:parse-callout": "bun src/scripts/parseCalloutPlayground.ts",
     "eval:parse": "bun src/scripts/parseEval.ts",
     "env:audit": "bun src/scripts/envAudit.ts",
+    "fills:backfill": "bun src/scripts/backfillFills.ts",
     "build": "bun build src/trader/index.ts --outdir dist --target bun",
     "typecheck": "tsc -p . --noEmit"
   },

@@ -6,6 +6,7 @@ import { JevCalloutDecider } from './pipeline/decide.js';
 import { JevClient } from './pipeline/jev.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { createMessageProcessor } from './pipeline/index.js';
+import { startFillMonitor } from './fills.js';
 import { startMaxLossMonitor } from './maxLoss.js';
 import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
@@ -81,6 +82,10 @@ async function main(): Promise<void> {
   void reparseStaleRecaps(db).catch((err: unknown) =>
     log.error('recap re-parse failed', errorFields(err))
   );
+
+  // Fill read-back: keeps placed orders' broker state current. Read-only, so
+  // it runs under every TRADE_EXECUTION_MODE.
+  startFillMonitor({ db, brokers, events });
 
   // Max Loss: process-lifetime flatten loop. Independent of the dashboard.
   startMaxLossMonitor({

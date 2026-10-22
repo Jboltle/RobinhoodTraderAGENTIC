@@ -333,9 +333,32 @@ export interface SubmittedOrder {
   readonly option: OptionContract | null;
   /** Robinhood order id (null until the broker accepts the request). */
   readonly orderId: string | null;
-  /** Broker-reported status at submit time. */
+  /**
+   * Broker-reported order state. Written at submit time (Robinhood answers
+   * `unconfirmed` for a freshly accepted order) and then kept current by the
+   * fill monitor (trader/fills.ts) until it reaches a terminal state.
+   */
   readonly status: string | null;
+  /** Contracts/shares the broker reports filled; null until the monitor sees a fill. */
+  readonly filledQuantity?: number | null;
+  /** Per-unit fill price as the broker reports it, premium scale for options. */
+  readonly averageFillPrice?: number | null;
+  /** When the monitor first saw the order filled (detection time, within one tick). */
+  readonly filledAt?: string | null;
 }
+
+/** Broker states after which an order will never change again. */
+export const TERMINAL_ORDER_STATES: ReadonlySet<string> = new Set([
+  'filled',
+  'cancelled',
+  'canceled',
+  'rejected',
+  'failed',
+  'expired',
+]);
+
+export const isTerminalOrderState = (status: string | null | undefined): boolean =>
+  status !== null && status !== undefined && TERMINAL_ORDER_STATES.has(status.toLowerCase());
 
 /**
  * One user's outcome for one Discord callout — a row in `trades`. Ticker and

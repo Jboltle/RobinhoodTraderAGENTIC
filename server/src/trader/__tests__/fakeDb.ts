@@ -15,7 +15,14 @@ import {
   assembleMessageText,
   truncateSafe,
 } from '../../shared/embedText.js';
-import { TradeSettingsSchema, type Callout, type Decision, type ResolvedTradeSettings, type TradeSettings } from '../../shared/types.js';
+import {
+  TradeSettingsSchema,
+  isTerminalOrderState,
+  type Callout,
+  type Decision,
+  type ResolvedTradeSettings,
+  type TradeSettings,
+} from '../../shared/types.js';
 import type {
   AuthUser,
   Caller,
@@ -221,6 +228,11 @@ export function createFakeDb(): FakeDb {
       }
       return record('resolvePendingApproval', userId, row !== undefined);
     },
+    async updateOrder(userId, messageId, order) {
+      const row = trades.find((r) => r.userId === userId && r.decision.messageId === messageId);
+      if (row) row.decision = { ...row.decision, order };
+      record('updateOrder', userId, undefined);
+    },
     async decisionsByMessageId(userId, messageIds) {
       const wanted = new Set(messageIds);
       const found = new Map<string, Decision>();
@@ -266,6 +278,18 @@ export function createFakeDb(): FakeDb {
 
     async listBrokerUserIds() {
       return [...brokerTokens.keys()];
+    },
+    async listOpenOrders(since) {
+      return trades
+        .filter(
+          ({ decision }) =>
+            (decision.kind === 'submitted' || decision.kind === 'max_loss_exit') &&
+            Date.parse(decision.at) >= since.getTime() &&
+            decision.order?.orderId != null &&
+            !isTerminalOrderState(decision.order.status)
+        )
+        .sort((a, b) => a.decision.at.localeCompare(b.decision.at))
+        .map(({ userId, decision }) => ({ userId, decision }));
     },
     async listUnprocessedMessages(limit) {
       return [...messages.values()]
