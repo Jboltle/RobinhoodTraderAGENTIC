@@ -144,6 +144,17 @@ describe('sweepFills', () => {
     expect(await db.listOpenOrders(new Date(0))).toHaveLength(0);
   });
 
+  it('never reaches for the session of a user with no connection row', async () => {
+    const { db, deps, tools } = setup({ orders: [liveOrder()] });
+    db.seedDecision('disconnected-user', submitted(placed()));
+
+    const result = await sweepFills(deps);
+
+    expect(result).toEqual({ open: 1, updated: 0 });
+    expect(tools.getOptionOrders).not.toHaveBeenCalled();
+    expect(deps.brokers.for('disconnected-user').mcp.ensureReady).not.toHaveBeenCalled();
+  });
+
   it('skips a user whose session needs OAuth consent without failing the sweep', async () => {
     const { db, deps, tools } = setup({
       ensureReady: vi.fn().mockRejectedValue(new BrokerUnavailableError('authorization required')),

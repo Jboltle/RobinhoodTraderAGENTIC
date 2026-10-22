@@ -79,8 +79,15 @@ export function startFillMonitor(deps: FillMonitorDeps): () => void {
 export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<SweepResult> {
   const now = deps.now?.() ?? new Date();
   const rows = await deps.db.listOpenOrders(since ?? new Date(now.getTime() - FILL_LOOKBACK_MS));
-  // Equity orders have no history tool to read; leave them as submitted.
-  const optionRows = rows.filter((row) => row.decision.order?.assetType === 'option');
+  if (rows.length === 0) return { open: 0, updated: 0 };
+
+  // Only users with a connection of record, as Max Loss does: reaching for a
+  // disconnected user's session would start an OAuth flow nobody asked for.
+  // Equity orders have no history tool to read; they keep their submit-time state.
+  const connected = new Set(await deps.db.listBrokerUserIds());
+  const optionRows = rows.filter(
+    (row) => connected.has(row.userId) && row.decision.order?.assetType === 'option'
+  );
 
   const byUser = new Map<string, OpenOrderRow[]>();
   for (const row of optionRows) {

@@ -292,6 +292,29 @@ Production configuration lives only in Railway variables; no `.env` file ships i
 | trader + Listener | `SUPABASE_DB_URL`, `RH_TOKENS_VAULT_KEY`, `DISCORD_USER_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_ALLOWED_AUTHOR_IDS`, `DISCORD_RECAP_CHANNEL_IDS`, `JEV_API_KEY`, `LLM_MODEL`, `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`), `TRADE_EXECUTION_MODE`, `NODE_ENV=production`; optional `LOG_LEVEL`, `JEV_MODEL`, `DECISION_ENGINE`, `KEEP_ALIVE_URL` |
 | dashboard | `API_URL` only. It is read at runtime by `client/server.ts`; nothing is baked into the bundle, and no secret belongs on this service. |
 
+### Staging
+
+A staging deployment runs the **trader only** (never a second Listener: one gateway session per Discord user token) with `TRADE_EXECUTION_MODE=read_only`, so nothing it does can reach a broker, against a database cloned from production without the broker tokens or sessions. Robinhood is never connected from staging: the agentic connection is one slot per account, and a second process refreshing the same grant invalidates production's refresh token.
+
+Seed the staging database from production (schema and data; `pg_dump` must match the server's major version, `brew install libpq`):
+
+```bash
+SOURCE_DB_URL="<production public URL>" TARGET_DB_URL="<staging URL>" server/scripts/seed-staging.sh
+```
+
+Local staging, using the Homebrew Postgres already on the box:
+
+```bash
+initdb -D ~/.local/share/rh-staging-pg -U postgres --auth=trust
+pg_ctl -D ~/.local/share/rh-staging-pg -o "-p 54342 -c listen_addresses=127.0.0.1" -l /tmp/pg-staging.log start
+psql postgresql://postgres@127.0.0.1:54342/postgres -c "create database staging"
+# seed as above with TARGET_DB_URL=postgresql://postgres@127.0.0.1:54342/staging, then:
+cd server && SUPABASE_DB_URL=postgresql://postgres@127.0.0.1:54342/staging TRADE_EXECUTION_MODE=read_only \
+  RH_TOKENS_VAULT_KEY=$(openssl rand -hex 16) TRADER_PORT=3100 NODE_ENV=production bun run trader
+```
+
+Railway staging, in the existing `Staging` environment (`railway environment link Staging`): `railway add --database postgres`, then `railway add --service TraderStaging --repo Jboltle/RobinhoodTraderAGENTIC --branch feat/desk-tracking` with `source.rootDirectory=server/`, `build.dockerfilePath=Dockerfile.server`, `deploy.startCommand="bun run trader"`, `deploy.healthcheckPath=/health`, and the trader variables from the table above minus `DISCORD_USER_TOKEN`, with `TRADE_EXECUTION_MODE=read_only` and `SUPABASE_DB_URL=${{Postgres.DATABASE_URL}}`. Enable the Postgres TCP proxy (`railway tcp-proxy create --port 5432 --service Postgres`) to run the seed script against it. Railway pauses new resources while the workspace is over its usage hard limit ("Paused temporarily").
+
 ## Risk controls
 
 Per user, not per environment. Each user owns one row in `settings`, edited from the dashboard's Settings page; the defaults below live in `TradeSettingsSchema` ([`server/src/shared/types.ts`](server/src/shared/types.ts)) and are the only source. There is no env or file layer behind them.
