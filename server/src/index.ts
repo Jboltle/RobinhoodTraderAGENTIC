@@ -56,16 +56,22 @@ async function main(): Promise<void> {
 }
 
 /**
- * Self-ping so Render's free tier never idles us out. Render suspends a free
- * web service after 15 minutes without inbound HTTP traffic; requests to the
- * service's own public URL go through Render's proxy and count as inbound, so
- * pinging /health every 10 minutes keeps the whole tree (Gateway socket
- * included) awake without an external cron. RENDER_EXTERNAL_URL is injected by
- * Render, so locally this is a no-op. If the process ever does die, Render's
- * restart brings the ping loop back with it.
+ * Self-ping so a PaaS free tier never idles us out. Render suspends a free
+ * web service after 15 minutes without inbound HTTP traffic (Railway's App
+ * Sleeping is the same idea); requests to the service's own public URL go
+ * through the platform proxy and count as inbound, so pinging /health every
+ * 10 minutes keeps the whole tree (Gateway socket included) awake without an
+ * external cron. The URL comes from KEEP_ALIVE_URL, else the platform's own
+ * injected variable (Render: RENDER_EXTERNAL_URL, Railway:
+ * RAILWAY_PUBLIC_DOMAIN), so locally this is a no-op.
  */
 function startKeepAlive(): void {
-  const externalUrl = process.env.RENDER_EXTERNAL_URL;
+  const externalUrl =
+    process.env.KEEP_ALIVE_URL?.trim() ||
+    process.env.RENDER_EXTERNAL_URL?.trim() ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN?.trim()
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim()}`
+      : '');
   if (!externalUrl) return;
 
   const url = `${externalUrl}/health`;

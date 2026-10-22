@@ -13,15 +13,10 @@ RUN bun install --frozen-lockfile
 
 COPY --chown=bun:bun client ./
 
-# Baked into the static bundle. The anon key is public by design; never pass
-# SUPABASE_SERVICE_ROLE_KEY — vite.config.ts does not expose it.
-# API_URL is optional: when set (public trader URL) Vite bakes it and the
-# browser calls that host. When unset, the browser uses same-origin /api and
-# server.ts proxies to the runtime API_URL. Do not bake a .railway.internal URL.
-# ARG (not ENV): compose --build-arg fills these for RUN. An ENV line
-# here would clobber Railway's build-time ENV with an empty ARG.
-ARG SUPABASE_URL
-ARG SUPABASE_ANON_KEY
+# API_URL is the client's only setting and is read at RUNTIME by server.ts,
+# which injects it into the page and proxies /api to it. Nothing is baked into
+# the bundle, so no build args are needed here. (Sign-in goes through the
+# trader; the client has no Supabase config any more.)
 RUN bun --bun run build
 
 USER bun

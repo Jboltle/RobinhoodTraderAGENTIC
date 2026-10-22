@@ -285,6 +285,13 @@ One thing that surprises people: the pipeline fans out to users who have a `brok
 
 Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries bun for the trader and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -f <file>`; the files are guarded to run on both that database and the local stack. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
 
+Production configuration lives only in Railway variables; no `.env` file ships in either image. The complete set each service reads (`bun run env:audit` in `server/` checks the code against `.env.example`):
+
+| Service | Variables |
+| --- | --- |
+| trader + Listener | `SUPABASE_DB_URL`, `RH_TOKENS_VAULT_KEY`, `DISCORD_USER_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_ALLOWED_AUTHOR_IDS`, `DISCORD_RECAP_CHANNEL_IDS`, `JEV_API_KEY`, `LLM_MODEL`, `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`), `TRADE_EXECUTION_MODE`, `NODE_ENV=production`; optional `LOG_LEVEL`, `JEV_MODEL`, `DECISION_ENGINE`, `KEEP_ALIVE_URL` |
+| dashboard | `API_URL` only. It is read at runtime by `client/server.ts`; nothing is baked into the bundle, and no secret belongs on this service. |
+
 ## Risk controls
 
 Per user, not per environment. Each user owns one row in `settings`, edited from the dashboard's Settings page; the defaults below live in `TradeSettingsSchema` ([`server/src/shared/types.ts`](server/src/shared/types.ts)) and are the only source. There is no env or file layer behind them.
