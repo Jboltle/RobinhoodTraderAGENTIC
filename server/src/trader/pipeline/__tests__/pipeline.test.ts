@@ -18,7 +18,7 @@ import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
 import { SymbolNotFoundError, type RobinhoodTools } from '../../rh/tools.js';
 import { JevCalloutDecider } from '../decide.js';
-import { contractsForPortion } from '../execute.js';
+import { BrokerWritesDisabledError, contractsForPortion, submitOrder } from '../execute.js';
 import { createMessageProcessor, liveCallerContracts, type PipelineDeps } from '../index.js';
 import { ACTIONS, JevError, type Action, type JevVerdict } from '../jev.js';
 import {
@@ -124,6 +124,7 @@ function setup(
     db,
     events,
     brokers: makeRegistry(toolsByUser),
+    executionMode: 'immediate',
   };
   return { db, deps, tools: toolsByUser.get(users[0]!)!, events };
 }
@@ -486,6 +487,25 @@ describe('fan-out — approval mode', () => {
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 
+  // The deployment kill switch can only tighten: a user set to immediate is
+  // still parked when TRADE_EXECUTION_MODE is approval or read_only, and the
+  // row says which switch held it.
+  it.each(['approval', 'read_only'] as const)(
+    'TRADE_EXECUTION_MODE=%s parks an immediate-mode user without submitting',
+    async (executionMode) => {
+      const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+      db.seedSettings(USER, { ...TRADING_SETTINGS, executionMode: 'immediate' });
+
+      await createMessageProcessor({ ...deps, executionMode }).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+      const [decision] = await db.listDecisions(USER, 10);
+      expect(decision!.kind).toBe('pending_approval');
+      expect(decision!.reason).toContain(`TRADE_EXECUTION_MODE=${executionMode}`);
+      expect(decision!.order?.quantity).toBeGreaterThan(0);
+      expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    }
+  );
+
   // Sizing happens before the approval gate so the dashboard can show what is
   // being approved, and so the approve endpoint has an order to submit.
   it('parks a fully sized order, not a bare intent', async () => {
@@ -645,6 +665,7 @@ describe('fan-out — several users', () => {
       db,
       events: new TraderEvents(),
       brokers: makeRegistry(toolsByUser),
+      executionMode: 'immediate',
     }).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('execution_failed');
@@ -992,6 +1013,29 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     [{ kind: 'fraction', value: 0.2 } as const, 12, 2],
   ])('sizes %j of %i held contracts as %i, rounding down', (portion, held, sold) => {
     expect(contractsForPortion(portion, held)).toBe(sold);
+  });
+
+  // The one broker write path refuses before any MCP call in a read-only
+  // deployment; every other mode passes straight through to the broker.
+  it('submitOrder throws BrokerWritesDisabledError under read_only and never calls the broker', async () => {
+    const tools = makeTools();
+    const order = {
+      symbol: 'QQQ',
+      side: 'sell' as const,
+      assetType: 'option' as const,
+      quantity: 1,
+      orderType: 'market' as const,
+      limitPrice: null,
+      option: { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' },
+      orderId: null,
+      status: null,
+    };
+
+    await expect(submitOrder(order, tools, 'read_only')).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+
+    await submitOrder(order, tools, 'approval');
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
   });
 
   it('records failed and a parse_failed row per user when Jev does not answer', async () => {

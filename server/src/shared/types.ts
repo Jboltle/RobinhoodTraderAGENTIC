@@ -29,6 +29,15 @@ export type SizeHintKind = (typeof SIZE_HINT_KINDS)[number];
 export const EXECUTION_MODES = ['immediate', 'approval'] as const;
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
+/**
+ * Deployment-wide execution policy (TRADE_EXECUTION_MODE). It can only tighten
+ * a user's own `executionMode`: `approval` parks every callout-driven trade and
+ * refuses the Approve button; `read_only` additionally stops every broker
+ * write, Max Loss included, so a staging deployment can never place an order.
+ */
+export const TRADE_EXECUTION_MODES = ['immediate', 'approval', 'read_only'] as const;
+export type TradeExecutionMode = (typeof TRADE_EXECUTION_MODES)[number];
+
 /** Who decides whether a message is a trade: hosted Jev, or the LLM parser it replaced. */
 export const DECISION_ENGINES = ['jev', 'parser'] as const;
 export type DecisionEngine = (typeof DECISION_ENGINES)[number];

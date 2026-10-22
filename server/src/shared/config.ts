@@ -1,6 +1,11 @@
 import { config as loadDotenv } from 'dotenv';
 
-import { DECISION_ENGINES, type DecisionEngine } from './types.js';
+import {
+  DECISION_ENGINES,
+  TRADE_EXECUTION_MODES,
+  type DecisionEngine,
+  type TradeExecutionMode,
+} from './types.js';
 
 // Env files live at the repo root (one level above server/). Resolve them
 // relative to this file, not cwd, so env loads no matter where the process
@@ -48,6 +53,17 @@ const decisionEngine = (raw: string | undefined): DecisionEngine => {
   return value as DecisionEngine;
 };
 
+/** Unset means the per-user settings decide; `approval` and `read_only` only ever tighten. */
+const tradeExecutionMode = (raw: string | undefined): TradeExecutionMode => {
+  const value = raw?.trim() || 'immediate';
+  if (!(TRADE_EXECUTION_MODES as readonly string[]).includes(value)) {
+    throw new Error(
+      `TRADE_EXECUTION_MODE must be one of ${TRADE_EXECUTION_MODES.join(', ')}, got "${value}".`
+    );
+  }
+  return value as TradeExecutionMode;
+};
+
 // OAuth: the browser is redirected to `redirectUri`; the local listener binds
 // `callbackHost:callbackPort`. `redirectUri` defaults to the redirect host so
 // it need not be set explicitly, but stays overridable for WSL/remote setups.
@@ -69,6 +85,14 @@ export const config = {
    * `messages` rows to the recaps table; structurally isolated from trading.
    */
   discordRecapChannelIds: list(env.DISCORD_RECAP_CHANNEL_IDS),
+
+  // ---- Execution policy -------------------------------------------------------
+  /**
+   * The deployment's kill switch. Enforced at the one broker write path
+   * (pipeline/execute.ts#submitOrder) and at the callout gates that lead to
+   * it; see TRADE_EXECUTION_MODES in types.ts for what each value holds back.
+   */
+  tradeExecutionMode: tradeExecutionMode(env.TRADE_EXECUTION_MODE),
 
   // ---- Decision engine ---------------------------------------------------------
   /** Who decides whether a message is a trade: hosted Jev, or the LLM parser it replaced. */

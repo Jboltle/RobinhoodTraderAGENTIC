@@ -9,6 +9,7 @@
 import { vi } from 'vitest';
 import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 
+import type { TradeExecutionMode } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
 import type { McpRegistry, UserBroker } from '../rh/mcpRegistry.js';
 import type { RobinhoodMcpClient } from '../rh/mcpClient.js';
@@ -47,7 +48,12 @@ export interface Harness {
   configureBroker(userId: string, options: BrokerStubOptions): void;
 }
 
-export function makeHarness(): Harness {
+export interface HarnessOptions {
+  /** Deployment kill switch under test; defaults to the mode that lets Approve submit. */
+  readonly executionMode?: TradeExecutionMode;
+}
+
+export function makeHarness(options: HarnessOptions = {}): Harness {
   const db = createFakeDb();
   const events = new TraderEvents();
   const stubs = new Map<string, UserBroker>();
@@ -66,7 +72,12 @@ export function makeHarness(): Harness {
     drop: (userId: string) => void stubs.delete(userId),
   };
 
-  const app = buildServer({ db, events, brokers });
+  const app = buildServer({
+    db,
+    events,
+    brokers,
+    executionMode: options.executionMode ?? 'immediate',
+  });
 
   return {
     app,

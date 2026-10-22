@@ -306,7 +306,7 @@ Per user, not per environment. Each user owns one row in `settings`, edited from
 
 `maxTradesPerDay` and `cooldownSeconds` are enforced against the `trades` table rather than an in-process counter, so they hold across restarts. They are checked when the callout arrives, which for an approval-mode trade is not when it is submitted — approving a backlog can therefore outrun the daily cap.
 
-The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch. It can only tighten: a trader booted in `approval` mode holds every user regardless of their own `executionMode`, and rejects the dashboard's Approve button with a 409, so the deployment submits nothing at all.
+The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch enforced at the single broker write path (`submitOrder` in [`server/src/trader/pipeline/execute.ts`](server/src/trader/pipeline/execute.ts)) and at the gates that lead to it. It can only tighten: a trader booted in `approval` mode parks every callout-driven trade regardless of the user's own `executionMode` and rejects the dashboard's Approve button with a 409, so no callout ever submits; Max Loss, which the user opted into as protection, still flattens. `read_only` goes further and stops every broker write, Max Loss included — a breach is logged, not sold — which is what a staging deployment or a historical replay runs with. Unset means `immediate`: the per-user setting decides. The mode is logged once at boot (`execution policy`).
 
 ## Project layout
 

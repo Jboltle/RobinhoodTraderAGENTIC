@@ -116,6 +116,25 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('submitted');
   });
 
+  // The README's promise, now enforced: a deployment held by the kill switch
+  // refuses the Approve button and leaves the row pending for later.
+  it.each(['approval', 'read_only'] as const)(
+    'approve 409s and keeps the trade pending when TRADE_EXECUTION_MODE=%s',
+    async (executionMode) => {
+      harness = makeHarness({ executionMode });
+      harness.db.addUser(USER, TOKEN);
+      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      const messageId = seedPending();
+
+      const response = await send('POST', `/api/trades/${messageId}/approve`, {});
+
+      expect(response.statusCode).toBe(409);
+      expect((response.json() as { error: string }).error).toContain(executionMode);
+      expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+      expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
+    }
+  );
+
   it('reject records the outcome without touching the broker', async () => {
     const messageId = seedPending();
 

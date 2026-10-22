@@ -17,6 +17,7 @@ import {
   type OrderSide,
   type RiskCheck,
   type SubmittedOrder,
+  type TradeExecutionMode,
 } from '../../shared/types.js';
 import type { RobinhoodTools } from '../rh/tools.js';
 import type { OptionPosition, PlaceOrderResult } from '../rh/types.js';
@@ -48,6 +49,21 @@ export class ParseInconsistencyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ParseInconsistencyError';
+  }
+}
+
+/**
+ * Thrown by submitOrder when the deployment runs read-only
+ * (TRADE_EXECUTION_MODE=read_only). Raised before any broker call, so a
+ * staging process can run the whole pipeline and never place an order.
+ */
+export class BrokerWritesDisabledError extends Error {
+  constructor(order: SubmittedOrder) {
+    super(
+      `read-only deployment: would have placed ${order.side} ${order.quantity} ${order.symbol}` +
+        (order.option ? ` ${optionLabel(order.option)}` : '')
+    );
+    this.name = 'BrokerWritesDisabledError';
   }
 }
 
@@ -272,14 +288,22 @@ async function sizeOptionExit(
 }
 
 /**
- * Place an already-sized order. The only function in this module that writes
+ * Place an already-sized order. The only function in the codebase that writes
  * to the broker, and the only one the approve endpoint needs — everything it
  * requires is on the SubmittedOrder the sizing half produced.
+ *
+ * `mode` is the deployment's TRADE_EXECUTION_MODE, passed in rather than read
+ * from config so every caller states its policy and tests can set theirs.
+ * Only `read_only` is enforced here: `approval` is a gate on how a trade
+ * reaches this function, not on the write itself.
  */
 export async function submitOrder(
   order: SubmittedOrder,
-  tools: RobinhoodTools
+  tools: RobinhoodTools,
+  mode: TradeExecutionMode
 ): Promise<PlaceOrderResult> {
+  if (mode === 'read_only') throw new BrokerWritesDisabledError(order);
+
   if (order.assetType === 'option') {
     if (order.option === null) {
       throw new Error(`options order for ${order.symbol} is missing its contract details`);

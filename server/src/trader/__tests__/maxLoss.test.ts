@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Decision, SubmittedOrder } from '../../shared/types.js';
+import type { Decision, SubmittedOrder, TradeExecutionMode } from '../../shared/types.js';
 import { TradeSettingsSchema } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
 import {
@@ -131,6 +131,45 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening);
 
     expect(ensureReady).toHaveBeenCalled();
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+  });
+
+  // The deployment kill switch: a read-only process observes the breach and
+  // never reaches the broker. Max Loss is protection the user opted into, so
+  // `approval` does not hold it — only `read_only` does.
+  it('read_only deployment logs the breach and places nothing', async () => {
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+      ],
+      markFor: () => 0.75,
+      executionMode: 'read_only',
+    });
+    db.seedDecision(USER, submittedBuy('QQQ', 1.5, { optionType: 'call', strike: 707, expiration: '2026-06-11' }));
+
+    await sweepMaxLoss(deps, flattening);
+    await sweepMaxLoss(deps, flattening);
+
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect((await db.listDecisions(USER, 10)).filter((d) => d.kind === 'max_loss_exit')).toHaveLength(0);
+    // The in-flight key stays set, so the breach is not re-logged every sweep.
+    expect(flattening.size).toBe(1);
+  });
+
+  it('approval deployment still flattens: Max Loss is protection, not an entry', async () => {
+    const { tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+      ],
+      markFor: () => 0.75,
+      executionMode: 'approval',
+    });
+    deps.db.seedDecision(USER, submittedBuy('QQQ', 1.5, { optionType: 'call', strike: 707, expiration: '2026-06-11' }));
+
+    await sweepMaxLoss(deps, flattening);
+
     expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
   });
 
@@ -489,6 +528,7 @@ function setupMonitor(opts: {
   markFor?: (symbol: string) => number;
   quoteFor?: (symbol: string) => number;
   ensureReady?: () => Promise<void>;
+  executionMode?: TradeExecutionMode;
 }) {
   const db = createFakeDb();
   db.seedBrokerTokens(USER, fakeTokens('tok'));
@@ -540,6 +580,7 @@ function setupMonitor(opts: {
     brokers,
     events: new TraderEvents(),
     enqueue: enqueue as MaxLossDeps['enqueue'],
+    executionMode: opts.executionMode ?? 'immediate',
     now: () => nowRef.value,
   };
   return { db, tools, enqueue, flattening, deps, nowRef };

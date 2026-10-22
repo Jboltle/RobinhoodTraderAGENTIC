@@ -9,6 +9,7 @@ import {
   type OptionContract,
   type ResolvedTradeSettings,
   type SubmittedOrder,
+  type TradeExecutionMode,
 } from '../../shared/types.js';
 import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
@@ -36,6 +37,8 @@ export interface PipelineDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
+  /** The deployment's TRADE_EXECUTION_MODE; required so no wiring can forget the kill switch. */
+  readonly executionMode: TradeExecutionMode;
 }
 
 export interface ProcessOptions {
@@ -515,20 +518,25 @@ export async function runForUser(
     // Approval is the last gate: everything above has already passed, and the
     // row carries the sized order so the dashboard can show what is at stake.
     // A review reason (Jev unsure, or an ambiguous contract) parks the trade
-    // even for accounts that otherwise trade immediately.
-    if (settings.executionMode === 'approval' || callout.reviewReason) {
+    // even for accounts that otherwise trade immediately, and so does a
+    // deployment whose TRADE_EXECUTION_MODE is anything but immediate: the
+    // kill switch can only tighten what the user chose.
+    const heldByDeployment = deps.executionMode !== 'immediate';
+    if (settings.executionMode === 'approval' || callout.reviewReason || heldByDeployment) {
       const receipt = summarizePendingApproval(sized);
+      const held = heldByDeployment ? `Held by TRADE_EXECUTION_MODE=${deps.executionMode}` : null;
+      const prefix = [callout.reviewReason, held].filter(Boolean).join('; ');
       return finalize(userId, deps, {
         ...base,
         ...identity,
         kind: 'pending_approval',
         code: null,
-        reason: callout.reviewReason ? `${callout.reviewReason}. ${receipt}` : receipt,
+        reason: prefix ? `${prefix}. ${receipt}` : receipt,
         order: sized,
       });
     }
 
-    const placed = await submitOrder(sized, tools);
+    const placed = await submitOrder(sized, tools, deps.executionMode);
     const order: SubmittedOrder = {
       ...sized,
       orderId: placed.orderId,

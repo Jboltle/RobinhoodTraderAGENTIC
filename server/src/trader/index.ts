@@ -27,15 +27,20 @@ async function main(): Promise<void> {
       ? new JevCalloutDecider(new JevClient({ apiKey: config.jevApiKey, model: config.jevModel }))
       : new LlmCalloutParser();
   log.info('decision engine', { engine: config.decisionEngine });
+  // Logged at boot on purpose: the one line to read when wondering why a
+  // deployment is (not) placing orders.
+  log.info('execution policy', { tradeExecutionMode: config.tradeExecutionMode });
 
+  const executionMode = config.tradeExecutionMode;
   const processor = createMessageProcessor({
     parser,
     db,
     events,
     brokers,
+    executionMode,
   });
 
-  const fastify = buildServer({ db, events, brokers });
+  const fastify = buildServer({ db, events, brokers, executionMode });
 
   // Listen before anything else: on a deployed box the OAuth flow can only
   // complete via the dashboard hitting /api/broker/*, so the port must be open
@@ -83,6 +88,7 @@ async function main(): Promise<void> {
     brokers,
     events,
     enqueue: (userId, run) => processor.enqueue(userId, run),
+    executionMode,
   });
 }
 

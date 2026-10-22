@@ -19,6 +19,7 @@ import {
   type AssetType,
   type Decision,
   type OptionType,
+  type TradeExecutionMode,
 } from '../shared/types.js';
 import { registerAuth, requireUser } from './auth.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
@@ -71,6 +72,8 @@ export interface ServerDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
+  /** The deployment's TRADE_EXECUTION_MODE: anything but immediate refuses Approve. */
+  readonly executionMode: TradeExecutionMode;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -247,6 +250,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (pending.order === null) {
       return reply.status(409).send({ error: 'that trade has no sized order to submit' });
     }
+    // The deployment's kill switch wins over the user's click: the row stays
+    // pending so it can be approved once the deployment trades again.
+    if (deps.executionMode !== 'immediate') {
+      return reply.status(409).send({
+        error: `this deployment is held by TRADE_EXECUTION_MODE=${deps.executionMode}; nothing can be approved here`,
+      });
+    }
 
     // Approving spends money over the user's broker session, so it must not
     // run against a stale one. The row stays pending — reconnect, then approve.
@@ -258,7 +268,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const approvedAt = new Date().toISOString();
     let outcome: ApprovalOutcome;
     try {
-      const placed = await submitOrder(pending.order, tools);
+      const placed = await submitOrder(pending.order, tools, deps.executionMode);
       const order = {
         ...pending.order,
         orderId: placed.orderId,
