@@ -124,7 +124,8 @@ Rules:
 // =============================================================================
 
 const TICKER = pattern`\$? (?<ticker> [A-Z]{1,6} )`;
-const STRIKE = pattern`(?<strike> \d+ (?: \. \d+ )? )`;
+// "$IWM $274P": some callers put a dollar sign on the strike too.
+const STRIKE = pattern`\$? (?<strike> \d+ (?: \. \d+ )? )`;
 const CP = pattern`(?<cp> [CP] )`;
 const EXPIRATION = pattern`
   (?<expiration>
@@ -133,7 +134,8 @@ const EXPIRATION = pattern`
     | \d{1,2} / \d{1,2} (?: / \d{2,4} )?
   )
 `;
-const PREMIUM = pattern`(?: @ | \$ )? \s* (?<limit> \d+ (?: \. \d+ )? )`;
+// "$.25" and ".5" are how sub-dollar premiums get written.
+const PREMIUM = pattern`(?: @ | \$ )? \s* (?<limit> \d+ (?: \. \d+ )? | \. \d+ )`;
 
 // "BTO SPY 755C 0DTE $0.71" / "BUY TO OPEN ... SPY 743P 0DTE 0.9" — run
 // against whitespace-collapsed content starting at the BTO directive line.
@@ -187,7 +189,7 @@ const CONTRACT_TEST = contractPattern('i');
 // the LLM's resolved date against the message text.
 const EXPIRATION_TOKEN_SCAN = regex('gi')`
   \b (?<token>
-      0DTE | TODAY
+      0DTE | TODAY | TOMORROW
     | NEXT \s+ FRIDAY | FRIDAY
     | WEEKLIES | WEEKLY | MONTHLY | EOY | LEAPS?
     | \d{4}-\d{2}-\d{2}
@@ -218,7 +220,7 @@ const OptionLineCaptureSchema = z
     strike: z.string().regex(/^\d+(?:\.\d+)?$/),
     cp: z.string().min(1),
     expiration: z.string().min(1).optional(),
-    limit: z.string().regex(/^\d+(?:\.\d+)?$/).optional(),
+    limit: z.string().regex(/^(?:\d+(?:\.\d+)?|\.\d+)$/).optional(),
   })
   .transform((capture) => {
     const cpLetter = capture.cp[0]!.toUpperCase();
@@ -650,6 +652,14 @@ function resolveDeterministicExpiration(raw: string, referenceTimestamp: string)
     return toIsoDate(utcDateOnly(reference));
   }
 
+  // "exp tomorrow" on a Friday means Monday: nothing expires on a weekend.
+  if (upper === 'TOMORROW') {
+    const date = utcDateOnly(reference);
+    date.setUTCDate(date.getUTCDate() + 1);
+    while (date.getUTCDay() === 0 || date.getUTCDay() === 6) date.setUTCDate(date.getUTCDate() + 1);
+    return toIsoDate(date);
+  }
+
   if (upper === 'FRIDAY' || upper === 'WEEKLY' || upper === 'WEEKLIES') {
     return toIsoDate(nextFridayOnOrAfter(reference));
   }
@@ -854,6 +864,11 @@ interface ContractCandidate {
   readonly optionType: OptionType;
   readonly expiration: string | null;
   readonly premium: number | null;
+  /**
+   * The ticker was written as one ("$IWM", "IWM"), not a lowercase word the
+   * case-insensitive scan happened to sit before ("your 275P", "close $9.5C").
+   */
+  readonly explicitTicker: boolean;
 }
 
 function extractContractCandidates(content: string, timestamp: string): ContractCandidate[] {
@@ -865,6 +880,7 @@ function extractContractCandidates(content: string, timestamp: string): Contract
     );
     if (!capture.success) continue;
     const contract = capture.data;
+    const rawTicker = groups.ticker ?? '';
     candidates.push({
       ticker: contract.ticker,
       strike: contract.strike,
@@ -874,6 +890,7 @@ function extractContractCandidates(content: string, timestamp: string): Contract
           ? null
           : resolveDeterministicExpiration(contract.expirationRaw, timestamp),
       premium: contract.limitPrice,
+      explicitTicker: match[0].startsWith('$') || rawTicker === rawTicker.toUpperCase(),
     });
   }
   return candidates;
@@ -1201,22 +1218,174 @@ const positivePrice = (raw: string | undefined): number | null => {
   return Number.isFinite(price) && price > 0 ? price : null;
 };
 
-/** The one contract the generic scanner finds; several different ones are ambiguous and trade nothing. */
-function readCandidateContract(
+// Words that make a dateless contract an entry being called now, so the
+// same-day default below applies. Exit language ("sold all exit $AAPL
+// $340P") is deliberately absent: an exit's contract comes from the Caller's
+// own entry, never from a guess.
+const ENTRY_WORDS =
+  /\b(?:entry|enter(?:ed|ing)?|bought|bto|buy(?:ing)?|long|load(?:ed|ing)?|lotto|scalp|starter|grab(?:bed|bing)?|took|taking|chas(?:e|ing)|here)\b/i;
+
+// "at $.25", "@ 1.05", "at .9": the price the caller says they paid. Stops
+// before a time ("at 9:30") or a percentage.
+const PRICE_AFTER_AT = /(?:\bat|@)\s*\$?(?<price>\d*\.\d+|\d+)(?![\d:%.])/i;
+
+// A strike-and-letter token on its own ("$279P", "280C"): how a caller names
+// the second leg of a pair without repeating the ticker.
+const BARE_CONTRACT_TOKEN = /(?<![A-Za-z0-9.])\$?(\d+(?:\.\d+)?)\s*([CP])\b/g;
+
+// Cashtags, uppercase only so "$.25" and "$x" never qualify.
+const CASHTAGS = /\$(?<ticker>[A-Z]{1,6})\b/g;
+
+// "Exp 10/23", "expiring tomorrow", "Oct 02 exp": the date the caller labels
+// as the expiry, which outranks any other date word in the post.
+const EXPIRY_TOKEN = String.raw`(?:0DTE|today|tomorrow|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s?\d{1,2})`;
+const EXPIRY_HINT = new RegExp(
+  String.raw`\bexp(?:iry|ires|iring|iration)?\.?\s*:?\s*(?<after>${EXPIRY_TOKEN})\b|\b(?<before>${EXPIRY_TOKEN})\s+exp(?:iry|ires|iring|iration)?\b`,
+  'i'
+);
+
+// Relative day words; a calendar date in the same post outranks them, since
+// "ER tomorrow" is about the earnings, not the contract.
+const RELATIVE_DATE_WORD = /^(?:0dte|today|tomorrow)$/i;
+
+/**
+ * The expiration a free-form post means for its first contract, best cue
+ * first: a date labelled "exp", the post's one calendar date, the first
+ * calendar date written next to the contract, the post's one relative word,
+ * and for an entry, today.
+ *
+ * ponytail: "today" is measured, not assumed. Against Swift's record of
+ * Harvey's Sep 22 - Oct 21 entries the dateless ones were same-day for the
+ * index ETFs and the large caps alike (META, MU, MSFT list daily/Mon-Wed-Fri
+ * weeklies); only names with Friday-only weeklies (UNH, ACI) meant Friday,
+ * and for those the same-day contract does not exist, so the broker lookup
+ * fails rather than trading the wrong one. Upgrade path: ask the chain for
+ * the nearest listed expiration.
+ */
+function pickExpiration(
   text: string,
+  firstLegText: string,
+  isEntry: boolean,
   timestamp: string
-): { ticker: string | null; option: OptionContract | null } {
-  const candidates = extractContractCandidates(text, timestamp);
-  const first = candidates[0];
-  if (!first) return { ticker: null, option: null };
-  const ticker = candidates.every((candidate) => candidate.ticker === first.ticker) ? first.ticker : null;
-  const distinct = new Set(candidates.map((c) => `${c.ticker} ${c.strike} ${c.optionType} ${c.expiration}`));
-  if (ticker === null || distinct.size > 1) return { ticker, option: null };
-  const expiration = first.expiration ?? soleExpiration(text, timestamp);
-  return {
-    ticker,
-    option: expiration ? { optionType: first.optionType, strike: first.strike, expiration } : null,
+): string | null {
+  // An "exp" label next to the contract itself; a label later in the post
+  // may belong to a second leg ("$30P Oct 9 ... $34C exp today").
+  const hintIn = (segment: string): string | null => {
+    const groups = segment.match(EXPIRY_HINT)?.groups;
+    const token = groups?.after ?? groups?.before;
+    return token ? resolveDeterministicExpiration(token, timestamp) : null;
   };
+  const legHint = hintIn(firstLegText);
+  if (legHint) return legHint;
+
+  const tokens = extractExpirationTokens(text, timestamp);
+  const calendar = [...tokens].filter(([token]) => !RELATIVE_DATE_WORD.test(token));
+  if (calendar.length === 1) return calendar[0]![1];
+  if (calendar.length > 1) {
+    const nearContract = [...extractExpirationTokens(firstLegText, timestamp)].find(
+      ([token]) => !RELATIVE_DATE_WORD.test(token)
+    );
+    if (nearContract) return nearContract[1];
+  }
+  const postHint = hintIn(text);
+  if (postHint) return postHint;
+  const relative = [...tokens].filter(([token]) => RELATIVE_DATE_WORD.test(token));
+  if (relative.length === 1) return relative[0]![1];
+
+  return isEntry ? resolveDeterministicExpiration('0DTE', timestamp) : null;
+}
+
+interface CandidateContract {
+  readonly ticker: string | null;
+  readonly option: OptionContract | null;
+  /** The price the caller states for this contract; null when not stated or ambiguous. */
+  readonly limitPrice: number | null;
+  /** True when the post names more than one contract in the ticker and `option` is only the first. */
+  readonly multiLeg: boolean;
+}
+
+const NO_CONTRACT: CandidateContract = { ticker: null, option: null, limitPrice: null, multiLeg: false };
+
+/**
+ * The contract the generic scanner reads from free-form text.
+ *
+ * One ticker only: two tickers in one post ("Taking SPY 700C and QQQ 600P")
+ * are two trades and trade nothing here. Within one ticker a post may name
+ * several legs ("$IWM $280C at $.55 $279P at $.40"); the first leg is read
+ * and `multiLeg` says so, so the decision can ask for approval rather than
+ * silently trading half a pair or, as before, nothing at all.
+ *
+ * A dateless entry is same-day (see pickExpiration for the measurement
+ * behind that), and a Buy still has to pass Jev's act-now gate. Exits never
+ * get the default: their contract resolves from the entry.
+ */
+function readCandidateContract(text: string, timestamp: string): CandidateContract {
+  const first = firstContract(text, timestamp);
+  if (!first) return NO_CONTRACT;
+
+  const legs = new Set<string>();
+  for (const match of text.matchAll(BARE_CONTRACT_TOKEN)) legs.add(`${Number(match[1])}${match[2]!.toUpperCase()}`);
+  const multiLeg = legs.size > 1;
+
+  // The caller's words about the first leg alone: from its contract token up
+  // to the next one. Its price and, failing a post-wide date, its date live here.
+  const firstIndex = text.search(BARE_CONTRACT_TOKEN);
+  const afterFirst = text
+    .slice(firstIndex >= 0 ? firstIndex : 0)
+    .replace(BARE_CONTRACT_TOKEN, (token, _strike, _cp, offset: number) => (offset === 0 ? token : '\u0000'));
+  const firstLegText = afterFirst.split('\u0000')[0] ?? '';
+  const limitPrice = first.premium ?? readStatedPrice(firstLegText);
+
+  const isEntry = limitPrice !== null || ENTRY_WORDS.test(text) || classifyPositionSize(text) !== null;
+  const expiration = first.expiration ?? pickExpiration(text, firstLegText, isEntry, timestamp);
+  return {
+    ticker: first.ticker,
+    option: expiration ? { optionType: first.optionType, strike: first.strike, expiration } : null,
+    limitPrice,
+    multiLeg,
+  };
+}
+
+/**
+ * The post's first contract and its ticker. Written tickers beat words the
+ * scan mistook for one; a lone cashtag claims any bare "$875C" token, which
+ * is how a caller writes a contract when the ticker opened the sentence.
+ * Two different tickers trade nothing.
+ */
+function firstContract(text: string, timestamp: string): ContractCandidate | null {
+  const candidates = extractContractCandidates(text, timestamp);
+  const sameTicker = (pool: readonly ContractCandidate[]): ContractCandidate | null => {
+    const first = pool[0];
+    return first && pool.every((candidate) => candidate.ticker === first.ticker) ? first : null;
+  };
+
+  const explicit = candidates.filter((candidate) => candidate.explicitTicker);
+  if (explicit.length > 0) return sameTicker(explicit);
+
+  const cashtags = new Set([...text.matchAll(CASHTAGS)].map((match) => match.groups!.ticker!));
+  const token = BARE_CONTRACT_TOKEN.exec(text);
+  BARE_CONTRACT_TOKEN.lastIndex = 0;
+  if (cashtags.size === 1 && token) {
+    return {
+      ticker: [...cashtags][0]!,
+      strike: Number(token[1]),
+      optionType: token[2]!.toUpperCase() === 'C' ? 'call' : 'put',
+      expiration: null,
+      premium: null,
+      explicitTicker: true,
+    };
+  }
+
+  // Lowercase "aapl 345c" is still a ticker when nothing better is written.
+  return sameTicker(candidates);
+}
+
+/** "at $.25" → 0.25. A whole number of 10 or more is Rowdy's cents and stays ambiguous (market). */
+function readStatedPrice(text: string): number | null {
+  const raw = text.match(PRICE_AFTER_AT)?.groups?.price;
+  if (!raw) return null;
+  if (!raw.includes('.') && Number(raw) >= 10) return null;
+  return positivePrice(raw);
 }
 
 function prefilterFlag(content: string, languageContent: string): string | null {
@@ -1330,16 +1499,27 @@ export function readPatterns(envelope: DiscordEnvelope): PatternRead {
   if (prefilter) flags.add(prefilter);
   if (WATCHLIST_SHAPES.some((shape) => shape.test(ownWords))) flags.add('watchlist');
 
-  const fields: PatternFields = template
-    ? fromRepoTemplate(template)
-    : (matchFormatTemplate(ownWords, envelope.content, envelope.timestamp) ?? {
+  let fields: PatternFields;
+  if (template) {
+    fields = fromRepoTemplate(template);
+  } else {
+    const formatted = matchFormatTemplate(ownWords, envelope.content, envelope.timestamp);
+    if (formatted) {
+      fields = formatted;
+    } else {
+      const candidate = readCandidateContract(languageContent, envelope.timestamp);
+      if (candidate.multiLeg) flags.add('multi_leg');
+      fields = {
         read: null,
         pattern: null,
         contractLabel: null,
-        ...readCandidateContract(languageContent, envelope.timestamp),
-        limitPrice: null,
+        ticker: candidate.ticker,
+        option: candidate.option,
+        limitPrice: candidate.limitPrice,
         positionSize: classifyPositionSize(languageContent),
-      });
+      };
+    }
+  }
   const ticker = fields.ticker ?? languageContent.match(CASHTAG)?.groups?.ticker ?? null;
   // "Out of NBIS" closes the Caller's whole position.
   const exitPortion: ExitPortion | null = template?.callout.tickerOnlyExit

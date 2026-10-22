@@ -7,6 +7,7 @@
 import { createLogger } from '../../shared/logger.js';
 import {
   CalloutSchema,
+  optionLabel,
   type Callout,
   type CalloutParser,
   type DiscordEnvelope,
@@ -75,7 +76,15 @@ export function decideCallout(patterns: PatternRead, verdict: JevVerdict): Callo
   }
   if (probability < REVIEW_MIN) return noTrade(`${said} is below ${REVIEW_MIN}`);
 
-  const routing = probability < AUTO_TRADE_MIN ? { reviewReason: `${said} is below ${AUTO_TRADE_MIN}` } : {};
+  // A post naming several legs in one ticker is read as its first leg only;
+  // the user decides whether half the pair is the trade they want.
+  const reviewReasons = [
+    probability < AUTO_TRADE_MIN ? `${said} is below ${AUTO_TRADE_MIN}` : null,
+    patterns.flags.includes('multi_leg') && patterns.option
+      ? `the post names more than one contract; read as its first leg, ${patterns.ticker} ${optionLabel(patterns.option)}`
+      : null,
+  ].filter((reason): reason is string => reason !== null);
+  const routing = reviewReasons.length > 0 ? { reviewReason: reviewReasons.join('; ') } : {};
   const common = {
     isCallout: true,
     assetType: 'option',

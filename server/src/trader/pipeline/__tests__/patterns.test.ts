@@ -119,6 +119,95 @@ describe('readPatterns — the tradable contract', () => {
     expect(read('Taking SPY 700C 10/16 and QQQ 600P 10/16').option).toBeNull();
   });
 
+  // Harvey's free-form entries, verbatim from #harvey-alerts. Every one of
+  // them was `not_callout` in production for want of three grammar rules: a
+  // dollar sign on the strike, a sub-dollar price written "$.25", and a
+  // dateless contract meaning today. Swift tracked all of them.
+  describe('free-form entries (Harvey)', () => {
+    const FRI_OCT_16 = '2026-10-16T14:18:46.000Z';
+    const at = (content: string, timestamp = FRI_OCT_16) => readPatterns(envelope(content, timestamp));
+
+    it.each([
+      ['$IWM $274P entry at $.25 <@&1531936405561938033>', 'IWM', 274, 'put', 0.25],
+      ['$TSLA $357.50P entry at $.18', 'TSLA', 357.5, 'put', 0.18],
+      ['$VST $150P at $.04 <@&1531936405561938033> Lotto', 'VST', 150, 'put', 0.04],
+      ['$MU $940C Scalp play entry at $.10', 'MU', 940, 'call', 0.1],
+      ['$AAPL $340P entry at $.06', 'AAPL', 340, 'put', 0.06],
+    ])('%j is a same-day contract at the stated price', (content, ticker, strike, optionType, limitPrice) => {
+      expect(at(content)).toMatchObject({
+        ticker,
+        option: { optionType, strike, expiration: '2026-10-16' },
+        limitPrice,
+      });
+    });
+
+    it('uses the date the caller writes, labelled or not, over the same-day default', () => {
+      expect(at('This may or may not work out - $LLY $1160P exp 10/23 at $.02', '2026-10-21T19:02:57Z').option).toEqual({
+        optionType: 'put', strike: 1160, expiration: '2026-10-23',
+      });
+      expect(at('$IWM $279C at $.90 Oct 09 🔥🔥🔥', '2026-10-07T16:03:00Z')).toMatchObject({
+        option: { strike: 279, expiration: '2026-10-09' },
+        limitPrice: 0.9,
+      });
+      // "ER tomorrow" is about the earnings; the calendar date is the expiry.
+      expect(at('$APLD ER Play 🚨$24.5C at $1.40 $24P at $1.20 Oct 9 - ER tomorrow 1:1 ratio', '2026-10-05T15:49:00Z').option).toMatchObject({
+        strike: 24.5, expiration: '2026-10-09',
+      });
+      // "Oct 02 exp" labels the expiry after the fact.
+      expect(at('$ACN ER tomorrow at open - $ACN $170P at $2.30 - 200C at $1.05 Oct 02 exp', '2026-09-30T14:31:00Z').option).toMatchObject({
+        strike: 170, expiration: '2026-10-02',
+      });
+    });
+
+    it('reads "exp tomorrow", skipping the weekend', () => {
+      expect(at('$TSLL $9.5C at $.09 exp tomorrow', '2026-10-01T18:29:00Z').option?.expiration).toBe('2026-10-02');
+      expect(at('$TSLL $9.5C at $.09 exp tomorrow', '2026-10-02T18:29:00Z').option?.expiration).toBe('2026-10-05');
+    });
+
+    it('finds the contract when the cashtag opens the sentence and the strike comes later', () => {
+      expect(at('$META Budget ER Play - $875C Oct 26 entry at $.18 $590P Oct 23 entry at $.28', '2026-10-21T18:03:02Z')).toMatchObject({
+        ticker: 'META',
+        option: { optionType: 'call', strike: 875, expiration: '2026-10-26' },
+        limitPrice: 0.18,
+        flags: ['multi_leg'],
+      });
+    });
+
+    it('never mistakes a lowercase word before a strike for the ticker', () => {
+      expect(at('IWM $275C just light entry at $.40 🔥 - Hold your 275P runners -', '2026-10-08T15:27:00Z')).toMatchObject({
+        ticker: 'IWM',
+        option: { strike: 275, optionType: 'call' },
+        limitPrice: 0.4,
+      });
+      expect(at('$TSLL delivery numbers today at close $9.5C at $.09 $9P at $.15 2:1 ratio exp tomorrow', '2026-10-01T18:29:00Z')).toMatchObject({
+        ticker: 'TSLL',
+        option: { strike: 9.5, optionType: 'call', expiration: '2026-10-02' },
+        limitPrice: 0.09,
+        flags: ['multi_leg'],
+      });
+    });
+
+    it('reads the first leg of a pair and flags the post as multi-leg', () => {
+      const pair = at('$NEE $76P entry at $.10 $82C at $.02 - Post ER run - Exp 10/23', '2026-10-21T15:15:57Z');
+      expect(pair).toMatchObject({
+        ticker: 'NEE',
+        option: { optionType: 'put', strike: 76, expiration: '2026-10-23' },
+        limitPrice: 0.1,
+        flags: ['multi_leg'],
+      });
+    });
+
+    it('gives an exit no default date: its contract comes from the entry', () => {
+      expect(at('Sold all exit 175% $AAPL $340P')).toMatchObject({ ticker: 'AAPL', option: null, limitPrice: null });
+      expect(at('Exit $MU')).toMatchObject({ ticker: 'MU', option: null });
+      expect(at('$TSLL $9P new avg $.02')).toMatchObject({ ticker: 'TSLL', option: null });
+    });
+
+    it('still trades nothing for two different tickers in one post', () => {
+      expect(at('Taking SPY 700C 10/16 and QQQ 600P 10/16')).toMatchObject({ ticker: null, option: null, flags: [] });
+    });
+  });
+
   it('keeps the ticker of a ticker-only exit and sells everything', () => {
     expect(read("Bishop's Ideas\nOut of SKHY for now")).toMatchObject({
       read: 'SELL',

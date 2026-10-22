@@ -55,6 +55,19 @@ describe('decideCallout — what never trades', () => {
     expect(callout.isCallout).toBe(false);
     expect(callout.rationale).toMatch(/no complete options contract/);
   });
+
+  // Half a pair is a trade the user should look at, not one the system picks.
+  it('parks a multi-leg post for approval, reading its first leg', () => {
+    const callout = decide('$IWM $280C at $.55 $279P at $.40', verdict('BUY', 0.95));
+    expect(callout).toMatchObject({
+      isCallout: true,
+      action: 'buy',
+      ticker: 'IWM',
+      option: { optionType: 'call', strike: 280, expiration: '2026-10-02' },
+      limitPrice: 0.55,
+    });
+    expect(callout.reviewReason).toMatch(/more than one contract; read as its first leg, IWM 280C 2026-10-02/);
+  });
 });
 
 describe('decideCallout — the act-now check', () => {
