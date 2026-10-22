@@ -1,0 +1,41 @@
+name: Test
+
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [main]
+
+# The suites are hermetic: routes run against an in-memory db and stubbed
+# broker sessions, so no Postgres, Discord or Robinhood access is needed.
+# vitest.config.ts supplies dummies for the vars config.ts requires at import.
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      - name: Every env var the runtime reads is documented
+        run: bun run env:audit
+
+  client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
