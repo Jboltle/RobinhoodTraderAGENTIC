@@ -5,10 +5,8 @@
 -- pipeline writes Caller exits, and GET /api/book reads it. Shape mirrors
 -- TrackedPosition in server/src/trader/book/ladder.ts.
 --
--- Shared data, no user scope (like callers / recaps). ACCESS MODEL: default-
--- deny like every other table — RLS on, zero policies, anon and authenticated
--- grants revoked. The server reaches it over the direct SUPABASE_DB_URL
--- connection.
+-- Shared data, no user scope (like callers / recaps). Default-deny like every
+-- other table: RLS on, zero policies; the trader connects as the owner.
 
 create table public.tracked_callouts (
   message_id text primary key,
@@ -50,5 +48,3 @@ create index tracked_callouts_caller_open_idx on public.tracked_callouts (author
   where closed_at is null;
 
 alter table public.tracked_callouts enable row level security;
-revoke all on table public.tracked_callouts from anon, authenticated;
-grant select, insert, update, delete on public.tracked_callouts to service_role;

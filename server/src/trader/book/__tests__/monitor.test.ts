@@ -116,7 +116,13 @@ describe('sweepBook', () => {
     const result = await sweepBook(makeDeps(db, { u1: broker }, AFTER_HOURS));
 
     expect(result).toEqual({ open: 2, marked: 0, settled: 1 });
-    expect(db.getTracked('expired')).toMatchObject({ closedBy: 'expiry', result: 'loss', exitPrice: 0 });
+    // Settles at the expiration day's 4 PM ET close, not at the sweep time.
+    expect(db.getTracked('expired')).toMatchObject({
+      closedBy: 'expiry',
+      result: 'loss',
+      exitPrice: 0,
+      closedAt: '2026-10-17T20:00:00.000Z',
+    });
     expect(db.getTracked('live')!.closedAt).toBeNull();
     expect(broker.mcp.ensureReady).not.toHaveBeenCalled();
   });

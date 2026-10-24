@@ -6,6 +6,7 @@ import {
   buildLadder,
   isExpired,
   isoDateEt,
+  marketCloseIso,
   mondayOf,
   nominalQty,
   openPosition,
@@ -170,5 +171,9 @@ describe('ET dates', () => {
     expect(mondayOf('2026-10-21')).toBe('2026-10-19');
     expect(mondayOf('2026-10-19')).toBe('2026-10-19');
     expect(mondayOf('2026-10-25')).toBe('2026-10-19');
+  });
+  it('marketCloseIso is 4 PM New York in both daylight and standard time', () => {
+    expect(marketCloseIso('2026-10-16')).toBe('2026-10-16T20:00:00.000Z');
+    expect(marketCloseIso('2026-12-18')).toBe('2026-12-18T21:00:00.000Z');
   });
 });

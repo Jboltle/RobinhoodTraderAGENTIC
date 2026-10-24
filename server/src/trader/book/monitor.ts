@@ -20,7 +20,14 @@ import { isRegularUsTradingHours } from '../pipeline/riskFilter.js';
 import { BrokerUnavailableError } from '../rh/mcpClient.js';
 import type { McpRegistry } from '../rh/mcpRegistry.js';
 import type { RobinhoodTools } from '../rh/tools.js';
-import { applyMark, isExpired, isoDateEt, settle, type TrackedPosition } from './ladder.js';
+import {
+  applyMark,
+  isExpired,
+  isoDateEt,
+  marketCloseIso,
+  settle,
+  type TrackedPosition,
+} from './ladder.js';
 
 const log = createLogger('trader:book-monitor');
 
@@ -80,7 +87,7 @@ export async function sweepBook(
       live.push(position);
       continue;
     }
-    await deps.db.saveTrackedCallout(settle(position, at));
+    await deps.db.saveTrackedCallout(settle(position, marketCloseIso(position.option.expiration)));
     settled += 1;
   }
 

@@ -256,6 +256,23 @@ function portionQty(portion: ExitPortion, remaining: number): number {
 export const isExpired = (position: TrackedPosition, todayIsoEt: string): boolean =>
   position.option.expiration < todayIsoEt;
 
+/**
+ * 4:00 PM New York on an ISO date, as an ISO instant: when an expired
+ * contract settles, so the close lands on its expiration day's session and
+ * not on whichever sweep noticed it.
+ */
+export function marketCloseIso(isoDate: string): string {
+  const hourEt = (iso: string): number =>
+    Number(
+      new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }).format(
+        new Date(iso)
+      )
+    );
+  // 20:00Z is 4 PM during daylight time; 21:00Z is 4 PM during standard time.
+  const daylight = `${isoDate}T20:00:00.000Z`;
+  return hourEt(daylight) === 16 ? daylight : `${isoDate}T21:00:00.000Z`;
+}
+
 /** An expired contract with no Caller exit: the remainder goes at the last mark, else worthless. */
 export function settle(position: TrackedPosition, at: string): TrackedPosition {
   if (position.closedAt !== null) return position;

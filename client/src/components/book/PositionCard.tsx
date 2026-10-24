@@ -54,18 +54,22 @@ export function PositionCard({
         <>
           <TrimLadder ladder={position.ladder} pctNow={position.pctNow} className="mt-3" />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs tabular-nums text-ink-400">
-            <span>
-              {position.remainingQty}
-              {position.remainingQty !== position.nominalQty ? `/${position.nominalQty}` : ''} @{' '}
-              {position.entryPrice === null ? '—' : fmtPremium(position.entryPrice)}
-              {' → '}
-              {position.lastMark === null ? '—' : fmtPremium(position.lastMark)}
-              {filled > 0 && (
-                <span className="ml-2 text-ink-500">
-                  {filled}/{position.ladder.length} trims
-                </span>
-              )}
-            </span>
+            {position.entryPrice === null ? (
+              <span>No stated entry: priced from the first mark</span>
+            ) : (
+              <span>
+                {position.remainingQty}
+                {position.remainingQty !== position.nominalQty ? `/${position.nominalQty}` : ''} @{' '}
+                {fmtPremium(position.entryPrice)}
+                {' → '}
+                {position.lastMark === null ? '—' : fmtPremium(position.lastMark)}
+                {filled > 0 && (
+                  <span className="ml-2 text-ink-500">
+                    {filled}/{position.ladder.length} trims
+                  </span>
+                )}
+              </span>
+            )}
             <span className="flex gap-3">
               {position.highestPct !== null && (
                 <span>
