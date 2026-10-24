@@ -319,8 +319,8 @@ export function createTraderDb(): TraderDb {
   // Remote URLs often omit sslmode; TLS is required anyway, and 'require' does
   // not verify the certificate (Railway's Postgres serves a self-signed one).
   // TLS stays off for local Postgres, which has none, and on Railway's private
-  // network, which WireGuard already encrypts. It has to: on Bun, postgres.js
-  // over TLS never frees what it reads (about 240 KB per 500-row query).
+  // network, which WireGuard already encrypts. (The Bun-era leak that first
+  // forced this is in docs/reports/2026-10-20-bun-tls-upgrade-leak.md.)
   const { hostname } = new URL(config.supabaseDbUrl);
   const plaintext =
     /^(localhost|127\.0\.0\.1|host\.docker\.internal)$/i.test(hostname) ||
@@ -841,6 +841,7 @@ function toSettings(row: typeof users.$inferSelect): ResolvedTradeSettings {
     optionsSmallPct: row.optionsSmallPct,
     optionsMediumPct: row.optionsMediumPct,
     optionsFullPct: row.optionsFullPct,
+    optionsLottoPct: row.optionsLottoPct,
     maxSingleContractPct: row.maxSingleContractPct,
     maxTradesPerDay: row.maxTradesPerDay,
     cooldownSeconds: row.cooldownSeconds,
@@ -848,6 +849,7 @@ function toSettings(row: typeof users.$inferSelect): ResolvedTradeSettings {
     blockedTickers: row.blockedTickers,
     minConfidence: row.minConfidence,
     regularHoursOnly: row.regularHoursOnly,
+    allowLottoTrades: row.allowLottoTrades,
     followedCallerIds: row.followedCallerIds,
     maxLossPct: row.maxLossPct,
     maxLossUsd: row.maxLossUsd,

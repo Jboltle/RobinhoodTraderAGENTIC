@@ -11,7 +11,7 @@
 -- ACCESS MODEL: default-deny like every other table (see
 -- 20260725012642_multi_tenant_schema.sql) — RLS on, zero policies, anon and
 -- authenticated grants revoked. The server reaches it over the direct
--- SUPABASE_DB_URL connection; the Listener writes over the same DSN.
+-- SUPABASE_DB_URL connection; the wListener writes over the same DSN.
 
 create table public.messages (
   -- Discord message snowflake. The primary key is the idempotency guard: a

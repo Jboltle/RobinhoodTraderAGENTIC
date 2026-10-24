@@ -8,7 +8,7 @@
  *
  *   RUN_LIVE_TRADE_TEST=1 LIVE_TRADE_USER_ID=<uuid>
  *     Connects to the real Robinhood MCP as that user (their broker_connections
- *     row must already hold tokens — run `bun run connect <email>` first) and
+ *     row must already hold tokens — run `npm run connect <email>` first) and
  *     performs a READ-ONLY buying-power check. No orders are placed.
  *
  *   RUN_LIVE_TRADE_TEST=1 LIVE_TRADE_PLACE_ORDER=1

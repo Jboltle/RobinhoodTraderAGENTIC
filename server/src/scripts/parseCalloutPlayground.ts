@@ -4,9 +4,9 @@
  * and what Callout it produces. Parse-only: nothing here touches Supabase,
  * Discord or a broker, so no order can ever result.
  *
- *   bun run test:parse-callout                                # interactive
- *   pbpaste | bun run test:parse-callout                      # one-shot stdin
- *   bun run test:parse-callout --timestamp 2026-07-20T14:20:00.000Z
+ *   npm run test:parse-callout                                # interactive
+ *   pbpaste | npm run test:parse-callout                      # one-shot stdin
+ *   npm run test:parse-callout -- --timestamp 2026-07-20T14:20:00.000Z
  *
  * Interactive mode: paste a message (multi-line is fine, blank lines are
  * kept), then finish it with a line containing only `---`. Type `quit` on an

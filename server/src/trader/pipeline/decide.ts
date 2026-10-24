@@ -89,6 +89,7 @@ export function decideCallout(patterns: PatternRead, verdict: JevVerdict): Callo
     isCallout: true,
     assetType: 'option',
     isAddition: false,
+    isLotto: patterns.isLotto,
     ticker: patterns.ticker,
     sizeHint: null,
     option: patterns.option,

@@ -1,7 +1,7 @@
 /**
  * One-shot Robinhood MCP connect + introspect for one user.
  *
- *   bun run connect <email or user id>
+ *   npm run connect <email or user id>
  *
  * On first run this triggers the OAuth flow: the script prints an
  * authorization URL, spins up a local listener at the configured redirect,
@@ -20,7 +20,7 @@ const log = createLogger('rh-connect');
 async function main(): Promise<void> {
   const identifier = process.argv[2]?.trim();
   if (!identifier) {
-    throw new Error('usage: bun run connect <email or user id>');
+    throw new Error('usage: npm run connect <email or user id>');
   }
 
   const db = createTraderDb();

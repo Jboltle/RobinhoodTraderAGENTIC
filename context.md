@@ -12,7 +12,7 @@ Three parts: `server/src/bot/` (Discord gateway, forwards HMAC-signed envelopes)
 
 - Bot + trader stay logically separate but run as one process tree (bot binds no port; one `/health` ping keeps the Gateway socket alive). Keep HMAC webhookAuth as the bot→trader trust boundary.
 - Invite-only multi-tenant, NOT self-hosted-per-person any more. Supabase Auth email/password; signup gated server-side against `allowed_emails`.
-- Runtime = Bun everywhere. vitest for tests, `tsc -p . --noEmit` typecheck.
+- Runtime = Node (TypeScript via tsx) for the server, Bun for the client; Bun leaks on postgres.js over TLS (docs/reports/2026-10-20-bun-tls-upgrade-leak.md). vitest for tests, `tsc -p . --noEmit` typecheck.
 - LLM: ONE factory in `server/src/shared/llm.ts` via TanStack AI adapters. Backend is inferred from `LLM_MODEL` by the adapter router in that file; `requiredString('LLM_MODEL')`.
 - MCP client: hand-rolled wrapper, one instance **per user** in `rh/mcpRegistry.ts` (`Map`, ponytail-marked unbounded, LRU is the upgrade path).
 - Data access: `server/src/trader/db.ts` is the ONLY module that constructs a Supabase client. Service-role key (bypasses RLS). Every per-user method takes `userId` first so scoping can't be forgotten.

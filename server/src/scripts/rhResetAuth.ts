@@ -1,7 +1,7 @@
 /**
  * Drop one user's stored Robinhood OAuth state.
  *
- *   bun run auth:reset <email or user id>
+ *   npm run auth:reset <email or user id>
  *
  * Use this when Robinhood shows the agent as connected but the app can no
  * longer trade with the tokens it holds. Removing the row means the user's
@@ -15,7 +15,7 @@ const log = createLogger('rh-reset-auth');
 async function main(): Promise<void> {
   const identifier = process.argv[2]?.trim();
   if (!identifier) {
-    log.error('usage: bun run auth:reset <email or user id>');
+    log.error('usage: npm run auth:reset <email or user id>');
     process.exitCode = 1;
     return;
   }

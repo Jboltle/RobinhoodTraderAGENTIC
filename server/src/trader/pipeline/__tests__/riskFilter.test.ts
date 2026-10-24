@@ -39,6 +39,7 @@ const SETTINGS: ResolvedTradeSettings = TradeSettingsSchema.parse({
   optionsSmallPct: 0.5,
   optionsMediumPct: 1,
   optionsFullPct: 2,
+  optionsLottoPct: 0.25,
   maxSingleContractPct: 5,
 });
 
@@ -172,6 +173,10 @@ describe('riskFilter — rejection codes', () => {
     ).toBe('ticker_not_allowed');
   });
 
+  it('lotto_blocked for a lotto entry while lotto trades are off', async () => {
+    expect(await codeOf({ ...BASE_OPTION, isLotto: true })).toBe('lotto_blocked');
+  });
+
   it('outside_market_hours when the gate is on', async () => {
     // Saturday noon UTC — never regular hours.
     expect(
@@ -264,6 +269,59 @@ describe('riskFilter — per-user settings', () => {
     expect(result.allow).toBe(true);
     if (!result.allow) return;
     expect(result.portfolioPct).toBeCloseTo(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lotto toggle — off by default, entries only
+// ---------------------------------------------------------------------------
+
+describe('riskFilter — lotto trades', () => {
+  const lottoEntry: Callout = { ...BASE_OPTION, isLotto: true };
+
+  it('skips a lotto entry by default', () => {
+    const result = checkRiskWithSettings(lottoEntry, SETTINGS);
+    expect(result.allow).toBe(false);
+    expect((result as { reason: string }).reason).toMatch(/lotto trades are off/);
+  });
+
+  it('takes the same entry once the user turns lotto trades on', () => {
+    expect(checkRiskWithSettings(lottoEntry, { ...SETTINGS, allowLottoTrades: true }).allow).toBe(true);
+  });
+
+  it('never gates an exit: a lotto already held must still be sold', () => {
+    const lottoExit: Callout = { ...lottoEntry, action: 'sell', orderType: 'market', limitPrice: null };
+    expect(checkRiskWithSettings(lottoExit, SETTINGS).allow).toBe(true);
+  });
+
+  it('leaves an entry the Caller did not call a lotto alone', () => {
+    expect(checkRiskWithSettings(BASE_OPTION, SETTINGS).allow).toBe(true);
+  });
+
+  describe('sizing', () => {
+    const LOTTO_ON: ResolvedTradeSettings = { ...SETTINGS, allowLottoTrades: true };
+    const pctOf = (callout: Callout, settings = LOTTO_ON) => {
+      const result = checkRiskWithSettings(callout, settings);
+      expect(result.allow).toBe(true);
+      return result.allow ? result.portfolioPct : NaN;
+    };
+
+    it('a lotto entry deploys optionsLottoPct, not Small', () => {
+      expect(pctOf(lottoEntry)).toBeCloseTo(0.25);
+    });
+
+    it('the lotto label outranks a size word in the same message', () => {
+      expect(pctOf({ ...lottoEntry, positionSize: 'medium' })).toBeCloseTo(0.25);
+    });
+
+    it('a Lotto set above the options ceiling clamps to it', () => {
+      expect(pctOf(lottoEntry, { ...LOTTO_ON, optionsLottoPct: 9, optionsFullPct: 2 })).toBeCloseTo(2);
+    });
+
+    it('an explicit contract count still wins, as it does over every size word', () => {
+      const result = checkRiskWithSettings({ ...lottoEntry, sizeHint: { kind: 'contracts', value: 3 } }, LOTTO_ON);
+      expect(result.allow && result.quantityHint).toBe(3);
+    });
   });
 });
 

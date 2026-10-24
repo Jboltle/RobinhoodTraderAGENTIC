@@ -63,3 +63,7 @@ _Avoid_: account, profile, auth user
 **Max Loss**:
 A per-user setting that closes one open position when its unrealized loss exceeds a percent of entry and/or a dollar amount.
 _Avoid_: stop loss, circuit breaker, flatten
+
+## Caller behaviour
+
+**Namrood** mixes images into his callouts to stop people copy-trading them. Contract details can live only in an attached image, which the text-only parse never sees, so a Namrood post with an image may be an incomplete Callout. In the Oct 1–13, 2026 data his bot account (Namrood-BOT) posted "Close or Trim & Set SL to BE" milestone alerts as a trade moved (+6%, +10%, …) and never posted an explicit exit.

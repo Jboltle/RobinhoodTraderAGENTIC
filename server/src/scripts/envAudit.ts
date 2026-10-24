@@ -3,7 +3,7 @@
  * documented in .env.example, and the script says which documented ones
  * nothing reads any more.
  *
- *   bun run env:audit          # exit 1 when a read variable is undocumented
+ *   npm run env:audit          # exit 1 when a read variable is undocumented
  *
  * Runtime code only: tests and one-shot scripts (this file included) read
  * their own knobs and are out of scope. Platform-injected names that no

@@ -451,6 +451,13 @@ function parseLabeledEntryOption(content: string, timestamp: string): Callout | 
 // depending on the LLM for them is pure downside.
 const LOTTO_KEYWORD = /\b(?:lotto|risky)\b/i;
 
+// The Caller's own label for a lotto, read from their words with reply quotes
+// and channel noise stripped. Narrower than LOTTO_KEYWORD on purpose: "risky"
+// is a sizing warning on many ordinary alerts, "lotto" is the trade itself.
+// ponytail: a bare word match, so "not a lotto" reads as one. Upgrade path: a
+// negation guard like HEDGED_EXIT.
+const LOTTO_WORD = /\blottos?\b/i;
+
 function parseLottoOption(content: string, timestamp: string): Callout | null {
   if (!LOTTO_KEYWORD.test(content)) return null;
 
@@ -1034,6 +1041,8 @@ export interface PatternRead {
   readonly positionSize: PositionSize | null;
   /** How much an exit says it sells; null when it doesn't say. */
   readonly exitPortion: ExitPortion | null;
+  /** The Caller called it a lotto. Not a flag: it changes nothing Jev decides. */
+  readonly isLotto: boolean;
   readonly flags: readonly string[];
 }
 
@@ -1396,7 +1405,7 @@ function prefilterFlag(content: string, languageContent: string): string | null 
   return null;
 }
 
-type PatternFields = Omit<PatternRead, 'exitPortion' | 'flags'>;
+type PatternFields = Omit<PatternRead, 'exitPortion' | 'isLotto' | 'flags'>;
 
 function fromRepoTemplate({ name, callout }: TemplateMatch): PatternFields {
   const { option } = callout;
@@ -1525,7 +1534,7 @@ export function readPatterns(envelope: DiscordEnvelope): PatternRead {
   const exitPortion: ExitPortion | null = template?.callout.tickerOnlyExit
     ? { kind: 'all' }
     : readExitPortion(ownWords);
-  return { ...fields, ticker, exitPortion, flags: [...flags].sort() };
+  return { ...fields, ticker, exitPortion, isLotto: LOTTO_WORD.test(languageContent), flags: [...flags].sort() };
 }
 
 /** The hint Jev reads as `pattern_match`; null when no template or filter fired. */
@@ -1574,7 +1583,18 @@ export class LlmCalloutParser implements CalloutParser {
     const startedAt = performance.now();
     let llmCalls = 0;
 
-    const finish = (callout: Callout, path: ParsePath): TracedParse => {
+    // Discord ANSI color codes end in `m` (`\u001b[1;32mTSLA` → `mTSLA`).
+    const cleaned: DiscordEnvelope = {
+      ...envelope,
+      content: envelope.content.replace(/\u001b\[[0-9;]*m/g, ''),
+    };
+    const languageContent = stripNoiseLines(cleaned.content).join('\n');
+    const isLotto = LOTTO_WORD.test(languageContent);
+
+    // Every path ends here, so the lotto label is stamped once, whichever
+    // template or model read the trade.
+    const finish = (read: Callout, path: ParsePath): TracedParse => {
+      const callout = read.isCallout ? { ...read, isLotto } : read;
       const elapsedMs = Math.round(performance.now() - startedAt);
       log.debug('parse complete', {
         messageId: envelope.messageId,
@@ -1584,12 +1604,6 @@ export class LlmCalloutParser implements CalloutParser {
         isCallout: callout.isCallout,
       });
       return { callout, path, elapsedMs, llmCalls };
-    };
-
-    // Discord ANSI color codes end in `m` (`\u001b[1;32mTSLA` → `mTSLA`).
-    const cleaned: DiscordEnvelope = {
-      ...envelope,
-      content: envelope.content.replace(/\u001b\[[0-9;]*m/g, ''),
     };
 
     const deterministic = tryParseDeterministicCallout(cleaned);
@@ -1616,7 +1630,6 @@ export class LlmCalloutParser implements CalloutParser {
       );
     }
 
-    const languageContent = stripNoiseLines(cleaned.content).join('\n');
     const prefilter = matchLanguagePrefilter(languageContent);
     if (prefilter) {
       log.debug('language pattern classified as non-callout; skipping LLM', {

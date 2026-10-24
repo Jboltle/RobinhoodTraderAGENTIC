@@ -32,6 +32,22 @@ describe('TradeSettingsSchema — followedCallerIds', () => {
   });
 });
 
+describe('TradeSettingsSchema — allowLottoTrades', () => {
+  it('defaults to off: a lotto is skipped until the user opts in', () => {
+    expect(TradeSettingsSchema.parse({}).allowLottoTrades).toBe(false);
+  });
+
+  it('keeps an explicit opt-in', () => {
+    expect(TradeSettingsSchema.parse({ allowLottoTrades: true }).allowLottoTrades).toBe(true);
+  });
+
+  it('sizes a lotto at a quarter percent by default, under Small', () => {
+    const settings = TradeSettingsSchema.parse({});
+    expect(settings.optionsLottoPct).toBe(0.25);
+    expect(settings.optionsLottoPct).toBeLessThan(settings.optionsSmallPct);
+  });
+});
+
 describe('TradeSettingsSchema — max loss', () => {
   it('defaults both thresholds to off', () => {
     const settings = TradeSettingsSchema.parse({});

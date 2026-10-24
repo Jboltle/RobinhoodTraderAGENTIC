@@ -110,6 +110,11 @@ describe('decideCallout — the trade itself', () => {
     });
   });
 
+  it("carries the Caller's lotto label so the user's toggle can act on it", () => {
+    expect(decide(WAXUI_ENTRY, verdict('BUY', 0.9)).isLotto).toBe(true);
+    expect(decide(FREE_FORM_ENTRY, verdict('BUY', 0.9)).isLotto).toBe(false);
+  });
+
   it("sells the caller's stated fraction on a Trim, and half when unstated", () => {
     const card = '✂️ TRIM +25% — SPY 773P · 0DTE\nSold **4 of 20** @ **$0.906** · **16** still running.';
     expect(decide(card, verdict('TRIM', 0.95)).exitPortion).toEqual({ kind: 'fraction', value: 0.2 });

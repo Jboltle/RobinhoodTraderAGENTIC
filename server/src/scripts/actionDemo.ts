@@ -5,13 +5,13 @@
  * trades, never calls Robinhood, never touches a database, and never shows
  * model or parser output while you label.
  *
- *   bun src/scripts/actionDemo.ts sample [--size all] [--seed 42] [--force]
- *   bun src/scripts/actionDemo.ts label [--dry-run] [--relabel]
- *   bun src/scripts/actionDemo.ts laya [--tag ft] [--limit N] [--model english] [--gate]
- *   bun src/scripts/actionDemo.ts parser [--live] [--limit N]
- *   bun src/scripts/actionDemo.ts export-train
- *   bun src/scripts/actionDemo.ts report
- *   bun src/scripts/actionDemo.ts decide [--source export.jsonl] [--since ISO]
+ *   npx tsx src/scripts/actionDemo.ts sample [--size all] [--seed 42] [--force]
+ *   npx tsx src/scripts/actionDemo.ts label [--dry-run] [--relabel]
+ *   npx tsx src/scripts/actionDemo.ts laya [--tag ft] [--limit N] [--model english] [--gate]
+ *   npx tsx src/scripts/actionDemo.ts parser [--live] [--limit N]
+ *   npx tsx src/scripts/actionDemo.ts export-train
+ *   npx tsx src/scripts/actionDemo.ts report
+ *   npx tsx src/scripts/actionDemo.ts decide [--source export.jsonl] [--since ISO]
  *
  * decide is the pre-deploy replay: the production Jev decider (patterns, then
  * hosted Jev) over the labeled set or a messages export, scored against the
@@ -1616,7 +1616,7 @@ async function decideCommand(
 // Runner
 // ---------------------------------------------------------------------------
 
-const USAGE = `usage: bun src/scripts/actionDemo.ts <command> [options]
+const USAGE = `usage: npx tsx src/scripts/actionDemo.ts <command> [options]
   sample        [--size all] [--seed 42] [--force]   build corpus.jsonl from local sources
   label         [--dry-run] [--relabel]              blind keyboard labeler (B A T S I N U K Q);
                                                      --relabel re-shows your NONE/UNSURE labels
@@ -1695,6 +1695,7 @@ async function main(argv: readonly string[]): Promise<void> {
   }
 }
 
-if (import.meta.main) {
+// Not import.meta.main: tsx leaves it undefined, so the guard would never open.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   await main(process.argv.slice(2)).catch((err: unknown) => fail(errorMessage(err)));
 }

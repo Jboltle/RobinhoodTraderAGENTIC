@@ -44,7 +44,7 @@ services:
       - "127.0.0.1:${ROBINHOOD_OAUTH_CALLBACK_PORT:-8788}:${ROBINHOOD_OAUTH_CALLBACK_PORT:-8788}"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "bun", "-e", "fetch(`http://localhost:$${process.env.TRADER_PORT||3000}/health`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch(`http://localhost:$${process.env.TRADER_PORT||3000}/health`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       # The trader binds its port before doing any Robinhood work, so this no

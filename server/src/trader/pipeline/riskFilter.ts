@@ -59,6 +59,12 @@ function resolveSize(
     return { portfolioPct: ceilingPct, quantityHint: null };
   }
 
+  // A lotto has its own size. The label outranks any size word riding along
+  // with it: "Super Lotto … Trim Targets:" once sized medium off "trim".
+  if (isOption && callout.isLotto) {
+    return { portfolioPct: Math.min(settings.optionsLottoPct, ceilingPct), quantityHint: null };
+  }
+
   const size: PositionSize = callout.positionSize ?? (isOption ? 'small' : 'medium');
   return { portfolioPct: sizePct(size, isOption, settings), quantityHint: null };
 }
@@ -164,6 +170,11 @@ export function checkRisk(
     !isAllowed(ticker, settings.allowedTickers)
   ) {
     return { allow: false, code: 'ticker_not_allowed', reason: `${ticker} not in allowlist` };
+  }
+  // Entries only: a lotto the user did take still has to be sold when the
+  // Caller sells it, whatever the toggle says by then.
+  if (callout.action === 'buy' && callout.isLotto && !settings.allowLottoTrades) {
+    return { allow: false, code: 'lotto_blocked', reason: 'lotto trades are off in your settings' };
   }
   if (settings.regularHoursOnly && !isRegularUsTradingHours(now)) {
     return { allow: false, code: 'outside_market_hours', reason: 'outside regular US trading hours' };

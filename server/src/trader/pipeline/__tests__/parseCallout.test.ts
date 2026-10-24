@@ -460,6 +460,35 @@ describe('parseCallout — Lotto / risky trades (positionSize)', () => {
     expect(result.limitPrice).toBe(1.7);
   });
 
+  it('stamps isLotto on a lotto alert whichever path reads it, and on nothing else', async () => {
+    // The bot's lotto template parses deterministically; the LLM is never asked.
+    const deterministic = new LlmCalloutParser({
+      callStructured: vi.fn().mockRejectedValue(new Error('LLM should not be called')),
+    });
+    expect((await deterministic.parse(makeEnvelope('⚠️ Lotto Trade — RISKY\nSPY 745C 0DTE $1.7'))).isLotto).toBe(true);
+
+    // Free-form lotto language reaches the model; the label still comes from the text.
+    const llmBuy = {
+      isCallout: true,
+      assetType: 'option',
+      action: 'buy',
+      ticker: 'SPY',
+      orderType: 'limit',
+      limitPrice: 0.1,
+      sizeHint: null,
+      positionSize: 'small',
+      option: { optionType: 'call', strike: 700, expiration: '2026-06-15' },
+      confidence: 0.85,
+      rationale: 'lotto entry',
+    };
+    const fromModel = await parserWithMock(llmBuy).parse(makeEnvelope('Grabbing a lotto on SPY 700C 0DTE at .10'));
+    expect(fromModel.isCallout).toBe(true);
+    expect(fromModel.isLotto).toBe(true);
+
+    // "risky" alone is a sizing warning, not the lotto label.
+    expect((await parserWithMock(llmBuy).parse(makeEnvelope('BTO SPY 700C 0DTE 0.10\nRISKY SIZE APPROPRIATE'))).isLotto).toBe(false);
+  });
+
   it('RISKY SIZE APPROPRIATE tag on QQQ put → positionSize small', async () => {
     const parser = parserWithMock({
       isCallout: true,

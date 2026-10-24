@@ -131,6 +131,12 @@ export const CalloutSchema = z
      * pipeline fills `option` from that Caller's entry before anyone trades.
      */
     tickerOnlyExit: z.boolean().optional(),
+    /**
+     * True when the Caller labels the trade a lotto ("Lotto", "super lotto").
+     * Read deterministically from the Caller's own words by both engines; the
+     * per-user `allowLottoTrades` setting decides whether to take it.
+     */
+    isLotto: z.boolean().optional(),
     /** For options this is the per-contract premium, NOT the strike. */
     limitPrice: z.number().positive().nullable(),
     sizeHint: z
@@ -189,6 +195,8 @@ export const TradeSettingsSchema = z.object({
   optionsSmallPct: pct.default(0.5),
   optionsMediumPct: pct.default(1),
   optionsFullPct: pct.default(2),
+  /** What a lotto entry deploys; the label outranks any size word in the message. Clamped to optionsFullPct. */
+  optionsLottoPct: pct.default(0.25),
   /** Skip options trades where even 1 contract exceeds this % of buying power. */
   maxSingleContractPct: pct.default(5),
   maxTradesPerDay: z.number().int().nonnegative().default(10),
@@ -198,6 +206,8 @@ export const TradeSettingsSchema = z.object({
   blockedTickers: tickerList.default([]),
   minConfidence: z.number().min(0).max(1).default(0.7),
   regularHoursOnly: z.boolean().default(true),
+  /** Take entries the Caller labels a lotto. Off by default: a lotto is skipped until the user opts in. */
+  allowLottoTrades: z.boolean().default(false),
   /**
    * Following: [] = follow no one (default — a new account trades nothing until
    * its owner picks Callers), non-empty = follow exactly those Discord author
@@ -264,6 +274,7 @@ export type RejectionCode =
   | 'parse_inconsistent'    // parse contradicts message text or market price (e.g. options language but equity parse)
   | 'ticker_blocked'        // ticker on the blocklist
   | 'ticker_not_allowed'    // ticker missing from a non-empty allowlist
+  | 'lotto_blocked'         // entry labelled a lotto and the user has lotto trades off
   | 'ticker_invalid'        // broker has no equity quote for the parsed ticker
   | 'broker_unavailable'    // user's Robinhood session not connected / needs re-authorization
   | 'outside_market_hours'  // regular-hours gate active

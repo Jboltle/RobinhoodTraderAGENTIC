@@ -923,6 +923,21 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     expect(unsure.tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 
+  it('skips a lotto entry as lotto_blocked until the user turns lotto trades on', async () => {
+    const LOTTO_ENTRY = `**LOTTO** ${ENTRY}`;
+
+    const off = setupJev(verdict('BUY', 0.9));
+    await createMessageProcessor(off.deps).process(message(LOTTO_ENTRY));
+    expect((await off.db.listDecisions(USER, 10))[0]).toMatchObject({ kind: 'risk_rejected', code: 'lotto_blocked' });
+    expect(off.tools.placeOptionsOrder).not.toHaveBeenCalled();
+
+    // $10,000 buying power at 2% is $200 — two $97 contracts, where Small
+    // (0.5%, $50) would have fallen back to one.
+    const on = setupJev(verdict('BUY', 0.9), {}, { allowLottoTrades: true, optionsLottoPct: 2 });
+    await createMessageProcessor(on.deps).process(message(LOTTO_ENTRY));
+    expect((await on.db.listDecisions(USER, 10))[0]).toMatchObject({ kind: 'submitted', order: { quantity: 2 } });
+  });
+
   it("uses Jev's cutoffs instead of the user's minConfidence", async () => {
     const { db, deps } = setupJev(verdict('BUY', 0.85), {}, { minConfidence: 0.9 });
     await createMessageProcessor(deps).process(message(ENTRY));

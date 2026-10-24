@@ -21,7 +21,7 @@ const EXIT_TIMEOUT_MS = 30_000;
 
 describe('stack supervisor', () => {
   it('exits non-zero when a child dies at startup', async () => {
-    const child = spawn('bun', ['src/index.ts'], {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
       cwd: SERVER_DIR,
       env: {
         ...process.env,

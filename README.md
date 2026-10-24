@@ -59,12 +59,12 @@ Deletes are soft (`deleted_at`): a retracted alert is itself a signal, so the ar
 
 ## Setup
 
-Backend code lives in `server/`, the dashboard in `client/`; run bun commands from the matching folder. The server's `.env` stays at the repo root; the client has its own `client/.env`.
+Backend code lives in `server/`, the dashboard in `client/`; run `npm` (server) or `bun` (client) commands from the matching folder. The server's `.env` stays at the repo root; the client has its own `client/.env`.
 
 ### 1. Install deps
 
 ```bash
-cd server && bun install
+cd server && npm install
 cd ../client && bun install
 ```
 
@@ -131,7 +131,7 @@ Local Supabase needs to be up first (`npx supabase start`). Then the backend, fr
 
 ```bash
 cd server
-bun run dev
+npm run dev
 ```
 
 `dev` starts the trader first, waits for `GET /health`, then starts the Listener (`uv run python -m listener` — first run installs its locked deps automatically). Both processes read the same root `.env`. The Listener only captures messages whose channel is in `DISCORD_ALLOWED_CHANNEL_IDS` / `DISCORD_RECAP_CHANNEL_IDS`; `DISCORD_ALLOWED_AUTHOR_IDS` remains an optional author allowlist on the callout channels.
@@ -152,8 +152,8 @@ On restart the trader reconnects every user who already had stored tokens, so th
 You can still run components separately when debugging:
 
 ```bash
-bun run trader
-bun run listener
+npm run trader
+npm run listener
 ```
 
 ## Ollama in WSL (local LLM)
@@ -177,8 +177,8 @@ With `LLM_MODEL=qwen3:8b` in `.env`, the trader uses it at `OLLAMA_BASE_URL` (de
 
 ```bash
 cd server
-bun run test        # unit tests
-bun run typecheck   # tsc -p . --noEmit
+npm run test        # unit tests
+npm run typecheck   # tsc -p . --noEmit
 ```
 
 The suite is hermetic: routes run against an in-memory database, so no Postgres or Robinhood account is needed.
@@ -229,16 +229,16 @@ ROBINHOOD_OAUTH_REDIRECT_HOST=YOUR_WSL_IP
 ROBINHOOD_OAUTH_CALLBACK_HOST=0.0.0.0
 ```
 
-Restart `bun run dev` after changing the redirect URI and use the newly printed Robinhood auth URL.
+Restart `npm run dev` after changing the redirect URI and use the newly printed Robinhood auth URL.
 
 If Robinhood says the agent is already connected but this app never continues, that user's `broker_connections` row may hold only partial OAuth state and no usable tokens. Drop it and start again:
 
 ```bash
-bun run auth:reset you@example.com   # email or user id
-bun run dev
+npm run auth:reset you@example.com   # email or user id
+npm run dev
 ```
 
-This does not disconnect anything inside Robinhood; it only removes the stored OAuth client/verifier/tokens for that one user so a new authorization flow can produce usable ones. `bun run connect <email or user id>` runs the same flow from the CLI instead of the dashboard, and additionally checks our canonical tool names against what the MCP server actually advertises.
+This does not disconnect anything inside Robinhood; it only removes the stored OAuth client/verifier/tokens for that one user so a new authorization flow can produce usable ones. `npm run connect <email or user id>` runs the same flow from the CLI instead of the dashboard, and additionally checks our canonical tool names against what the MCP server actually advertises.
 
 ## Test With Your Discord Channel
 
@@ -255,7 +255,7 @@ TRADE_EXECUTION_MODE=approval
 Then start everything:
 
 ```bash
-bun run dev
+npm run dev
 ```
 
 In your allowed Discord channel, send test callouts like:
@@ -283,9 +283,9 @@ One thing that surprises people: the pipeline fans out to users who have a `brok
 
 ## Deployment
 
-Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries bun for the trader and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -f <file>`; the files are guarded to run on both that database and the local stack. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
+Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries Node, running the trader's TypeScript through tsx, and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -f <file>`; the files are guarded to run on both that database and the local stack. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
 
-Production configuration lives only in Railway variables; no `.env` file ships in either image. The complete set each service reads (`bun run env:audit` in `server/` checks the code against `.env.example`):
+Production configuration lives only in Railway variables; no `.env` file ships in either image. The complete set each service reads (`npm run env:audit` in `server/` checks the code against `.env.example`):
 
 | Service | Variables |
 | --- | --- |
@@ -310,10 +310,10 @@ pg_ctl -D ~/.local/share/rh-staging-pg -o "-p 54342 -c listen_addresses=127.0.0.
 psql postgresql://postgres@127.0.0.1:54342/postgres -c "create database staging"
 # seed as above with TARGET_DB_URL=postgresql://postgres@127.0.0.1:54342/staging, then:
 cd server && SUPABASE_DB_URL=postgresql://postgres@127.0.0.1:54342/staging TRADE_EXECUTION_MODE=read_only \
-  RH_TOKENS_VAULT_KEY=$(openssl rand -hex 16) TRADER_PORT=3100 NODE_ENV=production bun run trader
+  RH_TOKENS_VAULT_KEY=$(openssl rand -hex 16) TRADER_PORT=3100 NODE_ENV=production npm run trader
 ```
 
-Railway staging, in the existing `Staging` environment (`railway environment link Staging`): `railway add --database postgres`, then `railway add --service TraderStaging --repo Jboltle/RobinhoodTraderAGENTIC --branch feat/desk-tracking` with `source.rootDirectory=server/`, `build.dockerfilePath=Dockerfile.server`, `deploy.startCommand="bun run trader"`, `deploy.healthcheckPath=/health`, and the trader variables from the table above minus `DISCORD_USER_TOKEN`, with `TRADE_EXECUTION_MODE=read_only` and `SUPABASE_DB_URL=${{Postgres.DATABASE_URL}}`. Enable the Postgres TCP proxy (`railway tcp-proxy create --port 5432 --service Postgres`) to run the seed script against it. Railway pauses new resources while the workspace is over its usage hard limit ("Paused temporarily").
+Railway staging, in the existing `Staging` environment (`railway environment link Staging`): `railway add --database postgres`, then `railway add --service TraderStaging --repo Jboltle/RobinhoodTraderAGENTIC --branch feat/desk-tracking` with `source.rootDirectory=server/`, `build.dockerfilePath=Dockerfile.server`, `deploy.startCommand="npm run trader"`, `deploy.healthcheckPath=/health`, and the trader variables from the table above minus `DISCORD_USER_TOKEN`, with `TRADE_EXECUTION_MODE=read_only` and `SUPABASE_DB_URL=${{Postgres.DATABASE_URL}}`. Enable the Postgres TCP proxy (`railway tcp-proxy create --port 5432 --service Postgres`) to run the seed script against it. Railway pauses new resources while the workspace is over its usage hard limit ("Paused temporarily").
 
 ## Risk controls
 
@@ -323,12 +323,14 @@ Per user, not per environment. Each user owns one row in `settings`, edited from
 | --- | --- | --- |
 | `equitySmallPct` / `equityMediumPct` / `equityFullPct` | 1.25 / 2.5 / 5 | What a stock callout deploys, as % of buying power, per size keyword |
 | `optionsSmallPct` / `optionsMediumPct` / `optionsFullPct` | 0.5 / 1 / 2 | Same, for options |
+| `optionsLottoPct` | 0.25 | What a lotto entry deploys once `allowLottoTrades` is on; the lotto label outranks any size word in the message |
 | `maxSingleContractPct` | 5 | Skip options trades where even 1 contract exceeds this % of buying power |
 | `maxTradesPerDay` | 10 | Total daily submitted trades across all tickers |
 | `cooldownSeconds` | 300 | Minimum gap between two trades on the same ticker |
 | `allowedTickers` / `blockedTickers` | `[]` / `[]` | Symbol allow/block lists; empty allowlist means allow everything |
 | `minConfidence` | 0.7 | Drop callouts the LLM rates below this confidence |
 | `regularHoursOnly` | `true` | Reject orders outside US/Eastern 09:30–16:00 weekdays |
+| `allowLottoTrades` | `false` | Take entries the Caller labels a lotto. Off skips them as `lotto_blocked`; exits of a lotto already held always go through |
 | `followedCallerIds` | `[]` | Which Callers to copy. Empty means nobody, so a new account trades nothing until its owner picks some |
 | `executionMode` | `approval` | This user's own switch: `approval` sizes and parks each trade for a per-row Approve/Reject in the dashboard, `immediate` submits as soon as risk checks pass |
 

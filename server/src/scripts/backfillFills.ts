@@ -3,8 +3,8 @@
  * still says `unconfirmed` (or any other non-terminal state). The running
  * trader's fill monitor only looks back 24 h; this widens the window.
  *
- *   bun run fills:backfill            # last 90 days
- *   bun run fills:backfill 180        # last N days
+ *   npm run fills:backfill            # last 90 days
+ *   npm run fills:backfill 180        # last N days
  *
  * Read-only against the broker, safe under every TRADE_EXECUTION_MODE. Users
  * whose Robinhood session needs consent are skipped and reported.

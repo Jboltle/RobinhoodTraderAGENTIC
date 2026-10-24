@@ -210,8 +210,9 @@ function SettingsForm({
           that says <em>medium size</em> deploys{' '}
           {Math.min(form.equityMediumPct ?? 0, form.equityFullPct ?? 0)}% of it.
           A callout with no size word uses Medium for stock and Small for
-          options. Full is the ceiling nothing gets past: a callout asking for
-          $5,000 is trimmed to it, and so is a Small or Medium you set above it.
+          options; one the Caller labels a lotto uses Lotto. Full is the
+          ceiling nothing gets past: a callout asking for $5,000 is trimmed to
+          it, and so is a Small, Medium or Lotto you set above it.
         </p>
 
         <SizingPreview form={form} />
@@ -234,6 +235,7 @@ function SettingsForm({
           onMedium={(v) => set('optionsMediumPct', v)}
           onFull={(v) => set('optionsFullPct', v)}
         />
+        <NumberField label="Options · Lotto (%) — only used when lotto callouts are on, under Filters" value={form.optionsLottoPct} onChange={(v) => set('optionsLottoPct', v)} placeholder={ph('optionsLottoPct')} min={0} max={100} step={0.25} />
         <NumberField label="Skip an options trade if one contract alone costs more than (% of buying power)" value={form.maxSingleContractPct} onChange={(v) => set('maxSingleContractPct', v)} placeholder={ph('maxSingleContractPct')} min={0} max={100} step={0.5} />
       </FormSection>
 
@@ -281,6 +283,13 @@ function SettingsForm({
           options={['true', 'false']}
           placeholder={ph('regularHoursOnly')}
           onChange={(v) => set('regularHoursOnly', v === undefined ? undefined : v === 'true')}
+        />
+        <SelectField
+          label="Trade lotto callouts (entries the Caller labels a lotto)"
+          value={form.allowLottoTrades === undefined ? undefined : String(form.allowLottoTrades)}
+          options={['true', 'false']}
+          placeholder={ph('allowLottoTrades')}
+          onChange={(v) => set('allowLottoTrades', v === undefined ? undefined : v === 'true')}
         />
       </FormSection>
 
@@ -369,6 +378,7 @@ function SizingPreview({ form }: { form: TradeSettingsInput }) {
     { label: 'Options · Small', pct: Math.min(form.optionsSmallPct ?? 0, optionsFull) },
     { label: 'Options · Medium', pct: Math.min(form.optionsMediumPct ?? 0, optionsFull) },
     { label: 'Options · Full', pct: optionsFull },
+    { label: 'Options · Lotto', pct: Math.min(form.optionsLottoPct ?? 0, optionsFull) },
   ]
   const widest = Math.max(...sizes.map((s) => s.pct))
   const dailyPct = (form.maxTradesPerDay ?? 0) * (form.equityFullPct ?? 0)

@@ -39,7 +39,7 @@ written while reading the same messages.
   there is no LLM fallback in the trade path.
 - Jev is not fully repeatable: about 2% of messages change direction between
   identical runs, mostly below the 0.6 cutoff.
-- Before each deploy, `bun src/scripts/actionDemo.ts decide` replays the
+- Before each deploy, `npx tsx src/scripts/actionDemo.ts decide` replays the
   production decider over the labeled set and a messages export and checks
   the ship bars (about 85% accuracy, at most 1 wrong entry, at least 60 of 70
   exits, at least 20 of the 24 followed missed entries, no averaging post

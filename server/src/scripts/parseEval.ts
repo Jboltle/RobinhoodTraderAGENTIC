@@ -6,7 +6,7 @@
  *
  *   psql "$DB_URL" -t -A -c "SELECT json_build_object('id', id, 'ts', sent_at,
  *     'content', content, 'embeds', embeds)::text FROM messages ..." > corpus.jsonl
- *   bun run eval:parse corpus.jsonl
+ *   npm run eval:parse corpus.jsonl
  *
  * Each row: { id?, ts, content, embeds? } — content is the raw message body,
  * embeds the raw Discord embed JSON; flattening happens here exactly as in
@@ -103,7 +103,7 @@ function checkInvariants(text: string, callout: Callout): Finding[] {
 
 const file = process.argv[2];
 if (!file) {
-  console.error('usage: bun run eval:parse <corpus.jsonl>');
+  console.error('usage: npm run eval:parse <corpus.jsonl>');
   process.exit(1);
 }
 

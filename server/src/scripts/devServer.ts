@@ -3,7 +3,7 @@
  * auth hook, real approval routes) wired to the in-memory db the tests use and
  * a stubbed Robinhood session.
  *
- *   bun src/scripts/devServer.ts
+ *   npx tsx src/scripts/devServer.ts
  *
  * That means no database, no Docker and no broker credentials are needed to
  * click through the UI, and no order can ever reach a real account. Sign in

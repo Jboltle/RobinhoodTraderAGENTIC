@@ -1,6 +1,6 @@
 /**
  * Service entrypoint: supervises the trader and the Listener (server/listener,
- * the Python gateway capture service) as one process tree. Used for `bun run
+ * the Python gateway capture service) as one process tree. Used for `npm run
  * dev` and in production — they are the same thing, and a production path that
  * differs from the one you develop against is a production path nobody has
  * tested.
@@ -39,7 +39,9 @@ const children = new Map<string, ChildProcess>();
 let shuttingDown = false;
 
 async function main(): Promise<void> {
-  const trader = start('trader', 'bun', ['src/trader/index.ts']);
+  // Same node binary and loader flags (tsx) as this process, so the trader
+  // runs exactly the way the supervisor was launched.
+  const trader = start('trader', process.execPath, [...process.execArgv, 'src/trader/index.ts']);
 
   // The Listener only writes to the database, so strictly it could start
   // first — but a healthy trader gate keeps startup failures ordered and the

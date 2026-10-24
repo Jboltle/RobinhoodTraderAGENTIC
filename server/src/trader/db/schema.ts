@@ -48,6 +48,7 @@ export const users = pgTable('users', {
   optionsSmallPct: numericAsNumber('options_small_pct').notNull().default(0.5),
   optionsMediumPct: numericAsNumber('options_medium_pct').notNull().default(1),
   optionsFullPct: numericAsNumber('options_full_pct').notNull().default(2),
+  optionsLottoPct: numericAsNumber('options_lotto_pct').notNull().default(0.25),
   maxSingleContractPct: numericAsNumber('max_single_contract_pct').notNull().default(5),
   maxTradesPerDay: integer('max_trades_per_day').notNull().default(10),
   cooldownSeconds: numericAsNumber('cooldown_seconds').notNull().default(300),
@@ -55,6 +56,7 @@ export const users = pgTable('users', {
   blockedTickers: text('blocked_tickers').array().notNull().default([]),
   minConfidence: numericAsNumber('min_confidence').notNull().default(0.7),
   regularHoursOnly: boolean('regular_hours_only').notNull().default(true),
+  allowLottoTrades: boolean('allow_lotto_trades').notNull().default(false),
   /** Null = legacy "follow everyone"; [] = follow no one (the default). */
   followedCallerIds: text('followed_caller_ids').array().default([]),
   maxLossPct: numericAsNumber('max_loss_pct'),

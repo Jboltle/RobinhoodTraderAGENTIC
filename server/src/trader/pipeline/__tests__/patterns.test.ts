@@ -219,6 +219,27 @@ describe('readPatterns — the tradable contract', () => {
   });
 });
 
+describe('readPatterns — the lotto label', () => {
+  it.each([
+    '**LOTTO** SPX here 10/02 7735C Avg. 5.00',
+    '$VST $150P at $.04 <@&1531936405561938033> Lotto',
+    '⚠️ Super Lotto — RISKY — Size Very Less\nSPY 779C 0DTE 0.255',
+    'Lottos only today: SPY 700C 0DTE @ .10',
+  ])('reads %j as a lotto', (content) => {
+    expect(read(content).isLotto).toBe(true);
+  });
+
+  it.each([
+    "I'm Entering\n**Option:** OUST 45 C 10/16\n**Entry:** 2.55",
+    // "risky" is a sizing warning, not the lotto label.
+    'BTO $QQQ 710p 06/08 0.97\n\nRISKY SIZE APPROPRIATE @Pro',
+    // A reply quoting a lotto is the replier's message, not a lotto.
+    '> ⚠️ Lotto Trade — RISKY\nStill in $SPY, holding',
+  ])('reads %j as not a lotto', (content) => {
+    expect(read(content).isLotto).toBe(false);
+  });
+});
+
 describe('readExitPortion', () => {
   it.each([
     ['Sold 4 of 20 @ $0.906 · 16 still running', { kind: 'fraction', value: 0.2 }],

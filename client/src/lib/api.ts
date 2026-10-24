@@ -96,6 +96,7 @@ export type RejectionCode =
   | 'parse_inconsistent'
   | 'ticker_blocked'
   | 'ticker_not_allowed'
+  | 'lotto_blocked'
   | 'ticker_invalid'
   | 'broker_unavailable'
   | 'outside_market_hours'
@@ -186,6 +187,8 @@ export interface TradeSettings {
   optionsSmallPct: number
   optionsMediumPct: number
   optionsFullPct: number
+  /** What a lotto entry deploys; outranks the message's size word, clamped to optionsFullPct. */
+  optionsLottoPct: number
   maxSingleContractPct: number
   maxTradesPerDay: number
   cooldownSeconds: number
@@ -193,6 +196,8 @@ export interface TradeSettings {
   blockedTickers: string[]
   minConfidence: number
   regularHoursOnly: boolean
+  /** Take entries the Caller labels a lotto. Off = skipped as lotto_blocked. */
+  allowLottoTrades: boolean
   /** null = follow every Caller including future ones; [] = follow no one. */
   followedCallerIds: string[] | null
   /** Flatten that position at this % drop from entry. null = off. */

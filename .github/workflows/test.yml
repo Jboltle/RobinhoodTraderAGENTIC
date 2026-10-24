@@ -17,14 +17,16 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
         with:
-          bun-version: latest
-      - run: bun install --frozen-lockfile
-      - run: bun run typecheck
-      - run: bun run test
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
       - name: Every env var the runtime reads is documented
-        run: bun run env:audit
+        run: npm run env:audit
 
   client:
     runs-on: ubuntu-latest
