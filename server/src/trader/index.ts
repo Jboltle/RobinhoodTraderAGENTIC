@@ -6,6 +6,7 @@ import { JevCalloutDecider } from './pipeline/decide.js';
 import { JevClient } from './pipeline/jev.js';
 import { LlmCalloutParser } from './pipeline/parseCallout.js';
 import { createMessageProcessor } from './pipeline/index.js';
+import { startBookMonitor } from './book/monitor.js';
 import { startFillMonitor } from './fills.js';
 import { startMaxLossMonitor } from './maxLoss.js';
 import { INSTANCE_ID, startPoller } from './poller.js';
@@ -86,6 +87,10 @@ async function main(): Promise<void> {
   // Fill read-back: keeps placed orders' broker state current. Read-only, so
   // it runs under every TRADE_EXECUTION_MODE.
   startFillMonitor({ db, brokers, events });
+
+  // The tracked-callout book: marks, simulated ladder fills and expiry
+  // settlement for every Caller entry. Read-only like the fill monitor.
+  startBookMonitor({ db, brokers, events });
 
   // Max Loss: process-lifetime flatten loop. Independent of the dashboard.
   startMaxLossMonitor({

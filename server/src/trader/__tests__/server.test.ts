@@ -396,6 +396,68 @@ describe('GET /api/callers', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Book
+// ---------------------------------------------------------------------------
+
+describe('GET /api/book', () => {
+  const tracked = (messageId: string, closedAt: string | null) =>
+    harness.db.openTrackedCallout({
+      messageId,
+      authorId: 'harvey',
+      ticker: 'SPY',
+      option: { optionType: 'call', strike: 680, expiration: '2026-12-18' },
+      entryPrice: 1,
+      nominalQty: 50,
+      openedAt: '2026-10-01T14:00:00.000Z',
+      closedAt,
+      closedBy: closedAt === null ? null : 'caller_exit',
+      exitPrice: closedAt === null ? null : 2,
+      lastMark: 1.5,
+      lastMarkAt: '2026-10-01T15:00:00.000Z',
+      highestPct: 50,
+      highestPrice: 1.5,
+      ladder: [],
+      fills: closedAt === null ? [] : [{ at: closedAt, qty: 50, price: 2, pctGain: 100, source: 'caller', messageId: 'x' }],
+      result: closedAt === null ? null : 'win',
+    });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // Wednesday 2026-10-21 10:00 ET.
+    vi.setSystemTime(new Date('2026-10-21T14:00:00.000Z'));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('returns open positions with derived numbers and the period\u2019s closed ones', async () => {
+    await tracked('open-1', null);
+    await tracked('closed-today', '2026-10-21T13:50:00.000Z');
+    await tracked('closed-monday', '2026-10-19T19:00:00.000Z');
+    await tracked('closed-last-week', '2026-10-15T19:00:00.000Z');
+
+    const today = await get('/api/book');
+    expect(today.statusCode).toBe(200);
+    expect(today.json()).toMatchObject({ period: 'today', today: '2026-10-21' });
+    expect(today.json().open.map((p: { messageId: string }) => p.messageId)).toEqual(['open-1']);
+    expect(today.json().open[0]).toMatchObject({ remainingQty: 50, realizedPnl: 0, unrealizedPnl: 2500, pctNow: 50 });
+    expect(today.json().closed.map((p: { messageId: string }) => p.messageId)).toEqual(['closed-today']);
+    expect(today.json().closed[0]).toMatchObject({ realizedPnl: 5000, unrealizedPnl: null });
+
+    const week = await get('/api/book?period=week');
+    expect(week.json().closed.map((p: { messageId: string }) => p.messageId)).toEqual([
+      'closed-today',
+      'closed-monday',
+    ]);
+
+    const all = await get('/api/book?period=all');
+    expect(all.json().closed).toHaveLength(3);
+  });
+
+  it('rejects an unknown period', async () => {
+    expect((await get('/api/book?period=year')).statusCode).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Portfolio / performance
 // ---------------------------------------------------------------------------
 

@@ -18,12 +18,19 @@ export interface UserEventHandlers {
   readonly onDecision?: (decision: Decision) => void;
 }
 
+/** The shared tracked-callout book changed (a mark, a fill, an open or a close). */
+export interface BookEvent {
+  readonly at: string;
+}
+
 /**
  * In-process fan-out from the pipeline to connected dashboards.
  *
  * Subscription is per user by construction — there is no way to listen to
  * every user's events, so an SSE connection cannot leak another account's
- * trades. ponytail: a plain EventEmitter, so this only reaches dashboards
+ * trades. The one exception is the book event: the tracked-callout book is
+ * shared data (Caller entries, not anyone's trades), so it is process-wide.
+ * ponytail: a plain EventEmitter, so this only reaches dashboards
  * attached to *this* process; upgrade path is real pub/sub if it ever shards.
  */
 export class TraderEvents {
@@ -41,6 +48,16 @@ export class TraderEvents {
 
   emitDecision(userId: string, decision: Decision): void {
     this.emitter.emit(`decision:${userId}`, decision);
+  }
+
+  emitBook(): void {
+    this.emitter.emit('book', { at: new Date().toISOString() } satisfies BookEvent);
+  }
+
+  /** Subscribe to book changes (shared, not per user). Returns the unsubscribe function. */
+  subscribeBook(onBook: (event: BookEvent) => void): () => void {
+    this.emitter.on('book', onBook);
+    return () => this.emitter.off('book', onBook);
   }
 
   /** Subscribe to one user's events. Returns the unsubscribe function. */

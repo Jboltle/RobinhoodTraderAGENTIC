@@ -22,6 +22,13 @@ import {
   type TradeExecutionMode,
 } from '../shared/types.js';
 import { registerAuth, requireUser } from './auth.js';
+import {
+  BOOK_PERIODS,
+  isoDateEt,
+  periodStartDate,
+  viewOf,
+  type BookPeriod,
+} from './book/ladder.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { resolveEquityEntry, resolveOptionEntry } from './maxLoss.js';
@@ -58,6 +65,12 @@ const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
  * row removed outside this process (auth:reset).
  */
 const CONNECTION_CHECK_INTERVAL_MS = 60_000;
+/**
+ * How far back GET /api/book reads closed rows for the today / week periods
+ * before trimming to ET trading days in code. Wider than a week so the ET
+ * day boundary never cuts a row off.
+ */
+const BOOK_RECENT_LOOKBACK_MS = 9 * 24 * 60 * 60 * 1000;
 /** How long POST /api/broker/connect waits for Robinhood to hand us a URL. */
 const AUTH_URL_TIMEOUT_MS = 15_000;
 const AUTH_URL_POLL_MS = 100;
@@ -341,6 +354,40 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
   });
 
+  // ---- Book ---------------------------------------------------------------------
+
+  // The tracked-callout book: every open Caller entry with its live mark and
+  // simulated ladder, plus the entries closed within the period. Shared data
+  // (same for every user; the dashboard filters by Caller and attaches the
+  // user's own decisions client-side), auth still required.
+  fastify.get('/api/book', async (request, reply) => {
+    requireUser(request);
+    const periodRaw = (request.query as { period?: string }).period ?? 'today';
+    if (!BOOK_PERIODS.includes(periodRaw as BookPeriod)) {
+      return reply.status(400).send({ error: `period must be one of ${BOOK_PERIODS.join(', ')}` });
+    }
+    const period = periodRaw as BookPeriod;
+    const now = new Date();
+    const today = isoDateEt(now);
+    const startDate = periodStartDate(period, today);
+    const [open, closedRecent] = await Promise.all([
+      deps.db.listTrackedOpen(),
+      deps.db.listTrackedClosedSince(
+        startDate === null ? null : new Date(now.getTime() - BOOK_RECENT_LOOKBACK_MS)
+      ),
+    ]);
+    const closed = closedRecent.filter(
+      (p) => startDate === null || isoDateEt(new Date(p.closedAt!)) >= startDate
+    );
+    return reply.send({
+      period,
+      today,
+      asOf: now.toISOString(),
+      open: open.map(viewOf),
+      closed: closed.map(viewOf),
+    });
+  });
+
   // ---- Settings -----------------------------------------------------------------
 
   fastify.get('/api/settings', async (request, reply) => {
@@ -411,8 +458,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // SSE stream for the dashboard: replaces client-side polling of
   // /api/decisions and /api/trades/performance (both kept for curl/fallback).
   // Events: `decisions` (snapshot on connect + on every append, newest-first),
-  // `performance` ({ positions, error } every 10s while connected), and `stage`
-  // (live trade lifecycle: received → parsing → risk_check → executing → done).
+  // `performance` ({ positions, error } every 10s while connected), `stage`
+  // (live trade lifecycle: received → parsing → risk_check → executing → done),
+  // and `book` ({ at }: the shared tracked-callout book changed; refetch it).
   //
   // Read with fetch, not EventSource, so it carries the same Authorization
   // header as every other route (see client/src/lib/stream.ts).
@@ -507,6 +555,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       },
       onStage: (event) => send('stage', event),
     });
+    // The book is shared and the client chooses its own period, so the frame
+    // is a change notice (the client refetches GET /api/book), not a snapshot.
+    const unsubscribeBook = deps.events.subscribeBook((event) => send('book', event));
 
     // ponytail: per-connection timers — N clients means N× Robinhood quote
     // traffic. Fine at invite-only scale; upgrade path is one shared broadcast
@@ -538,6 +589,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       clearInterval(heartbeatTimer);
       clearInterval(connectionTimer);
       unsubscribe();
+      unsubscribeBook();
       reply.raw.end();
     });
   });

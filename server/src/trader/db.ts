@@ -39,6 +39,7 @@ import {
   defaultSettings,
   type Callout,
   type Decision,
+  type OptionContract,
   type ResolvedTradeSettings,
   type SubmittedOrder,
   type TradeSettings,
@@ -49,6 +50,7 @@ import {
   assembleMessageText,
   truncateSafe,
 } from '../shared/embedText.js';
+import type { TrackedPosition } from './book/ladder.js';
 import { hashSessionToken } from './credentials.js';
 import {
   allowedEmails,
@@ -58,6 +60,7 @@ import {
   recapInsights,
   recaps,
   sessions,
+  trackedCallouts,
   trades,
   users,
 } from './db/schema.js';
@@ -291,6 +294,20 @@ export interface TraderDb {
 
   getRecapInsight(windowDays: number): Promise<StoredRecapInsight | null>;
   saveRecapInsight(insight: StoredRecapInsight): Promise<void>;
+
+  /**
+   * Open a tracked callout. A second open for the same message (crash replay)
+   * is dropped, so a row's marks and fills are never reset.
+   */
+  openTrackedCallout(position: TrackedPosition): Promise<void>;
+  /** Write a tracked position back in full (marks, ladder, fills, close). */
+  saveTrackedCallout(position: TrackedPosition): Promise<void>;
+  /** The book monitor's work list: open positions, oldest first. */
+  listTrackedOpen(): Promise<TrackedPosition[]>;
+  /** The Caller's newest open entry in this exact contract; what their exit closes. */
+  findTrackedOpen(authorId: string, ticker: string, option: OptionContract): Promise<TrackedPosition | null>;
+  /** Closed positions, newest close first; `since` null = all of them. */
+  listTrackedClosedSince(since: Date | null): Promise<TrackedPosition[]>;
 
   // ---- Auth ------------------------------------------------------------------
 
@@ -774,6 +791,63 @@ class DrizzleTraderDb implements TraderDb {
       .onConflictDoUpdate({ target: recapInsights.windowDays, set: values });
   }
 
+  async openTrackedCallout(position: TrackedPosition): Promise<void> {
+    await this.db
+      .insert(trackedCallouts)
+      .values(fromTrackedPosition(position))
+      .onConflictDoNothing({ target: trackedCallouts.messageId });
+  }
+
+  async saveTrackedCallout(position: TrackedPosition): Promise<void> {
+    const { messageId, ...values } = fromTrackedPosition(position);
+    await this.db.update(trackedCallouts).set(values).where(eq(trackedCallouts.messageId, messageId));
+  }
+
+  async listTrackedOpen(): Promise<TrackedPosition[]> {
+    const rows = await this.db
+      .select()
+      .from(trackedCallouts)
+      .where(isNull(trackedCallouts.closedAt))
+      .orderBy(asc(trackedCallouts.openedAt));
+    return rows.map(toTrackedPosition);
+  }
+
+  async findTrackedOpen(
+    authorId: string,
+    ticker: string,
+    option: OptionContract
+  ): Promise<TrackedPosition | null> {
+    const [row] = await this.db
+      .select()
+      .from(trackedCallouts)
+      .where(
+        and(
+          isNull(trackedCallouts.closedAt),
+          eq(trackedCallouts.authorId, authorId),
+          eq(trackedCallouts.ticker, ticker.toUpperCase()),
+          eq(trackedCallouts.optionType, option.optionType),
+          eq(trackedCallouts.strike, option.strike),
+          eq(trackedCallouts.expiration, option.expiration)
+        )
+      )
+      .orderBy(desc(trackedCallouts.openedAt))
+      .limit(1);
+    return row ? toTrackedPosition(row) : null;
+  }
+
+  async listTrackedClosedSince(since: Date | null): Promise<TrackedPosition[]> {
+    const rows = await this.db
+      .select()
+      .from(trackedCallouts)
+      .where(
+        since === null
+          ? isNotNull(trackedCallouts.closedAt)
+          : and(isNotNull(trackedCallouts.closedAt), gte(trackedCallouts.closedAt, since))
+      )
+      .orderBy(desc(trackedCallouts.closedAt));
+    return rows.map(toTrackedPosition);
+  }
+
   async userForSignIn(email: string): Promise<AuthUser | null> {
     const normalized = email.trim().toLowerCase();
     const existing = await this.findUserByEmail(normalized);
@@ -933,6 +1007,52 @@ function toPendingMessage(row: typeof messages.$inferSelect): PendingMessage {
     deletedAt: row.deletedAt?.toISOString() ?? null,
     disposition: row.disposition,
     replyToMessageId: raw.reference_id ?? null,
+  };
+}
+
+function toTrackedPosition(row: typeof trackedCallouts.$inferSelect): TrackedPosition {
+  return {
+    messageId: row.messageId,
+    authorId: row.authorId,
+    ticker: row.ticker,
+    option: { optionType: row.optionType, strike: row.strike, expiration: row.expiration },
+    entryPrice: row.entryPrice,
+    nominalQty: row.nominalQty,
+    openedAt: row.openedAt.toISOString(),
+    closedAt: row.closedAt?.toISOString() ?? null,
+    closedBy: row.closedBy,
+    exitPrice: row.exitPrice,
+    lastMark: row.lastMark,
+    lastMarkAt: row.lastMarkAt?.toISOString() ?? null,
+    highestPct: row.highestPct,
+    highestPrice: row.highestPrice,
+    ladder: row.ladder,
+    fills: row.fills,
+    result: row.result,
+  };
+}
+
+function fromTrackedPosition(position: TrackedPosition): typeof trackedCallouts.$inferInsert {
+  return {
+    messageId: position.messageId,
+    authorId: position.authorId,
+    ticker: position.ticker,
+    optionType: position.option.optionType,
+    strike: position.option.strike,
+    expiration: position.option.expiration,
+    entryPrice: position.entryPrice,
+    nominalQty: position.nominalQty,
+    openedAt: new Date(position.openedAt),
+    closedAt: position.closedAt === null ? null : new Date(position.closedAt),
+    closedBy: position.closedBy,
+    exitPrice: position.exitPrice,
+    lastMark: position.lastMark,
+    lastMarkAt: position.lastMarkAt === null ? null : new Date(position.lastMarkAt),
+    highestPct: position.highestPct,
+    highestPrice: position.highestPrice,
+    ladder: [...position.ladder],
+    fills: [...position.fills],
+    result: position.result,
   };
 }
 

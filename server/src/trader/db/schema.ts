@@ -24,7 +24,8 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 
-import type { Callout, Decision, ExecutionMode } from '../../shared/types.js';
+import type { Callout, Decision, ExecutionMode, OptionType } from '../../shared/types.js';
+import type { ClosedBy, LadderLevel, TrackedFill, TrackedResult } from '../book/ladder.js';
 import type { MessageDisposition } from '../db.js';
 import type { RecapParse, RecapParseStatus } from '../recaps/parser.js';
 
@@ -158,6 +159,32 @@ export const recaps = pgTable('recaps', {
   parse: jsonb('parse').$type<RecapParse>(),
   parseStatus: text('parse_status').$type<RecapParseStatus>().notNull(),
   parserVersion: integer('parser_version').notNull().default(0),
+});
+
+/**
+ * The tracked-callout book: one row per Caller entry, keyed by the opening
+ * Buy's message id. Shape mirrors TrackedPosition (book/ladder.ts).
+ */
+export const trackedCallouts = pgTable('tracked_callouts', {
+  messageId: text('message_id').primaryKey(),
+  authorId: text('author_id').notNull(),
+  ticker: text('ticker').notNull(),
+  optionType: text('option_type').$type<OptionType>().notNull(),
+  strike: numericAsNumber('strike').notNull(),
+  expiration: date('expiration').notNull(),
+  entryPrice: numericAsNumber('entry_price'),
+  nominalQty: integer('nominal_qty').notNull().default(0),
+  openedAt: isoTimestamp('opened_at').notNull(),
+  closedAt: isoTimestamp('closed_at'),
+  closedBy: text('closed_by').$type<ClosedBy>(),
+  exitPrice: numericAsNumber('exit_price'),
+  lastMark: numericAsNumber('last_mark'),
+  lastMarkAt: isoTimestamp('last_mark_at'),
+  highestPct: numericAsNumber('highest_pct'),
+  highestPrice: numericAsNumber('highest_price'),
+  ladder: jsonb('ladder').$type<LadderLevel[]>().notNull().default([]),
+  fills: jsonb('fills').$type<TrackedFill[]>().notNull().default([]),
+  result: text('result').$type<TrackedResult>(),
 });
 
 /** Cached LLM narration per recap window. */

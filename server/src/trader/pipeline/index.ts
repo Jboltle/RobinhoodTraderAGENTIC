@@ -11,6 +11,7 @@ import {
   type SubmittedOrder,
   type TradeExecutionMode,
 } from '../../shared/types.js';
+import { trackCallout } from '../book/track.js';
 import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { BrokerUnavailableError } from '../rh/mcpClient.js';
@@ -207,6 +208,9 @@ async function resolveCallout(
   }
 
   await setDisposition(deps, envelope.messageId, 'callout', callout);
+  // The shared book records the Caller's entry or exit once per message,
+  // before the per-user fan-out: tracking never depends on anyone trading.
+  await trackCallout(deps, envelope, callout);
   return { status: 'callout', callout, parseError: null };
 }
 

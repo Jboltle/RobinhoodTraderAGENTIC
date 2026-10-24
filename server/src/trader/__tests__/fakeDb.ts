@@ -35,6 +35,8 @@ import type {
   TraderDb,
 } from '../db.js';
 import type { PersistedState } from '../rh/types.js';
+import { optionLabel } from '../../shared/types.js';
+import type { TrackedPosition } from '../book/ladder.js';
 
 /** An in-memory `messages` row: capture columns + the trader's verdict marks. */
 export interface FakeMessageRow {
@@ -104,6 +106,8 @@ export interface FakeDb extends TraderDb {
   getMessage(messageId: string): FakeMessageRow | null;
   /** Put an email on the invite list. */
   allowEmail(email: string): void;
+  /** Inspect a tracked callout row; null when unknown. */
+  getTracked(messageId: string): TrackedPosition | null;
 }
 
 export function createFakeDb(): FakeDb {
@@ -115,6 +119,7 @@ export function createFakeDb(): FakeDb {
   const callers = new Map<string, Caller>();
   const recaps = new Map<string, StoredRecap>();
   const recapInsights = new Map<number, StoredRecapInsight>();
+  const tracked = new Map<string, TrackedPosition>();
   const usersByEmail = new Map<string, AuthUser>();
   const allowedEmails = new Set<string>();
   /** Bearer token -> session; a null expiry never ends (addUser's tokens). */
@@ -186,6 +191,9 @@ export function createFakeDb(): FakeDb {
     },
     allowEmail(email) {
       allowedEmails.add(email.toLowerCase());
+    },
+    getTracked(messageId) {
+      return tracked.get(messageId) ?? null;
     },
 
     // ---- Per-user ------------------------------------------------------------
@@ -451,6 +459,35 @@ export function createFakeDb(): FakeDb {
     },
     async saveRecapInsight(insight) {
       recapInsights.set(insight.windowDays, insight);
+    },
+    async openTrackedCallout(position) {
+      if (!tracked.has(position.messageId)) tracked.set(position.messageId, position);
+    },
+    async saveTrackedCallout(position) {
+      if (tracked.has(position.messageId)) tracked.set(position.messageId, position);
+    },
+    async listTrackedOpen() {
+      return [...tracked.values()]
+        .filter((p) => p.closedAt === null)
+        .sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+    },
+    async findTrackedOpen(authorId, ticker, option) {
+      return (
+        [...tracked.values()]
+          .filter(
+            (p) =>
+              p.closedAt === null &&
+              p.authorId === authorId &&
+              p.ticker === ticker.toUpperCase() &&
+              optionLabel(p.option) === optionLabel(option)
+          )
+          .sort((a, b) => b.openedAt.localeCompare(a.openedAt))[0] ?? null
+      );
+    },
+    async listTrackedClosedSince(since) {
+      return [...tracked.values()]
+        .filter((p) => p.closedAt !== null && (since === null || Date.parse(p.closedAt) >= since.getTime()))
+        .sort((a, b) => b.closedAt!.localeCompare(a.closedAt!));
     },
 
     // ---- Auth ----------------------------------------------------------------
