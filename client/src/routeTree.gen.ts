@@ -10,12 +10,18 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as RecapsRouteImport } from './routes/recaps'
 import { Route as PerformanceRouteImport } from './routes/performance'
 import { Route as IndexRouteImport } from './routes/index'
 
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RecapsRoute = RecapsRouteImport.update({
+  id: '/recaps',
+  path: '/recaps',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PerformanceRoute = PerformanceRouteImport.update({
@@ -32,30 +38,34 @@ const IndexRoute = IndexRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/performance': typeof PerformanceRoute
+  '/recaps': typeof RecapsRoute
   '/settings': typeof SettingsRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/performance': typeof PerformanceRoute
+  '/recaps': typeof RecapsRoute
   '/settings': typeof SettingsRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/performance': typeof PerformanceRoute
+  '/recaps': typeof RecapsRoute
   '/settings': typeof SettingsRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/performance' | '/settings'
+  fullPaths: '/' | '/performance' | '/recaps' | '/settings'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/performance' | '/settings'
-  id: '__root__' | '/' | '/performance' | '/settings'
+  to: '/' | '/performance' | '/recaps' | '/settings'
+  id: '__root__' | '/' | '/performance' | '/recaps' | '/settings'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   PerformanceRoute: typeof PerformanceRoute
+  RecapsRoute: typeof RecapsRoute
   SettingsRoute: typeof SettingsRoute
 }
 
@@ -66,6 +76,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/recaps': {
+      id: '/recaps'
+      path: '/recaps'
+      fullPath: '/recaps'
+      preLoaderRoute: typeof RecapsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/performance': {
@@ -88,6 +105,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   PerformanceRoute: PerformanceRoute,
+  RecapsRoute: RecapsRoute,
   SettingsRoute: SettingsRoute,
 }
 export const routeTree = rootRouteImport
