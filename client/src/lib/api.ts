@@ -315,6 +315,73 @@ export const fetchRecapPerformance = (
 ): Promise<RecapPerformanceResponse> =>
   request<RecapPerformanceResponse>(`/api/recaps/performance?days=${days}`)
 
+// ---- Tracked-callout book (mirrors server/src/trader/book/ladder.ts) --------
+
+export interface LadderLevel {
+  pct: number
+  qty: number
+  price: number
+  /** "+25%" */
+  label: string
+  isRunner: boolean
+  filledAt: string | null
+  /** What priced the fill; the server fills at the MCP mark today. */
+  fillBasis: 'mark' | null
+}
+
+/** One sale out of the tracked position, simulated or Caller-stated. */
+export interface TrackedFill {
+  at: string
+  qty: number
+  price: number
+  pctGain: number
+  source: 'ladder' | 'caller' | 'expiry'
+  messageId: string | null
+}
+
+export type TrackedResult = 'win' | 'loss' | 'be'
+
+/** One Caller entry priced against live marks, with the dashboard's derived numbers. */
+export interface TrackedPosition {
+  /** The opening Buy's message id; joins to this user's Decision for it. */
+  messageId: string
+  authorId: string
+  ticker: string
+  option: OptionContract
+  entryPrice: number | null
+  nominalQty: number
+  openedAt: string
+  closedAt: string | null
+  closedBy: 'caller_exit' | 'ladder' | 'expiry' | null
+  exitPrice: number | null
+  lastMark: number | null
+  lastMarkAt: string | null
+  highestPct: number | null
+  highestPrice: number | null
+  ladder: LadderLevel[]
+  fills: TrackedFill[]
+  result: TrackedResult | null
+  remainingQty: number
+  realizedPnl: number
+  unrealizedPnl: number | null
+  pctNow: number | null
+}
+
+export type BookPeriod = 'today' | 'week' | 'all'
+
+export interface BookResponse {
+  period: BookPeriod
+  /** The ET trading day the server computed the period from. */
+  today: string
+  asOf: string
+  open: TrackedPosition[]
+  /** Positions closed within the period, newest close first. */
+  closed: TrackedPosition[]
+}
+
+export const fetchBook = (period: BookPeriod): Promise<BookResponse> =>
+  request<BookResponse>(`/api/book?period=${period}`)
+
 /** GET /api/broker/status: the caller's Robinhood connection state. */
 export interface BrokerStatus {
   connected: boolean

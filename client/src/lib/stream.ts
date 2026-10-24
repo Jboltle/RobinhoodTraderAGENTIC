@@ -121,5 +121,10 @@ function applyEvent(queryClient: QueryClient, event: string, data: string): void
       }
       return
     }
+    case 'book':
+      // A change notice, not a snapshot: the book is shared and each tab has
+      // its own period, so every ['book', period] query refetches itself.
+      void queryClient.invalidateQueries({ queryKey: ['book'] })
+      return
   }
 }

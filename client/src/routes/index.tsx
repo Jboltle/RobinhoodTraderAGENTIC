@@ -1,15 +1,23 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
 
 import { CalloutCard } from '../components/CalloutCard'
 import { Outcome, TradesTable, chipClass } from '../components/TradesTable'
+import { ClosedRow } from '../components/book/ClosedRow'
+import { KpiGrid } from '../components/book/KpiGrid'
+import { PeriodToggle } from '../components/book/PeriodToggle'
+import { PositionCard, type Density } from '../components/book/PositionCard'
 import {
+  fetchBook,
   fetchCallers,
   fetchCallouts,
   fetchPortfolio,
   fetchSettings,
 } from '../lib/api'
 import type {
+  BookPeriod,
+  BookResponse,
   Caller,
   CalloutItem,
   Decision,
@@ -18,10 +26,19 @@ import type {
   StageEvent,
   TradeSettings,
 } from '../lib/api'
+import { filterByCaller, summarizeBook, type CallerSelection } from '../lib/book'
 
 export const Route = createFileRoute('/')({ component: Dashboard, ssr: false })
 
 const FEED_POLL_MS = 60_000
+/** Fallback cadence; the SSE `book` frame invalidates this query on every change. */
+const BOOK_POLL_MS = 60_000
+
+const CLOSED_HEADING: Record<BookPeriod, string> = {
+  today: 'Closed today',
+  week: 'Closed this week',
+  all: 'Closed',
+}
 
 function Dashboard() {
   // No queryFn/polling: both caches are hydrated and kept live by the SSE
@@ -65,23 +82,46 @@ function Dashboard() {
       followedCallerIds.includes(c.authorId),
   )
 
+  // This account's outcome per callout message, for the badge on each card.
+  // ponytail: both sources are the most recent page (50 decisions, 100
+  // callouts), so an older open entry can read "not traded" after a busy day.
+  // Upgrade path: a decisions lookup by message ids on /api/book.
+  const decisionByMessageId = useMemo(() => {
+    const map = new Map<string, Decision>()
+    for (const item of callouts.data ?? []) if (item.decision) map.set(item.messageId, item.decision)
+    for (const decision of decisions.data ?? []) map.set(decision.messageId, decision)
+    return map
+  }, [callouts.data, decisions.data])
+
+  const pending = (decisions.data ?? []).filter((d) => d.kind === 'pending_approval')
+
   return (
     <div className="flex flex-col gap-8">
       <LiveStageBanner />
-      <PortfolioSummaryBar />
+      {pending.length > 0 && <PendingApprovals decisions={pending} />}
+
+      <Book
+        callers={callers.data ?? []}
+        followedCallerIds={followedCallerIds}
+        decisionByMessageId={decisionByMessageId}
+      />
+
       <section>
-        <SectionTitle>Trades</SectionTitle>
-        {performance.isError && (
-          <p className="mb-3 inline-flex rounded-md bg-warn/10 px-3 py-1.5 text-xs text-warn">
-            Live prices unavailable ({(performance.error as Error).message})
-          </p>
-        )}
-        <TradesTable
-          decisions={decisions.data ?? []}
-          positions={performance.data ?? []}
-          callouts={callouts.data ?? []}
-          callers={callers.data ?? []}
-        />
+        <SectionTitle>My trades</SectionTitle>
+        <div className="flex flex-col gap-4">
+          <PortfolioSummaryBar />
+          {performance.isError && (
+            <p className="inline-flex self-start rounded-md bg-warn/10 px-3 py-1.5 text-xs text-warn">
+              Live prices unavailable ({(performance.error as Error).message})
+            </p>
+          )}
+          <TradesTable
+            decisions={decisions.data ?? []}
+            positions={performance.data ?? []}
+            callouts={callouts.data ?? []}
+            callers={callers.data ?? []}
+          />
+        </div>
       </section>
 
       <section>
@@ -97,6 +137,174 @@ function Dashboard() {
     </div>
   )
 }
+
+// =============================================================================
+// Pending approvals — one row per parked trade, each with its own controls
+// =============================================================================
+
+function PendingApprovals({ decisions }: { decisions: Decision[] }) {
+  return (
+    <section className="rounded-2xl border border-warn/40 bg-warn/8 px-5 py-3">
+      <p className="mb-2 text-sm font-medium text-white">
+        {decisions.length} trade{decisions.length === 1 ? '' : 's'} awaiting your approval
+      </p>
+      <ul className="flex flex-col gap-2">
+        {decisions.map((decision) => (
+          <li key={decision.messageId} className="flex flex-wrap items-center gap-3 text-sm">
+            <span className="font-semibold text-white">{decision.ticker ?? '—'}</span>
+            <span className="min-w-0 flex-1 truncate text-xs text-ink-400" title={decision.reason}>
+              {decision.reason}
+            </span>
+            <Outcome decision={decision} />
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+// =============================================================================
+// The book — every followed Caller's entries, priced live
+// =============================================================================
+
+function Book({
+  callers,
+  followedCallerIds,
+  decisionByMessageId,
+}: {
+  callers: Caller[]
+  followedCallerIds: string[] | null
+  decisionByMessageId: Map<string, Decision>
+}) {
+  const [period, setPeriod] = useState<BookPeriod>('today')
+  const [selection, setSelection] = useState<CallerSelection>('following')
+  const [tickerFilter, setTickerFilter] = useState('')
+  const [density, setDensity] = useState<Density>('normal')
+
+  const book = useQuery<BookResponse>({
+    queryKey: ['book', period],
+    queryFn: () => fetchBook(period),
+    refetchInterval: BOOK_POLL_MS,
+    placeholderData: keepPreviousData,
+    retry: false,
+  })
+
+  const callerById = useMemo(() => new Map(callers.map((c) => [c.authorId, c])), [callers])
+  const open = filterByCaller(book.data?.open ?? [], selection, followedCallerIds)
+  const closed = filterByCaller(book.data?.closed ?? [], selection, followedCallerIds)
+  const summary = summarizeBook(open, closed)
+  const needle = tickerFilter.trim().toUpperCase()
+  const visibleOpen = needle ? open.filter((p) => p.ticker.includes(needle)) : open
+
+  return (
+    <section className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <PeriodToggle value={period} onChange={setPeriod} />
+        <label className="flex items-center gap-2 text-xs text-ink-400">
+          Whose book
+          <select
+            value={selectionKey(selection)}
+            onChange={(e) => setSelection(selectionFromKey(e.target.value))}
+            className="rounded-lg border border-ink-600 bg-ink-800 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
+          >
+            <option value="following">Following</option>
+            <option value="all">Everyone</option>
+            {callers.map((caller) => (
+              <option key={caller.authorId} value={`caller:${caller.authorId}`}>
+                {caller.displayName}
+              </option>
+            ))}
+          </select>
+        </label>
+        {book.isError && (
+          <p className="rounded-md bg-warn/10 px-3 py-1.5 text-xs text-warn">
+            Book unavailable ({(book.error as Error).message})
+          </p>
+        )}
+        {book.data && (
+          <span className="ml-auto text-xs text-ink-500">
+            marks as of {new Date(book.data.asOf).toLocaleTimeString()}
+          </span>
+        )}
+      </div>
+
+      <KpiGrid summary={summary} period={period} />
+
+      <div>
+        <div className="mb-3 flex flex-wrap items-center gap-3">
+          <SectionTitle inline>Open {open.length}</SectionTitle>
+          <input
+            type="search"
+            value={tickerFilter}
+            onChange={(e) => setTickerFilter(e.target.value)}
+            placeholder="Filter ticker"
+            className="w-36 rounded-lg border border-ink-600 bg-ink-800 px-3 py-1.5 text-xs text-white placeholder:text-ink-500 focus:border-brand focus:outline-none"
+          />
+          <div className="ml-auto flex rounded-lg border border-ink-600 bg-ink-800 p-0.5">
+            {(['normal', 'compact'] as const).map((option) => (
+              <button
+                key={option}
+                type="button"
+                onClick={() => setDensity(option)}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium capitalize transition-colors ${
+                  density === option ? 'bg-ink-700 text-white' : 'text-ink-400 hover:text-white'
+                }`}
+              >
+                {option}
+              </button>
+            ))}
+          </div>
+        </div>
+        {book.isPending && <EmptyState>Loading…</EmptyState>}
+        {book.isSuccess && visibleOpen.length === 0 && (
+          <EmptyState>
+            {open.length === 0
+              ? 'No open entries. A Caller’s next Buy shows up here, priced every 15 s during market hours.'
+              : 'No open entries match that ticker.'}
+          </EmptyState>
+        )}
+        {visibleOpen.length > 0 && (
+          <div className={`grid gap-3 ${density === 'compact' ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
+            {visibleOpen.map((position) => (
+              <PositionCard
+                key={position.messageId}
+                position={position}
+                caller={callerById.get(position.authorId)}
+                decision={decisionByMessageId.get(position.messageId)}
+                density={density}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <SectionTitle>
+          {CLOSED_HEADING[period]} {closed.length}
+        </SectionTitle>
+        {book.isSuccess && closed.length === 0 && <EmptyState>Nothing closed in this period.</EmptyState>}
+        {closed.length > 0 && (
+          <ul className="flex flex-col gap-2">
+            {closed.map((position) => (
+              <ClosedRow
+                key={position.messageId}
+                position={position}
+                caller={callerById.get(position.authorId)}
+                decision={decisionByMessageId.get(position.messageId)}
+              />
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
+  )
+}
+
+const selectionKey = (selection: CallerSelection): string =>
+  typeof selection === 'string' ? selection : `caller:${selection.authorId}`
+
+const selectionFromKey = (key: string): CallerSelection =>
+  key === 'following' || key === 'all' ? key : { authorId: key.slice('caller:'.length) }
 
 // =============================================================================
 // Live trade lifecycle banner — driven by `stage` SSE frames (lib/stream.ts)
@@ -201,8 +409,8 @@ function Stat({ label, value }: { label: string; value: string }) {
   )
 }
 
-function SectionTitle({ children }: { children: React.ReactNode }) {
-  return <h2 className="mb-3 text-base font-semibold text-white">{children}</h2>
+function SectionTitle({ children, inline = false }: { children: React.ReactNode; inline?: boolean }) {
+  return <h2 className={`text-base font-semibold text-white ${inline ? '' : 'mb-3'}`}>{children}</h2>
 }
 
 function EmptyState({ children }: { children: React.ReactNode }) {
