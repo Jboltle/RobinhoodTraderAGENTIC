@@ -20,6 +20,8 @@
  * accumulated in the messages table during the gap.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { extname, join, resolve } from 'node:path';
 
 import { config } from './shared/config.js';
 import { createLogger } from './shared/logger.js';
@@ -39,17 +41,29 @@ const children = new Map<string, ChildProcess>();
 let shuttingDown = false;
 
 async function main(): Promise<void> {
-  // Same node binary and loader flags (tsx) as this process, so the trader
-  // runs exactly the way the supervisor was launched.
-  const trader = start('trader', process.execPath, [...process.execArgv, 'src/trader/index.ts']);
+  // Same node binary and loader flags as this process, so the trader runs
+  // exactly the way the supervisor was launched. Its entry sits next to this
+  // file: index.ts under tsx in dev, index.js from the tsc build in the image.
+  const traderEntry = join(import.meta.dirname, 'trader', `index${extname(import.meta.filename)}`);
+  const trader = start('trader', process.execPath, [...process.execArgv, traderEntry]);
 
   // The Listener only writes to the database, so strictly it could start
   // first — but a healthy trader gate keeps startup failures ordered and the
   // logs readable (a broken trader surfaces alone, not interleaved).
   await waitForTraderHealth(trader);
   // `uv run` syncs the environment from the lockfile before launching, so a
-  // fresh checkout needs only uv on PATH — no separate install step.
-  start('listener', 'uv', ['run', 'python', '-m', 'listener'], { cwd: 'listener' });
+  // fresh checkout needs only uv on PATH — no separate install step. The image
+  // already ran that sync (Dockerfile.server), and uv would only stay resident
+  // as the Python's parent (~70 MB) to forward signals, so production launches
+  // the venv's interpreter directly.
+  const venvPython = resolve('listener', '.venv', 'bin', 'python');
+  const useVenv = process.env.NODE_ENV === 'production' && existsSync(venvPython);
+  start(
+    'listener',
+    useVenv ? venvPython : 'uv',
+    useVenv ? ['-m', 'listener'] : ['run', 'python', '-m', 'listener'],
+    { cwd: 'listener' }
+  );
   startKeepAlive();
 
   log.info('stack running', {

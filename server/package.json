@@ -9,7 +9,8 @@
   },
   "scripts": {
     "dev": "tsx src/index.ts",
-    "start": "NODE_ENV=production tsx src/index.ts",
+    "build": "tsc -p .",
+    "start": "NODE_ENV=production node dist/index.js",
     "trader": "tsx src/trader/index.ts",
     "start:trader": "tsx src/trader/index.ts",
     "listener": "cd listener && uv run python -m listener",
@@ -36,12 +37,12 @@
     "fastify": "^5.8.5",
     "postgres": "^3.4.7",
     "regex": "^6.1.0",
-    "tsx": "^4.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "drizzle-kit": "^0.31.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.2",
     "vitest": "^4.1.9"
   }

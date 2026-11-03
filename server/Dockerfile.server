@@ -3,10 +3,19 @@
 # a single process tree, so one keep-alive ping on /health keeps both awake.
 # See src/index.ts for why they are not separate services.
 #
-# Runs the TypeScript source directly on Node through tsx (a production
-# dependency), the same command `npm run dev` uses. Node rather than Bun: Bun's
-# node:tls upgrade leaks every byte postgres.js reads over TLS -- see
-# docs/reports/2026-10-20-bun-tls-upgrade-leak.md.
+# Compiled with tsc and run as plain JavaScript. `npm run dev` runs the same
+# source through tsx instead, which costs ~35 MB of loader per Node process
+# plus a ~17 MB esbuild child each -- over 100 MB across the supervisor and
+# the trader, so the image pays the compile once at build time. Node rather
+# than Bun: Bun's node:tls upgrade leaks every byte postgres.js reads over
+# TLS -- see docs/reports/2026-10-20-bun-tls-upgrade-leak.md.
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
+COPY src ./src
+RUN npx tsc -p .
+
 FROM node:24-slim
 # Slim images omit CA certs; postgres.js TLS to a remote database then fails
 # on the first query and Drizzle reports only "Failed query".
@@ -34,11 +43,13 @@ USER node
 COPY --chown=node:node listener/pyproject.toml listener/uv.lock listener/
 RUN cd listener && uv sync --frozen --no-dev --no-install-project
 
-COPY --chown=node:node src ./src
+COPY --chown=node:node --from=build /app/dist ./dist
 COPY --chown=node:node listener ./listener
 # Install the listener package itself (deps are already in the cached layer).
 RUN cd listener && uv sync --frozen --no-dev
 
 # 3000 = /health + /api, 8788 = Robinhood OAuth browser callback
 EXPOSE 3000 8788
-CMD ["node", "--import", "tsx", "src/index.ts"]
+# No start command is set on the Railway service, so this is what runs. node
+# as PID 1 (not npm/sh/tsx wrappers) handles SIGTERM itself in src/index.ts.
+CMD ["node", "dist/index.js"]
