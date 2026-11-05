@@ -26,6 +26,7 @@ import type {
   PerformanceRow,
   SubmittedOrder,
 } from '../lib/api'
+import { callerPrice, priceGapPct } from '../lib/callerPrice'
 import { resolveTradeCaller, type TradeCallerFace } from '../lib/following'
 
 /** Decision kinds that belong in the trades table at all. */
@@ -88,6 +89,29 @@ interface TradeRowData {
   position: PerformanceRow | undefined
   caller: TradeCallerFace | null
   callout: CalloutItem | undefined
+  /** What the Caller said they paid or got; null when their card carried no price. */
+  callerPrice: number | null
+}
+
+/** "Theirs, and ours against it" for one row; the gap only once a fill exists. */
+function CallerPriceCell({ data }: { data: TradeRowData }) {
+  const theirs = data.callerPrice
+  if (theirs === null) return <span className="text-ink-500">—</span>
+  const { order } = data.decision
+  const gap = priceGapPct(order?.averageFillPrice, theirs)
+  // Paying less than the Caller on a buy, or getting more on a sell, is the good side.
+  const favorable = gap !== null && (order?.side === 'sell' ? gap >= 0 : gap <= 0)
+  return (
+    <span className="inline-flex items-baseline gap-1.5" title="the Caller's own price, and our fill against it">
+      <span>${theirs.toFixed(3).replace(/0$/, '')}</span>
+      {gap !== null && (
+        <span className={`text-xs ${favorable ? 'text-gain' : 'text-loss'}`}>
+          {gap >= 0 ? '+' : ''}
+          {gap.toFixed(1)}%
+        </span>
+      )}
+    </span>
+  )
 }
 
 const SHORT_TIME: Intl.DateTimeFormatOptions = {
@@ -192,6 +216,11 @@ const columns = helper.columns([
       )
     },
   }),
+  helper.accessor((r) => r.callerPrice, {
+    id: 'callerPrice',
+    header: 'Caller $',
+    cell: ({ row }) => <CallerPriceCell data={row.original} />,
+  }),
   helper.accessor((r) => r.position?.pctChange, {
     id: 'livePct',
     header: 'Live %',
@@ -263,16 +292,20 @@ export function TradesTable({
               Number(a.kind === 'pending_approval') ||
             b.at.localeCompare(a.at),
         )
-        .map((decision) => ({
-          decision,
-          position: matchPosition(decision, positions),
-          caller: resolveTradeCaller(
-            decision.messageId,
-            calloutByMessageId,
-            rosterByAuthorId,
-          ),
-          callout: calloutByMessageId.get(decision.messageId),
-        }))
+        .map((decision) => {
+          const callout = calloutByMessageId.get(decision.messageId)
+          return {
+            decision,
+            position: matchPosition(decision, positions),
+            caller: resolveTradeCaller(
+              decision.messageId,
+              calloutByMessageId,
+              rosterByAuthorId,
+            ),
+            callout,
+            callerPrice: callerPrice(callout, decision.order?.side ?? decision.action),
+          }
+        })
     )
   }, [trades, positions, callouts, callers, filter])
 
@@ -442,6 +475,7 @@ function CompactRow({
 function DetailRow({ data }: { data: TradeRowData }) {
   const { decision, position, callout } = data
   const { order } = decision
+  const gap = priceGapPct(order?.averageFillPrice, data.callerPrice)
   return (
     <tr className="border-t border-ink-600/60 bg-ink-900/40">
       <td colSpan={columnCount} className="px-4 py-4">
@@ -474,6 +508,15 @@ function DetailRow({ data }: { data: TradeRowData }) {
                     `${order.filledQuantity} of ${order.quantity}` +
                     (order.averageFillPrice != null ? ` @ $${order.averageFillPrice.toFixed(2)}` : '') +
                     (order.filledAt ? ` · ${new Date(order.filledAt).toLocaleString(undefined, SHORT_TIME)}` : '')
+                  }
+                />
+              )}
+              {data.callerPrice !== null && (
+                <Detail
+                  label="Caller's price"
+                  value={
+                    `$${data.callerPrice.toFixed(3)}` +
+                    (gap !== null ? ` · our fill ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}% vs theirs` : '')
                   }
                 />
               )}

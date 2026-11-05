@@ -147,6 +147,8 @@ export interface CalloutItem {
   content: string
   embeds: DiscordEmbed[]
   parseStatus: 'parsed' | 'not_callout' | 'failed' | 'skipped'
+  /** The shared verdict's trade fields; null unless parseStatus is 'parsed'. */
+  parse: { action: 'buy' | 'sell' | null; limitPrice: number | null } | null
   decision: Decision | null
 }
 
