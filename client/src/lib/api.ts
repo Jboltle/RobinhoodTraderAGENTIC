@@ -206,6 +206,10 @@ export interface TradeSettings {
   maxLossPct: number | null
   /** Flatten that position at this dollar loss (options × 100). null = off. */
   maxLossUsd: number | null
+  /** caller copies the caller's trims; ladder sells trimLevels and ignores those trims. */
+  exitMode: 'caller' | 'ladder'
+  /** Own-target rungs. Portion is a percent of the original lot. */
+  trimLevels: { gainPct: number; portionPct: number }[]
 }
 
 /** One row from GET /api/callers: a Caller known to the roster. */

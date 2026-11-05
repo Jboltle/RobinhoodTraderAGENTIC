@@ -55,8 +55,13 @@ const TRADING_SETTINGS = {
 function makeTools(overrides: Partial<RobinhoodTools> = {}): RobinhoodTools {
   return {
     getBuyingPower: vi.fn().mockResolvedValue({ amountUsd: 10_000 }),
-    getQuote: vi.fn().mockResolvedValue({ price: 150 }),
-    getOptionsMarkPrice: vi.fn().mockResolvedValue({ markPrice: 0.97 }),
+    // Near the strikes the fixtures trade, so the mismatch gate sees a sane spot.
+    getQuote: vi.fn().mockImplementation(async (symbol: string) => {
+      const spot: Record<string, number> = { QQQ: 710, SPY: 755, SBUX: 103, GOOGL: 370, AAPL: 150 }
+      return { price: spot[symbol] ?? 150 }
+    }),
+    getOptionsMarkPrice: vi.fn().mockResolvedValue(null),
+    confirmOption: vi.fn().mockResolvedValue(undefined),
     placeOrder: vi.fn().mockResolvedValue({ orderId: 'eq-001', status: 'queued' }),
     placeOptionsOrder: vi.fn().mockResolvedValue({ orderId: 'opt-001', status: 'queued' }),
     getPositions: vi.fn().mockResolvedValue({ positions: [], raw: {} }),
@@ -242,6 +247,92 @@ describe('fan-out — TRIM exit', () => {
       }
     );
     expect(decision.order?.quantity).toBe(1);
+  });
+
+  it('sells only the exiting caller\'s contracts when another caller holds the same one', async () => {
+    const { db, deps, tools } = setup(TRIM_QQQ_DOUBLE.expectedCallout, {
+      getOptionPositions: vi.fn().mockResolvedValue({
+        positions: [
+          { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 12, raw: {} },
+        ],
+        raw: {},
+      }),
+    });
+    const buy = (messageId: string, authorId: string, qty: number): void => {
+      db.seedMessage({ messageId, sentAt: '2026-06-11T13:00:00.000Z', authorId });
+      db.seedDecision(USER, {
+        at: '2026-06-11T13:00:00.000Z',
+        messageId,
+        kind: 'submitted',
+        code: null,
+        reason: 'filled',
+        ticker: 'QQQ',
+        action: 'buy',
+        order: {
+          symbol: 'QQQ',
+          side: 'buy',
+          assetType: 'option',
+          quantity: qty,
+          orderType: 'limit',
+          limitPrice: 1,
+          option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
+          orderId: messageId,
+          status: 'filled',
+          filledQuantity: qty,
+          averageFillPrice: 1,
+        },
+      });
+    };
+    buy('buy-caller', 'test-author', 2);
+    buy('buy-other', 'other-caller', 10);
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(TRIM_QQQ_DOUBLE));
+
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision?.order?.quantity).toBe(1);
+    expect(decision?.order?.lots).toEqual([{ lotId: 'buy-caller', quantity: 1 }]);
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+  });
+
+  it('does not trim another caller\'s contracts', async () => {
+    const { db, deps, tools } = setup(TRIM_QQQ_DOUBLE.expectedCallout, {
+      getOptionPositions: vi.fn().mockResolvedValue({
+        positions: [
+          { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 10, raw: {} },
+        ],
+        raw: {},
+      }),
+    });
+    db.seedMessage({ messageId: 'buy-other', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'other-caller' });
+    db.seedDecision(USER, {
+      at: '2026-06-11T13:00:00.000Z',
+      messageId: 'buy-other',
+      kind: 'submitted',
+      code: null,
+      reason: 'filled',
+      ticker: 'QQQ',
+      action: 'buy',
+      order: {
+        symbol: 'QQQ',
+        side: 'buy',
+        assetType: 'option',
+        quantity: 10,
+        orderType: 'limit',
+        limitPrice: 1,
+        option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
+        orderId: 'buy-other',
+        status: 'filled',
+        filledQuantity: 10,
+        averageFillPrice: 1,
+      },
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(TRIM_QQQ_DOUBLE));
+
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision?.kind).toBe('risk_rejected');
+    expect(decision?.reason).toMatch(/this caller/);
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 
   it('rejects option exits when the matching position is not open', async () => {
@@ -559,17 +650,20 @@ describe('fan-out — error paths', () => {
     expect(decision.reason).toMatch(/zero/i);
   });
 
-  it('rejects before placing when the broker has no quote for the ticker', async () => {
+  it('parks an option whose contract is not on the chain, even when the equity quote is missing', async () => {
     const mtsla: Callout = { ...BTO_QQQ_PUT.expectedCallout, ticker: 'MTSLA' };
     const { decision, tools } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       mtsla,
-      { getQuote: vi.fn().mockRejectedValue(new SymbolNotFoundError('no quote price')) }
+      {
+        getQuote: vi.fn().mockRejectedValue(new SymbolNotFoundError('no quote price')),
+        confirmOption: vi.fn().mockRejectedValue(new SymbolNotFoundError('no option instrument matched MTSLA')),
+      }
     );
 
-    expect(decision.kind).toBe('risk_rejected');
-    expect(decision.code).toBe('ticker_invalid');
-    expect(decision.reason).toMatch(/MTSLA/);
+    expect(decision.kind).toBe('pending_approval');
+    expect(decision.code).toBe('price_mismatch');
+    expect(decision.reason).toMatch(/no such contract/);
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
     expect(tools.getOptionsMarkPrice).not.toHaveBeenCalled();
     expect(tools.getBuyingPower).not.toHaveBeenCalled();
@@ -1014,9 +1108,51 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     await createMessageProcessor(deps).process(message('Out of QQQ'));
 
     const [decision] = await db.listDecisions(USER, 10);
-    expect(decision).toMatchObject({ kind: 'pending_approval', order: { option: { strike: 710 }, quantity: 3 } });
-    expect(decision!.reason).toMatch(/Bishop has 2 open QQQ entries; picked the newest, 710C 2026-06-11/);
+    expect(decision).toMatchObject({ kind: 'pending_approval', code: 'ambiguous_exit', order: null });
+    expect(decision!.reason).toMatch(/Bishop has 2 open QQQ entries/);
+    expect(decision!.reason).toMatch(/707C/);
+    expect(decision!.reason).toMatch(/710C/);
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+  });
+
+  it("resolves a ticker-less trim against that caller's one open lot", async () => {
+    const { db, deps, tools } = setupJev(verdict('TRIM', 0.95), holding(707, 2));
+    db.seedMessage({ messageId: 'buy-1', sentAt: '2026-06-10T13:00:00.000Z', authorId: CALLER });
+    db.seedDecision(USER, {
+      at: '2026-06-10T13:00:00.000Z',
+      messageId: 'buy-1',
+      kind: 'submitted',
+      code: null,
+      reason: 'filled',
+      ticker: 'QQQ',
+      action: 'buy',
+      order: {
+        symbol: 'QQQ',
+        side: 'buy',
+        assetType: 'option',
+        quantity: 2,
+        orderType: 'limit',
+        limitPrice: 1,
+        option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
+        orderId: 'buy-1',
+        status: 'filled',
+        filledQuantity: 2,
+        averageFillPrice: 1,
+      },
+    });
+
+    await createMessageProcessor(deps).process(message('.96 - 1st trim'));
+
+    const sell = (await db.listDecisions(USER, 10)).find((row) => row.action === 'sell');
+    expect(sell?.kind).toBe('submitted');
+    expect(sell?.order).toMatchObject({
+      symbol: 'QQQ',
+      side: 'sell',
+      quantity: 1,
+      option: { strike: 707 },
+      lots: [{ lotId: 'buy-1', quantity: 1 }],
+    });
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
   });
 
   it.each([

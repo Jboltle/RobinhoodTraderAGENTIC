@@ -11,9 +11,11 @@ import {
   fetchSettings,
   type BrokerStatus,
   type Caller,
+  type LadderLevel,
   type TradeSettings,
   type TradeSettingsInput,
 } from '../lib/api'
+import { TrimLadder } from '../components/book/TrimLadder'
 import { ConnectDialog } from '../components/ConnectDialog'
 import { discordDefaultAvatarUrl, toggleCaller } from '../lib/following'
 import { saveSettings } from '../lib/settingsSync'
@@ -244,12 +246,34 @@ function SettingsForm({
         <NumberField label="Per-ticker cooldown (seconds)" value={form.cooldownSeconds} onChange={(v) => set('cooldownSeconds', v)} placeholder={ph('cooldownSeconds')} min={0} step={1} />
       </FormSection>
 
+      <FormSection title="Exits">
+        <p className="-mt-2 text-xs leading-relaxed text-ink-400">
+          Copy the caller&apos;s trims, or sell your own targets. A caller&apos;s full close still
+          closes whatever you have left from that caller. One mode at a time.
+        </p>
+        <SelectField
+          label="Trim mode"
+          value={form.exitMode}
+          options={['caller', 'ladder'] as const}
+          labels={{ caller: "Copy the caller's trims", ladder: 'My own targets' }}
+          placeholder={ph('exitMode')}
+          onChange={(v) => set('exitMode', v)}
+        />
+        <TrimTargets
+          levels={form.trimLevels ?? defaults?.trimLevels ?? DEFAULT_TRIM_LEVELS}
+          onChange={(levels) => set('trimLevels', levels)}
+        />
+      </FormSection>
+
       <FormSection title="Max loss">
         <p className="-mt-2 text-xs leading-relaxed text-ink-400">
           Closes that one open position when either limit is hit — a losing
           NVDA call does not touch anything else. Stock loss is{' '}
           <em>(entry − mark) × shares</em>. Options loss is{' '}
-          <em>(entry − mark) × 100 × contracts</em>. Blank is off.
+          <em>(entry − mark) × 100 × contracts</em>. Blank is off. With a
+          percent set, the fill rests a stop at the broker for that drop. The
+          stop holds the contracts until it is cancelled, so another sell waits
+          on that cancel.
         </p>
         <NumberField
           label="Max loss (%)"
@@ -595,12 +619,14 @@ function SelectField<T extends string>({
   label,
   value,
   options,
+  labels,
   placeholder,
   onChange,
 }: {
   label: string
   value: T | undefined
   options: readonly T[]
+  labels?: Partial<Record<T, string>>
   placeholder: string
   onChange: (value: T | undefined) => void
 }) {
@@ -614,7 +640,7 @@ function SelectField<T extends string>({
         <option value="">{placeholder}</option>
         {options.map((o) => (
           <option key={o} value={o}>
-            {o}
+            {labels?.[o] ?? o}
           </option>
         ))}
       </select>
@@ -687,5 +713,61 @@ function TickerListField({
         }}
       />
     </Field>
+  )
+}
+
+const DEFAULT_TRIM_LEVELS = [
+  { gainPct: 25, portionPct: 25 },
+  { gainPct: 50, portionPct: 25 },
+  { gainPct: 75, portionPct: 25 },
+  { gainPct: 100, portionPct: 25 },
+]
+
+function TrimTargets({
+  levels,
+  onChange,
+}: {
+  levels: { gainPct: number; portionPct: number }[]
+  onChange: (levels: { gainPct: number; portionPct: number }[]) => void
+}) {
+  const ladder: LadderLevel[] = levels.map((level) => ({
+    pct: level.gainPct,
+    qty: level.portionPct,
+    price: 0,
+    label: `+${level.gainPct}%`,
+    isRunner: false,
+    filledAt: null,
+    fillBasis: null,
+  }))
+  const edit = (index: number, key: 'gainPct' | 'portionPct', value: number | undefined) => {
+    const next = levels.map((level, i) => (i === index ? { ...level, [key]: value ?? level[key] } : level))
+    onChange(next)
+  }
+  return (
+    <div className="flex flex-col gap-3">
+      <TrimLadder ladder={ladder} pctNow={null} />
+      {levels.map((level, index) => (
+        <div key={index} className="grid grid-cols-2 gap-3">
+          <NumberField
+            label={`Target ${index + 1} gain (%)`}
+            value={level.gainPct}
+            onChange={(v) => edit(index, 'gainPct', v)}
+            placeholder=""
+            min={1}
+            max={1000}
+            step={5}
+          />
+          <NumberField
+            label="Portion of the lot (%)"
+            value={level.portionPct}
+            onChange={(v) => edit(index, 'portionPct', v)}
+            placeholder=""
+            min={1}
+            max={100}
+            step={5}
+          />
+        </div>
+      ))}
+    </div>
   )
 }
