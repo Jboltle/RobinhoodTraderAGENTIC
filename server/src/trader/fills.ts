@@ -31,9 +31,10 @@ export const FILL_POLL_ACTIVE_MS = 5_000;
 /** Tick while nothing is open: one cheap indexed query. */
 export const FILL_POLL_IDLE_MS = 30_000;
 /**
- * How far back the sweep looks. A day order dies at the close, so anything
- * older than this that still reads non-terminal was never going to resolve
- * on its own; backfillFills.ts covers history with a wider window.
+ * How far back the sweep looks by default. A day order dies at the close, so
+ * anything older than this that still reads non-terminal was never going to
+ * resolve on its own; FILL_LOOKBACK_DAYS (config) widens it for one boot to
+ * backfill history, and backfillFills.ts does the same from the CLI.
  */
 export const FILL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
@@ -41,6 +42,8 @@ export interface FillMonitorDeps {
   readonly db: TraderDb;
   readonly brokers: McpRegistry;
   readonly events: TraderEvents;
+  /** Overrides FILL_LOOKBACK_MS for every sweep this monitor runs. */
+  readonly lookbackMs?: number;
   readonly now?: () => Date;
 }
 
@@ -78,7 +81,9 @@ export function startFillMonitor(deps: FillMonitorDeps): () => void {
  */
 export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<SweepResult> {
   const now = deps.now?.() ?? new Date();
-  const rows = await deps.db.listOpenOrders(since ?? new Date(now.getTime() - FILL_LOOKBACK_MS));
+  const rows = await deps.db.listOpenOrders(
+    since ?? new Date(now.getTime() - (deps.lookbackMs ?? FILL_LOOKBACK_MS))
+  );
   if (rows.length === 0) return { open: 0, updated: 0 };
 
   // Only users with a connection of record, as Max Loss does: reaching for a

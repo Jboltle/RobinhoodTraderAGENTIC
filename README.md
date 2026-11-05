@@ -289,7 +289,7 @@ Production configuration lives only in Railway variables; no `.env` file ships i
 
 | Service | Variables |
 | --- | --- |
-| trader + Listener | `SUPABASE_DB_URL`, `RH_TOKENS_VAULT_KEY`, `DISCORD_USER_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_ALLOWED_AUTHOR_IDS`, `DISCORD_RECAP_CHANNEL_IDS`, `JEV_API_KEY`, `LLM_MODEL`, `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`), `TRADE_EXECUTION_MODE`, `NODE_ENV=production`; optional `LOG_LEVEL`, `JEV_MODEL`, `DECISION_ENGINE`, `KEEP_ALIVE_URL` |
+| trader + Listener | `SUPABASE_DB_URL`, `RH_TOKENS_VAULT_KEY`, `DISCORD_USER_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_ALLOWED_AUTHOR_IDS`, `DISCORD_RECAP_CHANNEL_IDS`, `JEV_API_KEY`, `LLM_MODEL`, `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`), `TRADE_EXECUTION_MODE`, `NODE_ENV=production`; optional `LOG_LEVEL`, `JEV_MODEL`, `DECISION_ENGINE`, `KEEP_ALIVE_URL`, `FILL_LOOKBACK_DAYS` |
 | dashboard | `API_URL` only. It is read at runtime by `client/server.ts`; nothing is baked into the bundle, and no secret belongs on this service. |
 
 ### Staging

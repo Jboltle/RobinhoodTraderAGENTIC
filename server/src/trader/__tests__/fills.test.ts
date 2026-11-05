@@ -103,6 +103,17 @@ describe('sweepFills', () => {
     expect(tools.getOptionOrders).toHaveBeenCalledOnce();
   });
 
+  it('lookbackMs widens the window: a 50-day-old open row is swept only with it set', async () => {
+    const { db, deps } = setup({ orders: [liveOrder()] });
+    db.seedDecision(USER, submitted(placed(), '2026-09-01T15:18:06.000Z'));
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+    expect(await sweepFills({ ...deps, lookbackMs: 90 * 24 * 60 * 60 * 1000 })).toEqual({
+      open: 1,
+      updated: 1,
+    });
+  });
+
   it('normalizes a 159-scale fill price against the order limit', async () => {
     const { db, deps } = setup({ orders: [liveOrder({ averagePrice: 86 })] });
     db.seedDecision(USER, submitted(placed({ limitPrice: 0.865 })));

@@ -134,6 +134,14 @@ export const config = {
   robinhoodOAuthCallbackPort: oauthCallbackPort,
   robinhoodOAuthCallbackHost: env.ROBINHOOD_OAUTH_CALLBACK_HOST ?? '0.0.0.0',
 
+  // ---- Fill read-back ----------------------------------------------------------
+  /**
+   * How far back the fill monitor (trader/fills.ts) re-checks placed orders
+   * against the broker. One day covers live operation, since a day order dies
+   * at the close; set it higher for one boot to backfill older rows' fills.
+   */
+  fillLookbackMs: num(env.FILL_LOOKBACK_DAYS, 1) * 24 * 60 * 60 * 1000,
+
   // ---- HTTP ------------------------------------------------------------------
   // 127.0.0.1 by default; every /api route verifies a session token, but a
   // loopback bind keeps a misconfigured box off the local network anyway.
