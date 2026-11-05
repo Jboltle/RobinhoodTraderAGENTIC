@@ -22,6 +22,7 @@ import {
   type TradeExecutionMode,
 } from '../shared/types.js';
 import { registerAuth, requireUser } from './auth.js';
+import { cancelStops } from './stops.js';
 import {
   BOOK_PERIODS,
   isoDateEt,
@@ -281,6 +282,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const approvedAt = new Date().toISOString();
     let outcome: ApprovalOutcome;
     try {
+      if (pending.order.assetType === 'option' && pending.order.side === 'sell') {
+        await cancelStops(deps.db, userId, tools, pending.order.symbol, pending.order.option);
+      }
       const placed = await submitOrder(pending.order, tools, deps.executionMode);
       const order = {
         ...pending.order,

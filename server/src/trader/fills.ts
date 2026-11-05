@@ -16,8 +16,9 @@
  * and this sweep needs no other change.
  */
 import { createLogger, errorFields } from '../shared/logger.js';
-import { isTerminalOrderState, type Decision, type SubmittedOrder } from '../shared/types.js';
+import { isTerminalOrderState, type Decision, type SubmittedOrder, type TradeExecutionMode } from '../shared/types.js';
 import type { OpenOrderRow, TraderDb } from './db.js';
+import { restMissingStops } from './stops.js';
 import type { TraderEvents } from './events.js';
 import { normalizeOptionPremium } from './maxLoss.js';
 import { BrokerUnavailableError } from './rh/mcpClient.js';
@@ -45,6 +46,8 @@ export interface FillMonitorDeps {
   /** Overrides FILL_LOOKBACK_MS for every sweep this monitor runs. */
   readonly lookbackMs?: number;
   readonly now?: () => Date;
+  /** Immediate deployments rest a broker stop on a filled option buy when Max Loss is on. */
+  readonly executionMode?: TradeExecutionMode;
 }
 
 export interface SweepResult {
@@ -107,6 +110,26 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
       updated += await syncUser(userId, userRows, deps, now);
     } catch (err: unknown) {
       log.warn('fill sync failed for user', { userId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  if (deps.executionMode === 'immediate') {
+    for (const userId of await deps.db.listBrokerUserIds()) {
+      try {
+        const broker = deps.brokers.for(userId);
+        await broker.mcp.ensureReady();
+        await restMissingStops({
+          userId,
+          db: deps.db,
+          tools: broker.tools,
+          executionMode: deps.executionMode,
+        });
+      } catch (err: unknown) {
+        if (err instanceof BrokerUnavailableError) continue;
+        log.warn('stop rest failed for user', {
+          userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
   return { open: rows.length, updated };

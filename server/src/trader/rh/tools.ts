@@ -39,6 +39,7 @@ export const TOOL_NAMES = {
   optionInstruments: 'get_option_instruments',
   placeOrder: 'place_equity_order',
   placeOptionsOrder: 'place_option_order',
+  cancelOptionOrder: 'cancel_option_order',
 } as const;
 
 /**
@@ -213,6 +214,9 @@ export class RobinhoodTools {
     if (args.orderType === 'limit' && typeof args.limitPremium !== 'number') {
       throw new Error('limitPremium (per-contract price) required for limit options orders');
     }
+    if (args.orderType === 'stop_market' && typeof args.stopPrice !== 'number') {
+      throw new Error('stopPrice required for stop_market options orders');
+    }
     const instrument = await this.resolveOptionInstrument(
       args.symbol,
       args.optionType,
@@ -254,14 +258,40 @@ export class RobinhoodTools {
         ],
         type: args.orderType,
         quantity: String(args.contracts),
-        time_in_force: toRhTimeInForce(args.timeInForce),
+        // A market order must be gfd. A stop rests until it triggers, so it is gtc.
+        time_in_force: args.orderType === 'stop_market' ? 'gtc' : toRhTimeInForce(args.timeInForce),
         ref_id: randomUUID(),
-        // price is required for limit and must be OMITTED for market orders.
+        // price is required for limit and must be OMITTED for market and stop orders.
         ...(args.orderType === 'limit' && limitPremium !== undefined
           ? { price: String(limitPremium) }
           : {}),
+        ...(args.orderType === 'stop_market' && args.stopPrice !== undefined
+          ? { stop_price: String(roundPremiumToTick(args.stopPrice, 'sell', instrument.minTicks)) }
+          : {}),
       },
       parsePlaceOrder
+    );
+  }
+
+  /** True when the chain lists this contract. An empty match is definitive. */
+  async confirmOption(
+    symbol: string,
+    optionType: OptionType,
+    strike: number,
+    expiration: string
+  ): Promise<void> {
+    await this.resolveOptionInstrument(symbol, optionType, strike, expiration);
+  }
+
+  async cancelOptionOrder(orderId: string): Promise<void> {
+    await this.requireTokenForTrade();
+    await this.callTool(
+      TOOL_NAMES.cancelOptionOrder,
+      {
+        account_number: await this.getDefaultAccountNumber(),
+        order_id: orderId,
+      },
+      () => undefined
     );
   }
 
@@ -663,7 +693,9 @@ function parseOptionInstrumentRef(result: CallToolResult, contract: string): Opt
       return { optionId: id, minTicks: parseMinTicks(rec?.min_ticks) };
     }
   }
-  throw new Error(
+  // Empty is the chain's answer, not a transport failure: retrying it is what
+  // hammered get_option_instruments for a contract that was never listed.
+  throw new SymbolNotFoundError(
     `no option instrument matched ${contract}: ${extractText(result).slice(0, 200)}`
   );
 }

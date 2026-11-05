@@ -16,7 +16,15 @@ import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { BrokerUnavailableError } from '../rh/mcpClient.js';
 import type { McpRegistry } from '../rh/mcpRegistry.js';
-import { SymbolNotFoundError } from '../rh/tools.js';
+import { SymbolNotFoundError, type RobinhoodTools } from '../rh/tools.js';
+import {
+  allocateFifo,
+  entryMismatch,
+  isFullClose,
+  sameOption,
+  type OpenOptionLot,
+} from '../lots.js';
+import { cancelStops } from '../stops.js';
 import {
   CapitalConstraintError,
   ParseInconsistencyError,
@@ -195,9 +203,12 @@ async function resolveCallout(
     callout = await resolveCallerContract(callout, envelope, deps);
   }
 
-  // Options only on the Jev path: a trade still without a contract is skipped
-  // here, quietly, before anyone's trade row is written.
-  if (callout.engine === 'jev' && callout.option === null) {
+  // A buy still without a contract is not a trade. A sell that names a ticker
+  // and matches nothing is the same. A ticker-less sell, and a sell whose
+  // caller has several live entries, go to each user: their lots decide.
+  const unnamedSell = callout.action === 'sell' && callout.ticker === null;
+  const ambiguous = Boolean(callout.reviewReason) && callout.option === null;
+  if (callout.engine === 'jev' && callout.option === null && !unnamedSell && !ambiguous) {
     log.info('jev trade has no options contract; skipped', {
       messageId: envelope.messageId,
       ticker: callout.ticker,
@@ -207,10 +218,19 @@ async function resolveCallout(
     return { status: 'not_callout', callout: null, parseError: null };
   }
 
+  const mismatch =
+    callout.action === 'buy' && callout.option && callout.ticker
+      ? await entryMismatchReason(callout, envelope.messageId, deps)
+      : null;
+  if (mismatch) {
+    callout = { ...callout, reviewReason: [callout.reviewReason, mismatch].filter(Boolean).join('; ') };
+  }
+
   await setDisposition(deps, envelope.messageId, 'callout', callout);
   // The shared book records the Caller's entry or exit once per message,
   // before the per-user fan-out: tracking never depends on anyone trading.
-  await trackCallout(deps, envelope, callout);
+  // A buy whose contract failed the mismatch check is not tracked.
+  if (!mismatch) await trackCallout(deps, envelope, callout);
   return { status: 'callout', callout, parseError: null };
 }
 
@@ -258,10 +278,10 @@ async function resolveCallerContract(
     return callout;
   }
 
-  const resolved = withContract(callout, ticker, newest, `${envelope.authorName}'s entry`);
-  if (live.length === 1) return resolved;
-  const several = `${envelope.authorName} has ${live.length} open ${ticker} entries; picked the newest, ${optionLabel(newest)}`;
-  return { ...resolved, reviewReason: [callout.reviewReason, several].filter(Boolean).join('; ') };
+  if (live.length === 1) return withContract(callout, ticker, newest, `${envelope.authorName}'s entry`);
+  const listed = live.map((option) => optionLabel(option)).join(', ');
+  const several = `${envelope.authorName} has ${live.length} open ${ticker} entries (${listed}); none chosen`;
+  return { ...callout, reviewReason: [callout.reviewReason, several].filter(Boolean).join('; ') };
 }
 
 /** The Caller's own card this message replies to, when it names a contract. */
@@ -348,7 +368,7 @@ export async function runForUser(
 ): Promise<Decision | null> {
   const at = new Date().toISOString();
   const base = { at, messageId: envelope.messageId, order: null };
-  const { callout } = parsed;
+  let callout = parsed.callout;
 
   // ponytail: a settings DB failure here also drops missed/parser_error records
   // (they write to the same DB, so a fallback rarely helps); upgrade path is to
@@ -386,6 +406,47 @@ export async function runForUser(
       ticker: null,
       action: null,
     });
+  }
+
+  // A sell that names no contract. Several of this caller's lots: park, and
+  // pick none. Exactly one: that lot is the trade. None: there is nothing of
+  // theirs to sell.
+  if (callout.action === 'sell' && callout.option === null && callout.reviewReason) {
+    return finalize(userId, deps, {
+      ...base,
+      kind: 'pending_approval',
+      code: 'ambiguous_exit',
+      reason: callout.reviewReason,
+      ticker: callout.ticker,
+      action: 'sell',
+    });
+  }
+  if (callout.action === 'sell' && callout.option === null && callout.ticker === null) {
+    const lots = (await deps.db.listOpenOptionLots(userId)).filter((lot) => lot.authorId === envelope.authorId);
+    const contracts = distinctContracts(lots);
+    const only = contracts[0];
+    if (contracts.length === 1 && only) {
+      callout = withContract(callout, only.symbol, only.option, `${envelope.authorName}'s open lot`);
+    } else if (contracts.length > 1) {
+      const listed = contracts.map((lot) => `${lot.symbol} ${optionLabel(lot.option)}`).join(', ');
+      return finalize(userId, deps, {
+        ...base,
+        kind: 'pending_approval',
+        code: 'ambiguous_exit',
+        reason: `${envelope.authorName} has ${contracts.length} open lots (${listed}); none chosen`,
+        ticker: null,
+        action: 'sell',
+      });
+    } else {
+      return finalize(userId, deps, {
+        ...base,
+        kind: 'risk_rejected',
+        code: 'missing_contract',
+        reason: `no open lot from ${envelope.authorName}`,
+        ticker: null,
+        action: 'sell',
+      });
+    }
   }
 
   const identity = { ticker: callout.ticker, action: callout.action };
@@ -426,12 +487,21 @@ export async function runForUser(
   const side = callout.action!;
   const tools = deps.brokers.for(userId).tools;
 
-  // Confirm Robinhood can quote the underlying before sizing or looking up
-  // option instruments. Garbage tickers (e.g. ANSI-glued MTSLA) fail here
-  // instead of after three empty get_option_instruments retries.
+  if (callout.reviewReason?.includes('no such contract')) {
+    return finalize(userId, deps, {
+      ...base,
+      ...identity,
+      kind: 'pending_approval',
+      code: 'price_mismatch',
+      reason: callout.reviewReason,
+    });
+  }
+
+  // Equities still need a quote. An option is checked against the chain, so a
+  // missing equity quote (SPX, XSP) is not a reason to drop it.
   try {
     const quote = await tools.getQuote(symbol);
-    if (!(quote.price > 0)) {
+    if (!(quote.price > 0) && callout.assetType !== 'option') {
       return finalize(userId, deps, {
         ...base,
         ...identity,
@@ -441,23 +511,34 @@ export async function runForUser(
       });
     }
   } catch (err) {
-    // Only a broker that answered can call the ticker invalid. A session that
-    // is down or a transport failure says nothing about the symbol.
     if (err instanceof SymbolNotFoundError) {
+      if (callout.assetType !== 'option') {
+        return finalize(userId, deps, {
+          ...base,
+          ...identity,
+          kind: 'risk_rejected',
+          code: 'ticker_invalid',
+          reason: `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`,
+        });
+      }
+    } else {
       return finalize(userId, deps, {
         ...base,
         ...identity,
-        kind: 'risk_rejected',
-        code: 'ticker_invalid',
-        reason: `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`,
+        kind: 'execution_failed',
+        code: brokerErrorCode(err),
+        reason: `quote fetch for ${symbol} failed: ${errMsg(err)}`,
       });
     }
+  }
+
+  if (side === 'sell' && callout.assetType === 'option' && settings.exitMode === 'ladder' && !isFullClose(callout.exitPortion, callout.tickerOnlyExit)) {
     return finalize(userId, deps, {
       ...base,
       ...identity,
-      kind: 'execution_failed',
-      code: brokerErrorCode(err),
-      reason: `quote fetch for ${symbol} failed: ${errMsg(err)}`,
+      kind: 'risk_rejected',
+      code: 'own_targets',
+      reason: 'this account uses its own trim targets; the caller trim is not copied',
     });
   }
 
@@ -502,21 +583,41 @@ export async function runForUser(
   // trade that cannot say how many shares it is worth is not something anyone
   // can meaningfully approve.
   try {
+    const sellLots =
+      risk.assetType === 'option' && side === 'sell' && callout.option
+        ? await lotsForExit(deps, userId, envelope.authorId, symbol, callout.option)
+        : null;
+    if (sellLots?.kind === 'blocked') {
+      throw new CapitalConstraintError(
+        `no open ${symbol} ${optionLabel(callout.option!)} lot from this caller`
+      );
+    }
     const quantity =
       risk.assetType === 'option'
-        ? await sizeOptionsOrder(symbol, side, risk, callout, buyingPower, tools)
+        ? await sizeOptionsOrder(
+            symbol,
+            side,
+            risk,
+            callout,
+            buyingPower,
+            tools,
+            sellLots?.kind === 'sized' ? sellLots.held : undefined
+          )
         : await sizeEquityOrder(symbol, side, risk, callout, buyingPower, tools);
+    const links = sellLots?.kind === 'sized' ? allocateFifo(sellLots.lots, quantity) : undefined;
 
+    const pricedLimit = side === 'sell' && callout.limitPrice !== null;
     const sized: SubmittedOrder = {
       symbol,
       side,
       assetType: risk.assetType,
       quantity,
-      orderType: risk.orderType,
-      limitPrice: risk.limitPrice,
+      orderType: pricedLimit ? 'limit' : risk.orderType,
+      limitPrice: pricedLimit ? callout.limitPrice : risk.limitPrice,
       option: risk.assetType === 'option' ? callout.option : null,
       orderId: null,
       status: null,
+      ...(links && links.length > 0 ? { lots: links } : {}),
     };
 
     // Approval is the last gate: everything above has already passed, and the
@@ -540,6 +641,9 @@ export async function runForUser(
       });
     }
 
+    if (sized.assetType === 'option' && sized.side === 'sell') {
+      await cancelStops(deps.db, userId, tools, symbol, sized.option);
+    }
     const placed = await submitOrder(sized, tools, deps.executionMode);
     const order: SubmittedOrder = {
       ...sized,
@@ -576,6 +680,99 @@ export async function runForUser(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+// ponytail: one verdict per message, kept for the process. Upgrade path: a TTL.
+const entryVerdicts = new Map<string, string | null>();
+
+function distinctContracts(lots: readonly OpenOptionLot[]): OpenOptionLot[] {
+  const seen = new Set<string>();
+  const out: OpenOptionLot[] = [];
+  for (const lot of lots) {
+    const key = `${lot.symbol}|${lot.option.optionType}|${lot.option.strike}|${lot.option.expiration}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(lot);
+  }
+  return out;
+}
+
+async function lotsForExit(
+  deps: PipelineDeps,
+  userId: string,
+  authorId: string,
+  symbol: string,
+  option: NonNullable<Callout['option']>
+): Promise<{ kind: 'fallback' } | { kind: 'blocked' } | { kind: 'sized'; held: number; lots: OpenOptionLot[] }> {
+  const open = await deps.db.listOpenOptionLots(userId);
+  const same = open.filter((lot) => sameOption(lot, symbol, option));
+  if (same.length === 0) return { kind: 'fallback' };
+  const mine = same.filter((lot) => lot.authorId === authorId);
+  if (mine.length === 0) return { kind: 'blocked' };
+  return { kind: 'sized', held: mine.reduce((sum, lot) => sum + lot.openQty, 0), lots: mine };
+}
+
+/** Contract exists, then strike vs spot, then premium vs mark. Null when no session can look. */
+async function entryMismatchReason(
+  callout: Callout,
+  messageId: string,
+  deps: PipelineDeps
+): Promise<string | null> {
+  const option = callout.option;
+  const ticker = callout.ticker;
+  if (!option || !ticker) return null;
+  const cacheKey = `${messageId}|${ticker}|${option.optionType}|${option.strike}|${option.expiration}`;
+  const cached = entryVerdicts.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  let tools: RobinhoodTools | null = null;
+  for (const userId of await deps.db.listBrokerUserIds()) {
+    const candidate = deps.brokers.for(userId).tools;
+    if (typeof candidate.confirmOption === 'function') {
+      tools = candidate;
+      break;
+    }
+  }
+  if (!tools) return null;
+
+  let reason: string | null = null;
+  try {
+    let spot: number | null = null;
+    try {
+      const quote = await tools.getQuote(ticker);
+      if (quote.price > 0) spot = quote.price;
+    } catch (err) {
+      if (!(err instanceof SymbolNotFoundError)) throw err;
+    }
+    try {
+      await tools.confirmOption(ticker, option.optionType, option.strike, option.expiration);
+    } catch (err) {
+      if (err instanceof SymbolNotFoundError) {
+        reason = `no such contract: ${ticker} ${optionLabel(option)}`;
+      } else {
+        throw err;
+      }
+    }
+    if (!reason) {
+      const mark = await tools
+        .getOptionsMarkPrice(ticker, option.optionType, option.strike, option.expiration)
+        .then((quote) => quote?.markPrice ?? null)
+        .catch(() => null);
+      reason = entryMismatch({
+        ticker,
+        strike: option.strike,
+        spot,
+        callerPremium: callout.limitPrice,
+        mark,
+      });
+    }
+  } catch (err: unknown) {
+    if (err instanceof BrokerUnavailableError) return null;
+    log.warn('entry check skipped', { messageId, error: errMsg(err) });
+    return null;
+  }
+  entryVerdicts.set(cacheKey, reason);
+  return reason;
+}
 
 async function loadSettings(userId: string, deps: PipelineDeps): Promise<ResolvedTradeSettings> {
   return deps.db.getSettings(userId);

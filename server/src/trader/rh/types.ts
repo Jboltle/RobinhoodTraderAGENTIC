@@ -129,8 +129,10 @@ export interface PlaceOptionsOrderArgs extends OptionContract {
   readonly symbol: string;
   readonly contracts: number;       // each controls 100 shares
   readonly side: OrderSide;
-  readonly orderType: OrderType;
+  readonly orderType: OrderType | 'stop_market';
   readonly limitPremium?: number;
+  /** Trigger for a stop_market sell. Required when orderType is stop_market. */
+  readonly stopPrice?: number;
   readonly timeInForce?: TimeInForce;
 }
 

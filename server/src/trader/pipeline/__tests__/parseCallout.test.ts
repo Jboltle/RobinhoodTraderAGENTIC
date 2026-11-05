@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { LlmCalloutParser } from '../parseCallout.js';
+import { LlmCalloutParser, readPatterns } from '../parseCallout.js';
 import type { Callout, DiscordEnvelope, LlmProvider } from '../../../shared/types.js';
 
 // ---------------------------------------------------------------------------
@@ -487,6 +487,14 @@ describe('parseCallout — Lotto / risky trades (positionSize)', () => {
 
     // "risky" alone is a sizing warning, not the lotto label.
     expect((await parserWithMock(llmBuy).parse(makeEnvelope('BTO SPY 700C 0DTE 0.10\nRISKY SIZE APPROPRIATE'))).isLotto).toBe(false);
+
+    expect((await parserWithMock(llmBuy).parse(makeEnvelope('Not a lotto — BTO SPY 700C 0DTE at .10'))).isLotto).toBe(false);
+  });
+
+  it('reads a date written between the ticker and the strike', () => {
+    const read = readPatterns(makeEnvelope('QQQ 10/16 $728C - 2.8', '2026-10-01T14:00:00.000Z'));
+    expect(read.option).toMatchObject({ strike: 728, optionType: 'call', expiration: '2026-10-16' });
+    expect(read.ticker).toBe('QQQ');
   });
 
   it('RISKY SIZE APPROPRIATE tag on QQQ put → positionSize small', async () => {

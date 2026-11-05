@@ -24,7 +24,7 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 
-import type { Callout, Decision, ExecutionMode, OptionType } from '../../shared/types.js';
+import type { Callout, Decision, ExecutionMode, OptionType, ResolvedTradeSettings } from '../../shared/types.js';
 import type { ClosedBy, LadderLevel, TrackedFill, TrackedResult } from '../book/ladder.js';
 import type { MessageDisposition } from '../db.js';
 import type { RecapParse, RecapParseStatus } from '../recaps/parser.js';
@@ -62,6 +62,13 @@ export const users = pgTable('users', {
   followedCallerIds: text('followed_caller_ids').array().default([]),
   maxLossPct: numericAsNumber('max_loss_pct'),
   maxLossUsd: numericAsNumber('max_loss_usd'),
+  exitMode: text('exit_mode').$type<ResolvedTradeSettings['exitMode']>().notNull().default('caller'),
+  trimLevels: jsonb('trim_levels').$type<ResolvedTradeSettings['trimLevels']>().notNull().default([
+    { gainPct: 25, portionPct: 25 },
+    { gainPct: 50, portionPct: 25 },
+    { gainPct: 75, portionPct: 25 },
+    { gainPct: 100, portionPct: 25 },
+  ]),
   updatedAt: isoTimestamp('updated_at').notNull().defaultNow(),
 });
 

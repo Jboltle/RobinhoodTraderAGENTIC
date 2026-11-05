@@ -142,12 +142,14 @@ export async function sizeOptionsOrder(
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  tools: RobinhoodTools
+  tools: RobinhoodTools,
+  /** When set, the exit is sized from these contracts and then capped by the broker position. */
+  heldContracts?: number
 ): Promise<number> {
   const option = callout.option!;
 
   if (side === 'sell') {
-    return sizeOptionExit(symbol, risk, callout, tools);
+    return sizeOptionExit(symbol, risk, callout, tools, heldContracts);
   }
 
   // Adds ("averaging down") extend a position; with none held there is
@@ -253,11 +255,14 @@ async function sizeOptionExit(
   symbol: string,
   risk: RiskAllow,
   callout: Callout,
-  tools: RobinhoodTools
+  tools: RobinhoodTools,
+  callerHeld?: number
 ): Promise<number> {
   const option = callout.option!;
   const position = await findOpenOptionPosition(tools, symbol, option);
-  const heldContracts = Math.floor(position?.quantity ?? 0);
+  const brokerHeld = Math.floor(position?.quantity ?? 0);
+  // The caller's own lots, never more than the account actually holds.
+  const heldContracts = callerHeld === undefined ? brokerHeld : Math.min(callerHeld, brokerHeld);
 
   if (heldContracts < 1) {
     throw new CapitalConstraintError(

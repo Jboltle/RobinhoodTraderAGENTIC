@@ -178,8 +178,13 @@ const TRIM_EXIT_CONTRACT_LINE = regex`
 // Loose contract shape used for LLM candidates and pre-filter guards. Accepts
 // word forms ("180 puts") and makes expiration/premium optional. Built via a
 // helper because one source pattern is compiled with and without /g.
+// A date may sit between the ticker and the strike: "QQQ 10/16 $728C".
+// Unnamed, so it doesn't collide with the expiration group after the strike.
+const DATE_BEFORE_STRIKE = pattern`
+  (?: 0DTE | TODAY | \d{4}-\d{2}-\d{2} | \d{1,2} / \d{1,2} (?: / \d{2,4} )? )
+`;
 const contractPattern = (flags: string): RegExp => regex(flags)`
-  ${TICKER} \s+ ${STRIKE} \s* (?<cpWord> [CP] \b | calls? \b | puts? \b )
+  ${TICKER} (?: \s+ ${DATE_BEFORE_STRIKE} )? \s+ ${STRIKE} \s* (?<cpWord> [CP] \b | calls? \b | puts? \b )
   (?: \s+ ${EXPIRATION} )? (?: \s+ ${PREMIUM} )?
 `;
 const CONTRACT_SCAN = contractPattern('gi');
@@ -454,9 +459,13 @@ const LOTTO_KEYWORD = /\b(?:lotto|risky)\b/i;
 // The Caller's own label for a lotto, read from their words with reply quotes
 // and channel noise stripped. Narrower than LOTTO_KEYWORD on purpose: "risky"
 // is a sizing warning on many ordinary alerts, "lotto" is the trade itself.
-// ponytail: a bare word match, so "not a lotto" reads as one. Upgrade path: a
-// negation guard like HEDGED_EXIT.
 const LOTTO_WORD = /\blottos?\b/i;
+// "not a lotto" / "no lotto" is the caller saying it isn't one.
+const LOTTO_NEGATION = /(?:\b(?:not|no|never|isn't|ain't)\b|n't\b)[^.!?\n]{0,24}\blottos?\b/i;
+
+function textIsLotto(text: string): boolean {
+  return LOTTO_WORD.test(text) && !LOTTO_NEGATION.test(text);
+}
 
 function parseLottoOption(content: string, timestamp: string): Callout | null {
   if (!LOTTO_KEYWORD.test(content)) return null;
@@ -1534,7 +1543,7 @@ export function readPatterns(envelope: DiscordEnvelope): PatternRead {
   const exitPortion: ExitPortion | null = template?.callout.tickerOnlyExit
     ? { kind: 'all' }
     : readExitPortion(ownWords);
-  return { ...fields, ticker, exitPortion, isLotto: LOTTO_WORD.test(languageContent), flags: [...flags].sort() };
+  return { ...fields, ticker, exitPortion, isLotto: textIsLotto(languageContent), flags: [...flags].sort() };
 }
 
 /** The hint Jev reads as `pattern_match`; null when no template or filter fired. */
@@ -1589,7 +1598,7 @@ export class LlmCalloutParser implements CalloutParser {
       content: envelope.content.replace(/\u001b\[[0-9;]*m/g, ''),
     };
     const languageContent = stripNoiseLines(cleaned.content).join('\n');
-    const isLotto = LOTTO_WORD.test(languageContent);
+    const isLotto = textIsLotto(languageContent);
 
     // Every path ends here, so the lotto label is stamped once, whichever
     // template or model read the trade.

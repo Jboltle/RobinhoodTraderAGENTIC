@@ -23,7 +23,9 @@ export const ACTION_INSTRUCTIONS = 'Which Action does this Discord options-tradi
 export const ACTION_CRITERIA: Readonly<Record<Action, string>> = {
   BUY: 'Opens a new position.',
   AVERAGE: 'Buys more of a position the caller already holds.',
-  TRIM: 'Sells part of a position and keeps the rest.',
+  TRIM:
+    'Sells part of a position and keeps the rest. ' +
+    '"risk free", "make it risk free", and "cost out" are trims.',
   SELL: "Closes the whole position, even if headed TRIM. A sale that doesn't say how much is a SELL.",
   INFO:
     'News or a plan about a position the caller still holds, with no trade now: ' +
@@ -36,7 +38,9 @@ export const ACTING_NOW_QUESTION = {
   type: 'noul',
   instructions: 'Is the caller telling followers to make a trade right now?',
   criteria: {
-    true: 'A live instruction to buy, add to, trim or sell a position now.',
+    true:
+      'A live instruction to buy, add to, trim or sell a position now. ' +
+      'A contract, the word lotto, and a premium is an entry being called now.',
     false: 'Hype, a recap, a status update, a question, or a plan that may or may not happen.',
   },
 } as const;

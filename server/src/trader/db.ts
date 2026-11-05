@@ -64,6 +64,7 @@ import {
   trades,
   users,
 } from './db/schema.js';
+import { openOptionLots, type OpenOptionLot } from './lots.js';
 import { decryptTokens, encryptTokens } from './rh/tokenCrypto.js';
 import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
 import type { PersistedState } from './rh/types.js';
@@ -194,6 +195,8 @@ export interface TraderDb {
   saveSettings(userId: string, settings: TradeSettings): Promise<ResolvedTradeSettings>;
 
   listDecisions(userId: string, limit: number): Promise<Decision[]>;
+  /** Filled option buys this user still holds, minus the sells that name them. */
+  listOpenOptionLots(userId: string): Promise<OpenOptionLot[]>;
   recordDecision(userId: string, decision: Decision): Promise<void>;
   /**
    * Move a pending-approval row to its post-approval state, in place.
@@ -373,6 +376,31 @@ class DrizzleTraderDb implements TraderDb {
     const payload = TradeSettingsSchema.parse(settings);
     await this.db.update(users).set(payload).where(eq(users.id, userId));
     return payload;
+  }
+
+  async listOpenOptionLots(userId: string): Promise<ReturnType<typeof openOptionLots>> {
+    const rows = await this.db
+      .select({
+        id: trades.id,
+        messageId: trades.messageId,
+        action: trades.action,
+        authorId: messages.authorId,
+        at: trades.timestamp,
+        order: trades.orderPayload,
+      })
+      .from(trades)
+      .leftJoin(messages, eq(messages.id, trades.messageId))
+      .where(eq(trades.userId, userId));
+    return openOptionLots(
+      rows.map((row) => ({
+        id: row.id,
+        messageId: row.messageId,
+        action: row.action,
+        authorId: row.authorId,
+        at: row.at.toISOString(),
+        order: row.order,
+      }))
+    );
   }
 
   async listDecisions(userId: string, limit: number): Promise<Decision[]> {
@@ -927,6 +955,8 @@ function toSettings(row: typeof users.$inferSelect): ResolvedTradeSettings {
     followedCallerIds: row.followedCallerIds,
     maxLossPct: row.maxLossPct,
     maxLossUsd: row.maxLossUsd,
+    exitMode: row.exitMode,
+    trimLevels: row.trimLevels,
   };
 }
 

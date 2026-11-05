@@ -166,6 +166,7 @@ async function scanUser(
       ? await tools.getOptionOrders().catch(() => null)
       : null;
 
+  const openLots = await deps.db.listOpenOptionLots(userId).catch(() => []);
   const openKeys = new Set<string>();
 
   for (const position of equity.positions) {
@@ -198,6 +199,18 @@ async function scanUser(
       position.expiration
     );
     if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
+    // A resting broker stop is this position's Max Loss. Selling here too would
+    // double-close it. ponytail: the dollar cap does not fire while that stop
+    // rests. Upgrade path: cancel the stop and software-flatten only the usd breach.
+    const stopped = openLots.some(
+      (lot) =>
+        lot.stopOrderId !== null &&
+        lot.symbol === position.symbol.toUpperCase() &&
+        lot.option.optionType === position.optionType &&
+        lot.option.strike === position.strike &&
+        lot.option.expiration === position.expiration
+    );
+    if (stopped) continue;
     const mark = await tools
       .getOptionsMarkPrice(position.symbol, position.optionType, position.strike, position.expiration)
       .then((q) => q?.markPrice ?? null)

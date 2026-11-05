@@ -222,6 +222,27 @@ export const TradeSettingsSchema = z.object({
    */
   maxLossPct: z.number().min(0).max(100).nullable().default(null),
   maxLossUsd: z.number().min(0).nullable().default(null),
+  /**
+   * caller: copy the Caller's trims. ladder: ignore those trims and sell
+   * trimLevels instead. A Caller's full close still closes what remains.
+   */
+  exitMode: z.enum(['caller', 'ladder']).default('caller'),
+  /** Own-target rungs. Portions are of the original lot and should sum to 100. */
+  trimLevels: z
+    .array(
+      z.object({
+        gainPct: z.number().positive().max(1000),
+        portionPct: z.number().positive().max(100),
+      })
+    )
+    .min(1)
+    .max(8)
+    .default([
+      { gainPct: 25, portionPct: 25 },
+      { gainPct: 50, portionPct: 25 },
+      { gainPct: 75, portionPct: 25 },
+      { gainPct: 100, portionPct: 25 },
+    ]),
 });
 
 /** What a client may send: every field optional, defaults fill the rest. */
@@ -276,6 +297,9 @@ export type RejectionCode =
   | 'ticker_not_allowed'    // ticker missing from a non-empty allowlist
   | 'lotto_blocked'         // entry labelled a lotto and the user has lotto trades off
   | 'ticker_invalid'        // broker has no equity quote for the parsed ticker
+  | 'price_mismatch'        // strike or premium sits outside the live-market band, or the contract does not exist
+  | 'own_targets'           // account uses its own trim ladder, so this caller trim is not copied
+  | 'ambiguous_exit'        // the exit matches more than one of this caller's open lots
   | 'broker_unavailable'    // user's Robinhood session not connected / needs re-authorization
   | 'outside_market_hours'  // regular-hours gate active
   | 'daily_cap_reached'     // max trades per day hit
@@ -356,6 +380,10 @@ export interface SubmittedOrder {
   readonly averageFillPrice?: number | null;
   /** When the monitor first saw the order filled (detection time, within one tick). */
   readonly filledAt?: string | null;
+  /** Lots this sell closed. The id is the buy row's trades.id. */
+  readonly lots?: readonly { readonly lotId: string; readonly quantity: number; readonly gainPct?: number }[];
+  /** Resting broker stop for this buy, when Max Loss placed one. */
+  readonly stopOrderId?: string | null;
 }
 
 /** Broker states after which an order will never change again. */

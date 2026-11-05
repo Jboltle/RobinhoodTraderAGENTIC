@@ -15,6 +15,7 @@ import {
   assembleMessageText,
   truncateSafe,
 } from '../../shared/embedText.js';
+import { openOptionLots } from '../lots.js';
 import {
   TradeSettingsSchema,
   isTerminalOrderState,
@@ -209,6 +210,19 @@ export function createFakeDb(): FakeDb {
     async listDecisions(userId, limit) {
       const newestFirst = [...decisionsFor(userId)].sort((a, b) => b.at.localeCompare(a.at));
       return record('listDecisions', userId, newestFirst.slice(0, limit));
+    },
+    async listOpenOptionLots(userId) {
+      const rows = trades
+        .filter((row) => row.userId === userId)
+        .map((row) => ({
+          id: row.decision.messageId,
+          messageId: row.decision.messageId,
+          action: row.decision.action,
+          authorId: messages.get(row.decision.messageId)?.authorId ?? null,
+          at: row.decision.at,
+          order: row.decision.order,
+        }));
+      return record('listOpenOptionLots', userId, openOptionLots(rows));
     },
     async recordDecision(userId, decision) {
       // Mirrors trades_user_message_uidx + ON CONFLICT DO NOTHING.
