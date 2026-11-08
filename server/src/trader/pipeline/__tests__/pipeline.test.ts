@@ -674,7 +674,7 @@ describe('fan-out — error paths', () => {
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout,
       {
-        getQuote: vi
+        getBuyingPower: vi
           .fn()
           .mockRejectedValue(new BrokerUnavailableError('Robinhood authorization required')),
       }
@@ -686,15 +686,34 @@ describe('fan-out — error paths', () => {
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
   });
 
-  it('records execution_error, not ticker_invalid, when the quote call fails in transit', async () => {
-    const { decision } = await runWith(
-      envelopeFromFixture(BTO_QQQ_PUT),
-      BTO_QQQ_PUT.expectedCallout,
+  it('places the options order when the equity quote fails, as with SPX', async () => {
+    const spx: Callout = {
+      ...BTO_QQQ_PUT.expectedCallout,
+      ticker: 'SPX',
+      option: { optionType: 'call', strike: 7500, expiration: '2026-06-08' },
+    };
+    const { decision, tools } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), spx, {
+      getQuote: vi.fn().mockRejectedValue(new Error('cannot place an equity order for SPX')),
+    });
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order).toMatchObject({ symbol: 'SPX', assetType: 'option' });
+    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(tools.placeOrder).not.toHaveBeenCalled();
+  });
+
+  it('records execution_error, not ticker_invalid, when an equity quote fails in transit', async () => {
+    const equity: Callout = { ...BTO_QQQ_PUT.expectedCallout, assetType: 'equity', option: null, ticker: 'AAPL' };
+    const { decision, tools } = await runWith(
+      { ...envelopeFromFixture(BTO_QQQ_PUT), content: 'grabbing some AAPL here' },
+      equity,
       { getQuote: vi.fn().mockRejectedValue(new Error('fetch failed')) }
     );
 
     expect(decision.kind).toBe('execution_failed');
     expect(decision.code).toBe('execution_error');
+    expect(decision.reason).toMatch(/quote fetch for AAPL/);
+    expect(tools.placeOrder).not.toHaveBeenCalled();
   });
 
   it('records execution_failed when placeOptionsOrder throws', async () => {
