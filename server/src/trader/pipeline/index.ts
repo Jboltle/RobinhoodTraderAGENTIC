@@ -497,37 +497,32 @@ export async function runForUser(
     });
   }
 
-  // Equities still need a quote. An option is checked against the chain, so a
-  // missing equity quote (SPX, XSP) is not a reason to drop it.
-  try {
-    const quote = await tools.getQuote(symbol);
-    if (!(quote.price > 0) && callout.assetType !== 'option') {
-      return finalize(userId, deps, {
-        ...base,
-        ...identity,
-        kind: 'risk_rejected',
-        code: 'ticker_invalid',
-        reason: `${symbol} has no tradable Robinhood quote`,
-      });
-    }
-  } catch (err) {
-    if (err instanceof SymbolNotFoundError) {
-      if (callout.assetType !== 'option') {
+  // Stock needs a quote, and that quote is what rejects a ticker Robinhood
+  // cannot trade as stock. An option is checked on the chain. Index underlyings
+  // (SPX, XSP, NDX) have no equity: the only order they accept is an options
+  // order, and a failed equity quote must not block it.
+  if (callout.assetType !== 'option') {
+    try {
+      const quote = await tools.getQuote(symbol);
+      if (!(quote.price > 0)) {
         return finalize(userId, deps, {
           ...base,
           ...identity,
           kind: 'risk_rejected',
           code: 'ticker_invalid',
-          reason: `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`,
+          reason: `${symbol} has no tradable Robinhood quote`,
         });
       }
-    } else {
+    } catch (err) {
+      const notFound = err instanceof SymbolNotFoundError;
       return finalize(userId, deps, {
         ...base,
         ...identity,
-        kind: 'execution_failed',
-        code: brokerErrorCode(err),
-        reason: `quote fetch for ${symbol} failed: ${errMsg(err)}`,
+        kind: notFound ? 'risk_rejected' : 'execution_failed',
+        code: notFound ? 'ticker_invalid' : brokerErrorCode(err),
+        reason: notFound
+          ? `${symbol} is not a tradable Robinhood symbol: ${errMsg(err)}`
+          : `quote fetch for ${symbol} failed: ${errMsg(err)}`,
       });
     }
   }
@@ -741,7 +736,9 @@ async function entryMismatchReason(
       const quote = await tools.getQuote(ticker);
       if (quote.price > 0) spot = quote.price;
     } catch (err) {
-      if (!(err instanceof SymbolNotFoundError)) throw err;
+      // No equity quote (SPX, XSP) leaves spot null and the chain check runs.
+      // A dead session fails the chain the same way, so it still aborts here.
+      if (err instanceof BrokerUnavailableError) throw err;
     }
     try {
       await tools.confirmOption(ticker, option.optionType, option.strike, option.expiration);
