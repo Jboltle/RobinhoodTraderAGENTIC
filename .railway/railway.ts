@@ -29,7 +29,10 @@ export default defineRailway((ctx) => {
     replicas: { "us-east4-eqdc4a": 1 },
     deploy: { limitOverride: { containers: { cpu: 0.5, memoryBytes: 1000000000 } } },
     networking: { privateNetworkEndpoint: "robinhoodtradingserver" },
-    cdn: { enabled: true },
+    // Production only. Railway rejects edge caching on a service with no public
+    // address, and a new environment has none until `railway domain` is run, so
+    // with this set for staging the whole apply fails and creates nothing.
+    ...(isProd ? { cdn: { enabled: true } } : {}),
     env: {
       // The Postgres in the same environment, so staging cannot be pointed at
       // production's database by a typo.
@@ -56,7 +59,7 @@ export default defineRailway((ctx) => {
     replicas: { "us-east4-eqdc4a": 1 },
     deploy: { limitOverride: { containers: { cpu: 1, memoryBytes: 1000000000 } }, restartPolicyMaxRetries: 5 },
     networking: { privateNetworkEndpoint: "robinhoodtraderagentic" },
-    cdn: { defaultTtlSeconds: 86400, enabled: true },
+    ...(isProd ? { cdn: { defaultTtlSeconds: 86400, enabled: true } } : {}), // as on the trader
     env: {
       // Production's value is a fixed address and is left as it is. Staging's is
       // a Railway reference to the trader in its own environment, so the staging
