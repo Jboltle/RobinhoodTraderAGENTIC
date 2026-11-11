@@ -68,7 +68,7 @@ export default defineRailway((ctx) => {
   });
 
   return project("RobinhoodTrader", {
-    // variables: { managed: true },
+    variables: { managed: true },
     resources: [RobinhoodTradingServer, Postgres, RobinhoodTraderWebsite, postgresVolume],
   });
 });
