@@ -124,7 +124,9 @@ export function ConnectDialog({
         <p className="mt-3 text-sm text-ink-400">Robinhood is connected.</p>
       ) : (
         <div className="mt-4 flex flex-col gap-4">
-          <BeforeYouStart />
+          {/* A refused start (a read_only deployment: "Robinhood cannot be
+              connected from this environment") has no approval step to warn about. */}
+          {!connect.isError && <BeforeYouStart />}
 
           {connect.isPending && !pendingUrl && (
             <p className="text-xs text-ink-400">Starting…</p>

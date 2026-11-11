@@ -75,6 +75,12 @@ const BOOK_RECENT_LOOKBACK_MS = 9 * 24 * 60 * 60 * 1000;
 /** How long POST /api/broker/connect waits for Robinhood to hand us a URL. */
 const AUTH_URL_TIMEOUT_MS = 15_000;
 const AUTH_URL_POLL_MS = 100;
+/**
+ * A Robinhood account has one agent slot, so a login from a read_only
+ * deployment (staging) would take it away from the deployment that trades.
+ */
+const READ_ONLY_CONNECT_ERROR =
+  'Robinhood cannot be connected from this environment (TRADE_EXECUTION_MODE=read_only)';
 
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
 const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
@@ -153,6 +159,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // redirect URL into POST /api/broker/callback.
   fastify.post('/api/broker/connect', async (request, reply) => {
     const { id: userId } = requireUser(request);
+    if (deps.executionMode === 'read_only') {
+      return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
+    }
     const parsed = BrokerConnectBodySchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.status(400).send({ error: 'body must be { force?: boolean }' });
@@ -186,6 +195,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   fastify.post('/api/broker/callback', async (request, reply) => {
     const { id: userId } = requireUser(request);
+    if (deps.executionMode === 'read_only') {
+      return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
+    }
     const parsed = BrokerCallbackBodySchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: 'body must be { redirectUrl: string }' });

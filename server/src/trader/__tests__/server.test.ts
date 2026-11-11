@@ -860,6 +860,33 @@ describe('/api/broker', () => {
     expect((await send('POST', '/api/broker/callback', { redirectUrl: url })).statusCode).toBe(409);
   });
 
+  // Staging runs read_only with a public website: a login from there would
+  // take the account's one Robinhood agent slot away from production.
+  it('connect and callback 409 on a read_only deployment and never reach Robinhood', async () => {
+    harness = makeHarness({ executionMode: 'read_only' });
+    harness.db.addUser(USER, TOKEN);
+    // A session that would otherwise hand out an auth URL and accept the code.
+    harness.configureBroker(USER.id, {
+      authUrl: 'https://robinhood.com/mcp/trading?state=abc',
+      authPending: true,
+    });
+    const broker = harness.brokerFor(USER.id);
+
+    const connect = await send('POST', '/api/broker/connect', { force: true });
+    expect(connect.statusCode).toBe(409);
+    expect((connect.json() as { error: string }).error).toContain(
+      'cannot be connected from this environment'
+    );
+    expect(broker.mcp.ensureConnected).not.toHaveBeenCalled();
+    expect(harness.brokers.existing(USER.id)).toBe(broker);
+
+    const callback = await send('POST', '/api/broker/callback', {
+      redirectUrl: 'http://127.0.0.1:8788/oauth/callback?code=x&state=y',
+    });
+    expect(callback.statusCode).toBe(409);
+    expect(broker.mcp.submitAuthCode).not.toHaveBeenCalled();
+  });
+
   it('disconnect drops the stored tokens and the live session', async () => {
     harness.db.seedBrokerTokens(USER.id, fakeTokens('abc'));
     harness.brokerFor(USER.id);
