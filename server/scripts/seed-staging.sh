@@ -26,6 +26,19 @@ if [[ "$TARGET_DB_URL" == *"railway.internal"* || "$TARGET_DB_URL" == "$SOURCE_D
   exit 1
 fi
 
+# Production holds stored broker logins and staging never does (they are
+# excluded below), so a TARGET with any is production under swapped addresses.
+# Nested ifs: a fresh target has no such table, and the inner query must not
+# be planned there. A failed check stops the script before anything is dropped.
+psql "$TARGET_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "
+  do \$\$ begin
+    if to_regclass('public.broker_connections') is not null then
+      if exists (select 1 from public.broker_connections) then
+        raise exception 'refusing: TARGET_DB_URL holds broker_connections rows, so it is production';
+      end if;
+    end if;
+  end \$\$;"
+
 # Shared archive first (no foreign keys), then users, then the rows that
 # reference users. allowed_emails + users let the same people sign in to
 # staging; trades give the dashboard its history.
