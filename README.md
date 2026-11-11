@@ -294,13 +294,35 @@ Production configuration lives only in Railway variables; no `.env` file ships i
 
 ### Staging
 
-A staging deployment runs the **trader only** (never a second Listener: one gateway session per Discord user token) with `TRADE_EXECUTION_MODE=read_only`, so nothing it does can reach a broker, against a database cloned from production without the broker tokens or sessions. Robinhood is never connected from staging: the agentic connection is one slot per account, and a second process refreshing the same grant invalidates production's refresh token.
+Railway's `Staging` environment is production without the Listener: the trader, the dashboard and its own Postgres, under the same service names, deploying from the `staging` branch. A change is merged to `staging`, checked there, then merged to `main`.
 
-Seed the staging database from production (schema and data; `pg_dump` must match the server's major version, `brew install libpq`):
+Both environments are described in one file, [`.railway/railway.ts`](.railway/railway.ts) (Railway infrastructure as code). Railway does not read it during deploys, so committing it deploys nothing; it changes Railway only through `railway config apply`. Secrets stay in Railway (`preserve()` in the file).
 
 ```bash
-SOURCE_DB_URL="<production public URL>" TARGET_DB_URL="<staging URL>" server/scripts/seed-staging.sh
+(cd .railway && npm ci)                        # the `railway` SDK that evaluates the file
+railway config plan --environment production   # must always report no changes
+railway config plan --environment Staging      # what applying the file would change on staging
+railway config apply --environment Staging     # staging only; production is never applied from the file
 ```
+
+What keeps staging apart from production:
+
+- **No Listener.** Staging starts the trader alone (`node dist/trader/index.js`) and has no `DISCORD_USER_TOKEN`: one gateway session per Discord user token.
+- **No orders.** `TRADE_EXECUTION_MODE=read_only` is pinned in the file. Every callout stops at waiting for approval, Approve is refused and nothing writes to a broker, Max Loss included. Production's value is held in Railway, not in the file, so it can be flipped there at once.
+- **No Robinhood login.** A `read_only` deployment refuses `POST /api/broker/connect` and `/api/broker/callback`. The agentic connection is one slot per account, so a login from staging would take production's. Staging has its own `RH_TOKENS_VAULT_KEY`.
+- **Own database.** `SUPABASE_DB_URL` is `${{Postgres.DATABASE_URL}}`, the Postgres in the same environment.
+- **Own trader behind the dashboard.** Staging's `API_URL` is `https://${{RobinhoodTradingServer.RAILWAY_PUBLIC_DOMAIN}}`, the trader in the same environment. Production's is a fixed address held in Railway.
+
+The generated `*.up.railway.app` addresses are created with `railway domain`; they are not in the file. The staging site signs in by email address alone, like production, and holds a copy of every user's history and settings.
+
+Staging's database is a clone of production taken on demand, without the broker tokens or sessions. `pg_dump` must be at least the server's major version, 18 (`brew install libpq`, which is not put on `PATH`):
+
+```bash
+PATH="$(brew --prefix libpq)/bin:$PATH" SOURCE_DB_URL="<production public URL>" TARGET_DB_URL="<staging public URL>" \
+  server/scripts/seed-staging.sh
+```
+
+The closing row counts must show `broker_connections` and `sessions` at zero.
 
 Local staging, using the Homebrew Postgres already on the box:
 
@@ -312,8 +334,6 @@ psql postgresql://postgres@127.0.0.1:54342/postgres -c "create database staging"
 cd server && SUPABASE_DB_URL=postgresql://postgres@127.0.0.1:54342/staging TRADE_EXECUTION_MODE=read_only \
   RH_TOKENS_VAULT_KEY=$(openssl rand -hex 16) TRADER_PORT=3100 NODE_ENV=production npm run trader
 ```
-
-Railway staging, in the existing `Staging` environment (`railway environment link Staging`): `railway add --database postgres`, then `railway add --service TraderStaging --repo Jboltle/RobinhoodTraderAGENTIC --branch feat/desk-tracking` with `source.rootDirectory=server/`, `build.dockerfilePath=Dockerfile.server`, `deploy.startCommand="npm run trader"`, `deploy.healthcheckPath=/health`, and the trader variables from the table above minus `DISCORD_USER_TOKEN`, with `TRADE_EXECUTION_MODE=read_only` and `SUPABASE_DB_URL=${{Postgres.DATABASE_URL}}`. Enable the Postgres TCP proxy (`railway tcp-proxy create --port 5432 --service Postgres`) to run the seed script against it. Railway pauses new resources while the workspace is over its usage hard limit ("Paused temporarily").
 
 ## Risk controls
 
