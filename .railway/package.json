@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "Evaluates railway.ts for `railway config plan` and `railway config apply`. Not part of the server or client builds.",
+  "devDependencies": {
+    "railway": "3.16.0"
+  }
+}
