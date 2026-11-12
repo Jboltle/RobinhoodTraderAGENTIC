@@ -591,6 +591,25 @@ describe('two accounts of one user', () => {
 
     expect(heard).toEqual(['robinhood']);
   });
+
+  it('one account waiting on its broker does not hold up the other', async () => {
+    let answerRobinhood: () => void = () => undefined;
+    fakes.get(ROBINHOOD.id)!.getAccount.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answerRobinhood = () => resolve({ buyingPowerUsd: 10_000, portfolioValueUsd: 0 });
+        })
+    );
+
+    const processing = processor.process(ENTRY_ENVELOPE);
+
+    await vi.waitFor(() => expect(placedOrders(fakes.get(PAPER.id)!, 'option')).toHaveLength(1));
+    expect(placedOrders(fakes.get(ROBINHOOD.id)!, 'option')).toHaveLength(0);
+
+    answerRobinhood();
+    await processing;
+    expect(placedOrders(fakes.get(ROBINHOOD.id)!, 'option')).toHaveLength(1);
+  });
 });
 
 describe('routes act on the selected account, never on the user id', () => {

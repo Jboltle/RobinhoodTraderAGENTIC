@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Decision, SubmittedOrder } from '../../shared/types.js';
+import { TradeSettingsSchema, type Decision, type SubmittedOrder } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
 import { applyBrokerState, sweepFills, type FillMonitorDeps } from '../fills.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import type { BrokerOrder } from '../broker/types.js';
 import { createFakeDb, fakeAccount, fakeTokens } from './fakeDb.js';
-import { makeFakeBroker, makeFakeRegistry } from './harness.js';
+import { makeFakeBroker, makeFakeRegistry, placedOrders } from './harness.js';
 
 const USER = 'user-1';
 const NOW = new Date('2026-10-21T15:18:30.000Z');
@@ -197,6 +197,19 @@ describe('sweepFills', () => {
 
     expect(result.updated).toBe(1);
     expect((await db.listDecisions(USER, 10))[0]!.order).toMatchObject({ status: 'filled', averageFillPrice: 0.4 });
+  });
+
+  it("an immediate deployment rests the Max Loss stop on the account's own filled lot", async () => {
+    const { db, deps, broker } = setup({ orders: [liveOrder()] });
+    const buy = submitted(placed());
+    db.seedSettings(USER, TradeSettingsSchema.parse({ maxLossPct: 50 }));
+    db.seedMessage({ messageId: buy.messageId, sentAt: buy.at });
+    db.seedDecision(USER, buy);
+
+    await sweepFills({ ...deps, executionMode: 'immediate' });
+
+    expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', type: 'stop', quantity: 3 }]);
+    expect((await db.listOpenOptionLots(USER)).map((lot) => lot.stopOrderId)).toEqual(['opt-001']);
   });
 });
 

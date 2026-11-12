@@ -632,6 +632,45 @@ describe('sweepMaxLoss across two accounts of one user', () => {
     // Each scan runs on its own account's queue, the one its callouts use.
     expect(enqueue.mock.calls.map(([accountId]) => accountId)).toEqual([PROTECTED.id, UNPROTECTED.id]);
   });
+
+  it("one account's close in flight does not hold back the other account's", async () => {
+    // Both accounts hold the same contract past the same threshold.
+    const accounts = [PROTECTED, UNPROTECTED];
+    const db = createFakeDb();
+    const brokers = new Map(
+      accounts.map((account) => {
+        db.addAccount(account);
+        db.seedBrokerTokens(account.id, fakeTokens('tok'));
+        db.seedDecision(account.id, submittedBuy('QQQ', 1.5, CALL));
+        db.seedSettings(account.id, TradeSettingsSchema.parse({ maxLossPct: 50 }));
+        const broker = makeFakeBroker({
+          positions: [optionPosition('QQQ', CALL.optionType, CALL.strike, CALL.expiration, 2)],
+          optionMark: 0.75,
+        });
+        return [account.id, broker] as const;
+      })
+    );
+    const session = {
+      isConnected: vi.fn().mockReturnValue(true),
+      ensureReady: vi.fn().mockResolvedValue(undefined),
+    } as unknown as RobinhoodMcpClient;
+    const deps: MaxLossDeps = {
+      db,
+      brokers: makeFakeRegistry((accountId) => ({ session, broker: brokers.get(accountId)! })),
+      events: new TraderEvents(),
+      enqueue: (_accountId, run) => run(),
+      now: () => RTH,
+    };
+    const flattening = new Map<string, number>();
+    const closes = (): number[] => accounts.map((account) => placedOrders(brokers.get(account.id)!, 'option').length);
+
+    await sweepMaxLoss(deps, flattening);
+    expect(closes()).toEqual([1, 1]);
+
+    // Inside the retry window each account's own close still holds its own re-sell back.
+    await sweepMaxLoss(deps, flattening);
+    expect(closes()).toEqual([1, 1]);
+  });
 });
 
 interface OptionRow {
