@@ -216,7 +216,13 @@ function TopHeader() {
       <span className="text-sm font-medium text-ink-400 md:hidden">
         RH TRADER
       </span>
-      <nav className="flex gap-1 md:hidden">
+      {/* At phone width the four links are wider than the header, so they
+          scroll inside the nav and the account menu stays on screen. The
+          padding (cancelled by the margin) keeps a link's focus outline from
+          being clipped by the scroll box.
+          ponytail: the last links need a sideways swipe there. Upgrade path:
+          a phone-sized nav of its own (icons, or a bar under the header). */}
+      <nav className="flex gap-1 max-sm:-m-1 max-sm:min-w-0 max-sm:overflow-x-auto max-sm:p-1 max-sm:[scrollbar-width:none] md:hidden">
         <Link to="/" className={navLinkClass}>
           Dashboard
         </Link>
@@ -230,7 +236,7 @@ function TopHeader() {
           Settings
         </Link>
       </nav>
-      <label className="ml-auto flex w-64 items-center gap-2 rounded-lg border border-ink-600 bg-ink-700 px-3 py-2 focus-within:border-brand max-sm:w-40">
+      <label className="ml-auto flex w-64 items-center gap-2 rounded-lg border border-ink-600 bg-ink-700 px-3 py-2 focus-within:border-brand max-sm:hidden">
         <Search className="size-4 shrink-0 text-ink-400" />
         <input
           type="search"
