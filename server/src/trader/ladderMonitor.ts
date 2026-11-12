@@ -11,6 +11,7 @@ import { contractsAtLevel } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
 import type { McpRegistry } from './broker/registry.js';
 import { BrokerUnavailableError } from './broker/errors.js';
+import { instrumentOf } from './broker/instrument.js';
 import { cancelStops } from './stops.js';
 
 const log = createLogger('trader:ladder');
@@ -59,8 +60,7 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
   for (const lot of lots) {
     if (lot.entryPrice <= 0) continue;
     const mark = await broker.broker
-      .getOptionsMarkPrice(lot.symbol, lot.option.optionType, lot.option.strike, lot.option.expiration)
-      .then((quote) => quote?.markPrice ?? null)
+      .getMark(instrumentOf({ symbol: lot.symbol, assetType: 'option', option: lot.option }))
       .catch(() => null);
     if (mark === null) continue;
     for (const level of contractsAtLevel(lot.originalQty, settings.trimLevels)) {

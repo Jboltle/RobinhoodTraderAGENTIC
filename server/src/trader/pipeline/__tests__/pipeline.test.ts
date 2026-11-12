@@ -1,6 +1,6 @@
 /**
  * Pipeline integration tests — from DiscordEnvelope to per-user Decision rows,
- * with a mocked parser, stubbed Robinhood tools and the in-memory db.
+ * with a mocked parser, the shared fake broker and the in-memory db.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,12 +13,19 @@ import type {
   TradeSettings,
 } from '../../../shared/types.js';
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
+import {
+  makeFakeBroker,
+  makeFakeRegistry,
+  markReads,
+  optionPosition,
+  placedOrders,
+  type FakeBroker,
+  type FakeBrokerOptions,
+} from '../../__tests__/harness.js';
 import { TraderEvents } from '../../events.js';
 import type { McpRegistry } from '../../broker/registry.js';
-import type { UserBroker } from '../../broker/types.js';
 import { BrokerUnavailableError, SymbolNotFoundError } from '../../broker/errors.js';
 import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
-import type { RobinhoodTools } from '../../robinhood/tools.js';
 import { JevCalloutDecider } from '../decide.js';
 import { BrokerWritesDisabledError, contractsForPortion, submitOrder } from '../execute.js';
 import { createMessageProcessor, liveCallerContracts, type PipelineDeps } from '../index.js';
@@ -54,43 +61,28 @@ const TRADING_SETTINGS = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeTools(overrides: Partial<RobinhoodTools> = {}): RobinhoodTools {
-  return {
-    getBuyingPower: vi.fn().mockResolvedValue({ amountUsd: 10_000 }),
-    // Near the strikes the fixtures trade, so the mismatch gate sees a sane spot.
-    getQuote: vi.fn().mockImplementation(async (symbol: string) => {
-      const spot: Record<string, number> = { QQQ: 710, SPY: 755, SBUX: 103, GOOGL: 370, AAPL: 150 }
-      return { price: spot[symbol] ?? 150 }
-    }),
-    getOptionsMarkPrice: vi.fn().mockResolvedValue(null),
-    confirmOption: vi.fn().mockResolvedValue(undefined),
-    placeOrder: vi.fn().mockResolvedValue({ orderId: 'eq-001', status: 'queued' }),
-    placeOptionsOrder: vi.fn().mockResolvedValue({ orderId: 'opt-001', status: 'queued' }),
-    getPositions: vi.fn().mockResolvedValue({ positions: [], raw: {} }),
-    getOptionPositions: vi.fn().mockResolvedValue({
-      positions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 5, raw: {} },
-      ],
-      raw: {},
-    }),
-    ...overrides,
-  } as unknown as RobinhoodTools;
+// Near the strikes the fixtures trade, so the mismatch gate sees a sane spot.
+const SPOT: Record<string, number> = { QQQ: 710, SPY: 755, SBUX: 103, GOOGL: 370, AAPL: 150 };
+const DEFAULT_SPOT = 150;
+
+/** This file's broker: no option mark, and five QQQ 707C held. */
+function makeBroker(options: FakeBrokerOptions = {}): FakeBroker {
+  return makeFakeBroker({
+    equityMark: (symbol) => SPOT[symbol] ?? DEFAULT_SPOT,
+    optionMark: null,
+    positions: [optionPosition('QQQ', 'call', 707, '2026-06-11', 5)],
+    ...options,
+  });
 }
 
 const makeMcp = (): RobinhoodMcpClient =>
   ({ isConnected: vi.fn().mockReturnValue(true) }) as unknown as RobinhoodMcpClient;
 
-function makeRegistry(toolsByUser: Map<string, RobinhoodTools>): McpRegistry {
-  const brokers = new Map<string, UserBroker>();
-  const forUser = (userId: string): UserBroker => {
-    let broker = brokers.get(userId);
-    if (!broker) {
-      broker = { session: makeMcp(), broker: toolsByUser.get(userId) ?? makeTools() };
-      brokers.set(userId, broker);
-    }
-    return broker;
-  };
-  return { for: forUser, existing: (id) => brokers.get(id), drop: (id) => void brokers.delete(id) };
+function makeRegistry(brokerByUser: Map<string, FakeBroker>): McpRegistry {
+  return makeFakeRegistry((userId) => ({
+    session: makeMcp(),
+    broker: brokerByUser.get(userId) ?? makeBroker(),
+  }));
 }
 
 function makeParser(callout: Callout | Error): CalloutParser {
@@ -105,24 +97,24 @@ function makeParser(callout: Callout | Error): CalloutParser {
 interface Setup {
   readonly db: FakeDb;
   readonly deps: PipelineDeps;
-  readonly tools: RobinhoodTools;
+  readonly broker: FakeBroker;
   readonly events: TraderEvents;
 }
 
-/** One connected user by default; extra users get their own tools. */
+/** One connected user by default; extra users get their own broker. */
 function setup(
   callout: Callout | Error,
-  toolsOverrides: Partial<RobinhoodTools> = {},
+  brokerOptions: FakeBrokerOptions = {},
   users: readonly string[] = [USER]
 ): Setup {
   const db = createFakeDb();
-  const toolsByUser = new Map<string, RobinhoodTools>();
+  const brokerByUser = new Map<string, FakeBroker>();
   for (const userId of users) {
     db.seedBrokerTokens(userId, fakeTokens(`token-${userId}`));
     // The schema now defaults to approval mode and following nobody, so the
     // baseline test user has to opt back in to auto-execution explicitly.
     db.seedSettings(userId, { ...TRADING_SETTINGS });
-    toolsByUser.set(userId, makeTools(toolsOverrides));
+    brokerByUser.set(userId, makeBroker(brokerOptions));
   }
 
   const events = new TraderEvents();
@@ -130,22 +122,22 @@ function setup(
     parser: makeParser(callout),
     db,
     events,
-    brokers: makeRegistry(toolsByUser),
+    brokers: makeRegistry(brokerByUser),
     executionMode: 'immediate',
   };
-  return { db, deps, tools: toolsByUser.get(users[0]!)!, events };
+  return { db, deps, broker: brokerByUser.get(users[0]!)!, events };
 }
 
 /** Run one message through the fan-out and return the first user's outcome. */
 async function runWith(
   envelope: DiscordEnvelope,
   callout: Callout | Error,
-  toolsOverrides: Partial<RobinhoodTools> = {}
-): Promise<{ decision: Decision; tools: RobinhoodTools; db: FakeDb }> {
-  const { db, deps, tools } = setup(callout, toolsOverrides);
+  brokerOptions: FakeBrokerOptions = {}
+): Promise<{ decision: Decision; broker: FakeBroker; db: FakeDb }> {
+  const { db, deps, broker } = setup(callout, brokerOptions);
   await createMessageProcessor(deps).process(envelope);
   const decisions = await db.listDecisions(USER, 10);
-  return { decision: decisions[0]!, tools, db };
+  return { decision: decisions[0]!, broker, db };
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +174,7 @@ describe('fan-out — non-callouts', () => {
 
 describe('fan-out — BTO entry', () => {
   it('submits a limit buy for BTO $QQQ 710p', async () => {
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout
     );
@@ -195,7 +187,7 @@ describe('fan-out — BTO entry', () => {
       orderType: 'limit',
       limitPrice: 0.97,
     });
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   it('records the callout verdict and its parse on the messages row', async () => {
@@ -208,7 +200,7 @@ describe('fan-out — BTO entry', () => {
 
 describe('fan-out — TRIM exit', () => {
   it('submits a market sell for TRIM QQQ 707C', async () => {
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(TRIM_QQQ_FIRST),
       TRIM_QQQ_FIRST.expectedCallout
     );
@@ -220,11 +212,11 @@ describe('fan-out — TRIM exit', () => {
       assetType: 'option',
       orderType: 'market',
     });
-    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    const call = placedOrders(broker, 'option')[0]!;
     expect(call.side).toBe('sell');
-    expect(call.strike).toBe(707);
-    expect(call.contracts).toBe(1);
-    expect(tools.getBuyingPower).not.toHaveBeenCalled();
+    expect(call.instrument).toMatchObject({ strike: 707 });
+    expect(call.quantity).toBe(1);
+    expect(broker.getAccount).not.toHaveBeenCalled();
   });
 
   it('sells most and leaves one contract for TRIM TRIM / heavy exits', async () => {
@@ -240,25 +232,15 @@ describe('fan-out — TRIM exit', () => {
       envelopeFromFixture(RUNNERS_ONLY_QQQ),
       RUNNERS_ONLY_QQQ.expectedCallout,
       {
-        getOptionPositions: vi.fn().mockResolvedValue({
-          positions: [
-            { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 1, raw: {} },
-          ],
-          raw: {},
-        }),
+        positions: [optionPosition('QQQ', 'call', 707, '2026-06-11', 1)],
       }
     );
     expect(decision.order?.quantity).toBe(1);
   });
 
   it('sells only the exiting caller\'s contracts when another caller holds the same one', async () => {
-    const { db, deps, tools } = setup(TRIM_QQQ_DOUBLE.expectedCallout, {
-      getOptionPositions: vi.fn().mockResolvedValue({
-        positions: [
-          { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 12, raw: {} },
-        ],
-        raw: {},
-      }),
+    const { db, deps, broker } = setup(TRIM_QQQ_DOUBLE.expectedCallout, {
+      positions: [optionPosition('QQQ', 'call', 707, '2026-06-11', 12)],
     });
     const buy = (messageId: string, authorId: string, qty: number): void => {
       db.seedMessage({ messageId, sentAt: '2026-06-11T13:00:00.000Z', authorId });
@@ -293,17 +275,12 @@ describe('fan-out — TRIM exit', () => {
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision?.order?.quantity).toBe(1);
     expect(decision?.order?.lots).toEqual([{ lotId: 'buy-caller', quantity: 1 }]);
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   it('does not trim another caller\'s contracts', async () => {
-    const { db, deps, tools } = setup(TRIM_QQQ_DOUBLE.expectedCallout, {
-      getOptionPositions: vi.fn().mockResolvedValue({
-        positions: [
-          { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 10, raw: {} },
-        ],
-        raw: {},
-      }),
+    const { db, deps, broker } = setup(TRIM_QQQ_DOUBLE.expectedCallout, {
+      positions: [optionPosition('QQQ', 'call', 707, '2026-06-11', 10)],
     });
     db.seedMessage({ messageId: 'buy-other', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'other-caller' });
     db.seedDecision(USER, {
@@ -334,19 +311,19 @@ describe('fan-out — TRIM exit', () => {
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision?.kind).toBe('risk_rejected');
     expect(decision?.reason).toMatch(/this caller/);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('rejects option exits when the matching position is not open', async () => {
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(TRIM_QQQ_FIRST),
       TRIM_QQQ_FIRST.expectedCallout,
-      { getOptionPositions: vi.fn().mockResolvedValue({ positions: [], raw: {} }) }
+      { positions: [] }
     );
 
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.reason).toMatch(/no open QQQ 707C 2026-06-11 position/);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 });
 
@@ -400,17 +377,14 @@ describe('fan-out — ticker-only exits ("out of QQQ")', () => {
     db.seedMessage({ messageId, sentAt, authorId, disposition: 'callout', parse: callout, processedAt: sentAt });
 
   const holdsBothStrikes = {
-    getOptionPositions: vi.fn().mockResolvedValue({
-      positions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 234, expiration: '2026-10-02', quantity: 3, raw: {} },
-        { symbol: 'QQQ', optionType: 'call', strike: 255, expiration: '2026-10-02', quantity: 2, raw: {} },
-      ],
-      raw: {},
-    }),
+    positions: [
+      optionPosition('QQQ', 'call', 234, '2026-10-02', 3),
+      optionPosition('QQQ', 'call', 255, '2026-10-02', 2),
+    ],
   };
 
   it("sells the whole position in the Caller's own contract, never another Caller's", async () => {
-    const { db, deps, tools } = setup(TICKER_ONLY_EXIT, holdsBothStrikes);
+    const { db, deps, broker } = setup(TICKER_ONLY_EXIT, holdsBothStrikes);
     seedEntry(db, 'entry-a', 'caller-a', entry(234));
     seedEntry(db, 'entry-b', 'caller-b', entry(255), '2026-09-30T13:34:30.000Z');
 
@@ -418,8 +392,8 @@ describe('fan-out — ticker-only exits ("out of QQQ")', () => {
 
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision?.kind).toBe('submitted');
-    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(call).toMatchObject({ side: 'sell', strike: 234, contracts: 3 });
+    const call = placedOrders(broker, 'option')[0]!;
+    expect(call).toMatchObject({ side: 'sell', instrument: { strike: 234 }, quantity: 3 });
     expect(db.getMessage('exit-001')?.parse?.option).toEqual({
       optionType: 'call',
       strike: 234,
@@ -428,14 +402,14 @@ describe('fan-out — ticker-only exits ("out of QQQ")', () => {
   });
 
   it('rejects instead of guessing when the Caller has no open entry in the ticker', async () => {
-    const { db, deps, tools } = setup(TICKER_ONLY_EXIT, holdsBothStrikes);
+    const { db, deps, broker } = setup(TICKER_ONLY_EXIT, holdsBothStrikes);
     seedEntry(db, 'entry-b', 'caller-b', entry(255));
 
     await createMessageProcessor(deps).process(exitFrom('caller-a'));
 
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision).toMatchObject({ kind: 'risk_rejected', code: 'missing_contract' });
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('lists the live entries newest first, each contract once', () => {
@@ -466,36 +440,31 @@ describe('fan-out — averaging-down adds', () => {
   // as a fresh entry and submitted 20 naked 0DTE puts for users who never
   // held the position. Adds must require an existing position.
   it('rejects an add when the user holds no matching position', async () => {
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(AVG_DOWN_SPY_PUT),
       AVG_DOWN_SPY_PUT.expectedCallout
-      // default tools hold only QQQ 707C — no SPY 772P position
+      // the default broker holds only QQQ 707C — no SPY 772P position
     );
 
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.reason).toMatch(/no open SPY 772P 2026-09-22 position to add to/);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('executes the add for a user who holds the position', async () => {
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(AVG_DOWN_SPY_PUT),
       AVG_DOWN_SPY_PUT.expectedCallout,
       {
-        getOptionPositions: vi.fn().mockResolvedValue({
-          positions: [
-            { symbol: 'SPY', optionType: 'put', strike: 772, expiration: '2026-09-22', quantity: 25, raw: {} },
-          ],
-          raw: {},
-        }),
+        positions: [optionPosition('SPY', 'put', 772, '2026-09-22', 25)],
       }
     );
 
     expect(decision.kind).toBe('submitted');
-    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    const call = placedOrders(broker, 'option')[0]!;
     expect(call.side).toBe('buy');
-    expect(call.strike).toBe(772);
-    expect(call.limitPremium).toBe(0.295);
+    expect(call.instrument).toMatchObject({ strike: 772 });
+    expect(call.limitPrice).toBe(0.295);
   });
 });
 
@@ -529,12 +498,12 @@ describe('fan-out — parse consistency guardrails', () => {
   };
 
   it('rejects an equity parse of an options-language message (the AAPL incident)', async () => {
-    const { decision, tools } = await runWith(INCIDENT_ENVELOPE, BAD_EQUITY_PARSE);
+    const { decision, broker } = await runWith(INCIDENT_ENVELOPE, BAD_EQUITY_PARSE);
 
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.code).toBe('parse_inconsistent');
     expect(decision.order).toBeNull();
-    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'equity')).toHaveLength(0);
   });
 
   it('rejects an equity limit buy wildly below the live quote', async () => {
@@ -544,14 +513,14 @@ describe('fan-out — parse consistency guardrails', () => {
       content: 'grabbing some AAPL here 7.70', // no options language — passes the text check
     };
 
-    const { decision, tools } = await runWith(envelope, BAD_EQUITY_PARSE, {
-      getQuote: vi.fn().mockResolvedValue({ price: 211 }),
+    const { decision, broker } = await runWith(envelope, BAD_EQUITY_PARSE, {
+      equityMark: 211,
     });
 
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.code).toBe('parse_inconsistent');
     expect(decision.reason).toMatch(/option premium misread/);
-    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'equity')).toHaveLength(0);
   });
 
   it('still submits a plausible equity limit buy', async () => {
@@ -560,24 +529,24 @@ describe('fan-out — parse consistency guardrails', () => {
       messageId: 'plausible-equity-buy',
       content: 'grabbing some AAPL here, 145 limit',
     };
-    const { decision, tools } = await runWith(envelope, { ...BAD_EQUITY_PARSE, limitPrice: 145 });
+    const { decision, broker } = await runWith(envelope, { ...BAD_EQUITY_PARSE, limitPrice: 145 });
 
     expect(decision.kind).toBe('submitted');
     expect(decision.order).toMatchObject({ symbol: 'AAPL', assetType: 'equity', limitPrice: 145 });
-    expect(tools.placeOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'equity')).toHaveLength(1);
   });
 });
 
 describe('fan-out — approval mode', () => {
   it("a user's own 'approval' setting parks the trade without submitting", async () => {
-    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, broker } = setup(BTO_QQQ_PUT.expectedCallout);
     db.seedSettings(USER, { ...TRADING_SETTINGS, executionMode: 'approval' });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     const [decision] = await db.listDecisions(USER, 10);
     expect(decision!.kind).toBe('pending_approval');
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   // The deployment kill switch can only tighten: a user set to immediate is
@@ -586,7 +555,7 @@ describe('fan-out — approval mode', () => {
   it.each(['approval', 'read_only'] as const)(
     'TRADE_EXECUTION_MODE=%s parks an immediate-mode user without submitting',
     async (executionMode) => {
-      const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+      const { db, deps, broker } = setup(BTO_QQQ_PUT.expectedCallout);
       db.seedSettings(USER, { ...TRADING_SETTINGS, executionMode: 'immediate' });
 
       await createMessageProcessor({ ...deps, executionMode }).process(envelopeFromFixture(BTO_QQQ_PUT));
@@ -595,7 +564,7 @@ describe('fan-out — approval mode', () => {
       expect(decision!.kind).toBe('pending_approval');
       expect(decision!.reason).toContain(`TRADE_EXECUTION_MODE=${executionMode}`);
       expect(decision!.order?.quantity).toBeGreaterThan(0);
-      expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
     }
   );
 
@@ -633,18 +602,18 @@ describe('fan-out — error paths', () => {
 
   it('records risk_rejected for a low-confidence callout', async () => {
     const lowConf: Callout = { ...BTO_QQQ_PUT.expectedCallout, confidence: 0.3 };
-    const { decision, tools } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), lowConf);
+    const { decision, broker } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), lowConf);
 
     expect(decision.kind).toBe('risk_rejected');
     expect(decision.code).toBe('low_confidence');
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('records risk_rejected when buying power is zero', async () => {
     const { decision } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout,
-      { getBuyingPower: vi.fn().mockResolvedValue({ amountUsd: 0 }) }
+      { buyingPowerUsd: 0 }
     );
 
     expect(decision.kind).toBe('risk_rejected');
@@ -654,38 +623,46 @@ describe('fan-out — error paths', () => {
 
   it('parks an option whose contract is not on the chain, even when the equity quote is missing', async () => {
     const mtsla: Callout = { ...BTO_QQQ_PUT.expectedCallout, ticker: 'MTSLA' };
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       mtsla,
       {
-        getQuote: vi.fn().mockRejectedValue(new SymbolNotFoundError('no quote price')),
-        confirmOption: vi.fn().mockRejectedValue(new SymbolNotFoundError('no option instrument matched MTSLA')),
+        equityMark: () => {
+          throw new SymbolNotFoundError('no quote price');
+        },
+        overrides: {
+          confirmInstrument: vi
+            .fn()
+            .mockRejectedValue(new SymbolNotFoundError('no option instrument matched MTSLA')),
+        },
       }
     );
 
     expect(decision.kind).toBe('pending_approval');
     expect(decision.code).toBe('price_mismatch');
     expect(decision.reason).toMatch(/no such contract/);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
-    expect(tools.getOptionsMarkPrice).not.toHaveBeenCalled();
-    expect(tools.getBuyingPower).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+    expect(markReads(broker, 'option')).toHaveLength(0);
+    expect(broker.getAccount).not.toHaveBeenCalled();
   });
 
   it('records broker_unavailable, not ticker_invalid, when the Robinhood session is down', async () => {
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout,
       {
-        getBuyingPower: vi
-          .fn()
-          .mockRejectedValue(new BrokerUnavailableError('Robinhood authorization required')),
+        overrides: {
+          getAccount: vi
+            .fn()
+            .mockRejectedValue(new BrokerUnavailableError('Robinhood authorization required')),
+        },
       }
     );
 
     expect(decision.kind).toBe('execution_failed');
     expect(decision.code).toBe('broker_unavailable');
     expect(decision.reason).toMatch(/authorization required/);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('places the options order when the equity quote fails, as with SPX', async () => {
@@ -694,35 +671,41 @@ describe('fan-out — error paths', () => {
       ticker: 'SPX',
       option: { optionType: 'call', strike: 7500, expiration: '2026-06-08' },
     };
-    const { decision, tools } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), spx, {
-      getQuote: vi.fn().mockRejectedValue(new Error('cannot place an equity order for SPX')),
+    const { decision, broker } = await runWith(envelopeFromFixture(BTO_QQQ_PUT), spx, {
+      equityMark: () => {
+        throw new Error('cannot place an equity order for SPX');
+      },
     });
 
     expect(decision.kind).toBe('submitted');
     expect(decision.order).toMatchObject({ symbol: 'SPX', assetType: 'option' });
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
-    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
+    expect(placedOrders(broker, 'equity')).toHaveLength(0);
   });
 
   it('records execution_error, not ticker_invalid, when an equity quote fails in transit', async () => {
     const equity: Callout = { ...BTO_QQQ_PUT.expectedCallout, assetType: 'equity', option: null, ticker: 'AAPL' };
-    const { decision, tools } = await runWith(
+    const { decision, broker } = await runWith(
       { ...envelopeFromFixture(BTO_QQQ_PUT), content: 'grabbing some AAPL here' },
       equity,
-      { getQuote: vi.fn().mockRejectedValue(new Error('fetch failed')) }
+      {
+        equityMark: () => {
+          throw new Error('fetch failed');
+        },
+      }
     );
 
     expect(decision.kind).toBe('execution_failed');
     expect(decision.code).toBe('execution_error');
     expect(decision.reason).toMatch(/quote fetch for AAPL/);
-    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'equity')).toHaveLength(0);
   });
 
-  it('records execution_failed when placeOptionsOrder throws', async () => {
+  it('records execution_failed when placing the options order throws', async () => {
     const { decision } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
       BTO_QQQ_PUT.expectedCallout,
-      { placeOptionsOrder: vi.fn().mockRejectedValue(new Error('broker rejected')) }
+      { overrides: { placeOrder: vi.fn().mockRejectedValue(new Error('broker rejected')) } }
     );
 
     expect(decision.kind).toBe('execution_failed');
@@ -766,9 +749,14 @@ describe('fan-out — several users', () => {
 
   it("one user's broker failure does not stop the others", async () => {
     const db = createFakeDb();
-    const toolsByUser = new Map<string, RobinhoodTools>([
-      [USER, makeTools({ getBuyingPower: vi.fn().mockRejectedValue(new Error('MCP transport closed')) })],
-      [OTHER_USER, makeTools()],
+    const brokerByUser = new Map<string, FakeBroker>([
+      [
+        USER,
+        makeBroker({
+          overrides: { getAccount: vi.fn().mockRejectedValue(new Error('MCP transport closed')) },
+        }),
+      ],
+      [OTHER_USER, makeBroker()],
     ]);
     for (const userId of [USER, OTHER_USER]) {
       db.seedBrokerTokens(userId, fakeTokens(`token-${userId}`));
@@ -779,13 +767,13 @@ describe('fan-out — several users', () => {
       parser: makeParser(BTO_QQQ_PUT.expectedCallout),
       db,
       events: new TraderEvents(),
-      brokers: makeRegistry(toolsByUser),
+      brokers: makeRegistry(brokerByUser),
       executionMode: 'immediate',
     }).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('execution_failed');
     expect((await db.listDecisions(OTHER_USER, 10))[0]!.kind).toBe('submitted');
-    expect(toolsByUser.get(OTHER_USER)!.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(brokerByUser.get(OTHER_USER)!, 'option')).toHaveLength(1);
   });
 });
 
@@ -802,13 +790,13 @@ describe('fan-out — Following', () => {
 
   // The reason a fresh account cannot copy nineteen strangers on day one.
   it('the default follows no one, so a brand-new account trades nothing', async () => {
-    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, broker } = setup(BTO_QQQ_PUT.expectedCallout);
     db.seedSettings(USER, {});
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect(await db.listDecisions(USER, 10)).toEqual([]);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('an explicit list including the author trades normally', async () => {
@@ -821,23 +809,23 @@ describe('fan-out — Following', () => {
   });
 
   it('an explicit list excluding the author skips silently — no trade, no record', async () => {
-    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, broker } = setup(BTO_QQQ_PUT.expectedCallout);
     db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: ['someone-else'] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect(await db.listDecisions(USER, 10)).toEqual([]);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('an empty list follows no one', async () => {
-    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, broker } = setup(BTO_QQQ_PUT.expectedCallout);
     db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: [] });
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
 
     expect(await db.listDecisions(USER, 10)).toEqual([]);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('Following is per user: one user skips while the other trades', async () => {
@@ -958,7 +946,7 @@ describe('fan-out — envelope contract', () => {
 
 describe('fan-out — missed callouts', () => {
   it('records missed without touching the broker or the LLM', async () => {
-    const { db, deps, tools } = setup(BTO_QQQ_PUT.expectedCallout);
+    const { db, deps, broker } = setup(BTO_QQQ_PUT.expectedCallout);
 
     await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT), { missed: true });
 
@@ -966,7 +954,7 @@ describe('fan-out — missed callouts', () => {
     expect(decision!.kind).toBe('missed');
     expect(decision!.reason).toMatch(/stale/);
     expect(deps.parser.parse).not.toHaveBeenCalled();
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
     expect(db.getMessage(envelopeFromFixture(BTO_QQQ_PUT).messageId)?.disposition).toBe('missed');
   });
 });
@@ -1002,10 +990,10 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
   /** setup() with the real decider in front of a Jev that answers `answer`. */
   function setupJev(
     answer: JevVerdict | Error,
-    toolsOverrides: Partial<RobinhoodTools> = {},
+    brokerOptions: FakeBrokerOptions = {},
     settings: TradeSettings = {}
   ): Setup {
-    const base = setup(BTO_QQQ_PUT.expectedCallout, toolsOverrides);
+    const base = setup(BTO_QQQ_PUT.expectedCallout, brokerOptions);
     if (Object.keys(settings).length > 0) base.db.seedSettings(USER, { ...TRADING_SETTINGS, ...settings });
     const jev = {
       ask: answer instanceof Error ? vi.fn().mockRejectedValue(answer) : vi.fn().mockResolvedValue(answer),
@@ -1014,10 +1002,7 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
   }
 
   const holding = (strike: number, quantity: number, expiration = '2026-06-11') => ({
-    getOptionPositions: vi.fn().mockResolvedValue({
-      positions: [{ symbol: 'QQQ', optionType: 'call', strike, expiration, quantity, raw: {} }],
-      raw: {},
-    }),
+    positions: [optionPosition('QQQ', 'call', strike, expiration, quantity)],
   });
 
   const ENTRY = "I'm Entering\n**Option:** QQQ 707 C 6/11\n**Entry:** 0.97";
@@ -1035,7 +1020,7 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     const [parked] = await unsure.db.listDecisions(USER, 10);
     expect(parked).toMatchObject({ kind: 'pending_approval' });
     expect(parked!.reason).toMatch(/^Jev BUY 0\.75 .* is below 0\.8\. Approval required: BUY/);
-    expect(unsure.tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(unsure.broker, 'option')).toHaveLength(0);
   });
 
   it('skips a lotto entry as lotto_blocked until the user turns lotto trades on', async () => {
@@ -1044,7 +1029,7 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     const off = setupJev(verdict('BUY', 0.9));
     await createMessageProcessor(off.deps).process(message(LOTTO_ENTRY));
     expect((await off.db.listDecisions(USER, 10))[0]).toMatchObject({ kind: 'risk_rejected', code: 'lotto_blocked' });
-    expect(off.tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(off.broker, 'option')).toHaveLength(0);
 
     // $10,000 buying power at 2% is $200 — two $97 contracts, where Small
     // (0.5%, $50) would have fallen back to one.
@@ -1060,24 +1045,24 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
   });
 
   it('never trades an Average and writes no trade rows', async () => {
-    const { db, deps, tools } = setupJev(verdict('AVERAGE', 1));
+    const { db, deps, broker } = setupJev(verdict('AVERAGE', 1));
     await createMessageProcessor(deps).process(message('➕ AVERAGING DOWN — QQQ 707C · Jun 11\nAdded 10 @ $0.325'));
     expect(db.getMessage('jev-msg-1')?.disposition).toBe('not_callout');
     expect(await db.listDecisions(USER, 10)).toEqual([]);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it("sells the caller's stated fraction of the held position, rounding down", async () => {
     const card = '✂️ TRIM +25% — QQQ 707C · Jun 11\nSold **4 of 20** @ **$0.906** · **16** still running.';
-    const { db, deps, tools } = setupJev(verdict('TRIM', 0.95), holding(707, 12));
+    const { db, deps, broker } = setupJev(verdict('TRIM', 0.95), holding(707, 12));
     await createMessageProcessor(deps).process(message(card));
     expect((await db.listDecisions(USER, 10))[0]!.kind).toBe('submitted');
-    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(call).toMatchObject({ side: 'sell', strike: 707, contracts: 2 });
+    const call = placedOrders(broker, 'option')[0]!;
+    expect(call).toMatchObject({ side: 'sell', instrument: { strike: 707 }, quantity: 2 });
   });
 
   it("takes a contract-less exit's contract from the Caller's card it replies to", async () => {
-    const { db, deps, tools } = setupJev(verdict('TRIM', 0.9), holding(707, 5));
+    const { db, deps, broker } = setupJev(verdict('TRIM', 0.9), holding(707, 5));
     db.seedMessage({
       messageId: 'card-1',
       sentAt: '2026-06-10T13:00:00.000Z',
@@ -1087,12 +1072,12 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
       processedAt: '2026-06-10T13:00:00.000Z',
     });
     await createMessageProcessor(deps).process(message('Trimming here', { replyToMessageId: 'card-1' }));
-    const call = (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(call).toMatchObject({ side: 'sell', strike: 707, contracts: 2 });
+    const call = placedOrders(broker, 'option')[0]!;
+    expect(call).toMatchObject({ side: 'sell', instrument: { strike: 707 }, quantity: 2 });
   });
 
   it('ignores a card from another Caller, and skips quietly when nothing matches', async () => {
-    const { db, deps, tools } = setupJev(verdict('SELL', 0.95), holding(707, 5));
+    const { db, deps, broker } = setupJev(verdict('SELL', 0.95), holding(707, 5));
     db.seedMessage({
       messageId: 'card-b',
       sentAt: '2026-06-10T13:00:00.000Z',
@@ -1104,11 +1089,11 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     await createMessageProcessor(deps).process(message('Out of QQQ', { replyToMessageId: 'card-b' }));
     expect(db.getMessage('jev-msg-1')?.disposition).toBe('not_callout');
     expect(await db.listDecisions(USER, 10)).toEqual([]);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it("sends an exit to approval when the Caller has several live entries in the ticker", async () => {
-    const { db, deps, tools } = setupJev(verdict('SELL', 0.95), holding(710, 3));
+    const { db, deps, broker } = setupJev(verdict('SELL', 0.95), holding(710, 3));
     const entryAt = (strike: number, sentAt: string) =>
       db.seedMessage({
         messageId: `entry-${strike}`,
@@ -1133,11 +1118,11 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     expect(decision!.reason).toMatch(/Bishop has 2 open QQQ entries/);
     expect(decision!.reason).toMatch(/707C/);
     expect(decision!.reason).toMatch(/710C/);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it("resolves a ticker-less trim against that caller's one open lot", async () => {
-    const { db, deps, tools } = setupJev(verdict('TRIM', 0.95), holding(707, 2));
+    const { db, deps, broker } = setupJev(verdict('TRIM', 0.95), holding(707, 2));
     db.seedMessage({ messageId: 'buy-1', sentAt: '2026-06-10T13:00:00.000Z', authorId: CALLER });
     db.seedDecision(USER, {
       at: '2026-06-10T13:00:00.000Z',
@@ -1173,7 +1158,7 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
       option: { strike: 707 },
       lots: [{ lotId: 'buy-1', quantity: 1 }],
     });
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   it.each([
@@ -1190,7 +1175,7 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
   // The one broker write path refuses before any MCP call in a read-only
   // deployment; every other mode passes straight through to the broker.
   it('submitOrder throws BrokerWritesDisabledError under read_only and never calls the broker', async () => {
-    const tools = makeTools();
+    const broker = makeBroker();
     const order = {
       symbol: 'QQQ',
       side: 'sell' as const,
@@ -1203,19 +1188,19 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
       status: null,
     };
 
-    await expect(submitOrder(order, tools, 'read_only')).rejects.toBeInstanceOf(BrokerWritesDisabledError);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    await expect(submitOrder(order, broker, 'read_only')).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
 
-    await submitOrder(order, tools, 'approval');
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    await submitOrder(order, broker, 'approval');
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   it('records failed and a parse_failed row per user when Jev does not answer', async () => {
-    const { db, deps, tools } = setupJev(new JevError('no answer within 1500 ms', 'timeout'));
+    const { db, deps, broker } = setupJev(new JevError('no answer within 1500 ms', 'timeout'));
     await createMessageProcessor(deps).process(message(ENTRY));
     expect(db.getMessage('jev-msg-1')?.disposition).toBe('failed');
     expect((await db.listDecisions(USER, 10))[0]).toMatchObject({ kind: 'parser_error', code: 'parse_failed' });
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 });
 

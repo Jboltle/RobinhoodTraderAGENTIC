@@ -1,12 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
+import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from '../../__tests__/harness.js';
 import { TraderEvents } from '../../events.js';
 import { BrokerUnavailableError } from '../../broker/errors.js';
 import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
-import type { McpRegistry } from '../../broker/registry.js';
-import type { UserBroker } from '../../broker/types.js';
-import type { RobinhoodTools } from '../../robinhood/tools.js';
 import { openPosition } from '../ladder.js';
 import { sweepBook, type BookMonitorDeps } from '../monitor.js';
 
@@ -15,35 +13,36 @@ const RTH = new Date('2026-10-20T14:30:00.000Z');
 /** Same Tuesday, 20:00 ET — after the close. */
 const AFTER_HOURS = new Date('2026-10-21T00:00:00.000Z');
 
+const DEFAULT_MARK = 0.8;
+
 interface StubOptions {
   readonly unavailable?: boolean;
   readonly markPrice?: number | null;
 }
 
-function makeBroker(options: StubOptions = {}): UserBroker {
+interface StubBroker {
+  readonly session: RobinhoodMcpClient;
+  readonly broker: FakeBroker;
+}
+
+function makeBroker(options: StubOptions = {}): StubBroker {
   const mcp = {
     ensureReady: options.unavailable
       ? vi.fn().mockRejectedValue(new BrokerUnavailableError('needs consent'))
       : vi.fn().mockResolvedValue(undefined),
   } as unknown as RobinhoodMcpClient;
-  const tools = {
-    getOptionsMarkPrice: vi
-      .fn()
-      .mockResolvedValue(options.markPrice === null ? null : { markPrice: options.markPrice ?? 0.8 }),
-  } as unknown as RobinhoodTools;
-  return { session: mcp, broker: tools };
+  const broker = makeFakeBroker({
+    optionMark: options.markPrice === undefined ? DEFAULT_MARK : options.markPrice,
+  });
+  return { session: mcp, broker };
 }
 
 function makeDeps(
   db: FakeDb,
-  brokers: Record<string, UserBroker>,
+  brokers: Record<string, StubBroker>,
   now: Date
 ): BookMonitorDeps & { events: TraderEvents } {
-  const registry: McpRegistry = {
-    for: (userId) => brokers[userId]!,
-    existing: (userId) => brokers[userId],
-    drop: vi.fn(),
-  };
+  const registry = makeFakeRegistry((userId) => brokers[userId]!);
   return { db, brokers: registry, events: new TraderEvents(), now: () => now };
 }
 
@@ -74,7 +73,7 @@ describe('sweepBook', () => {
     const result = await sweepBook(deps);
 
     expect(result).toEqual({ open: 2, marked: 2, settled: 0 });
-    expect(broker.broker.getOptionsMarkPrice).toHaveBeenCalledTimes(2);
+    expect(broker.broker.getMark).toHaveBeenCalledTimes(2);
     expect(db.getTracked('m-1')!.lastMark).toBe(0.8);
     expect(db.getTracked('m-1')!.highestPct).toBeCloseTo(60);
     expect(db.getTracked('m-1')!.fills).toHaveLength(2);
@@ -92,8 +91,8 @@ describe('sweepBook', () => {
 
     await sweepBook(makeDeps(db, { u1: dead, u2: live }, RTH), state);
 
-    expect(dead.broker.getOptionsMarkPrice).not.toHaveBeenCalled();
-    expect(live.broker.getOptionsMarkPrice).toHaveBeenCalledTimes(1);
+    expect(dead.broker.getMark).not.toHaveBeenCalled();
+    expect(live.broker.getMark).toHaveBeenCalledTimes(1);
     expect(state.preferredUserId).toBe('u2');
   });
 

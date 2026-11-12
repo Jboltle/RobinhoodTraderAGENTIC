@@ -14,12 +14,16 @@ import {
   weightedAverageEntry,
   type MaxLossDeps,
 } from '../maxLoss.js';
-import type { McpRegistry } from '../broker/registry.js';
-import type { UserBroker } from '../broker/types.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
-import type { RobinhoodTools } from '../robinhood/tools.js';
 import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
+import {
+  equityPosition,
+  makeFakeBroker,
+  makeFakeRegistry,
+  optionPosition,
+  placedOrders,
+} from './harness.js';
 
 const USER = 'user-1';
 
@@ -120,10 +124,10 @@ describe('weightedAverageEntry', () => {
 describe('sweepMaxLoss', () => {
   it('reconnects a cold session from stored tokens before scanning', async () => {
     const ensureReady = vi.fn().mockResolvedValue(undefined);
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
       ],
       markFor: () => 0.75,
       ensureReady,
@@ -133,17 +137,17 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening);
 
     expect(ensureReady).toHaveBeenCalled();
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   // The deployment kill switch: a read-only process observes the breach and
   // never reaches the broker. Max Loss is protection the user opted into, so
   // `approval` does not hold it — only `read_only` does.
   it('read_only deployment logs the breach and places nothing', async () => {
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
       ],
       markFor: () => 0.75,
       executionMode: 'read_only',
@@ -153,17 +157,17 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening);
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
     expect((await db.listDecisions(USER, 10)).filter((d) => d.kind === 'max_loss_exit')).toHaveLength(0);
     // The in-flight key stays set, so the breach is not re-logged every sweep.
     expect(flattening.size).toBe(1);
   });
 
   it('approval deployment still flattens: Max Loss is protection, not an entry', async () => {
-    const { tools, flattening, deps } = setupMonitor({
+    const { broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
       ],
       markFor: () => 0.75,
       executionMode: 'approval',
@@ -172,27 +176,27 @@ describe('sweepMaxLoss', () => {
 
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   it('skips a user whose session needs OAuth consent', async () => {
-    const { tools, flattening, deps } = setupMonitor({
+    const { broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       ensureReady: vi.fn().mockRejectedValue(new BrokerUnavailableError('authorization required')),
     });
 
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.getOptionPositions).not.toHaveBeenCalled();
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(broker.getPositions).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('market-sells a 50% down option and leaves a sibling position untouched', async () => {
-    const { db, tools, enqueue, flattening, deps } = setupMonitor({
+    const { db, broker, enqueue, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
-        { symbol: 'NVDA', optionType: 'call', strike: 180, expiration: '2026-06-20', quantity: 3, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
+        { symbol: 'NVDA', optionType: 'call', strike: 180, expiration: '2026-06-20', quantity: 3 },
       ],
       markFor: (symbol) => (symbol === 'QQQ' ? 0.75 : 4.5),
     });
@@ -201,58 +205,61 @@ describe('sweepMaxLoss', () => {
 
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
-    expect(tools.placeOptionsOrder).toHaveBeenCalledWith(
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
+    expect(broker.placeOrder).toHaveBeenCalledWith(
       expect.objectContaining({
-        symbol: 'QQQ',
-        optionType: 'call',
-        strike: 707,
-        expiration: '2026-06-11',
-        contracts: 2,
+        instrument: {
+          kind: 'option',
+          symbol: 'QQQ',
+          optionType: 'call',
+          strike: 707,
+          expiration: '2026-06-11',
+        },
+        quantity: 2,
         side: 'sell',
-        orderType: 'market',
+        type: 'market',
       })
     );
-    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'equity')).toHaveLength(0);
     const rows = await db.listDecisions(USER, 10);
     expect(rows.some((d) => d.kind === 'max_loss_exit' && d.ticker === 'QQQ')).toBe(true);
     expect(enqueue).toHaveBeenCalled();
   });
 
   it('does not sell when entry is unknown', async () => {
-    const { tools, flattening, deps } = setupMonitor({
+    const { broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
       ],
       markFor: () => 0.3,
     });
 
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('writes nothing when both thresholds are off', async () => {
-    const { tools, flattening, deps } = setupMonitor({
+    const { broker, flattening, deps } = setupMonitor({
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
       ],
       markFor: () => 0.3,
     });
 
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.getPositions).not.toHaveBeenCalled();
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
-    expect(tools.placeOrder).not.toHaveBeenCalled();
+    expect(broker.getPositions).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+    expect(placedOrders(broker, 'equity')).toHaveLength(0);
   });
 
   it('does not double-fire a position already flattening', async () => {
-    const { tools, flattening, deps } = setupMonitor({
+    const { broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2, raw: {} },
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
       ],
       markFor: () => 0.75,
     });
@@ -264,14 +271,14 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening);
     await sweepMaxLoss(deps, flattening);
 
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 
   it('stops out on the averaged-down basis, not the latest add price', async () => {
     const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
-      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 4, raw: {} }],
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 4 }],
       markFor: () => 0.7,
     });
     db.seedDecision(
@@ -287,15 +294,20 @@ describe('sweepMaxLoss', () => {
 
     // Basis is (2×$2 + 2×$1)/4 = $1.50, so mark $0.70 is −53%. From the $1.00
     // add alone the move is only −30% and the stop would never have fired.
-    expect(tools.placeOptionsOrder).toHaveBeenCalledWith(
-      expect.objectContaining({ symbol: 'QQQ', contracts: 4, side: 'sell', orderType: 'market' })
+    expect(broker.placeOrder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instrument: expect.objectContaining({ kind: 'option', symbol: 'QQQ' }),
+        quantity: 4,
+        side: 'sell',
+        type: 'market',
+      })
     );
   });
 
   it('stops an equity out on the broker average cost, not the latest add limit', async () => {
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 40,
-      equityPositions: [{ symbol: 'PLTR', quantity: 10, raw: { average_buy_price: '2.0000' } }],
+      equityPositions: [{ symbol: 'PLTR', quantity: 10, averageEntryPrice: 2 }],
       quoteFor: () => 1.05,
     });
     db.seedDecision(USER, submittedBuy('PLTR', 1.0, null, { quantity: 10 }));
@@ -304,16 +316,21 @@ describe('sweepMaxLoss', () => {
 
     // Broker basis $2.00 → mark $1.05 is −47.5%; from the $1.00 add alone the
     // position would look up 5% and never stop out.
-    expect(tools.placeOrder).toHaveBeenCalledWith(
-      expect.objectContaining({ symbol: 'PLTR', side: 'sell', orderType: 'market', quantity: 10 })
+    expect(broker.placeOrder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instrument: { kind: 'equity', symbol: 'PLTR' },
+        side: 'sell',
+        type: 'market',
+        quantity: 10,
+      })
     );
   });
 
   it('re-protects a position re-entered after an earlier max-loss exit', async () => {
     const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
-      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2 }],
       markFor: () => 0.75,
     });
     db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
@@ -321,52 +338,52 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening); // flattens; in-flight key set
     expect(flattening.size).toBe(1);
 
-    asMock(tools.getOptionPositions).mockResolvedValueOnce({ positions: [], raw: {} });
+    broker.getPositions.mockResolvedValueOnce([]);
     await sweepMaxLoss(deps, flattening); // exit filled, position gone → key pruned
     expect(flattening.size).toBe(0);
 
     await sweepMaxLoss(deps, flattening); // same contract re-entered and down again
 
-    expect(tools.placeOptionsOrder).toHaveBeenCalledTimes(2);
+    expect(placedOrders(broker, 'option')).toHaveLength(2);
   });
 
   it('records no exit for a rejected close and retries it on the next sweep', async () => {
     const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
-      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2 }],
       markFor: () => 0.75,
     });
     db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
-    asMock(tools.placeOptionsOrder).mockResolvedValueOnce({ orderId: 'opt-dead', status: 'rejected' });
+    broker.placeOrder.mockResolvedValueOnce({ orderId: 'opt-dead', status: 'rejected' });
 
     await sweepMaxLoss(deps, flattening);
     const afterReject = await db.listDecisions(USER, 10);
     expect(afterReject.some((d) => d.kind === 'max_loss_exit')).toBe(false);
 
     await sweepMaxLoss(deps, flattening);
-    expect(tools.placeOptionsOrder).toHaveBeenCalledTimes(2);
+    expect(placedOrders(broker, 'option')).toHaveLength(2);
     const afterRetry = await db.listDecisions(USER, 10);
     expect(afterRetry.filter((d) => d.kind === 'max_loss_exit')).toHaveLength(1);
   });
 
   it('re-sells after the retry TTL when the close died but the position is still open', async () => {
     const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
-    const { db, tools, flattening, deps, nowRef } = setupMonitor({
+    const { db, broker, flattening, deps, nowRef } = setupMonitor({
       maxLossPct: 50,
-      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2 }],
       markFor: () => 0.75,
     });
     db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
 
     await sweepMaxLoss(deps, flattening);
     await sweepMaxLoss(deps, flattening); // in-flight close still fresh → skip
-    expect(tools.placeOptionsOrder).toHaveBeenCalledTimes(1);
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
 
     nowRef.value = new Date(RTH.getTime() + FLATTEN_RETRY_MS + 1_000);
     await sweepMaxLoss(deps, flattening); // guard went stale → close re-sent
 
-    expect(tools.placeOptionsOrder).toHaveBeenCalledTimes(2);
+    expect(placedOrders(broker, 'option')).toHaveLength(2);
   });
 });
 
@@ -377,12 +394,12 @@ describe('sweepMaxLoss entry history', () => {
 
   it('reads the history once and still stops out from the cached basis', async () => {
     let mark = 1.2;
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [
-        { symbol: 'QQQ', ...contract, quantity: 2, raw: {} },
+        { symbol: 'QQQ', ...contract, quantity: 2 },
         // Opened by hand: no history prices it, which must not re-read every sweep.
-        { symbol: 'NVDA', optionType: 'call', strike: 180, expiration: '2026-06-20', quantity: 1, raw: {} },
+        { symbol: 'NVDA', optionType: 'call', strike: 180, expiration: '2026-06-20', quantity: 1 },
       ],
       markFor: () => mark,
     });
@@ -395,16 +412,21 @@ describe('sweepMaxLoss entry history', () => {
     await sweepMaxLoss(deps, flattening, entries);
 
     expect(historyReads(db)).toBe(1);
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
-    expect(tools.placeOptionsOrder).toHaveBeenCalledWith(
-      expect.objectContaining({ symbol: 'QQQ', contracts: 2, side: 'sell', orderType: 'market' })
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
+    expect(broker.placeOrder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instrument: expect.objectContaining({ kind: 'option', symbol: 'QQQ' }),
+        quantity: 2,
+        side: 'sell',
+        type: 'market',
+      })
     );
   });
 
   it('re-reads after a decision, so an add re-averages the stop', async () => {
-    const position = { symbol: 'QQQ', ...contract, raw: {} };
+    const position = { symbol: 'QQQ', ...contract };
     let mark = 1.1;
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
       optionPositions: [{ ...position, quantity: 2 }],
       markFor: () => mark,
@@ -422,10 +444,7 @@ describe('sweepMaxLoss entry history', () => {
     });
     await db.recordDecision(USER, add);
     deps.events.emitDecision(USER, add);
-    asMock(tools.getOptionPositions).mockResolvedValue({
-      positions: [{ ...position, quantity: 4 }],
-      raw: {},
-    });
+    broker.getPositions.mockResolvedValue(optionPositions([{ ...position, quantity: 4 }]));
     mark = 0.9;
     await sweepMaxLoss(deps, flattening, entries);
 
@@ -433,14 +452,14 @@ describe('sweepMaxLoss entry history', () => {
     // (2×$0.60 + 2×$2.00)/4 = $1.30, and $0.90 is −31%: held. The cached
     // $2.00 basis would read −55% and sell at a loss the user never set.
     expect(historyReads(db)).toBe(2);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
   it('re-reads for a newly held position even when no decision event arrives', async () => {
     const nvda = { optionType: 'call' as const, strike: 180, expiration: '2026-06-20' };
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
-      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2 }],
       markFor: (symbol) => (symbol === 'QQQ' ? 1.4 : 2.0),
     });
     db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
@@ -449,26 +468,29 @@ describe('sweepMaxLoss entry history', () => {
 
     // NVDA was bought and logged, but no event reached the monitor.
     db.seedDecision(USER, submittedBuy('NVDA', 5, nvda));
-    asMock(tools.getOptionPositions).mockResolvedValue({
-      positions: [
-        { symbol: 'QQQ', ...contract, quantity: 2, raw: {} },
-        { symbol: 'NVDA', ...nvda, quantity: 2, raw: {} },
-      ],
-      raw: {},
-    });
+    broker.getPositions.mockResolvedValue(
+      optionPositions([
+        { symbol: 'QQQ', ...contract, quantity: 2 },
+        { symbol: 'NVDA', ...nvda, quantity: 2 },
+      ])
+    );
     await sweepMaxLoss(deps, flattening, entries);
 
     expect(historyReads(db)).toBe(2);
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
-    expect(tools.placeOptionsOrder).toHaveBeenCalledWith(
-      expect.objectContaining({ symbol: 'NVDA', strike: 180, contracts: 2, side: 'sell' })
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
+    expect(broker.placeOrder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instrument: expect.objectContaining({ kind: 'option', symbol: 'NVDA', strike: 180 }),
+        quantity: 2,
+        side: 'sell',
+      })
     );
   });
 
   it('does not keep a failed read: the next sweep reads again and stops out', async () => {
-    const { db, tools, flattening, deps } = setupMonitor({
+    const { db, broker, flattening, deps } = setupMonitor({
       maxLossPct: 50,
-      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2 }],
       markFor: () => 0.75,
     });
     db.seedDecision(USER, submittedBuy('QQQ', 1.5, contract));
@@ -476,15 +498,26 @@ describe('sweepMaxLoss entry history', () => {
     const entries = new Map();
 
     await sweepMaxLoss(deps, flattening, entries);
-    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
 
     await sweepMaxLoss(deps, flattening, entries);
     expect(listDecisions).toHaveBeenCalledTimes(2);
-    expect(tools.placeOptionsOrder).toHaveBeenCalledOnce();
+    expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 });
 
-const asMock = (fn: unknown): ReturnType<typeof vi.fn> => fn as ReturnType<typeof vi.fn>;
+interface OptionRow {
+  readonly symbol: string;
+  readonly optionType: 'call' | 'put';
+  readonly strike: number;
+  readonly expiration: string;
+  readonly quantity: number;
+}
+
+const optionPositions = (rows: readonly OptionRow[]) =>
+  rows.map((row) =>
+    optionPosition(row.symbol, row.optionType, row.strike, row.expiration, row.quantity)
+  );
 
 function submittedBuy(
   symbol: string,
@@ -518,15 +551,8 @@ function submittedBuy(
 function setupMonitor(opts: {
   maxLossPct?: number | null;
   maxLossUsd?: number | null;
-  equityPositions?: Array<{ symbol: string; quantity: number; raw: unknown }>;
-  optionPositions?: Array<{
-    symbol: string;
-    optionType: 'call' | 'put';
-    strike: number;
-    expiration: string;
-    quantity: number;
-    raw: unknown;
-  }>;
+  equityPositions?: Array<{ symbol: string; quantity: number; averageEntryPrice?: number }>;
+  optionPositions?: OptionRow[];
   markFor?: (symbol: string) => number;
   quoteFor?: (symbol: string) => number;
   ensureReady?: () => Promise<void>;
@@ -542,38 +568,22 @@ function setupMonitor(opts: {
     })
   );
 
-  const tools = {
-    getBuyingPower: vi.fn().mockResolvedValue({ amountUsd: 10_000 }),
-    getQuote: vi
-      .fn()
-      .mockImplementation((symbol: string) =>
-        Promise.resolve({ price: opts.quoteFor?.(symbol) ?? 150 })
+  const broker = makeFakeBroker({
+    positions: [
+      ...(opts.equityPositions ?? []).map((row) =>
+        equityPosition(row.symbol, row.quantity, row.averageEntryPrice ?? null)
       ),
-    getOptionsMarkPrice: vi
-      .fn()
-      .mockImplementation((symbol: string) =>
-        Promise.resolve({ markPrice: opts.markFor?.(symbol) ?? 0.97 })
-      ),
-    placeOrder: vi.fn().mockResolvedValue({ orderId: 'eq-001', status: 'queued' }),
-    placeOptionsOrder: vi.fn().mockResolvedValue({ orderId: 'opt-001', status: 'queued' }),
-    getPositions: vi
-      .fn()
-      .mockResolvedValue({ positions: opts.equityPositions ?? [], raw: {} }),
-    getOptionPositions: vi
-      .fn()
-      .mockResolvedValue({ positions: opts.optionPositions ?? [], raw: {} }),
-    getOptionOrders: vi.fn().mockResolvedValue(null),
-  } as unknown as RobinhoodTools;
+      ...optionPositions(opts.optionPositions ?? []),
+    ],
+    equityMark: (symbol) => opts.quoteFor?.(symbol) ?? 150,
+    optionMark: (contract) => opts.markFor?.(contract.symbol) ?? 0.97,
+  });
 
   const mcp = {
     isConnected: vi.fn().mockReturnValue(true),
     ensureReady: opts.ensureReady ?? vi.fn().mockResolvedValue(undefined),
   } as unknown as RobinhoodMcpClient;
-  const brokers: McpRegistry = {
-    for: (): UserBroker => ({ session: mcp, broker: tools }),
-    existing: () => ({ session: mcp, broker: tools }),
-    drop: () => undefined,
-  };
+  const brokers = makeFakeRegistry(() => ({ session: mcp, broker }));
   const enqueue = vi.fn(<T,>(_userId: string, run: () => Promise<T>) => run());
   const flattening = new Map<string, number>();
   const nowRef = { value: RTH };
@@ -585,5 +595,5 @@ function setupMonitor(opts: {
     executionMode: opts.executionMode ?? 'immediate',
     now: () => nowRef.value,
   };
-  return { db, tools, enqueue, flattening, deps, nowRef };
+  return { db, broker, enqueue, flattening, deps, nowRef };
 }

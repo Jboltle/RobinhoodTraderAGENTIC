@@ -15,7 +15,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { Decision } from '../../shared/types.js';
 import type { StoredCallout } from '../db.js';
 import { fakeTokens } from './fakeDb.js';
-import { makeHarness, type Harness } from './harness.js';
+import { equityPosition, makeHarness, type Harness } from './harness.js';
 
 const USER_A = { id: 'user-a', email: 'a@example.com' };
 const USER_B = { id: 'user-b', email: 'b@example.com' };
@@ -92,7 +92,7 @@ beforeEach(() => {
     connected: true,
     authUrl: 'https://robinhood.com/mcp/trading?state=a-only',
     portfolioValueUsd: 42_424.42,
-    equityPositions: [{ symbol: 'NVDA', quantity: 7, raw: {} }],
+    positions: [equityPosition('NVDA', 7)],
   });
   harness.configureBroker(USER_B.id, { connected: false, portfolioValueUsd: 0 });
 });
@@ -212,8 +212,8 @@ describe('user B cannot see user A', () => {
     });
 
     expect(response.statusCode).toBe(404);
-    expect(harness.brokerFor(USER_B.id).broker.placeOrder).not.toHaveBeenCalled();
-    expect(harness.brokerFor(USER_A.id).broker.placeOrder).not.toHaveBeenCalled();
+    expect(harness.fakeBroker(USER_B.id).placeOrder).not.toHaveBeenCalled();
+    expect(harness.fakeBroker(USER_A.id).placeOrder).not.toHaveBeenCalled();
 
     const asA = await harness.as(TOKEN_A, { method: 'GET', url: '/api/decisions' });
     const pending = (asA.json() as { decisions: Decision[] }).decisions.find(

@@ -19,8 +19,8 @@ import {
   type SubmittedOrder,
   type TradeExecutionMode,
 } from '../../shared/types.js';
-import type { RobinhoodTools } from '../robinhood/tools.js';
-import type { OptionPosition, PlaceOrderResult } from '../robinhood/types.js';
+import { instrumentOf } from '../broker/instrument.js';
+import type { Broker, BrokerPosition, PlacedOrder } from '../broker/types.js';
 
 const log = createLogger('trader:pipeline');
 
@@ -78,19 +78,19 @@ export async function sizeEquityOrder(
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  tools: RobinhoodTools
+  broker: Broker
 ): Promise<number> {
   const price =
-    risk.limitPrice !== null
-      ? risk.limitPrice
-      : await tools.getQuote(symbol).then((q) => q.price);
+    risk.limitPrice !== null ? risk.limitPrice : await broker.getMark({ kind: 'equity', symbol });
   if (price === null) throw new Error(`could not determine price for ${symbol}`);
 
   // Same add-gate as the options path: an "averaging down" buy needs shares
   // already held, otherwise it silently becomes a fresh entry.
   if (side === 'buy' && callout.isAddition) {
-    const { positions } = await tools.getPositions();
-    const held = positions.find((p) => p.symbol.toUpperCase() === symbol && p.quantity > 0);
+    const positions = await broker.getPositions('equity');
+    const held = positions.find(
+      (p) => p.instrument.symbol.toUpperCase() === symbol && p.quantity > 0
+    );
     if (!held) {
       throw new CapitalConstraintError(
         `averaging-down add skipped — no open ${symbol} position to add to`
@@ -103,7 +103,7 @@ export async function sizeEquityOrder(
   // ponytail: a stale or absent quote skips the check. Upgrade path:
   // quote-check at risk-filter time.
   if (side === 'buy' && risk.limitPrice !== null) {
-    const quote = await tools.getQuote(symbol).then((q) => q.price);
+    const quote = await broker.getMark({ kind: 'equity', symbol });
     if (quote !== null && risk.limitPrice < quote * EQUITY_LIMIT_MIN_QUOTE_FRACTION) {
       throw new ParseInconsistencyError(
         `equity limit $${risk.limitPrice.toFixed(2)} is <${EQUITY_LIMIT_MIN_QUOTE_FRACTION * 100}% of ${symbol} quote $${quote.toFixed(2)} — likely an option premium misread as a share price`
@@ -142,14 +142,14 @@ export async function sizeOptionsOrder(
   risk: RiskAllow,
   callout: Callout,
   buyingPower: number,
-  tools: RobinhoodTools,
+  broker: Broker,
   /** When set, the exit is sized from these contracts and then capped by the broker position. */
   heldContracts?: number
 ): Promise<number> {
   const option = callout.option!;
 
   if (side === 'sell') {
-    return sizeOptionExit(symbol, risk, callout, tools, heldContracts);
+    return sizeOptionExit(symbol, risk, callout, broker, heldContracts);
   }
 
   // Adds ("averaging down") extend a position; with none held there is
@@ -157,7 +157,7 @@ export async function sizeOptionsOrder(
   // position off a status update. Mirrors the sell-side "no open position to
   // trim" guard, so the rule holds for every caller regardless of format.
   if (callout.isAddition) {
-    const position = await findOpenOptionPosition(tools, symbol, option);
+    const position = await findOpenOptionPosition(broker, symbol, option);
     if (!position || Math.floor(position.quantity) < 1) {
       throw new CapitalConstraintError(
         `averaging-down add skipped — no open ${symbol} ${optionLabel(option)} position to add to`
@@ -170,9 +170,7 @@ export async function sizeOptionsOrder(
   const premium: number | null =
     risk.limitPrice !== null
       ? risk.limitPrice
-      : await tools
-          .getOptionsMarkPrice(symbol, option.optionType, option.strike, option.expiration)
-          .then((q) => q?.markPrice ?? null);
+      : await broker.getMark(instrumentOf({ symbol, assetType: 'option', option }));
 
   // Cost in USD to enter one contract (each controls 100 shares).
   const contractCost = premium !== null ? premium * 100 : null;
@@ -255,11 +253,11 @@ async function sizeOptionExit(
   symbol: string,
   risk: RiskAllow,
   callout: Callout,
-  tools: RobinhoodTools,
+  broker: Broker,
   callerHeld?: number
 ): Promise<number> {
   const option = callout.option!;
-  const position = await findOpenOptionPosition(tools, symbol, option);
+  const position = await findOpenOptionPosition(broker, symbol, option);
   const brokerHeld = Math.floor(position?.quantity ?? 0);
   // The caller's own lots, never more than the account actually holds.
   const heldContracts = callerHeld === undefined ? brokerHeld : Math.min(callerHeld, brokerHeld);
@@ -304,50 +302,35 @@ async function sizeOptionExit(
  */
 export async function submitOrder(
   order: SubmittedOrder,
-  tools: RobinhoodTools,
+  broker: Broker,
   mode: TradeExecutionMode
-): Promise<PlaceOrderResult> {
+): Promise<PlacedOrder> {
   if (mode === 'read_only') throw new BrokerWritesDisabledError(order);
 
-  if (order.assetType === 'option') {
-    if (order.option === null) {
-      throw new Error(`options order for ${order.symbol} is missing its contract details`);
-    }
-    return tools.placeOptionsOrder({
-      symbol: order.symbol,
-      optionType: order.option.optionType,
-      strike: order.option.strike,
-      expiration: order.option.expiration,
-      contracts: order.quantity,
-      side: order.side,
-      orderType: order.orderType,
-      ...(order.limitPrice !== null ? { limitPremium: order.limitPrice } : {}),
-    });
-  }
-
-  return tools.placeOrder({
-    symbol: order.symbol,
+  return broker.placeOrder({
+    instrument: instrumentOf(order),
     side: order.side,
-    orderType: order.orderType,
     quantity: order.quantity,
+    type: order.orderType,
     ...(order.limitPrice !== null ? { limitPrice: order.limitPrice } : {}),
   });
 }
 
 async function findOpenOptionPosition(
-  tools: RobinhoodTools,
+  broker: Broker,
   symbol: string,
   option: OptionContract
-): Promise<OptionPosition | null> {
-  const result = await tools.getOptionPositions();
+): Promise<BrokerPosition | null> {
+  const positions = await broker.getPositions('option');
   return (
-    result.positions.find(
-      (p) =>
-        p.symbol.toUpperCase() === symbol &&
-        p.optionType === option.optionType &&
-        p.expiration === option.expiration &&
-        Math.abs(p.strike - option.strike) < 0.0001 &&
-        p.quantity > 0
+    positions.find(
+      ({ instrument, quantity }) =>
+        instrument.kind === 'option' &&
+        instrument.symbol.toUpperCase() === symbol &&
+        instrument.optionType === option.optionType &&
+        instrument.expiration === option.expiration &&
+        Math.abs(instrument.strike - option.strike) < 0.0001 &&
+        quantity > 0
     ) ?? null
   );
 }

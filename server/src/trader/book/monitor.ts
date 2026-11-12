@@ -18,8 +18,9 @@ import type { TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { isRegularUsTradingHours } from '../pipeline/riskFilter.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
+import { instrumentOf } from '../broker/instrument.js';
 import type { McpRegistry } from '../broker/registry.js';
-import type { RobinhoodTools } from '../robinhood/tools.js';
+import type { Broker } from '../broker/types.js';
 import {
   applyMark,
   isExpired,
@@ -93,12 +94,12 @@ export async function sweepBook(
 
   let marked = 0;
   if (live.length > 0 && isRegularUsTradingHours(now)) {
-    const tools = await quoteSession(deps, state);
-    if (tools === null) {
+    const broker = await quoteSession(deps, state);
+    if (broker === null) {
       log.warn('no connected broker session to quote the book', { open: live.length });
     } else {
       for (const position of live) {
-        const mark = await markFor(tools, position);
+        const mark = await markFor(broker, position);
         if (mark === null) continue;
         await deps.db.saveTrackedCallout(applyMark(position, mark, at));
         marked += 1;
@@ -118,7 +119,7 @@ export async function sweepBook(
 async function quoteSession(
   deps: BookMonitorDeps,
   state: QuoteSessionState
-): Promise<RobinhoodTools | null> {
+): Promise<Broker | null> {
   const userIds = await deps.db.listBrokerUserIds();
   const ordered =
     state.preferredUserId !== null && userIds.includes(state.preferredUserId)
@@ -138,10 +139,8 @@ async function quoteSession(
   return null;
 }
 
-async function markFor(tools: RobinhoodTools, position: TrackedPosition): Promise<number | null> {
-  const { option } = position;
-  const quote = await tools
-    .getOptionsMarkPrice(position.ticker, option.optionType, option.strike, option.expiration)
+function markFor(broker: Broker, position: TrackedPosition): Promise<number | null> {
+  return broker
+    .getMark(instrumentOf({ symbol: position.ticker, assetType: 'option', option: position.option }))
     .catch(() => null);
-  return quote?.markPrice ?? null;
 }

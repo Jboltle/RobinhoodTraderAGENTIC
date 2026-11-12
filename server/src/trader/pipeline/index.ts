@@ -15,8 +15,8 @@ import { trackCallout } from '../book/track.js';
 import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js';
+import { instrumentOf } from '../broker/instrument.js';
 import type { McpRegistry } from '../broker/registry.js';
-import type { RobinhoodTools } from '../robinhood/tools.js';
 import {
   allocateFifo,
   entryMismatch,
@@ -485,7 +485,7 @@ export async function runForUser(
 
   const symbol = callout.ticker!.toUpperCase();
   const side = callout.action!;
-  const tools = deps.brokers.for(userId).broker;
+  const { broker } = deps.brokers.for(userId);
 
   if (callout.reviewReason?.includes('no such contract')) {
     return finalize(userId, deps, {
@@ -503,8 +503,8 @@ export async function runForUser(
   // order, and a failed equity quote must not block it.
   if (callout.assetType !== 'option') {
     try {
-      const quote = await tools.getQuote(symbol);
-      if (!(quote.price > 0)) {
+      const price = await broker.getMark({ kind: 'equity', symbol });
+      if (price === null || !(price > 0)) {
         return finalize(userId, deps, {
           ...base,
           ...identity,
@@ -550,8 +550,8 @@ export async function runForUser(
   let buyingPower = 0;
   if (needsBuyingPower) {
     try {
-      const bp = await tools.getBuyingPower();
-      buyingPower = bp.amountUsd;
+      const account = await broker.getAccount();
+      buyingPower = account.buyingPowerUsd;
     } catch (err) {
       return finalize(userId, deps, {
         ...base,
@@ -595,10 +595,10 @@ export async function runForUser(
             risk,
             callout,
             buyingPower,
-            tools,
+            broker,
             sellLots?.kind === 'sized' ? sellLots.held : undefined
           )
-        : await sizeEquityOrder(symbol, side, risk, callout, buyingPower, tools);
+        : await sizeEquityOrder(symbol, side, risk, callout, buyingPower, broker);
     const links = sellLots?.kind === 'sized' ? allocateFifo(sellLots.lots, quantity) : undefined;
 
     const pricedLimit = side === 'sell' && callout.limitPrice !== null;
@@ -637,9 +637,9 @@ export async function runForUser(
     }
 
     if (sized.assetType === 'option' && sized.side === 'sell') {
-      await cancelStops(deps.db, userId, tools, symbol, sized.option);
+      await cancelStops(deps.db, userId, broker, symbol, sized.option);
     }
-    const placed = await submitOrder(sized, tools, deps.executionMode);
+    const placed = await submitOrder(sized, broker, deps.executionMode);
     const order: SubmittedOrder = {
       ...sized,
       orderId: placed.orderId,
@@ -719,29 +719,24 @@ async function entryMismatchReason(
   const cached = entryVerdicts.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  let tools: RobinhoodTools | null = null;
-  for (const userId of await deps.db.listBrokerUserIds()) {
-    const candidate = deps.brokers.for(userId).broker;
-    if (typeof candidate.confirmOption === 'function') {
-      tools = candidate;
-      break;
-    }
-  }
-  if (!tools) return null;
+  const [firstUserId] = await deps.db.listBrokerUserIds();
+  if (firstUserId === undefined) return null;
+  const { broker } = deps.brokers.for(firstUserId);
+  const contract = instrumentOf({ symbol: ticker, assetType: 'option', option });
 
   let reason: string | null = null;
   try {
     let spot: number | null = null;
     try {
-      const quote = await tools.getQuote(ticker);
-      if (quote.price > 0) spot = quote.price;
+      const price = await broker.getMark({ kind: 'equity', symbol: ticker });
+      if (price !== null && price > 0) spot = price;
     } catch (err) {
       // No equity quote (SPX, XSP) leaves spot null and the chain check runs.
       // A dead session fails the chain the same way, so it still aborts here.
       if (err instanceof BrokerUnavailableError) throw err;
     }
     try {
-      await tools.confirmOption(ticker, option.optionType, option.strike, option.expiration);
+      await broker.confirmInstrument(contract);
     } catch (err) {
       if (err instanceof SymbolNotFoundError) {
         reason = `no such contract: ${ticker} ${optionLabel(option)}`;
@@ -750,10 +745,7 @@ async function entryMismatchReason(
       }
     }
     if (!reason) {
-      const mark = await tools
-        .getOptionsMarkPrice(ticker, option.optionType, option.strike, option.expiration)
-        .then((quote) => quote?.markPrice ?? null)
-        .catch(() => null);
+      const mark = await broker.getMark(contract).catch(() => null);
       reason = entryMismatch({
         ticker,
         strike: option.strike,

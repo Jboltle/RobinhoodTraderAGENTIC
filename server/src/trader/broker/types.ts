@@ -1,6 +1,5 @@
 import type { OptionType, OrderSide } from '../../shared/types.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
-import type { RobinhoodTools } from '../robinhood/tools.js';
 
 /** What an order, a position or a price refers to. */
 export type Instrument =
@@ -88,11 +87,11 @@ export interface Broker {
   cancelOrder(orderId: string): Promise<void>;
 }
 
-// ponytail: still the Robinhood classes under their current method names. The
-// instrument-keyed Broker interface replaces them when a second adapter needs it.
+// ponytail: the session is still the Robinhood MCP client class. Upgrade path:
+// a BrokerSession interface once a second adapter has a session of its own.
 export interface UserBroker {
   readonly session: RobinhoodMcpClient;
-  readonly broker: RobinhoodTools;
+  readonly broker: Broker;
 }
 
 /** Opens one user's broker session; the registry holds the result per user. */

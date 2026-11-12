@@ -20,8 +20,13 @@ import { BrokerWritesDisabledError, submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import { BrokerUnavailableError } from './broker/errors.js';
 import type { McpRegistry } from './broker/registry.js';
-import type { RobinhoodTools } from './robinhood/tools.js';
-import type { OptionOrder, OptionPosition, Position } from './robinhood/types.js';
+import type {
+  Broker,
+  BrokerOrder,
+  BrokerPosition,
+  Instrument,
+  OptionInstrument,
+} from './broker/types.js';
 
 const log = createLogger('trader:max-loss');
 
@@ -142,98 +147,70 @@ async function scanUser(
   const settings = await deps.db.getSettings(userId);
   if (!lossEnabled(settings.maxLossPct, settings.maxLossUsd)) return null;
 
-  const broker = deps.brokers.for(userId);
+  const { session, broker } = deps.brokers.for(userId);
   // Reconnect from stored tokens so a dropped session does not silently turn
   // Max Loss off; a session that needs OAuth consent is skipped this sweep.
   try {
-    await broker.session.ensureReady();
+    await session.ensureReady();
   } catch (err) {
     if (err instanceof BrokerUnavailableError) return null;
     throw err;
   }
 
-  const tools = broker.broker;
-  const [equity, options] = await Promise.all([tools.getPositions(), tools.getOptionPositions()]);
-  const held = new Set([
-    ...equity.positions.filter((p) => p.quantity > 0).map((p) => positionKey('equity', p.symbol)),
-    ...options.positions
-      .filter((p) => p.quantity > 0)
-      .map((p) => positionKey('option', p.symbol, p.optionType, p.strike, p.expiration)),
-  ]);
+  const positions = await broker.getPositions();
+  const held = new Set(
+    positions.filter((p) => p.quantity > 0).map((p) => positionKey(p.instrument))
+  );
   const submitted = await entryHistory(userId, deps, entries, held);
-  const optionOrders =
-    typeof tools.getOptionOrders === 'function'
-      ? await tools.getOptionOrders().catch(() => null)
-      : null;
+  const orders = await broker.getOrders().catch(() => null);
 
   const openLots = await deps.db.listOpenOptionLots(userId).catch(() => []);
   const openKeys = new Set<string>();
 
-  for (const position of equity.positions) {
-    const key = positionKey('equity', position.symbol);
-    if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
-    await considerPosition({
-      userId,
-      deps,
-      flattening,
-      now,
-      tools,
-      settings,
-      key,
-      symbol: position.symbol,
-      quantity: position.quantity,
-      assetType: 'equity',
-      option: null,
-      entry: resolveEquityEntry(submitted, position),
-      mark: await tools.getQuote(position.symbol).then((q) => q.price).catch(() => null),
-      multiplier: EQUITY_MULTIPLIER,
-    });
-  }
-
-  for (const position of options.positions) {
-    const key = positionKey(
-      'option',
-      position.symbol,
-      position.optionType,
-      position.strike,
-      position.expiration
-    );
+  for (const position of positions) {
+    const { instrument } = position;
+    const key = positionKey(instrument);
     if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
     // A resting broker stop is this position's Max Loss. Selling here too would
     // double-close it. ponytail: the dollar cap does not fire while that stop
     // rests. Upgrade path: cancel the stop and software-flatten only the usd breach.
-    const stopped = openLots.some(
-      (lot) =>
-        lot.stopOrderId !== null &&
-        lot.symbol === position.symbol.toUpperCase() &&
-        lot.option.optionType === position.optionType &&
-        lot.option.strike === position.strike &&
-        lot.option.expiration === position.expiration
-    );
+    const stopped =
+      instrument.kind === 'option' &&
+      openLots.some(
+        (lot) =>
+          lot.stopOrderId !== null &&
+          lot.symbol === instrument.symbol.toUpperCase() &&
+          lot.option.optionType === instrument.optionType &&
+          lot.option.strike === instrument.strike &&
+          lot.option.expiration === instrument.expiration
+      );
     if (stopped) continue;
-    const mark = await tools
-      .getOptionsMarkPrice(position.symbol, position.optionType, position.strike, position.expiration)
-      .then((q) => q?.markPrice ?? null)
-      .catch(() => null);
+    const mark = await broker.getMark(instrument).catch(() => null);
     await considerPosition({
       userId,
       deps,
       flattening,
       now,
-      tools,
+      broker,
       settings,
       key,
-      symbol: position.symbol,
+      symbol: instrument.symbol,
       quantity: position.quantity,
-      assetType: 'option',
-      option: {
-        optionType: position.optionType,
-        strike: position.strike,
-        expiration: position.expiration,
-      },
-      entry: resolveOptionEntry(submitted, position, optionOrders?.orders ?? null, mark),
+      assetType: instrument.kind,
+      option:
+        instrument.kind === 'option'
+          ? {
+              optionType: instrument.optionType,
+              strike: instrument.strike,
+              expiration: instrument.expiration,
+            }
+          : null,
+      entry:
+        instrument.kind === 'option'
+          ? resolveOptionEntry(submitted, instrument, position.quantity, orders, mark)
+          : resolveEquityEntry(submitted, position),
       mark,
-      multiplier: OPTION_MULTIPLIER,
+      multiplier: instrument.kind === 'option' ? OPTION_MULTIPLIER : EQUITY_MULTIPLIER,
     });
   }
 
@@ -298,7 +275,7 @@ interface ConsiderArgs {
   readonly deps: MaxLossDeps;
   readonly flattening: Map<string, number>;
   readonly now: Date;
-  readonly tools: RobinhoodTools;
+  readonly broker: Broker;
   readonly settings: { maxLossPct: number | null; maxLossUsd: number | null };
   readonly key: string;
   readonly symbol: string;
@@ -354,7 +331,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
       orderId: null,
       status: null,
     };
-    const placed = await submitOrder(sized, args.tools, args.deps.executionMode);
+    const placed = await submitOrder(sized, args.broker, args.deps.executionMode);
     // A dead submit-time status means nothing will fill: surface it as a
     // failure (no max_loss_exit row) so the next sweep retries the close.
     if (placed.status !== null && DEAD_ORDER_STATUSES.has(placed.status.toLowerCase())) {
@@ -403,15 +380,10 @@ export function lossEnabled(maxLossPct: number | null, maxLossUsd: number | null
   return (maxLossPct !== null && maxLossPct > 0) || (maxLossUsd !== null && maxLossUsd > 0);
 }
 
-function positionKey(
-  assetType: AssetType,
-  symbol: string,
-  optionType?: string,
-  strike?: number,
-  expiration?: string
-): string {
-  if (assetType === 'equity') return `eq:${symbol.toUpperCase()}`;
-  return `opt:${symbol.toUpperCase()}:${optionType}:${strike}:${expiration}`;
+function positionKey(instrument: Instrument): string {
+  const symbol = instrument.symbol.toUpperCase();
+  if (instrument.kind === 'equity') return `eq:${symbol}`;
+  return `opt:${symbol}:${instrument.optionType}:${instrument.strike}:${instrument.expiration}`;
 }
 
 /** One buy lot: unit price paid and units bought. Callers pass lots newest-first. */
@@ -500,13 +472,15 @@ function findOptionEntry(
  * broker's per-share average cost from the position row when present (it
  * already averages every fill, including adds), else the weighted average of
  * the submitted buy limits covering the open shares. Shared with the
- * dashboard's performance view (server.ts). `cost_basis` is deliberately not
- * read — it is a position total, not a per-share price.
+ * dashboard's performance view (server.ts).
  */
-export function resolveEquityEntry(submitted: readonly Decision[], position: Position): number | null {
+export function resolveEquityEntry(
+  submitted: readonly Decision[],
+  position: BrokerPosition
+): number | null {
   return (
-    numberFromRaw(position.raw, ['average_buy_price', 'average_price', 'average_cost']) ??
-    findEquityEntry(submitted, position.symbol, position.quantity)
+    position.averageEntryPrice ??
+    findEquityEntry(submitted, position.instrument.symbol, position.quantity)
   );
 }
 
@@ -519,29 +493,31 @@ export function resolveEquityEntry(submitted: readonly Decision[], position: Pos
  */
 export function resolveOptionEntry(
   submitted: readonly Decision[],
-  position: OptionPosition,
-  orders: readonly OptionOrder[] | null,
+  contract: OptionInstrument,
+  openQuantity: number,
+  orders: readonly BrokerOrder[] | null,
   mark: number | null
 ): number | null {
   const fillLots = (orders ?? [])
     .filter(
       (o) =>
         o.side === 'buy' &&
-        (o.state === null || o.state === 'filled') &&
-        o.symbol === position.symbol &&
-        o.optionType === position.optionType &&
-        Math.abs(o.strike - position.strike) < 0.0001 &&
-        o.expiration === position.expiration &&
-        o.averagePrice !== null
+        (o.status === null || o.status === 'filled') &&
+        o.instrument.kind === 'option' &&
+        o.instrument.symbol === contract.symbol &&
+        o.instrument.optionType === contract.optionType &&
+        Math.abs(o.instrument.strike - contract.strike) < 0.0001 &&
+        o.instrument.expiration === contract.expiration &&
+        o.fillPrice !== null
     )
     .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
     .map((o) => ({
-      price: normalizeOptionPremium(o.averagePrice!, mark),
+      price: normalizeOptionPremium(o.fillPrice!, mark),
       quantity: o.quantity > 0 ? o.quantity : 1,
     }));
   return (
-    weightedAverageEntry(fillLots, position.quantity) ??
-    findOptionEntry(submitted, position, position.quantity)
+    weightedAverageEntry(fillLots, openQuantity) ??
+    findOptionEntry(submitted, contract, openQuantity)
   );
 }
 
@@ -550,25 +526,6 @@ export function normalizeOptionPremium(average: number, mark: number | null): nu
   if (mark !== null && mark > 0 && average / mark >= 20) return average / 100;
   if (mark === null && average > 20) return average / 100;
   return average;
-}
-
-function numberFromRaw(raw: unknown, keys: readonly string[]): number | null {
-  if (raw === null || raw === undefined || typeof raw !== 'object') return null;
-  const rec = raw as Record<string, unknown>;
-  for (const k of keys) {
-    const v = rec[k];
-    if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
-    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) && Number(v) > 0) {
-      return Number(v);
-    }
-  }
-  for (const child of Object.values(rec)) {
-    if (child && typeof child === 'object') {
-      const found = numberFromRaw(child, keys);
-      if (found !== null) return found;
-    }
-  }
-  return null;
 }
 
 function maxLossReason(order: SubmittedOrder, entry: number, mark: number): string {

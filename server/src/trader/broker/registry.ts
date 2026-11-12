@@ -1,5 +1,5 @@
 /**
- * One Robinhood MCP client — and one RobinhoodTools — per user.
+ * One broker session — and one Broker over it — per user.
  *
  * Each user authorizes their own Robinhood account, so a shared client would
  * place every user's orders on whichever account happened to authorize first.

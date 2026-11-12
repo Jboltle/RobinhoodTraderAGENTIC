@@ -23,7 +23,7 @@ import type { TraderEvents } from './events.js';
 import { normalizeOptionPremium } from './maxLoss.js';
 import { BrokerUnavailableError } from './broker/errors.js';
 import type { McpRegistry } from './broker/registry.js';
-import type { OptionOrder } from './robinhood/types.js';
+import type { BrokerOrder } from './broker/types.js';
 
 const log = createLogger('trader:fills');
 
@@ -120,7 +120,7 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
         await restMissingStops({
           userId,
           db: deps.db,
-          tools: broker.broker,
+          broker: broker.broker,
           executionMode: deps.executionMode,
         });
       } catch (err: unknown) {
@@ -151,10 +151,10 @@ async function syncUser(
     throw err;
   }
 
-  const history = await broker.broker.getOptionOrders();
+  const history = await broker.broker.getOrders();
   if (history === null) return 0;
-  const byId = new Map<string, OptionOrder>();
-  for (const order of history.orders) {
+  const byId = new Map<string, BrokerOrder>();
+  for (const order of history) {
     if (order.orderId) byId.set(order.orderId, order);
   }
 
@@ -192,8 +192,8 @@ async function syncUser(
  * sometimes reports 159 for a 1.59 premium, and the order's own limit is the
  * reference when there is one.
  */
-export function applyBrokerState(order: SubmittedOrder, live: OptionOrder, now: Date): SubmittedOrder {
-  const status = live.state?.toLowerCase() ?? order.status;
+export function applyBrokerState(order: SubmittedOrder, live: BrokerOrder, now: Date): SubmittedOrder {
+  const status = live.status?.toLowerCase() ?? order.status;
   const filled = status === 'filled';
   const partial = status === 'partially_filled';
 
@@ -203,8 +203,8 @@ export function applyBrokerState(order: SubmittedOrder, live: OptionOrder, now: 
       ? live.quantity
       : (order.filledQuantity ?? null);
   const averageFillPrice =
-    (filled || partial) && live.averagePrice !== null
-      ? normalizeOptionPremium(live.averagePrice, order.limitPrice)
+    (filled || partial) && live.fillPrice !== null
+      ? normalizeOptionPremium(live.fillPrice, order.limitPrice)
       : (order.averageFillPrice ?? null);
   const filledAt = filled ? (order.filledAt ?? now.toISOString()) : (order.filledAt ?? null);
 

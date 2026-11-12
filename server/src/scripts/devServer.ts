@@ -17,7 +17,6 @@ import { TraderEvents } from '../trader/events.js';
 import type { McpRegistry } from '../trader/broker/registry.js';
 import type { UserBroker } from '../trader/broker/types.js';
 import type { RobinhoodMcpClient } from '../trader/robinhood/mcpClient.js';
-import type { RobinhoodTools } from '../trader/robinhood/tools.js';
 import { buildServer } from '../trader/server.js';
 
 const log = createLogger('dev-server');
@@ -26,6 +25,8 @@ const PORT = 3000;
 const USER = { id: 'dev-user', email: 'dev@example.com' };
 const BUYING_POWER_USD = 25_000;
 const PORTFOLIO_VALUE_USD = 31_480;
+const EQUITY_PRICE = 172.5;
+const OPTION_MARK = 2.4;
 
 const db = createFakeDb();
 
@@ -186,18 +187,20 @@ const broker: UserBroker = {
     getToolNames: () => [],
   } as unknown as RobinhoodMcpClient,
   broker: {
-    getBuyingPower: async () => ({
-      amountUsd: BUYING_POWER_USD,
-      accountNumber: 'dev-account',
+    getAccount: async () => ({
+      buyingPowerUsd: BUYING_POWER_USD,
       portfolioValueUsd: PORTFOLIO_VALUE_USD,
     }),
-    getQuote: async () => ({ price: 172.5 }),
-    getOptionsMarkPrice: async () => ({ markPrice: 2.4 }),
-    placeOrder: async () => ({ orderId: `dev-eq-${Date.now()}`, status: 'queued' }),
-    placeOptionsOrder: async () => ({ orderId: `dev-opt-${Date.now()}`, status: 'queued' }),
-    getPositions: async () => ({ positions: [], raw: {} }),
-    getOptionPositions: async () => ({ positions: [], raw: {} }),
-  } as unknown as RobinhoodTools,
+    getMark: async (instrument) => (instrument.kind === 'equity' ? EQUITY_PRICE : OPTION_MARK),
+    confirmInstrument: async () => {},
+    getPositions: async () => [],
+    getOrders: async () => null,
+    placeOrder: async ({ instrument }) => ({
+      orderId: `dev-${instrument.kind === 'equity' ? 'eq' : 'opt'}-${Date.now()}`,
+      status: 'queued',
+    }),
+    cancelOrder: async () => {},
+  },
 };
 
 const brokers: McpRegistry = {

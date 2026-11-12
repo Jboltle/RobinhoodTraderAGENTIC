@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Decision } from '../../shared/types.js';
 import type { StoredCallout } from '../db.js';
 import { fakeTokens } from './fakeDb.js';
-import { makeHarness, type Harness } from './harness.js';
+import { equityPosition, makeHarness, markReads, optionPosition, type Harness } from './harness.js';
 
 const USER = { id: 'user-1', email: 'user@example.com' };
 const TOKEN = 'a-valid-token';
@@ -109,9 +109,12 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(decision.kind).toBe('submitted');
     expect(decision.order).toMatchObject({ orderId: 'eq-001', status: 'queued', quantity: 4 });
 
-    const tools = harness.brokerFor(USER.id).broker;
-    expect(tools.placeOrder).toHaveBeenCalledWith(
-      expect.objectContaining({ symbol: 'AAPL', side: 'buy', quantity: 4 })
+    expect(harness.fakeBroker(USER.id).placeOrder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instrument: { kind: 'equity', symbol: 'AAPL' },
+        side: 'buy',
+        quantity: 4,
+      })
     );
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('submitted');
   });
@@ -130,7 +133,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
       expect(response.statusCode).toBe(409);
       expect((response.json() as { error: string }).error).toContain(executionMode);
-      expect(harness.brokerFor(USER.id).broker.placeOrder).not.toHaveBeenCalled();
+      expect(harness.fakeBroker(USER.id).placeOrder).not.toHaveBeenCalled();
       expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
     }
   );
@@ -142,7 +145,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
     expect(response.statusCode).toBe(200);
     expect((response.json() as { decision: Decision }).decision.kind).toBe('rejected');
-    expect(harness.brokerFor(USER.id).broker.placeOrder).not.toHaveBeenCalled();
+    expect(harness.fakeBroker(USER.id).placeOrder).not.toHaveBeenCalled();
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('rejected');
   });
 
@@ -155,7 +158,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
     const second = await send('POST', `/api/trades/${messageId}/approve`, {});
 
     expect(second.statusCode).toBe(404);
-    expect(harness.brokerFor(USER.id).broker.placeOrder).toHaveBeenCalledOnce();
+    expect(harness.fakeBroker(USER.id).placeOrder).toHaveBeenCalledOnce();
   });
 
   it('404s for a callout with no pending row', async () => {
@@ -168,7 +171,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
   it('a broker failure records execution_failed instead of leaving the row pending', async () => {
     const messageId = seedPending();
     harness.configureBroker(USER.id, {
-      toolsOverrides: {
+      overrides: {
         placeOrder: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
       },
     });
@@ -192,7 +195,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
-    expect(harness.brokerFor(USER.id).broker.placeOrder).not.toHaveBeenCalled();
+    expect(harness.fakeBroker(USER.id).placeOrder).not.toHaveBeenCalled();
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
   });
 });
@@ -471,7 +474,7 @@ describe('GET /api/trades/performance', () => {
     await harness.db.deleteBrokerTokens(USER.id);
     harness.configureBroker(USER.id, {
       connected: true,
-      equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+      positions: [equityPosition('AAPL', 10)],
     });
 
     const response = await get('/api/trades/performance');
@@ -481,12 +484,9 @@ describe('GET /api/trades/performance', () => {
 
   it('joins open positions with the caller\u2019s submitted orders and live quotes', async () => {
     harness.configureBroker(USER.id, {
-      equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
-      optionPositions: [
-        { symbol: 'QQQ', optionType: 'put', strike: 710, expiration: '2026-06-08', quantity: 2, raw: {} },
-      ],
-      quotePrice: 165,
-      markPrice: 1.94,
+      positions: [equityPosition('AAPL', 10), optionPosition('QQQ', 'put', 710, '2026-06-08', 2)],
+      equityMark: 165,
+      optionMark: 1.94,
     });
 
     harness.db.seedDecision(
@@ -543,8 +543,8 @@ describe('GET /api/trades/performance', () => {
 
   it('entry price comes from the buy even when a sell decision is newer', async () => {
     harness.configureBroker(USER.id, {
-      equityPositions: [{ symbol: 'AAPL', quantity: 5, raw: {} }],
-      quotePrice: 165,
+      positions: [equityPosition('AAPL', 5)],
+      equityMark: 165,
     });
 
     const equityOrder = (side: 'buy' | 'sell', limitPrice: number) => ({
@@ -575,35 +575,30 @@ describe('GET /api/trades/performance', () => {
 
   it('prefers the broker-reported cost basis over the submitted limit price', async () => {
     harness.configureBroker(USER.id, {
-      // RH string-encodes numerics; the row's average cost must beat the limit.
-      equityPositions: [
-        { symbol: 'AAPL', quantity: 10, raw: { average_buy_price: '148.5000' } },
+      // The position row's average cost must beat the limit.
+      positions: [
+        equityPosition('AAPL', 10, 148.5),
+        optionPosition('QQQ', 'put', 710, '2026-06-08', 2),
       ],
-      optionPositions: [
-        { symbol: 'QQQ', optionType: 'put', strike: 710, expiration: '2026-06-08', quantity: 2, raw: {} },
+      equityMark: 165,
+      optionMark: 1.94,
+      orders: [
+        {
+          orderId: 'opt-fill-1',
+          instrument: {
+            kind: 'option',
+            symbol: 'QQQ',
+            optionType: 'put',
+            strike: 710,
+            expiration: '2026-06-08',
+          },
+          side: 'buy',
+          status: 'filled',
+          fillPrice: 0.92,
+          quantity: 2,
+          createdAt: '2026-07-14T14:00:00.000Z',
+        },
       ],
-      quotePrice: 165,
-      markPrice: 1.94,
-      toolsOverrides: {
-        getOptionOrders: vi.fn().mockResolvedValue({
-          orders: [
-            {
-              orderId: 'opt-fill-1',
-              symbol: 'QQQ',
-              optionType: 'put',
-              strike: 710,
-              expiration: '2026-06-08',
-              side: 'buy',
-              state: 'filled',
-              averagePrice: 0.92,
-              quantity: 2,
-              createdAt: '2026-07-14T14:00:00.000Z',
-              raw: {},
-            },
-          ],
-          raw: {},
-        }),
-      },
     });
 
     harness.db.seedDecision(
@@ -655,7 +650,7 @@ describe('GET /api/trades/performance', () => {
 
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
     harness.configureBroker(USER.id, {
-      toolsOverrides: {
+      overrides: {
         getPositions: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
       },
     });
@@ -687,12 +682,10 @@ describe('GET /api/portfolio', () => {
   it('returns portfolio value and counts only open positions', async () => {
     harness.configureBroker(USER.id, {
       portfolioValueUsd: 25_431.5,
-      equityPositions: [
-        { symbol: 'AAPL', quantity: 10, raw: {} },
-        { symbol: 'MSFT', quantity: 0, raw: {} }, // closed — not counted
-      ],
-      optionPositions: [
-        { symbol: 'QQQ', optionType: 'put', strike: 710, expiration: '2026-06-08', quantity: 2, raw: {} },
+      positions: [
+        equityPosition('AAPL', 10),
+        equityPosition('MSFT', 0), // closed — not counted
+        optionPosition('QQQ', 'put', 710, '2026-06-08', 2),
       ],
     });
 
@@ -703,8 +696,8 @@ describe('GET /api/portfolio', () => {
 
   it('returns 503 when Robinhood MCP is unavailable', async () => {
     harness.configureBroker(USER.id, {
-      toolsOverrides: {
-        getBuyingPower: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
+      overrides: {
+        getAccount: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
       },
     });
 
@@ -1062,7 +1055,7 @@ describe('GET /api/stream', () => {
   it('performance frames report not-connected instead of serving a stale session', async () => {
     harness.configureBroker(USER.id, {
       connected: true,
-      equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+      positions: [equityPosition('AAPL', 10)],
     });
     harness.brokerFor(USER.id);
 
@@ -1132,10 +1125,9 @@ describe('GET /api/stream', () => {
     it('a tick re-fetches only live prices; connect and decisions read history and the row', async () => {
       harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
       let price = 150;
-      const getQuote = vi.fn().mockImplementation(async () => ({ price: price++ }));
       harness.configureBroker(USER.id, {
-        equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
-        toolsOverrides: { getQuote },
+        positions: [equityPosition('AAPL', 10)],
+        equityMark: () => price++,
       });
       const stream = await openStream();
       try {
@@ -1149,7 +1141,7 @@ describe('GET /api/stream', () => {
           await vi.advanceTimersByTimeAsync(TICK_MS);
           await stream.readUntil(`"currentPrice":${next}`);
         }
-        expect(getQuote).toHaveBeenCalledTimes(4);
+        expect(markReads(harness.fakeBroker(USER.id), 'equity')).toHaveLength(4);
         expect(reads('getBrokerTokens')).toBe(1);
         expect(reads('listDecisions')).toBe(2);
 
@@ -1170,9 +1162,9 @@ describe('GET /api/stream', () => {
       harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
       harness.configureBroker(USER.id, {
         connected: true,
-        equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+        positions: [equityPosition('AAPL', 10)],
       });
-      const tools = harness.brokerFor(USER.id).broker;
+      const broker = harness.fakeBroker(USER.id);
       const stream = await openStream();
       try {
         await stream.readUntil('"symbol":"AAPL"');
@@ -1182,7 +1174,7 @@ describe('GET /api/stream', () => {
         await stream.readUntil('"error":"Robinhood is not connected"');
 
         // The dropped session was never read again after the disconnect.
-        expect(tools.getPositions).toHaveBeenCalledOnce();
+        expect(broker.getPositions).toHaveBeenCalledOnce();
       } finally {
         await stream.close();
       }
@@ -1192,7 +1184,7 @@ describe('GET /api/stream', () => {
       harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
       harness.configureBroker(USER.id, {
         connected: true,
-        equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+        positions: [equityPosition('AAPL', 10)],
       });
       const stream = await openStream();
       try {
@@ -1222,7 +1214,7 @@ describe('GET /api/stream', () => {
         harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
         harness.configureBroker(USER.id, {
           connected: true,
-          equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
+          positions: [equityPosition('AAPL', 10)],
         });
         await vi.advanceTimersByTimeAsync(TICK_MS);
         await stream.readUntil('"symbol":"AAPL"');

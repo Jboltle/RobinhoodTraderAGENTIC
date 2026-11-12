@@ -43,8 +43,7 @@ import {
 } from './recaps/analytics.js';
 import { readTokenStatus } from './robinhood/mcpClient.js';
 import type { McpRegistry } from './broker/registry.js';
-import type { UserBroker } from './broker/types.js';
-import type { RobinhoodTools } from './robinhood/tools.js';
+import type { Broker, UserBroker } from './broker/types.js';
 import type { TokenState } from './robinhood/types.js';
 
 const log = createLogger('trader:server');
@@ -287,8 +286,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     // Approving spends money over the user's broker session, so it must not
     // run against a stale one. The row stays pending — reconnect, then approve.
-    const tools = await connectedBrokerTools(deps, userId);
-    if (tools === null) {
+    const broker = await connectedBrokerTools(deps, userId);
+    if (broker === null) {
       return reply.status(409).send({ error: 'Robinhood is not connected' });
     }
 
@@ -296,9 +295,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     let outcome: ApprovalOutcome;
     try {
       if (pending.order.assetType === 'option' && pending.order.side === 'sell') {
-        await cancelStops(deps.db, userId, tools, pending.order.symbol, pending.order.option);
+        await cancelStops(deps.db, userId, broker, pending.order.symbol, pending.order.option);
       }
-      const placed = await submitOrder(pending.order, tools, deps.executionMode);
+      const placed = await submitOrder(pending.order, broker, deps.executionMode);
       const order = {
         ...pending.order,
         orderId: placed.orderId,
@@ -429,23 +428,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // count of open (quantity > 0) equity + option positions.
   fastify.get('/api/portfolio', async (request, reply) => {
     const { id: userId } = requireUser(request);
-    const tools = await connections.tools(userId);
-    if (tools === null) {
+    const broker = await connections.tools(userId);
+    if (broker === null) {
       return reply.status(409).send({ error: 'Robinhood is not connected' });
     }
     try {
-      const [buyingPower, equity, options] = await Promise.all([
-        tools.getBuyingPower(),
-        tools.getPositions(),
-        tools.getOptionPositions(),
-      ]);
-      const openPositions =
-        equity.positions.filter((p) => p.quantity > 0).length +
-        options.positions.filter((p) => p.quantity > 0).length;
+      const [account, positions] = await Promise.all([broker.getAccount(), broker.getPositions()]);
       return reply.send({
-        portfolioValueUsd: buyingPower.portfolioValueUsd,
-        buyingPowerUsd: buyingPower.amountUsd,
-        openPositions,
+        portfolioValueUsd: account.portfolioValueUsd,
+        buyingPowerUsd: account.buyingPowerUsd,
+        openPositions: positions.filter((p) => p.quantity > 0).length,
       });
     } catch (err) {
       return reply
@@ -521,13 +513,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // (dis)connect or a logged decision, so both are read on connect and after
     // each decision, and a tick re-fetches only live broker data. Undefined =
     // read on the next tick.
-    let connection: RobinhoodTools | null | undefined;
+    let connection: Broker | null | undefined;
     let history: Promise<Decision[]> | undefined;
 
     // The registry is the in-memory disconnect signal: disconnect, Reconnect
     // and stale-session eviction drop or replace the session, and a finished
     // OAuth adds a connected one. Any of those re-checks the row.
-    const sessionChanged = (cached: RobinhoodTools | null): boolean => {
+    const sessionChanged = (cached: Broker | null): boolean => {
       const live = deps.brokers.existing(userId);
       return cached === null ? live?.session.isConnected() === true : live?.broker !== cached;
     };
@@ -690,7 +682,7 @@ async function loadFeed(deps: ServerDeps, userId: string): Promise<CalloutFeedIt
 async function connectedBrokerTools(
   deps: ServerDeps,
   userId: string
-): Promise<RobinhoodTools | null> {
+): Promise<Broker | null> {
   const stored = await deps.db.getBrokerTokens(userId);
   if (readTokenStatus(stored?.tokens).state !== 'missing') {
     return deps.brokers.for(userId).broker;
@@ -723,7 +715,7 @@ interface ConnectionCache {
   /** The token state of the user's broker_connections row. */
   state(userId: string): Promise<TokenState>;
   /** connectedBrokerTools, from the cached row. */
-  tools(userId: string): Promise<RobinhoodTools | null>;
+  tools(userId: string): Promise<Broker | null>;
   invalidate(userId: string): void;
 }
 
@@ -824,68 +816,47 @@ interface PerformanceRow {
 }
 
 async function collectPerformance(
-  tools: RobinhoodTools,
+  broker: Broker,
   history: Promise<Decision[]>
 ): Promise<PerformanceRow[]> {
-  const [equity, options, decisions] = await Promise.all([
-    tools.getPositions(),
-    tools.getOptionPositions(),
-    history,
-  ]);
+  const [positions, decisions] = await Promise.all([broker.getPositions(), history]);
   // Already newest-first, so find() picks the most recent entry for a position.
   const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);
   // Real option fills for the entry basis; degrade to the trade log when the
-  // server doesn't advertise the tool or the call fails.
-  const optionOrders =
-    typeof tools.getOptionOrders === 'function'
-      ? await tools.getOptionOrders().catch(() => null)
-      : null;
+  // broker offers no order history or the call fails.
+  const orders = await broker.getOrders().catch(() => null);
 
-  const equityRows = equity.positions
+  const rows = positions
     .filter((position) => position.quantity > 0)
     .map(async (position): Promise<PerformanceRow> => {
-      const entryPrice = resolveEquityEntry(submitted, position);
-      const currentPrice = await tools.getQuote(position.symbol).then((q) => q.price);
-      return {
-        assetType: 'equity',
-        symbol: position.symbol,
-        quantity: position.quantity,
-        entryPrice,
-        currentPrice,
-        pctChange: pctChange(entryPrice, currentPrice),
-      };
-    });
-
-  const optionRows = options.positions
-    .filter((position) => position.quantity > 0)
-    .map(async (position): Promise<PerformanceRow> => {
-      const quote = await tools.getOptionsMarkPrice(
-        position.symbol,
-        position.optionType,
-        position.strike,
-        position.expiration
-      );
-      const currentPrice = quote?.markPrice ?? null;
-      const entryPrice = resolveOptionEntry(
-        submitted,
-        position,
-        optionOrders?.orders ?? null,
-        currentPrice
-      );
+      const { instrument, quantity } = position;
+      const currentPrice = await broker.getMark(instrument);
+      if (instrument.kind === 'equity') {
+        const entryPrice = resolveEquityEntry(submitted, position);
+        return {
+          assetType: 'equity',
+          symbol: instrument.symbol,
+          quantity,
+          entryPrice,
+          currentPrice,
+          pctChange: pctChange(entryPrice, currentPrice),
+        };
+      }
+      const entryPrice = resolveOptionEntry(submitted, instrument, quantity, orders, currentPrice);
       return {
         assetType: 'option',
-        symbol: position.symbol,
-        quantity: position.quantity,
-        optionType: position.optionType,
-        strike: position.strike,
-        expiration: position.expiration,
+        symbol: instrument.symbol,
+        quantity,
+        optionType: instrument.optionType,
+        strike: instrument.strike,
+        expiration: instrument.expiration,
         entryPrice,
         currentPrice,
         pctChange: pctChange(entryPrice, currentPrice),
       };
     });
 
-  return Promise.all([...equityRows, ...optionRows]);
+  return Promise.all(rows);
 }
 
 const pctChange = (entry: number | null, current: number | null): number | null =>
