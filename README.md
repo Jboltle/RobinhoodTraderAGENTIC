@@ -300,18 +300,18 @@ Three files. Each is one statement, so it applies entirely or not at all, and it
 - `supabase/migrations/20261111210000_accounts_contract.sql` drops the old settings columns and `broker_connections`.
 - `supabase/rollback/accounts_reverse_copy.sql` is the rollback. It is not a migration and nothing applies it automatically.
 
-Every step runs outside market hours with PostgreSQL 18 client tools. To apply a file is `psql "<public database URL>" -X -1 -v ON_ERROR_STOP=1 -f <file>`, and only exit status 0 is success.
+Every step runs outside market hours with PostgreSQL 18 client tools. To apply a file is `psql "<public database URL>" -X -1 -v ON_ERROR_STOP=1 -f <file>`, and only exit status 0 is success. The three files and the Railway commands below were rehearsed on Staging (with `--environment Staging`).
 
-1. **Back up.** `pg_dump "<public database URL>" -Fc -f <path outside the repository>`. The dump holds the encrypted broker logins and the sessions.
-2. **Stop the trader.** Note `select count(*) from public.broker_connections` (8 when this was written), then `railway down --service RobinhoodTradingServer --environment production --yes`, which removes the most recent deployment. Confirm the previous code cannot come back: the service shows no active deployment, `/health` no longer answers, nothing is merged to `main` before step 5 (a merge deploys), no local process holds production's `SUPABASE_DB_URL`, and this lists no application connection:
+1. **Stop the trader.** Note `select count(*) from public.broker_connections` (8 when this was written), then `railway down --service RobinhoodTradingServer --environment production --yes`, which removes the running deployment within about 15 seconds. Confirm the previous code cannot come back: `railway service status --service RobinhoodTradingServer --environment production` reports `NO DEPLOYMENT`, `/health` answers 404 `Application not found` (Railway's edge, no longer the trader), nothing is merged to `main` before step 5 (a merge deploys), no local process holds production's `SUPABASE_DB_URL`, and this returns no rows (on staging a running trader showed as idle `postgres.js` connections, and Railway kept none of its own):
 
    ```sql
    select pid, client_addr, application_name, state from pg_stat_activity
     where datname = current_database() and pid <> pg_backend_pid();
    ```
 
+2. **Back up**, only now: a dump taken while the trader runs can hold a refresh token that a later refresh retires. `pg_dump "<public database URL>" -Fc -f <path outside the repository>`. The dump holds the encrypted broker logins and the sessions.
 3. **Expand.** Apply `supabase/migrations/20261111200000_accounts_expand.sql`.
-4. **Verify.** The first query must return no rows, the second `0`, the third the count noted in step 2:
+4. **Verify.** The first query must return no rows, the second `0`, the third the count noted in step 1:
 
    ```sql
    select u.email
@@ -328,9 +328,9 @@ Every step runs outside market hours with PostgreSQL 18 client tools. To apply a
    select count(*) from public.accounts where credentials is not null;
    ```
 
-5. **Deploy the accounts code** (merge `staging` to `main`) with `RH_TOKENS_VAULT_KEY` unchanged: the logins were copied as ciphertext, and only that key opens them. The trader's boot log must show `restoring broker sessions` with `accounts` at the third number from step 4.
-6. **Rollback, only before step 7.** The accounts code writes `accounts` alone, so the old columns and `broker_connections` go stale from its first write: old settings, a refresh token Robinhood has retired, a disconnected user still traded for. Stop the trader as in step 2, apply `supabase/rollback/accounts_reverse_copy.sql`, run the first query of step 4 again (no rows), then deploy the previous code. Never start the previous code against this database any other way.
-7. **Contract**, once the accounts code will not be rolled back, and before any deploy that can create a second account for a user (until this step a unique index refuses one): stop the trader as in step 2, apply `supabase/migrations/20261111210000_accounts_contract.sql`, redeploy. From here there is no rollback: the previous code fails on its first settings read, and the reverse copy refuses to run.
+5. **Deploy the accounts code** (merge `staging` to `main`) with `RH_TOKENS_VAULT_KEY` unchanged: the logins were copied as ciphertext, and only that key opens them. Wait for `/health` to answer 200, which can come some seconds after the deployment reads `SUCCESS`. The trader's boot log must show `restoring broker sessions` with `accounts` at the third number from step 4.
+6. **Rollback, only before step 7.** The accounts code writes `accounts` alone, so the old columns and `broker_connections` go stale from its first write: old settings, a refresh token Robinhood has retired, a disconnected user still traded for. Stop the trader as in step 1, apply `supabase/rollback/accounts_reverse_copy.sql`, run the first query of step 4 again (no rows), then deploy the previous code with `railway redeploy --service RobinhoodTradingServer --environment production --commit <full SHA of the previous main commit> --yes`. That deploys the commit once without pinning it, and the next push to `main` deploys `main` again, so revert `main` before anything else is merged. Never start the previous code against this database any other way.
+7. **Contract**, once the accounts code will not be rolled back, and before any deploy that can create a second account for a user (until this step a unique index refuses one): stop the trader as in step 1, apply `supabase/migrations/20261111210000_accounts_contract.sql`, then bring the trader back with `railway redeploy --service RobinhoodTradingServer --environment production --from-source --yes`, which builds the head of `main` (60 to 90 seconds on staging until `/health` answers 200). After `railway down` a plain `railway redeploy` or `railway restart` answers `No deployment found for service`. From here there is no rollback: the previous code fails on its first settings read, and the reverse copy refuses to run.
 
 ### Staging
 
