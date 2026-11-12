@@ -64,6 +64,18 @@ const ROBINHOOD = fakeAccount('account-robinhood', OWNER.id);
 const PAPER = fakeSnapTradeAccount('account-paper', OWNER.id);
 /** SnapTrade's own id for the account (fakeSnapTradeAccount's): what every request must name. */
 const PAPER_SNAPTRADE_ID = `external-${PAPER.id}`;
+/** The same owner's SnapTrade account at a live broker: real money, so never a paper account. */
+const LIVE: AccountRow = {
+  id: 'account-live',
+  userId: OWNER.id,
+  adapter: 'snaptrade',
+  institution: 'schwab',
+  externalAccountId: 'external-account-live',
+  label: 'Schwab Individual',
+  isPaper: false,
+  needsReconnect: false,
+  adapterData: { connectionId: 'connection-2', institutionSlug: 'SCHWAB', maskedAccountNumber: '9876' },
+};
 
 /** Auto-executing and following everyone, with the calendar guards relaxed. */
 const TRADING: TradeSettings = {
@@ -170,14 +182,24 @@ type Request = (options: InjectOptions) => Promise<LightMyRequestResponse>;
 
 /** The dashboard's routes, signed in as the owner. */
 /** The dashboard's server over the world, with `viewed` the account its owner has selected. */
-function serverOver(world: World, viewed: AccountRow, snapTrade: SnapTradeAccess | null = null): FastifyInstance {
+function serverOver(
+  world: World,
+  viewed: AccountRow,
+  snapTrade: SnapTradeAccess | null = null,
+  mode: TradeExecutionMode = 'immediate'
+): FastifyInstance {
   const { db, events, brokers } = world;
   db.addAccount(viewed, { select: true });
-  return buildServer({ db, events, brokers, executionMode: 'immediate', snapTrade });
+  return buildServer({ db, events, brokers, executionMode: mode, snapTrade });
 }
 
-function serve(world: World, viewed: AccountRow = PAPER, snapTrade: SnapTradeAccess | null = null): Request {
-  const app = serverOver(world, viewed, snapTrade);
+function serve(
+  world: World,
+  viewed: AccountRow = PAPER,
+  snapTrade: SnapTradeAccess | null = null,
+  mode: TradeExecutionMode = 'immediate'
+): Request {
+  const app = serverOver(world, viewed, snapTrade, mode);
   return (options) =>
     app.inject({
       ...options,
@@ -323,6 +345,85 @@ describe('a read_only deployment with the SnapTrade adapter', () => {
   });
 });
 
+/**
+ * What staging runs: the paper account beside a Robinhood account and a
+ * SnapTrade account at a live broker, each set to trade at once.
+ */
+describe('a paper_only deployment with the SnapTrade adapter', () => {
+  const PAPER_ONLY: TradeExecutionMode = 'paper_only';
+  const HELD = `Held by TRADE_EXECUTION_MODE=${PAPER_ONLY}`;
+  const SNAPTRADE_WRITES = [OPTION_ORDER, 'trading.placeForceOrder', 'trading.cancelOrder'];
+
+  function makePaperOnlyWorld(options: WorldOptions = {}): World {
+    const world = makeWorld({ ...options, mode: PAPER_ONLY });
+    world.db.addAccount(LIVE);
+    world.db.seedSettings(LIVE.id, { ...TRADING, ...options.paperSettings });
+    return world;
+  }
+
+  /** The calls made to SnapTrade naming the account, in order. */
+  const requestsFor = (world: World, account: AccountRow): string[] =>
+    world.sdk.calls
+      .filter(([, sent]) => (sent as { accountId?: string }).accountId === account.externalAccountId)
+      .map(([name]) => name);
+
+  const expectNoWriteButPaper = (world: World): void => {
+    for (const write of SNAPTRADE_WRITES) expect(requestsFor(world, LIVE)).not.toContain(write);
+    expect(world.robinhoodBroker.placeOrder).not.toHaveBeenCalled();
+    expect(world.robinhoodBroker.cancelOrder).not.toHaveBeenCalled();
+  };
+
+  it('an entry is placed on the paper account alone; the others are held by the deployment', async () => {
+    const world = makePaperOnlyWorld();
+
+    await processCallout(world, BTO_QQQ_PUT, PAPER_ONLY);
+
+    expect(requestsFor(world, PAPER)).toEqual([BALANCE_READ, OPTION_ORDER]);
+    expect(await decisionsOf(world.db, PAPER.id)).toMatchObject([{ kind: 'submitted', order: { side: 'buy' } }]);
+    expectNoWriteButPaper(world);
+    for (const account of [LIVE, ROBINHOOD]) {
+      const [decision] = await decisionsOf(world.db, account.id);
+      expect(decision).toMatchObject({ kind: 'pending_approval' });
+      expect(decision!.reason).toContain(HELD);
+    }
+  });
+
+  it("the Caller's exit is placed on the paper account alone", async () => {
+    const world = makePaperOnlyWorld({ answers: { positions: held(HELD_QQQ_CALL) } });
+
+    await processCallout(world, TRIM_QQQ_FIRST, PAPER_ONLY);
+
+    expect(requestsFor(world, PAPER)).toEqual([POSITIONS_READ, OPTION_ORDER]);
+    expect(await decisionsOf(world.db, PAPER.id)).toMatchObject([{ kind: 'submitted', order: { side: 'sell' } }]);
+    expectNoWriteButPaper(world);
+    expect((await decisionsOf(world.db, LIVE.id)).map((decision) => decision.kind)).not.toContain('submitted');
+  });
+
+  it('Max Loss, the stop rest and the own-target ladder ask nothing of SnapTrade and place nothing anywhere', async () => {
+    const MESSAGE_ID = 'msg-filled-lot';
+    const protect: TradeSettings = { maxLossPct: 50, exitMode: 'ladder', trimLevels: [{ gainPct: 50, portionPct: 50 }] };
+    const world = makePaperOnlyWorld({ paperSettings: protect });
+    world.db.seedSettings(ROBINHOOD.id, { ...TRADING, ...protect });
+    world.db.seedMessage({ messageId: MESSAGE_ID, sentAt: NOW.toISOString() });
+    for (const account of [PAPER, LIVE, ROBINHOOD]) {
+      world.db.seedDecision(account.id, {
+        ...workingBuy('limit', 1.6, MESSAGE_ID),
+        order: { ...workingBuy('limit', 1.6).order!, orderId: 'filled-buy', status: 'filled', averageFillPrice: 1.59 },
+      });
+    }
+    // Something still open, so the fill sweep has work and reaches the stop rest.
+    world.db.seedDecision(ROBINHOOD.id, workingBuy('limit', 1.6));
+    const { db, brokers, events } = world;
+
+    await sweepMaxLoss({ db, brokers, events, enqueue: (_accountId, run) => run(), now: () => NOW }, new Map());
+    await sweepFills({ db, brokers, events, executionMode: PAPER_ONLY, now: () => NOW });
+    expect(await sweepLadders({ db, brokers, events, executionMode: PAPER_ONLY })).toBe(0);
+
+    expect(world.sdk.calls).toEqual([]);
+    expectNoWriteButPaper(world);
+  });
+});
+
 describe('the dashboard routes, viewing a SnapTrade account that stores no credentials', () => {
   const PENDING_MESSAGE_ID = 'msg-pending';
   const pendingEntry: Decision = {
@@ -413,6 +514,35 @@ describe('the dashboard routes, viewing a SnapTrade account that stores no crede
     expect(await decisionsOf(world.db, PAPER.id)).toMatchObject([
       { kind: 'submitted', order: { orderId: PLACED_ORDER_ID } },
     ]);
+  });
+
+  it('under paper_only, Approve places the paper account\'s order with no credentials stored for it', async () => {
+    const world = makeWorld({ mode: 'paper_only' });
+    world.db.seedDecision(PAPER.id, pendingEntry);
+
+    const response = await approve(serve(world, PAPER, null, 'paper_only'));
+
+    expect(await world.db.getBrokerTokens(PAPER.id)).toBeNull();
+    expect(response.statusCode).toBe(200);
+    expect(world.sdk.calls).toMatchObject([[OPTION_ORDER, { accountId: PAPER_SNAPTRADE_ID }]]);
+    expect(await decisionsOf(world.db, PAPER.id)).toMatchObject([{ kind: 'submitted' }]);
+  });
+
+  it.each([
+    ['a SnapTrade account at a live broker', LIVE],
+    ['the Robinhood account', ROBINHOOD],
+  ])('under paper_only, Approve is refused for %s: it is not a paper account', async (_name, account) => {
+    const world = makeWorld({ mode: 'paper_only' });
+    world.db.addAccount(account);
+    world.db.seedDecision(account.id, pendingEntry);
+
+    const response = await approve(serve(world, account, null, 'paper_only'));
+
+    expect(response.statusCode).toBe(409);
+    expect((response.json() as { error: string }).error).toMatch(/paper_only.*not a paper account/);
+    expect((await decisionsOf(world.db, account.id))[0]!.kind).toBe('pending_approval');
+    expect(world.sdk.calls).toEqual([]);
+    expect(world.robinhoodBroker.placeOrder).not.toHaveBeenCalled();
   });
 
   it.each([

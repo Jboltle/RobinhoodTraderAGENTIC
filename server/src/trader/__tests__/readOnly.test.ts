@@ -23,6 +23,7 @@ import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { RobinhoodTools, TOOL_NAMES } from '../robinhood/tools.js';
 import { createSnapTradeAdapter } from '../snaptrade/adapter.js';
 import { fakeSnapTradeClient } from '../snaptrade/__tests__/fakeClient.js';
+import { optionOrderPlaced } from '../snaptrade/__tests__/fixtures/unverified.js';
 import { cancelStops, restMissingStops } from '../stops.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from './harness.js';
@@ -137,6 +138,52 @@ describe.each(ADAPTERS)('paper_only deployment over %s, for an account that is n
     );
 
     expect(adapter.callsReachingBroker()).toBe(0);
+  });
+});
+
+/** The SnapTrade adapter registered as the trader registers it, opening SnapTrade rows. */
+describe('paper_only deployment with the real SnapTrade adapter', () => {
+  const PAPER = fakeSnapTradeAccount('account-paper', USER);
+  /** A SnapTrade row that differs from the paper one in what the paper rule reads. */
+  const snapTradeRow = (isPaper: boolean, institutionSlug: string): AccountRow => ({
+    id: 'account-other',
+    userId: USER,
+    adapter: 'snaptrade',
+    institution: institutionSlug.toLowerCase(),
+    externalAccountId: 'external-account-other',
+    label: 'Other',
+    isPaper,
+    needsReconnect: false,
+    adapterData: { connectionId: 'connection-2', institutionSlug, maskedAccountNumber: '9876' },
+  });
+
+  function setup(): { sdk: ReturnType<typeof fakeSnapTradeClient>; brokers: ReturnType<typeof createMcpRegistry> } {
+    const sdk = fakeSnapTradeClient({ optionOrder: optionOrderPlaced() });
+    return { sdk, brokers: createMcpRegistry([createSnapTradeAdapter(sdk.client)], 'paper_only') };
+  }
+
+  it.each([
+    ['at a live broker', snapTradeRow(false, 'SCHWAB')],
+    ['flagged paper at a brokerage that is not on the allowlist', snapTradeRow(true, 'SCHWAB')],
+    ['at the paper brokerage that is not flagged paper', snapTradeRow(false, 'ALPACA-PAPER')],
+  ])('a SnapTrade account %s is refused every order and every cancel before the SDK is reached', async (_name, account) => {
+    const { sdk, brokers } = setup();
+    const { broker } = brokers.for(account);
+
+    for (const order of WRITES) {
+      await expect(broker.placeOrder(order)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    }
+    await expect(broker.cancelOrder(RESTING_STOP_ID)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+
+    expect(sdk.calls).toEqual([]);
+  });
+
+  it("the paper account's order is the one that reaches SnapTrade", async () => {
+    const { sdk, brokers } = setup();
+
+    await brokers.for(PAPER).broker.placeOrder(WRITES[2]!);
+
+    expect(sdk.calls).toMatchObject([['trading.placeMlegOrder', { accountId: PAPER.externalAccountId }]]);
   });
 });
 
