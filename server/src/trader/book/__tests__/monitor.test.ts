@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
 import { TraderEvents } from '../../events.js';
-import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
-import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
-import type { RobinhoodTools } from '../../rh/tools.js';
+import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
+import type { McpRegistry, UserBroker } from '../../robinhood/mcpRegistry.js';
+import type { RobinhoodTools } from '../../robinhood/tools.js';
 import { openPosition } from '../ladder.js';
 import { sweepBook, type BookMonitorDeps } from '../monitor.js';
 

@@ -29,7 +29,7 @@ The period lost **−$104.47 realized** on 18 closed round trips. **5 × ACI Oct
    - All 15 of your orders on Oct 12 were recorded `execution_failed` with "API error 409: Reference ID must be unique". **12 of them filled**: 9 buys and 3 sells.
    - On Oct 13, 2 of 3 orders failed the same way: a QQQ buy at 09:36 and an SNXX buy at 10:12. The third, 7 × SPY 778C at 14:27, was recorded `submitted` with its status unconfirmed.
    - It started on Oct 12. All 17 of these 409s fall on Oct 12–13, and the first was at 09:33 on Oct 12. Your 11 earlier `execution_failed` rows (Sep 9–30) were genuine failures: no matching contract, other API errors, or a lapsed Robinhood authorization. The first 409 came before the account switched to margin (09:42–10:01), so look for what else changed that morning: a deploy, or a change on Robinhood's side.
-   - Cause: `place_option_order` builds its `ref_id` once, and `withRetry` resends the same arguments (`trader/rh/tools.ts:240-258,736-761`).
+   - Cause: `place_option_order` builds its `ref_id` once, and `withRetry` resends the same arguments (`trader/robinhood/tools.ts:240-258,736-761`).
      - A 409 on a retry therefore proves the first attempt reached Robinhood.
      - It also settles an open question: Robinhood does de-duplicate by `ref_id`.
      - The first attempt's error isn't stored; only the Railway logs have it.
@@ -159,13 +159,13 @@ where id = 'a8da12d5-1a60-4359-98f8-e2fdd4f60bae';
 ### Code changes before switching back to immediate mode
 
 1. **Treat 409 "Reference ID must be unique" as "already placed".**
-   - Keep the `ref_id` outside the call. On a 409, look the order up with `get_option_orders` (`trader/rh/tools.ts:38,174`), then record it as `submitted` with its order id and quantity.
+   - Keep the `ref_id` outside the call. On a 409, look the order up with `get_option_orders` (`trader/robinhood/tools.ts:38,174`), then record it as `submitted` with its order id and quantity.
    - Match by `ref_id` if the response includes it; otherwise match by option id, side, quantity and creation time. Which fields come back is unverified.
    - Fix the cause too, once the logs show the first attempt's error.
    - Verify: a test where the first call throws and the retry gets a 409 records `submitted` with the broker's order id, not `execution_failed`.
 2. **Treat working orders as pending positions.**
    - Exits should look at working orders as well as positions. When the caller exits before the entry fills, cancel the working buy; when it is partly filled, cancel the rest and sell what filled.
-   - This needs `cancel_option_order` wired (`trader/rh/tools.ts:29-42`).
+   - This needs `cancel_option_order` wired (`trader/robinhood/tools.ts:29-42`).
    - Verify: with a resting buy and no position, a caller exit cancels the buy and records it.
 3. **Fix entry sizing.**
    - Test the small pattern before medium in `classifyPositionSize`, or stop matching "trim" as a size word (`trader/pipeline/parseCallout.ts:303-310`).
@@ -326,7 +326,7 @@ No callout carried a contract count the system used. Buying power isn't stored; 
 Buys through 09:42 on Oct 12 are type C (cash) and 1 lot. From 10:01 they are type M (margin) and 6–41 lots.
 
 - FINRA [Regulatory Notice 26-10][finra-2610] replaced the pattern-day-trader rule with intraday margin standards, effective June 4, 2026. Firms may phase in until Oct 20, 2027. Robinhood's adoption date is unverified.
-- Sizing multiplies the broker's `buying_power` (`trader/rh/tools.ts:492-497`). If that figure includes margin, the same percentages size larger positions. Unverified: inspect one raw `get_portfolio` response.
+- Sizing multiplies the broker's `buying_power` (`trader/robinhood/tools.ts:492-497`). If that figure includes margin, the same percentages size larger positions. Unverified: inspect one raw `get_portfolio` response.
 
 ---
 
@@ -355,7 +355,7 @@ Every Critical and High finding was re-read in the code at `23dc3a8`; † marks 
 | E2 | High | Exits face entry gates: the daily cap (20 for you), the 09:30–16:00 gate, the ticker lists and the parser's confidence floor. | `trader/pipeline/riskFilter.ts:147-173` | Exempt position-reducing sells. | Latent: 0 exits blocked |
 | E3 | High | Jev confidence of 0.6–0.8 parks an order for approval even in immediate mode. Approvals need Supabase Auth, pending rows never expire, and a late approval submits a stale price. | `trader/pipeline/index.ts:519-529`; `trader/pipeline/decide.ts:76-78`; `trader/server.ts:247-301` | Auto-execute exits for held positions; expire pending rows. | Latent for exits: 0. Two re-entries were parked and rejected (Prod) |
 | E5 | Medium | A Jev timeout (1.5 s budget) or HTTP error makes the message `failed` for good, with no fallback. | `trader/pipeline/jev.ts:31,154`; `trader/pipeline/index.ts:175-180` | Retry exit-shaped messages with a longer budget. | Latent: 1 timeout (an Average), no impact |
-| E9 | Medium | Every decision first needs an equity quote of the underlying. A broker tool error becomes `ticker_invalid`, never retried. | `trader/pipeline/index.ts:422-455`; `trader/rh/tools.ts:69-79` | Skip the quote gate for sells of held positions. | Prod: only SPX hit it (X10) |
+| E9 | Medium | Every decision first needs an equity quote of the underlying. A broker tool error becomes `ticker_invalid`, never retried. | `trader/pipeline/index.ts:422-455`; `trader/robinhood/tools.ts:69-79` | Skip the quote gate for sells of held positions. | Prod: only SPX hit it (X10) |
 | E12 | Medium | Ticker-only exits count entries the caller already closed; with several, the newest is picked and parked. | `trader/pipeline/index.ts:286-305` | Subtract the caller's Sells. | Code |
 | E13 | Medium | Exits match by contract, not by caller. | `trader/pipeline/execute.ts:308-324` | Track units per caller. | Code |
 | E14 | Medium | On the parser engine (the rollback), a plain Sell sells 1 contract and "close all" sells all but one. | `trader/pipeline/execute.ts:326-340` | Use the exit portion on both engines. | Trades: Oct 1 |
@@ -367,14 +367,14 @@ Every Critical and High finding was re-read in the code at `23dc3a8`; † marks 
 |---|---|---|---|---|---|
 | X9 | Critical | **New.** The size classifier tests "trim" before "lotto/risky". Every Swift BUY contains "Trim Targets:", so every Swift entry was sized medium (50% for you). | `trader/pipeline/parseCallout.ts:303-310` | Test small first, or don't treat "trim" as a size word (code fix 3). | Prod: about $146 of the −$354 |
 | X1 | Critical | Contracts are budget ÷ premium with dollar-only caps. With 30–70% budgets, cheap options produce 21–41-lot positions where one cent is 4–20% of the premium. There's no contract cap, premium floor or spread check. | `trader/pipeline/execute.ts:150-219` | A per-order contract cap and premium floor (code fix 3); spread and live-quote checks later. | Prod; Trades: −$354 on three trades |
-| X2 | Critical | Entries are good-for-day limits that nothing polls or cancels; no cancel tool is wired. A working order isn't a position, so caller exits find "no open position" and a late fill is held with no exit. | `trader/rh/tools.ts:29-42,257`; `trader/pipeline/execute.ts:287-296,308-324` | Working orders as pending positions; cancel on caller exit or timeout (code fix 2). | Prod: 4 late fills; $231 vs the caller on two |
+| X2 | Critical | Entries are good-for-day limits that nothing polls or cancels; no cancel tool is wired. A working order isn't a position, so caller exits find "no open position" and a late fill is held with no exit. | `trader/robinhood/tools.ts:29-42,257`; `trader/pipeline/execute.ts:287-296,308-324` | Working orders as pending positions; cancel on caller exit or timeout (code fix 2). | Prod: 4 late fills; $231 vs the caller on two |
 | X4 | High | Entries without a price, and every exit including Max Loss, are market orders. | `trader/pipeline/decide.ts:99,109`; `trader/maxLoss.ts:270-276` | Capped marketable limits. | Prod: milestone exits filled 7–13% below the alert |
 | X5 | Medium | 1-lot positions can't be trimmed, because half of 1 rounds to 0. | `trader/pipeline/execute.ts:349-358` | Your call: sell 1 when the fraction is at least 0.5. | Prod: 15 "trim size 0 for 1" rejections |
 | X10 | Medium | **New.** SPX isn't a tradable Robinhood symbol through `get_equity_quotes`, so every SPX decision is rejected. | `trader/pipeline/index.ts:422-455` | Map SPX/SPXW, or tell the caller list it's unsupported. | Prod: 48 `ticker_invalid` (no SPX held) |
-| X3 | Medium | A failed option quote returns `null`, so a callout without a price sends a 1-contract market order with the caps skipped. | `trader/rh/tools.ts:101-110`; `trader/pipeline/execute.ts:200-206` | No quote, no trade. | Latent: all 26 October entries were limits |
+| X3 | Medium | A failed option quote returns `null`, so a callout without a price sends a 1-contract market order with the caps skipped. | `trader/robinhood/tools.ts:101-110`; `trader/pipeline/execute.ts:200-206` | No quote, no trade. | Latent: all 26 October entries were limits |
 | X6 | Medium | When Jev says BUY on a message the templates read as an exit, the system buys the contract the caller is exiting. | `trader/pipeline/decide.ts:70-102` | Require agreement on direction. | Code |
 | X7 | Medium | Approvals bypass the per-user chain. | `trader/server.ts:277`; `trader/pipeline/index.ts:69-79` | Route approvals through `processor.enqueue`. | Code |
-| X8 | Medium | With no active agentic account, orders fall back to the default account (†). | `trader/rh/tools.ts:466-480` | Fail loudly. | Code |
+| X8 | Medium | With no active agentic account, orders fall back to the default account (†). | `trader/robinhood/tools.ts:466-480` | Fail loudly. | Code |
 
 ### 4.3 Parsing and decisioning
 
@@ -391,12 +391,12 @@ Every Critical and High finding was re-read in the code at `23dc3a8`; † marks 
 
 | ID | Sev | What fails, and what it costs | Where | Fix direction | Evidence |
 |---|---|---|---|---|---|
-| R6 | Critical | `withRetry` resends `place_option_order` with the same `ref_id` after any error. When the first attempt reached Robinhood, the retry gets 409 "Reference ID must be unique", and the order is recorded `execution_failed` with no order id. The position then exists only at the broker. | `trader/rh/tools.ts:240-258,736-761` | Treat the 409 as "already placed": look it up with `get_option_orders` and record it (code fix 1). | Prod: 15 of 15 orders on Oct 12 (12 filled), 2 of 3 on Oct 13 |
+| R6 | Critical | `withRetry` resends `place_option_order` with the same `ref_id` after any error. When the first attempt reached Robinhood, the retry gets 409 "Reference ID must be unique", and the order is recorded `execution_failed` with no order id. The position then exists only at the broker. | `trader/robinhood/tools.ts:240-258,736-761` | Treat the 409 as "already placed": look it up with `get_option_orders` and record it (code fix 1). | Prod: 15 of 15 orders on Oct 12 (12 filled), 2 of 3 on Oct 13 |
 | R4 | High | Nothing reconciles the records with the broker. A failed decision write after submit is only logged, and the cap and cooldown undercount. | `trader/pipeline/index.ts:547-561,572-584` | A reconciliation loop on positions and working orders. | Prod: Oct 12 shows zero positions for a day with 9 buys |
 | R7 | High | Per-user failures can leave no row: a crash mid fan-out marks the message done for users who never ran, and per-user DB errors write nothing. | `trader/poller.ts:124-135`; `trader/pipeline/index.ts:130-139` | Per-user completion markers; alert on a missing row. | Prod: 9 silent drops Oct 1–2 (cause unconfirmed), none after Oct 5 |
-| R5 | High | A non-401 transport error leaves the MCP client broken until restart (†). | `trader/rh/mcpClient.ts:125-126,337-345` | Reset on transport errors. | Code |
-| R1 | Medium | The poller handles one message at a time and waits for every user's broker calls (up to about 3 minutes each). Max Loss shares the chain. | `trader/poller.ts:100-108,206-216`; `trader/rh/tools.ts:736-761` | Shorter call timeouts; decouple fan-out. | Latent: 0 stalls; recap processing took 39 and 20 minutes after hours |
-| R2 | Medium | Approve calls the broker before its compare-and-set, with a fresh `ref_id`. | `trader/server.ts:259,277,300`; `trader/rh/tools.ts:258` | Compare-and-set first; persist the `ref_id`. | Latent: 0 duplicates |
+| R5 | High | A non-401 transport error leaves the MCP client broken until restart (†). | `trader/robinhood/mcpClient.ts:125-126,337-345` | Reset on transport errors. | Code |
+| R1 | Medium | The poller handles one message at a time and waits for every user's broker calls (up to about 3 minutes each). Max Loss shares the chain. | `trader/poller.ts:100-108,206-216`; `trader/robinhood/tools.ts:736-761` | Shorter call timeouts; decouple fan-out. | Latent: 0 stalls; recap processing took 39 and 20 minutes after hours |
+| R2 | Medium | Approve calls the broker before its compare-and-set, with a fresh `ref_id`. | `trader/server.ts:259,277,300`; `trader/robinhood/tools.ts:258` | Compare-and-set first; persist the `ref_id`. | Latent: 0 duplicates |
 | R3 | Medium | If the disposition and processed writes both fail, the next tick orders again. | `trader/pipeline/index.ts:308-321`; `trader/poller.ts:155-156` | An order-intent row before submitting. | Latent: 0 duplicates |
 | R8 | Medium | The daily cap resets at server-local midnight (UTC, so 20:00 ET); no holiday calendar. | `trader/pipeline/riskFilter.ts:95-99,204-219` | America/New_York plus a market calendar. | Code |
 | R9 | Low | Unbounded in-memory maps; Max Loss closures pile up when scans exceed 15 s. | `trader/pipeline/index.ts:68-70` | Bounded maps and an overlap guard. | Prior (memory chart, Oct 6) |
@@ -523,8 +523,8 @@ Put these in one gate in code, before every `place_*` call (models: [SEC 15c3-5]
 
 | Change | Where | Success check |
 |---|---|---|
-| 1. 409 "Reference ID must be unique" → look up with `get_option_orders` and record as placed | `trader/rh/tools.ts:240-258,736-761`; `trader/pipeline/index.ts:531-561` | A first-call-throws, retry-409 test records `submitted` with the broker order id |
-| 2. Working orders as pending positions; caller exits cancel or replace them | `trader/rh/tools.ts` (wire `cancel_option_order`); `trader/pipeline/execute.ts:308-324` | With a resting buy and no position, an exit cancels it |
+| 1. 409 "Reference ID must be unique" → look up with `get_option_orders` and record as placed | `trader/robinhood/tools.ts:240-258,736-761`; `trader/pipeline/index.ts:531-561` | A first-call-throws, retry-409 test records `submitted` with the broker order id |
+| 2. Working orders as pending positions; caller exits cancel or replace them | `trader/robinhood/tools.ts` (wire `cancel_option_order`); `trader/pipeline/execute.ts:308-324` | With a resting buy and no position, an exit cancels it |
 | 3. Size classifier order, contract cap, premium floor | `trader/pipeline/parseCallout.ts:303-310`; `trader/pipeline/execute.ts:183-219` | Swift lotto → small; $250 at $0.05 → 10; $0.05 rejected |
 | Exits follow the position, not the Following list | `trader/pipeline/index.ts:351-360` | An unfollowed author's exit sells a held contract |
 | Milestone policy: one trim per position | `trader/pipeline/decide.ts:105-113` | Six milestones on an 8-lot position give one trim |
@@ -539,7 +539,7 @@ Put these in one gate in code, before every `place_*` call (models: [SEC 15c3-5]
 | Change | Where | Success check |
 |---|---|---|
 | Reconciliation loop and a position ledger | New module using `getOptionPositions` and `getOptionOrders` | An injected mismatch alerts within 60 s |
-| Order lifecycle: poll, timeout, marketable-limit ladder | `trader/rh/tools.ts`; `trader/pipeline/execute.ts` | No entry order alive past its timeout |
+| Order lifecycle: poll, timeout, marketable-limit ladder | `trader/robinhood/tools.ts`; `trader/pipeline/execute.ts` | No entry order alive past its timeout |
 | Idempotency: intent row and deterministic `ref_id` | `trader/pipeline/index.ts:531`; `trader/server.ts:255-301` | A replayed message places one order |
 | Per-user completion markers (the Oct 1–2 drops) | `trader/poller.ts:124-135`; `trader/pipeline/index.ts:130-139` | A per-user failure writes a row and alerts |
 | Time stop and 0DTE flatten by 15:25 | Generalize `trader/maxLoss.ts` | A simulated-clock test closes a 0DTE position by 15:25 |
@@ -551,7 +551,7 @@ Put these in one gate in code, before every `place_*` call (models: [SEC 15c3-5]
 
 | Change | Where | Success check |
 |---|---|---|
-| Broker-side disaster stops, after the schema check | `server/scripts/dump-option-schemas.ts`, then `trader/rh/tools.ts` | Every fill has a resting stop |
+| Broker-side disaster stops, after the schema check | `server/scripts/dump-option-schemas.ts`, then `trader/robinhood/tools.ts` | Every fill has a resting stop |
 | Trading hot path off Supabase | Trader process state plus an async audit write | A drill with Supabase blocked still exits positions |
 | Sanctioned ingestion relay | Listener | At least 99% of messages de-duplicate across both paths |
 | Per-caller analytics | New report on `trades` | Follow decisions use realized slippage and P&L per caller (Namrood +$302, Swift −$406 here) |
@@ -583,7 +583,7 @@ Put these in one gate in code, before every `place_*` call (models: [SEC 15c3-5]
 ## 8. Other latent issues (not yet observed)
 
 - **Market-order exits at the open.** Robinhood accepts option market orders only from 09:35 to 16:00 ET ([market orders][rh-mkt]). A milestone exit at 09:30–09:35 would likely be rejected and never retried. MCP behaviour is unverified.
-- **Margin sizing.** Sizing multiplies `buying_power` (`trader/rh/tools.ts:492-497`), which may include margin.
+- **Margin sizing.** Sizing multiplies `buying_power` (`trader/robinhood/tools.ts:492-497`), which may include margin.
 - **Same-day entries late in the day.** Robinhood stops new same-day option opens at 15:30 when expiration-date trading is on ([options hours][rh-hours]).
 - **Approvals Robinhood holds.** Robinhood may require approval for some agent trades ([trading with your agent][rh-tools]). The system would record those orders as `submitted`.
 - **Half days and holidays** break the hours gate and the daily cap (R8).
@@ -614,7 +614,7 @@ Put these in one gate in code, before every `place_*` call (models: [SEC 15c3-5]
 ### A. Verification notes
 
 The production findings were checked against the extracts in `/tmp/rh-forensics/db/` and the code at `23dc3a8`:
-- the `ref_id` built once in `trader/rh/tools.ts:258`;
+- the `ref_id` built once in `trader/robinhood/tools.ts:258`;
 - the classifier order in `trader/pipeline/parseCallout.ts:303-310`;
 - settings read per callout (`trader/pipeline/index.ts:349,568`);
 - `NULL` versus `'{}'` Following (`:353`);

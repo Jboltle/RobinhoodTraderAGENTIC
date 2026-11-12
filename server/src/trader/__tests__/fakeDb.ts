@@ -35,7 +35,7 @@ import type {
   StoredRecapInsight,
   TraderDb,
 } from '../db.js';
-import type { PersistedState } from '../rh/types.js';
+import type { PersistedState } from '../robinhood/types.js';
 import { optionLabel } from '../../shared/types.js';
 import type { TrackedPosition } from '../book/ladder.js';
 

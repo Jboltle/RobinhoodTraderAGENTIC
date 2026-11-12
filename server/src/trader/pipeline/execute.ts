@@ -19,8 +19,8 @@ import {
   type SubmittedOrder,
   type TradeExecutionMode,
 } from '../../shared/types.js';
-import type { RobinhoodTools } from '../rh/tools.js';
-import type { OptionPosition, PlaceOrderResult } from '../rh/types.js';
+import type { RobinhoodTools } from '../robinhood/tools.js';
+import type { OptionPosition, PlaceOrderResult } from '../robinhood/types.js';
 
 const log = createLogger('trader:pipeline');
 

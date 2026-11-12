@@ -114,7 +114,7 @@ export const config = {
   // ---- Robinhood MCP ---------------------------------------------------------
   robinhoodMcpUrl: env.ROBINHOOD_MCP_URL ?? 'https://agent.robinhood.com/mcp/trading',
   // Constant, not env-driven: OAuth client display name for dynamic registration.
-  // Lives here (not at the consumer in trader/rh/) so it stays next to the other
+  // Lives here (not at the consumer in trader/robinhood/) so it stays next to the other
   // Robinhood OAuth settings.
   //
   // Robinhood's DCR endpoint maps this name to a pre-provisioned client_id whose

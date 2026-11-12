@@ -12,7 +12,7 @@ import { startLadderMonitor } from './ladderMonitor.js';
 import { startMaxLossMonitor } from './maxLoss.js';
 import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
-import { createMcpRegistry } from './rh/mcpRegistry.js';
+import { createMcpRegistry } from './robinhood/mcpRegistry.js';
 import { buildServer } from './server.js';
 
 const log = createLogger('trader');

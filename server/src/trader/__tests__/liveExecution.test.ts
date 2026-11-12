@@ -27,8 +27,8 @@ import { describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../shared/logger.js';
 import { createTraderDb } from '../db.js';
-import { RobinhoodMcpClient } from '../rh/mcpClient.js';
-import { RobinhoodTools } from '../rh/tools.js';
+import { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import { RobinhoodTools } from '../robinhood/tools.js';
 
 const log = createLogger('test:live-execution');
 

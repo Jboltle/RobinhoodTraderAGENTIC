@@ -41,10 +41,10 @@ import {
   computeRecapPerformance,
   isoDateDaysAgo,
 } from './recaps/analytics.js';
-import { readTokenStatus } from './rh/mcpClient.js';
-import type { McpRegistry, UserBroker } from './rh/mcpRegistry.js';
-import type { RobinhoodTools } from './rh/tools.js';
-import type { TokenState } from './rh/types.js';
+import { readTokenStatus } from './robinhood/mcpClient.js';
+import type { McpRegistry, UserBroker } from './robinhood/mcpRegistry.js';
+import type { RobinhoodTools } from './robinhood/tools.js';
+import type { TokenState } from './robinhood/types.js';
 
 const log = createLogger('trader:server');
 

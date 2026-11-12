@@ -7,7 +7,7 @@ import { createLogger } from '../shared/logger.js';
 import type { OptionContract, TradeExecutionMode } from '../shared/types.js';
 import type { TraderDb } from './db.js';
 import { stopTrigger } from './lots.js';
-import { roundPremiumToTick, type RobinhoodTools } from './rh/tools.js';
+import { roundPremiumToTick, type RobinhoodTools } from './robinhood/tools.js';
 
 const log = createLogger('trader:stops');
 

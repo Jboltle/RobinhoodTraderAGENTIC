@@ -380,7 +380,7 @@ server/
 │       ├── auth.ts    Supabase JWT preHandler; the public-route list lives here
 │       ├── db.ts      the only database client; every per-user method takes userId first
 │       ├── pipeline/  parse-once + per-user fan-out, riskFilter, execute, summarize
-│       └── rh/        per-user MCP registry, MCP client, OAuth, token crypto, tool wrappers
+│       └── robinhood/ per-user MCP registry, MCP client, OAuth, token crypto, tool wrappers
 supabase/
 ├── config.toml        local stack config (ports shifted off the CLI defaults)
 └── migrations/        the schema; portable to a hosted project with `db push`

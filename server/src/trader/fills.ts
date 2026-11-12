@@ -21,9 +21,9 @@ import type { OpenOrderRow, TraderDb } from './db.js';
 import { restMissingStops } from './stops.js';
 import type { TraderEvents } from './events.js';
 import { normalizeOptionPremium } from './maxLoss.js';
-import { BrokerUnavailableError } from './rh/mcpClient.js';
-import type { McpRegistry } from './rh/mcpRegistry.js';
-import type { OptionOrder } from './rh/types.js';
+import { BrokerUnavailableError } from './robinhood/mcpClient.js';
+import type { McpRegistry } from './robinhood/mcpRegistry.js';
+import type { OptionOrder } from './robinhood/types.js';
 
 const log = createLogger('trader:fills');
 

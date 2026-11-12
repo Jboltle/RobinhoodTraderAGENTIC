@@ -14,9 +14,9 @@ import { createLogger } from '../shared/logger.js';
 import type { Decision, SubmittedOrder } from '../shared/types.js';
 import { createFakeDb, fakeTokens } from '../trader/__tests__/fakeDb.js';
 import { TraderEvents } from '../trader/events.js';
-import type { McpRegistry, UserBroker } from '../trader/rh/mcpRegistry.js';
-import type { RobinhoodMcpClient } from '../trader/rh/mcpClient.js';
-import type { RobinhoodTools } from '../trader/rh/tools.js';
+import type { McpRegistry, UserBroker } from '../trader/robinhood/mcpRegistry.js';
+import type { RobinhoodMcpClient } from '../trader/robinhood/mcpClient.js';
+import type { RobinhoodTools } from '../trader/robinhood/tools.js';
 import { buildServer } from '../trader/server.js';
 
 const log = createLogger('dev-server');

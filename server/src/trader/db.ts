@@ -65,9 +65,9 @@ import {
   users,
 } from './db/schema.js';
 import { openOptionLots, type OpenOptionLot } from './lots.js';
-import { decryptTokens, encryptTokens } from './rh/tokenCrypto.js';
+import { decryptTokens, encryptTokens } from './robinhood/tokenCrypto.js';
 import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
-import type { PersistedState } from './rh/types.js';
+import type { PersistedState } from './robinhood/types.js';
 
 /**
  * The trader's verdict on a captured Message. Null on the row means the poller

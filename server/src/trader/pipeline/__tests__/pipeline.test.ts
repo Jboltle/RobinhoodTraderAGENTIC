@@ -14,9 +14,9 @@ import type {
 } from '../../../shared/types.js';
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
 import { TraderEvents } from '../../events.js';
-import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
-import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
-import { SymbolNotFoundError, type RobinhoodTools } from '../../rh/tools.js';
+import type { McpRegistry, UserBroker } from '../../robinhood/mcpRegistry.js';
+import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
+import { SymbolNotFoundError, type RobinhoodTools } from '../../robinhood/tools.js';
 import { JevCalloutDecider } from '../decide.js';
 import { BrokerWritesDisabledError, contractsForPortion, submitOrder } from '../execute.js';
 import { createMessageProcessor, liveCallerContracts, type PipelineDeps } from '../index.js';

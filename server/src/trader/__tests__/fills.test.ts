@@ -3,10 +3,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Decision, SubmittedOrder } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
 import { applyBrokerState, sweepFills, type FillMonitorDeps } from '../fills.js';
-import { BrokerUnavailableError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
-import type { McpRegistry, UserBroker } from '../rh/mcpRegistry.js';
-import type { RobinhoodTools } from '../rh/tools.js';
-import type { OptionOrder } from '../rh/types.js';
+import { BrokerUnavailableError, type RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import type { McpRegistry, UserBroker } from '../robinhood/mcpRegistry.js';
+import type { RobinhoodTools } from '../robinhood/tools.js';
+import type { OptionOrder } from '../robinhood/types.js';
 import { createFakeDb, fakeTokens } from './fakeDb.js';
 
 const USER = 'user-1';

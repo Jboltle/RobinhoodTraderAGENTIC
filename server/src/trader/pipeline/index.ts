@@ -14,9 +14,9 @@ import {
 import { trackCallout } from '../book/track.js';
 import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
-import { BrokerUnavailableError } from '../rh/mcpClient.js';
-import type { McpRegistry } from '../rh/mcpRegistry.js';
-import { SymbolNotFoundError, type RobinhoodTools } from '../rh/tools.js';
+import { BrokerUnavailableError } from '../robinhood/mcpClient.js';
+import type { McpRegistry } from '../robinhood/mcpRegistry.js';
+import { SymbolNotFoundError, type RobinhoodTools } from '../robinhood/tools.js';
 import {
   allocateFifo,
   entryMismatch,

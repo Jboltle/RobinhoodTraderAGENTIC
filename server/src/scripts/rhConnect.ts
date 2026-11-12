@@ -12,8 +12,8 @@
 import { config } from '../shared/config.js';
 import { createLogger } from '../shared/logger.js';
 import { createTraderDb } from '../trader/db.js';
-import { RobinhoodMcpClient } from '../trader/rh/mcpClient.js';
-import { RobinhoodTools, TOOL_NAMES } from '../trader/rh/tools.js';
+import { RobinhoodMcpClient } from '../trader/robinhood/mcpClient.js';
+import { RobinhoodTools, TOOL_NAMES } from '../trader/robinhood/tools.js';
 
 const log = createLogger('rh-connect');
 
@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   if (missing > 0) {
     log.warn(
       'one or more canonical tool names do not match the live MCP surface ' +
-        '— update src/trader/rh/tools.ts TOOL_NAMES to the values shown above'
+        '— update src/trader/robinhood/tools.ts TOOL_NAMES to the values shown above'
     );
   }
   log.info('done');

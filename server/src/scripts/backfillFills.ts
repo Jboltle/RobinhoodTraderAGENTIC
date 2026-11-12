@@ -14,7 +14,7 @@ import { createLogger, errorFields } from '../shared/logger.js';
 import { createTraderDb } from '../trader/db.js';
 import { TraderEvents } from '../trader/events.js';
 import { sweepFills } from '../trader/fills.js';
-import { createMcpRegistry } from '../trader/rh/mcpRegistry.js';
+import { createMcpRegistry } from '../trader/robinhood/mcpRegistry.js';
 
 const log = createLogger('scripts:backfill-fills');
 const DEFAULT_DAYS = 90;
