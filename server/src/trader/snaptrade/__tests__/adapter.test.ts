@@ -7,8 +7,7 @@ import { describe, expect, it } from 'vitest';
 
 import { BrokerUnavailableError } from '../../broker/errors.js';
 import type { AccountRow } from '../../broker/types.js';
-import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
-import { createSnapTradeAdapter, type SnapTradeSession } from '../adapter.js';
+import { createSnapTradeAdapter } from '../adapter.js';
 import type { SnapTradeBrokerClient } from '../broker.js';
 
 const SNAPTRADE_ACCOUNT_ID = 'snaptrade-account-1';
@@ -24,19 +23,6 @@ const ACCOUNT: AccountRow = {
   needsReconnect: false,
   adapterData: { connectionId: 'connection-1', institutionSlug: 'ALPACA-PAPER', maskedAccountNumber: null },
 };
-
-/**
- * Every session method called outside the Robinhood adapter (registry, quote
- * source, monitors, server). The SnapTrade session has to answer each the way
- * the Robinhood one is typed, or it could not stand in once the port's
- * session type is an interface.
- */
-type SessionMethodsInUse = Pick<
-  RobinhoodMcpClient,
-  'ensureReady' | 'ensureConnected' | 'isConnected' | 'getPendingAuthUrl' | 'isAuthPending' | 'submitAuthCode'
->;
-export type SessionFits = SnapTradeSession extends SessionMethodsInUse ? true : never;
-const SESSION_FITS: SessionFits = true;
 
 interface Fake {
   readonly client: SnapTradeBrokerClient;
@@ -74,7 +60,6 @@ describe('the SnapTrade adapter', () => {
 
     expect(adapter.id).toBe('snaptrade');
     expect(adapter.quotesOptions).toBe(false);
-    expect(SESSION_FITS).toBe(true);
   });
 
   it('opens an account ready, at no request, with a broker on its SnapTrade account id', async () => {
@@ -106,7 +91,7 @@ describe('the SnapTrade adapter', () => {
 
     expect(session.getPendingAuthUrl()).toBeNull();
     expect(session.isAuthPending()).toBe(false);
-    expect(() => session.submitAuthCode()).toThrow(/SnapTrade portal/);
+    expect(() => session.submitAuthCode('code', null)).toThrow(/SnapTrade portal/);
   });
 
   it('refuses an account with no SnapTrade account id, and one of another adapter', () => {

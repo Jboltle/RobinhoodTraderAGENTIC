@@ -2,16 +2,11 @@
  * The SnapTrade adapter: opens a SnapTrade account as the broker port.
  *
  * It takes the SDK client as a parameter and builds nothing, so it reads no
- * environment and a test hands it a fake.
- *
- * Not registered yet. `UserBroker.session` (broker/types.ts) is the Robinhood
- * session class, which no other session can be, so this cannot be typed as a
- * BrokerAdapter. Once that field is an interface of the six methods on
- * SnapTradeSession, `createSnapTradeAdapter` returns a BrokerAdapter as it
- * stands and SnapTradeAdapter below goes.
+ * environment and a test hands it a fake. trader/adapters.ts registers it
+ * when the deployment holds the SnapTrade keys.
  */
 import { BrokerUnavailableError } from '../broker/errors.js';
-import type { AccountRow, Broker, BrokerAdapter } from '../broker/types.js';
+import type { BrokerAdapter, BrokerSession } from '../broker/types.js';
 import { SnapTradeBroker, type SnapTradeBrokerClient } from './broker.js';
 
 /**
@@ -24,7 +19,7 @@ import { SnapTradeBroker, type SnapTradeBrokerClient } from './broker.js';
  * path: the sync drops the account from the registry when `needsReconnect`
  * changes, so the next use opens it from the new row.
  */
-export class SnapTradeSession {
+export class SnapTradeSession implements BrokerSession {
   constructor(private readonly needsReconnect: boolean) {}
 
   async ensureReady(): Promise<void> {
@@ -43,8 +38,8 @@ export class SnapTradeSession {
     return !this.needsReconnect;
   }
 
-  // The three below are Robinhood's pasted-code OAuth, which the session type
-  // still asks for. SnapTrade connects in its own portal, so none is pending.
+  // The three below are the pasted-code login. SnapTrade connects in its own
+  // portal, so none is pending.
   getPendingAuthUrl(): string | null {
     return null;
   }
@@ -60,16 +55,7 @@ export class SnapTradeSession {
   }
 }
 
-export interface OpenedSnapTradeAccount {
-  readonly session: SnapTradeSession;
-  readonly broker: Broker;
-}
-
-export interface SnapTradeAdapter extends Omit<BrokerAdapter, 'open'> {
-  open(account: AccountRow): OpenedSnapTradeAccount;
-}
-
-export function createSnapTradeAdapter(client: SnapTradeBrokerClient): SnapTradeAdapter {
+export function createSnapTradeAdapter(client: SnapTradeBrokerClient): BrokerAdapter {
   return {
     id: 'snaptrade',
     // SnapTrade prices no option contract; marks come from the shared quote source.

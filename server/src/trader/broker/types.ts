@@ -1,5 +1,4 @@
 import type { OptionType, OrderSide } from '../../shared/types.js';
-import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 
 /** What an order, a position or a price refers to. */
 export type Instrument =
@@ -120,11 +119,24 @@ export type AccountRow =
   | (AccountIdentity & { readonly adapter: 'robinhood'; readonly adapterData: Record<string, never> })
   | (AccountIdentity & { readonly adapter: 'snaptrade'; readonly adapterData: SnapTradeAdapterData });
 
-// ponytail: the session is still the Robinhood MCP client class. Upgrade path:
-// a BrokerSession interface once a second adapter has a session of its own.
+/**
+ * One account's connection to its broker: exactly what the callers outside an
+ * adapter ask of it. The last three are the pasted-code login (Robinhood); an
+ * adapter with no such login answers that none is pending.
+ */
+export interface BrokerSession {
+  /** Resolves once the account can be traded; rejects with BrokerUnavailableError when it needs its owner. */
+  ensureReady(timeoutMs?: number): Promise<void>;
+  ensureConnected(): Promise<void>;
+  isConnected(): boolean;
+  getPendingAuthUrl(): string | null;
+  isAuthPending(): boolean;
+  submitAuthCode(code: string, state: string | null): void;
+}
+
 /** One account's session and the Broker over it. */
 export interface UserBroker {
-  readonly session: RobinhoodMcpClient;
+  readonly session: BrokerSession;
   readonly broker: Broker;
   /** Its adapter's `quotesOptions`, stamped on by the registry. */
   readonly quotesOptions: boolean;
