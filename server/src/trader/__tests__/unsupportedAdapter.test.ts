@@ -350,13 +350,13 @@ describe('the routes, when the selected account is one whose adapter is not depl
     expect((await harness.db.listDecisions(UNSUPPORTED.id, 10))[0]!.kind).toBe('pending_approval');
   });
 
-  it('the account reads as not connected in the status and in the account list', async () => {
+  it('the account reads as not connected in the status, and with its real connection in the account list', async () => {
     expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
 
     const { brokers } = (await get('/api/accounts')).json() as AccountsResponse;
     expect(brokers).toMatchObject([
       { adapter: 'robinhood', account: { id: ROBINHOOD.id, connected: true } },
-      { adapter: 'snaptrade', accounts: { [UNSUPPORTED.id]: { connected: false } } },
+      { adapter: 'snaptrade', accounts: { [UNSUPPORTED.id]: { connected: true } } },
     ]);
   });
 

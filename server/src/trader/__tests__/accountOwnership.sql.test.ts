@@ -33,6 +33,7 @@ import postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createTraderDb, type TraderDb } from '../db.js';
+import type { SnapTradeAccountRow } from '../snaptrade/sync.js';
 
 const DATABASE_URL = process.env.ACCOUNT_OWNERSHIP_TEST_DATABASE_URL?.trim() ?? '';
 const RUN = DATABASE_URL !== '';
@@ -175,5 +176,105 @@ describe.skipIf(!RUN)('account ownership, in the real SQL', () => {
     } finally {
       await sql`update public.users set selected_account_id = ${owner.robinhoodAccountId} where id = ${owner.id}`;
     }
+  });
+
+  // Last: it adds accounts to both users. The SnapTrade sync and the rule for
+  // "connected" are SQL the fake re-implements, so they are run here too.
+  it("a SnapTrade sync writes the user's own SnapTrade accounts only, and decides who is connected", async () => {
+    const found = (externalAccountId: string, extra: Partial<SnapTradeAccountRow> = {}): SnapTradeAccountRow => ({
+      externalAccountId,
+      institution: 'alpaca-paper',
+      label: `Alpaca Paper · ${externalAccountId}`,
+      isPaper: true,
+      needsReconnect: false,
+      adapterData: { connectionId: 'connection-1', institutionSlug: 'ALPACA-PAPER', maskedAccountNumber: '1234' },
+      ...extra,
+    });
+    const accountOf = async (user: TestUser, externalAccountId: string) => {
+      const { accounts } = await db.listAccounts(user.id);
+      const listing = accounts.find(({ account }) => account.externalAccountId === externalAccountId);
+      if (!listing) throw new Error(`no account ${externalAccountId}`);
+      return listing;
+    };
+    const connectedIds = async (): Promise<string[]> => {
+      const ours = new Set(
+        (await Promise.all([owner, other].map((user) => db.listAccounts(user.id)))).flatMap(({ accounts }) =>
+          accounts.map(({ account }) => account.id)
+        )
+      );
+      return (await db.listConnectedAccounts()).map((account) => account.id).filter((id) => ours.has(id));
+    };
+
+    // The other user holds a SnapTrade account under the very same broker id.
+    const [othersPaper] = await sql<{ id: string }[]>`
+      insert into public.accounts
+        (user_id, adapter, institution, external_account_id, label, is_paper, execution_mode, adapter_data)
+      values
+        (${other.id}, 'snaptrade', 'alpaca-paper', 'external-1', 'Their paper', true, 'immediate',
+         ${sql.json({ connectionId: 'connection-9', institutionSlug: 'ALPACA-PAPER', maskedAccountNumber: null })})
+      returning id`;
+    await db.saveSettings(owner.robinhoodAccountId, {
+      executionMode: 'immediate',
+      maxTradesPerDay: 4,
+      followedCallerIds: ['caller-1', 'caller-2'],
+    });
+    await db.saveSettings(ownerPaperAccountId, { executionMode: 'immediate', maxTradesPerDay: 9 });
+    const robinhoodBefore = await db.getSettings(owner.robinhoodAccountId);
+
+    // Not theirs to copy from: nothing is written.
+    await expect(db.syncSnapTradeAccounts(owner.id, other.robinhoodAccountId, [found('external-2')])).rejects.toThrow();
+
+    expect(
+      await db.syncSnapTradeAccounts(owner.id, owner.robinhoodAccountId, [found('external-1'), found('external-2')])
+    ).toEqual({ added: 1, updated: 1, disconnected: 0 });
+
+    // The new account: the viewed account's settings, but waiting for approval.
+    const added = await accountOf(owner, 'external-2');
+    expect(added.account).toMatchObject({ userId: owner.id, adapter: 'snaptrade', label: 'Alpaca Paper · external-2' });
+    expect(await db.getSettings(added.account.id)).toEqual({ ...robinhoodBefore, executionMode: 'approval' });
+    // The one already there: same row, new label, its own settings.
+    const kept = await accountOf(owner, 'external-1');
+    expect(kept.account).toMatchObject({ id: ownerPaperAccountId, label: 'Alpaca Paper · external-1' });
+    expect(await db.getSettings(ownerPaperAccountId)).toMatchObject({ executionMode: 'immediate', maxTradesPerDay: 9 });
+    // No stored credentials anywhere: the SnapTrade accounts are the connected ones, oldest first.
+    expect(await connectedIds()).toEqual([ownerPaperAccountId, othersPaper!.id, added.account.id]);
+
+    // One is no longer listed; the other's brokerage login broke.
+    expect(
+      await db.syncSnapTradeAccounts(owner.id, owner.robinhoodAccountId, [found('external-2', { needsReconnect: true })])
+    ).toEqual({ added: 0, updated: 1, disconnected: 1 });
+    expect((await accountOf(owner, 'external-1')).connected).toBe(false);
+    expect(await accountOf(owner, 'external-2')).toMatchObject({ connected: false, account: { needsReconnect: true } });
+    expect(await connectedIds()).toEqual([othersPaper!.id]);
+
+    // Nothing listed at all: the rest goes too, and a repeat finds nothing left to do.
+    expect(await db.syncSnapTradeAccounts(owner.id, owner.robinhoodAccountId, [])).toEqual({ added: 0, updated: 0, disconnected: 1 });
+    expect(await db.syncSnapTradeAccounts(owner.id, owner.robinhoodAccountId, [])).toEqual({ added: 0, updated: 0, disconnected: 0 });
+
+    // Back again: connected, but no longer placing orders on its own.
+    expect(await db.syncSnapTradeAccounts(owner.id, owner.robinhoodAccountId, [found('external-1')])).toEqual({
+      added: 0,
+      updated: 1,
+      disconnected: 0,
+    });
+    expect((await accountOf(owner, 'external-1')).connected).toBe(true);
+    expect(await db.getSettings(ownerPaperAccountId)).toMatchObject({ executionMode: 'approval', maxTradesPerDay: 9 });
+
+    // Throughout: no account was deleted, and nobody else's row or the Robinhood row moved.
+    expect((await db.listAccounts(owner.id)).accounts.map(({ account }) => account.id)).toEqual([
+      owner.robinhoodAccountId,
+      ownerPaperAccountId,
+      added.account.id,
+    ]);
+    expect(await db.getSettings(owner.robinhoodAccountId)).toEqual(robinhoodBefore);
+    const [robinhood] = await sql<{ disconnected_at: Date | null }[]>`
+      select disconnected_at from public.accounts where id = ${owner.robinhoodAccountId}`;
+    expect(robinhood?.disconnected_at).toBeNull();
+    expect(await accountOf(other, 'external-1')).toMatchObject({
+      connected: true,
+      executionMode: 'immediate',
+      account: { id: othersPaper!.id, label: 'Their paper' },
+    });
+    expect((await db.listAccounts(other.id)).accounts).toHaveLength(2);
   });
 });

@@ -134,6 +134,15 @@ export const config = {
   robinhoodOAuthCallbackPort: oauthCallbackPort,
   robinhoodOAuthCallbackHost: env.ROBINHOOD_OAUTH_CALLBACK_HOST ?? '0.0.0.0',
 
+  // ---- SnapTrade ---------------------------------------------------------------
+  // A Personal key: the owner's own SnapTrade login. All three are optional;
+  // connecting other brokers is simply off while any of them is absent
+  // (trader/snaptrade/client.ts).
+  snaptradeClientId: env.SNAPTRADE_CLIENT_ID?.trim() || null,
+  snaptradeConsumerKey: env.SNAPTRADE_CONSUMER_KEY?.trim() || null,
+  /** The one dashboard sign-in email allowed to connect SnapTrade accounts. */
+  snaptradeOwnerEmail: env.SNAPTRADE_OWNER_EMAIL?.trim() || null,
+
   // ---- Fill read-back ----------------------------------------------------------
   /**
    * How far back the fill monitor (trader/fills.ts) re-checks placed orders

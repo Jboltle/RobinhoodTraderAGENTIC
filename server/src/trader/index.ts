@@ -15,6 +15,7 @@ import { reparseStaleRecaps } from './recaps/sweep.js';
 import { createQuoteSource } from './broker/quotes.js';
 import { createMcpRegistry, restoreSessions } from './broker/registry.js';
 import { createRobinhoodAdapter } from './robinhood/adapter.js';
+import { createSnapTradeAccess } from './snaptrade/client.js';
 import { buildServer } from './server.js';
 
 const log = createLogger('trader');
@@ -47,7 +48,16 @@ async function main(): Promise<void> {
     executionMode,
   });
 
-  const fastify = buildServer({ db, events, brokers, executionMode });
+  // Connecting other brokers (the dashboard's "Other broker"): off unless all
+  // three SnapTrade variables are set. No order goes through this client.
+  const snapTrade = createSnapTradeAccess({
+    clientId: config.snaptradeClientId,
+    consumerKey: config.snaptradeConsumerKey,
+    ownerEmail: config.snaptradeOwnerEmail,
+  });
+  log.info('snaptrade connect', { enabled: snapTrade !== null });
+
+  const fastify = buildServer({ db, events, brokers, executionMode, snapTrade });
 
   // Listen before anything else: on a deployed box the OAuth flow can only
   // complete via the dashboard hitting /api/broker/*, so the port must be open

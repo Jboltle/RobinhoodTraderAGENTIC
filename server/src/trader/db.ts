@@ -33,7 +33,7 @@
  *   allowed_emails      invite list: an email here gets its users row at first
  *                       sign-in
  */
-import { and, asc, count, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, ne, notInArray, or, sql } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { z } from 'zod';
@@ -77,6 +77,7 @@ import { openOptionLots, type OpenOptionLot } from './lots.js';
 import { decryptTokens, encryptTokens } from './robinhood/tokenCrypto.js';
 import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
 import type { PersistedState } from './robinhood/types.js';
+import type { SnapTradeAccountRow } from './snaptrade/sync.js';
 
 const log = createLogger('trader:db');
 
@@ -207,7 +208,7 @@ export interface AuthSession {
 /** One of a user's accounts, with what the account menu shows about it. */
 export interface AccountListing {
   readonly account: AccountRow;
-  /** Has a connection of record: the test listConnectedAccounts fans out by. */
+  /** Has a connection of record (CONNECTED): the test listConnectedAccounts fans out by. */
   readonly connected: boolean;
   readonly executionMode: ExecutionMode;
   /** Null = follows every Caller. */
@@ -229,6 +230,15 @@ export interface AccountListings {
   /** Oldest first. */
   readonly accounts: AccountListing[];
   readonly unusable: UnusableAccount[];
+}
+
+/** What one SnapTrade sync did to a user's accounts. */
+export interface SnapTradeSyncCounts {
+  readonly added: number;
+  /** Accounts already here that SnapTrade still lists. */
+  readonly updated: number;
+  /** Accounts SnapTrade no longer lists, marked disconnected by this sync. */
+  readonly disconnected: number;
 }
 
 /** A placed order whose broker state is not yet terminal, with the account that placed it. */
@@ -380,6 +390,22 @@ export interface TraderDb {
    * theirs. Which accounts trade is unaffected: that is listConnectedAccounts.
    */
   selectAccount(userId: string, accountId: string): Promise<boolean>;
+  /**
+   * Make the user's SnapTrade accounts match `found`, what SnapTrade lists as
+   * able to take orders right now. Safe to repeat.
+   *
+   * A new account copies the settings and followed Callers of
+   * `settingsFromAccountId` (one of the user's own), except that it starts in
+   * approval mode whatever that account is in. An account already here keeps
+   * its settings; one that was disconnected and is listed again comes back in
+   * approval mode. One that is no longer listed is marked disconnected, never
+   * deleted: its trades point at it. Accounts of other adapters are untouched.
+   */
+  syncSnapTradeAccounts(
+    userId: string,
+    settingsFromAccountId: string,
+    found: readonly SnapTradeAccountRow[]
+  ): Promise<SnapTradeSyncCounts>;
   /** Start a session for `token` (only its hash is stored), ending at `expiresAt`. */
   createSession(userId: string, token: string, expiresAt: Date): Promise<void>;
   /** End the session for `token`, if it exists. */
@@ -647,13 +673,10 @@ class DrizzleTraderDb implements TraderDb {
   }
 
   async listConnectedAccounts(): Promise<AccountRow[]> {
-    // ponytail: connected means stored credentials, which every adapter that
-    // exists keeps. Upgrade path: an adapter that keeps none (SnapTrade) adds
-    // its own clause here (disconnected_at is null and not needs_reconnect).
     const rows = await this.db
       .select(accountColumns)
       .from(accounts)
-      .where(isNotNull(accounts.credentials))
+      .where(CONNECTED)
       .orderBy(asc(accounts.createdAt), asc(accounts.id));
     // One unreadable row must not stop every other account from trading.
     return rows.flatMap((row) => {
@@ -1019,7 +1042,7 @@ class DrizzleTraderDb implements TraderDb {
 
   async listAccounts(userId: string): Promise<AccountListings> {
     const rows = await this.db
-      .select({ ...accountColumns, connected: sql<boolean>`${accounts.credentials} is not null` })
+      .select({ ...accountColumns, connected: CONNECTED })
       .from(accounts)
       .where(eq(accounts.userId, userId))
       .orderBy(asc(accounts.createdAt), asc(accounts.id));
@@ -1054,6 +1077,76 @@ class DrizzleTraderDb implements TraderDb {
       )
       .returning({ id: users.id });
     return updated.length > 0;
+  }
+
+  async syncSnapTradeAccounts(
+    userId: string,
+    settingsFromAccountId: string,
+    rows: readonly SnapTradeAccountRow[]
+  ): Promise<SnapTradeSyncCounts> {
+    return this.db.transaction(async (tx) => {
+      const [template] = await tx
+        .select()
+        .from(accounts)
+        .where(and(eq(accounts.id, settingsFromAccountId), eq(accounts.userId, userId)));
+      if (!template) {
+        throw new Error(`account ${settingsFromAccountId} is not one of user ${userId}'s accounts`);
+      }
+      // Everything that is not the row's identity or its connection is a
+      // setting, so a settings column added later is copied without a change here.
+      const {
+        id: _id,
+        credentials: _credentials,
+        disconnectedAt: _disconnectedAt,
+        createdAt: _createdAt,
+        updatedAt: _updatedAt,
+        ...settings
+      } = template;
+
+      let added = 0;
+      for (const found of rows) {
+        // A plain object: the jsonb column takes any record, not the interface.
+        const row = { ...found, adapterData: { ...found.adapterData } };
+        const [written] = await tx
+          .insert(accounts)
+          .values({ ...settings, ...row, adapter: SNAPTRADE_ADAPTER, executionMode: NEW_ACCOUNT_EXECUTION_MODE })
+          .onConflictDoUpdate({
+            target: [accounts.userId, accounts.adapter, accounts.externalAccountId],
+            set: {
+              institution: row.institution,
+              label: row.label,
+              isPaper: row.isPaper,
+              needsReconnect: row.needsReconnect,
+              adapterData: row.adapterData,
+              // Coming back from disconnected is a new connection: it does not
+              // resume placing orders on its own in the mode it was left in.
+              executionMode: sql`case when ${accounts.disconnectedAt} is null then ${accounts.executionMode} else ${NEW_ACCOUNT_EXECUTION_MODE} end`,
+              disconnectedAt: null,
+            },
+          })
+          // xmax is 0 on a row this statement inserted, and set on one it updated.
+          .returning({ inserted: sql<boolean>`xmax = 0` });
+        if (written?.inserted) added += 1;
+      }
+
+      const listed = rows.map((row) => row.externalAccountId);
+      const disconnected = await tx
+        .update(accounts)
+        .set({ disconnectedAt: new Date() })
+        .where(
+          and(
+            eq(accounts.userId, userId),
+            eq(accounts.adapter, SNAPTRADE_ADAPTER),
+            isNull(accounts.disconnectedAt),
+            listed.length === 0
+              ? undefined
+              : or(isNull(accounts.externalAccountId), notInArray(accounts.externalAccountId, listed))
+          )
+        )
+        .returning({ id: accounts.id });
+
+      return { added, updated: rows.length - added, disconnected: disconnected.length };
+    });
   }
 
   async createSession(userId: string, token: string, expiresAt: Date): Promise<void> {
@@ -1111,6 +1204,20 @@ const DIRECT_ROBINHOOD_ACCOUNT = {
   institution: 'robinhood',
   label: 'Robinhood',
 } as const;
+
+const SNAPTRADE_ADAPTER = 'snaptrade';
+/** Every newly connected account waits for approval, a paper one included. */
+const NEW_ACCOUNT_EXECUTION_MODE: ExecutionMode = 'approval';
+
+/**
+ * Whether an account has a connection of record: what the account list shows
+ * and what the pipeline fans out over. A SnapTrade account stores no
+ * credentials (the deployment's key reaches it), so it is connected until a
+ * sync finds it gone (disconnected_at) or its brokerage login broken
+ * (needs_reconnect). Every other account is connected while it has stored
+ * credentials.
+ */
+const CONNECTED = sql<boolean>`case when ${accounts.adapter} = ${SNAPTRADE_ADAPTER} then ${accounts.disconnectedAt} is null and not ${accounts.needsReconnect} else ${accounts.credentials} is not null end`;
 
 /**
  * Every accounts column except the credentials: what a settings read and an

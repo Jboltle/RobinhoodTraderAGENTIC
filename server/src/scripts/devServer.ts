@@ -213,7 +213,7 @@ const brokers: McpRegistry = {
 };
 
 // The dev broker above is a stub, so letting Approve "submit" is harmless.
-const fastify = buildServer({ db, events: new TraderEvents(), brokers, executionMode: 'immediate' });
+const fastify = buildServer({ db, events: new TraderEvents(), brokers, executionMode: 'immediate', snapTrade: null });
 
 await fastify.listen({ port: PORT, host: '127.0.0.1' });
 log.info('dev trader listening', {

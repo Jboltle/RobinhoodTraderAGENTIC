@@ -24,6 +24,7 @@ import type {
 } from '../broker/types.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { buildServer } from '../server.js';
+import type { SnapTradeAccess } from '../snaptrade/client.js';
 import { createFakeDb, type FakeDb } from './fakeDb.js';
 
 // =============================================================================
@@ -156,6 +157,8 @@ export interface HarnessOptions {
   readonly executionMode?: TradeExecutionMode;
   /** The adapters this deployment has; the Robinhood one alone unless given. */
   readonly adapters?: readonly BrokerAdapter['id'][];
+  /** A fake SnapTrade client and its owner; a deployment without the keys unless given. */
+  readonly snapTrade?: SnapTradeAccess;
 }
 
 export function makeHarness(options: HarnessOptions = {}): Harness {
@@ -172,7 +175,7 @@ export function makeHarness(options: HarnessOptions = {}): Harness {
     return { session: makeSessionStub(options), broker };
   }, executionMode, options.adapters);
 
-  const app = buildServer({ db, events, brokers, executionMode });
+  const app = buildServer({ db, events, brokers, executionMode, snapTrade: options.snapTrade ?? null });
 
   return {
     app,

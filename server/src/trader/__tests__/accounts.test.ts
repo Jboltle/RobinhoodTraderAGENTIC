@@ -142,7 +142,8 @@ describe('GET /api/accounts', () => {
               label: 'Alpaca Paper',
               institution: 'alpaca-paper',
               isPaper: true,
-              connected: false,
+              // A SnapTrade account stores no credentials: connected until a sync says otherwise.
+              connected: true,
               needsReconnect: false,
               executionMode: 'approval',
               followedCallerCount: 0,
@@ -152,6 +153,7 @@ describe('GET /api/accounts', () => {
           },
         },
       ],
+      canConnectSnapTrade: false,
     });
   });
 
@@ -231,7 +233,7 @@ describe('POST /api/accounts/select', () => {
     const fanOut = async (): Promise<string[]> =>
       (await harness.db.listConnectedAccounts()).map((account) => account.id);
     const before = await fanOut();
-    expect(before).toEqual([ROBINHOOD.id, STRANGER_ROBINHOOD.id]);
+    expect(before).toEqual([ROBINHOOD.id, PAPER.id, STRANGER_ROBINHOOD.id]);
 
     await select(PAPER.id);
     expect(await fanOut()).toEqual(before);

@@ -12,7 +12,7 @@
  * another scope and the test fails. A fixture names the account it means
  * (firstAccountId, or addUser's third argument), never the user.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import {
   EmbedLike,
@@ -172,6 +172,8 @@ export function createFakeDb(): FakeDb {
   const settings = new Map<string, ResolvedTradeSettings>();
   const trades: Array<{ accountId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
+  /** Accounts with disconnected_at set: disconnected here, or found gone by a sync. */
+  const disconnected = new Set<string>();
   const messages = new Map<string, FakeMessageRow>();
   const callers = new Map<string, Caller>();
   const recaps = new Map<string, StoredRecap>();
@@ -207,6 +209,11 @@ export function createFakeDb(): FakeDb {
     if (!selectedAccounts.has(created.userId)) selectedAccounts.set(created.userId, accountId);
     return created;
   };
+  // Mirrors CONNECTED in db.ts: a SnapTrade account stores no credentials.
+  const isConnected = (account: AccountRow): boolean =>
+    account.adapter === 'snaptrade'
+      ? !disconnected.has(account.id) && !account.needsReconnect
+      : brokerTokens.has(account.id);
   const feedRows = (limit: number): FakeMessageRow[] =>
     [...messages.values()]
       .filter((row) => row.disposition !== null && row.disposition !== 'recap')
@@ -383,17 +390,21 @@ export function createFakeDb(): FakeDb {
     },
     async saveBrokerTokens(accountId, state) {
       brokerTokens.set(accountId, state);
+      disconnected.delete(accountId);
       record('saveBrokerTokens', accountId, undefined);
     },
     async deleteBrokerTokens(accountId) {
       brokerTokens.delete(accountId);
+      disconnected.add(accountId);
       record('deleteBrokerTokens', accountId, undefined);
     },
 
     // ---- Shared --------------------------------------------------------------
 
     async listConnectedAccounts() {
-      return [...brokerTokens.keys()].map(ensureAccount).filter((account) => !unreadable.has(account.id));
+      // Tokens seeded for an account nobody registered still make it one.
+      for (const accountId of brokerTokens.keys()) ensureAccount(accountId);
+      return [...accounts.values()].filter((account) => isConnected(account) && !unreadable.has(account.id));
     },
     async listOpenOrders(since) {
       return trades
@@ -624,7 +635,7 @@ export function createFakeDb(): FakeDb {
             const resolved = settings.get(account.id) ?? TradeSettingsSchema.parse({});
             return {
               account,
-              connected: brokerTokens.has(account.id),
+              connected: isConnected(account),
               executionMode: resolved.executionMode,
               followedCallerIds: resolved.followedCallerIds,
             };
@@ -633,6 +644,37 @@ export function createFakeDb(): FakeDb {
           .filter((account) => unreadable.has(account.id))
           .map(({ id, label, institution, isPaper }) => ({ id, label, institution, isPaper })),
       };
+    },
+    async syncSnapTradeAccounts(userId, settingsFromAccountId, rows) {
+      if (accounts.get(settingsFromAccountId)?.userId !== userId) {
+        throw new Error(`account ${settingsFromAccountId} is not one of user ${userId}'s accounts`);
+      }
+      const settingsOf = (accountId: string): ResolvedTradeSettings =>
+        settings.get(accountId) ?? TradeSettingsSchema.parse({});
+      const owned = (): AccountRow[] =>
+        [...accounts.values()].filter((account) => account.userId === userId && account.adapter === 'snaptrade');
+
+      let added = 0;
+      for (const row of rows) {
+        const existing = owned().find((account) => account.externalAccountId === row.externalAccountId);
+        const id = existing?.id ?? randomUUID();
+        accounts.set(id, { ...row, id, userId, adapter: 'snaptrade' });
+        if (existing === undefined) {
+          added += 1;
+          settings.set(id, { ...settingsOf(settingsFromAccountId), executionMode: 'approval' });
+        } else if (disconnected.delete(id)) {
+          settings.set(id, { ...settingsOf(id), executionMode: 'approval' });
+        }
+      }
+
+      const listed = new Set(rows.map((row) => row.externalAccountId));
+      const vanished = owned().filter(
+        (account) =>
+          !disconnected.has(account.id) &&
+          (account.externalAccountId === null || !listed.has(account.externalAccountId))
+      );
+      for (const account of vanished) disconnected.add(account.id);
+      return { added, updated: rows.length - added, disconnected: vanished.length };
     },
     async selectAccount(userId, accountId) {
       // Mirrors the real UPDATE: matched among this user's own accounts only.

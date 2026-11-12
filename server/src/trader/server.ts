@@ -1,6 +1,6 @@
 /**
  * Trader HTTP server: the per-account REST API (feed, position performance,
- * trade settings, Robinhood connection). Message ingestion does not pass
+ * trade settings, Robinhood connection, SnapTrade connect). Message ingestion does not pass
  * through HTTP any more — the poller reads the `messages` table directly.
  *
  * Every /api route runs behind the session-token hook in auth.ts and reads or
@@ -31,7 +31,7 @@ import {
   viewOf,
   type BookPeriod,
 } from './book/ladder.js';
-import type { ApprovalOutcome, StoredCallout, TraderDb, UnusableAccount } from './db.js';
+import type { ApprovalOutcome, AuthUser, StoredCallout, TraderDb, UnusableAccount } from './db.js';
 import type { TraderEvents } from './events.js';
 import type { OpenOptionLot } from './lots.js';
 import { resolveEquityEntry, resolveOptionEntry } from './maxLoss.js';
@@ -47,6 +47,8 @@ import { readTokenStatus } from './robinhood/mcpClient.js';
 import type { McpRegistry } from './broker/registry.js';
 import type { AccountRow, Broker, UserBroker } from './broker/types.js';
 import type { TokenState } from './robinhood/types.js';
+import type { SnapTradeAccess, SnapTradeClient } from './snaptrade/client.js';
+import { planSnapTradeSync, type SnapTradeSyncPlan } from './snaptrade/sync.js';
 
 const log = createLogger('trader:server');
 
@@ -84,6 +86,10 @@ const AUTH_URL_POLL_MS = 100;
 const READ_ONLY_CONNECT_ERROR =
   'Robinhood cannot be connected from this environment (TRADE_EXECUTION_MODE=read_only)';
 const NO_ROBINHOOD_ACCOUNT_ERROR = 'this user has no Robinhood account to connect';
+/** One answer for "not the owner" and "no keys here": neither is told which. */
+const SNAPTRADE_UNAVAILABLE_ERROR = 'Connecting another broker is not available for this sign-in';
+const SNAPTRADE_LINK_FAILED_ERROR = 'SnapTrade did not issue a connection link. Nothing was changed. Try again.';
+const SNAPTRADE_READ_FAILED_ERROR = 'SnapTrade could not be read. Nothing was changed. Try again.';
 const UNUSABLE_ACCOUNT_ERROR =
   'that account cannot be used: its saved connection details cannot be read. Nothing was changed.';
 
@@ -94,6 +100,9 @@ const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 const BrokerConnectBodySchema = z.object({ force: z.boolean().optional() });
 
 const SelectAccountBodySchema = z.object({ accountId: z.string().min(1) });
+
+/** `reconnect`: the connection id of one of the user's own SnapTrade accounts, to repair it. */
+const SnapTradeLinkBodySchema = z.object({ reconnect: z.string().min(1).optional() });
 
 /** One account in GET /api/accounts: what the account menu shows about it. */
 export interface AccountSummary {
@@ -132,6 +141,19 @@ export interface AccountsResponse {
    * from the menu, but never selectable. Absent when there are none.
    */
   readonly unusableAccounts?: UnusableAccount[];
+  /** Whether this sign-in may connect another broker through SnapTrade. */
+  readonly canConnectSnapTrade: boolean;
+}
+
+/** POST /api/snaptrade/sync: what the sync found at SnapTrade and did here. */
+export interface SnapTradeSyncResponse {
+  readonly added: number;
+  readonly updated: number;
+  readonly disconnected: number;
+  readonly skippedReadOnlyConnections: number;
+  readonly skippedSandboxConnections: number;
+  /** Connections whose accounts SnapTrade does not list yet; sync again later. */
+  readonly connectionsAwaitingAccounts: number;
 }
 
 export interface ServerDeps {
@@ -140,6 +162,8 @@ export interface ServerDeps {
   readonly brokers: McpRegistry;
   /** The deployment's TRADE_EXECUTION_MODE: anything but immediate refuses Approve. */
   readonly executionMode: TradeExecutionMode;
+  /** Null on a deployment without the SnapTrade keys: connecting other brokers is off. */
+  readonly snapTrade: SnapTradeAccess | null;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -183,7 +207,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // The user's own accounts and which of them the dashboard and Settings show.
   fastify.get('/api/accounts', async (request, reply) => {
     const selected = requireAccount(request);
-    return reply.send(await listAccounts(deps, selected));
+    return reply.send(await listAccounts(deps, requireUser(request), selected));
   });
 
   // Switches what the screens and Settings show and edit. Which accounts trade
@@ -315,6 +339,65 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     deps.brokers.drop(account.id);
     connections.invalidate(account.id);
     return reply.send({ ok: true });
+  });
+
+  // ---- SnapTrade connect (owner only) -----------------------------------------
+  //
+  // Both routes place no order, so a read_only deployment allows them: the
+  // write guard still refuses every order on every adapter. Both are changes,
+  // so both must name the viewed account like any other (auth.ts): the sync
+  // copies that account's settings onto a new account, and the link is issued
+  // from the same dialog.
+
+  // A fresh Connection Portal link. It lives five minutes, so the dashboard
+  // asks for it as the portal opens.
+  fastify.post('/api/snaptrade/link', async (request, reply) => {
+    const account = requireAccount(request);
+    const snapTrade = snapTradeFor(deps, requireUser(request));
+    if (snapTrade === null) {
+      return reply.status(403).send({ error: SNAPTRADE_UNAVAILABLE_ERROR });
+    }
+    const parsed = SnapTradeLinkBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'body must be { reconnect?: string }' });
+    }
+    const { reconnect } = parsed.data;
+    if (reconnect !== undefined && !(await ownsSnapTradeConnection(deps, account.userId, reconnect))) {
+      return reply.status(404).send({ error: 'no such connection' });
+    }
+    let url: string;
+    try {
+      url = await snapTrade.portalLink(reconnect);
+    } catch (err: unknown) {
+      log.warn('SnapTrade portal link failed', { error: (err as Error).message });
+      return reply.status(502).send({ error: SNAPTRADE_LINK_FAILED_ERROR });
+    }
+    // The link signs its holder in to the portal: never kept by a cache.
+    return reply.header('cache-control', 'no-store').send({ url });
+  });
+
+  // Makes the user's SnapTrade accounts match what SnapTrade lists.
+  fastify.post('/api/snaptrade/sync', async (request, reply) => {
+    const account = requireAccount(request);
+    const snapTrade = snapTradeFor(deps, requireUser(request));
+    if (snapTrade === null) {
+      return reply.status(403).send({ error: SNAPTRADE_UNAVAILABLE_ERROR });
+    }
+    // Read in full before anything is written: a failed read must never be
+    // taken for "SnapTrade lists nothing" and disconnect every account.
+    let plan: SnapTradeSyncPlan;
+    try {
+      const [connections, accounts] = await Promise.all([snapTrade.listConnections(), snapTrade.listAccounts()]);
+      plan = planSnapTradeSync(connections, accounts);
+    } catch (err: unknown) {
+      log.warn('SnapTrade sync could not read SnapTrade', { error: (err as Error).message });
+      return reply.status(502).send({ error: SNAPTRADE_READ_FAILED_ERROR });
+    }
+    const { rows, ...found } = plan;
+    const counts = await deps.db.syncSnapTradeAccounts(account.userId, account.id, rows);
+    const result: SnapTradeSyncResponse = { ...counts, ...found };
+    log.info('SnapTrade sync', { userId: account.userId, ...result });
+    return reply.send(result);
   });
 
   // ---- Feed --------------------------------------------------------------------
@@ -711,7 +794,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
  * The accounts of the selected account's owner, grouped by adapter. The
  * database keeps one row per account; this shape is built on read.
  */
-async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<AccountsResponse> {
+async function listAccounts(deps: ServerDeps, user: AuthUser, selected: AccountRow): Promise<AccountsResponse> {
   const { accounts: listings, unusable } = await deps.db.listAccounts(selected.userId);
   const followsEveryone = listings.some((listing) => listing.followedCallerIds === null);
   const rosterSize = followsEveryone ? (await deps.db.listCallers()).length : 0;
@@ -724,7 +807,9 @@ async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<Acc
       label: account.label,
       institution: account.institution,
       isPaper: account.isPaper,
-      connected: connected && deps.brokers.supports(account),
+      // The connection of record, whether or not this deployment has the
+      // account's adapter: the status route is what says it cannot be used here.
+      connected,
       needsReconnect: account.needsReconnect,
       executionMode,
       followedCallerCount: followedCallerIds?.length ?? rosterSize,
@@ -750,7 +835,26 @@ async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<Acc
     selectedAccountId: selected.id,
     brokers,
     ...(unusable.length > 0 ? { unusableAccounts: unusable } : {}),
+    canConnectSnapTrade: snapTradeFor(deps, user) !== null,
   };
+}
+
+/**
+ * The SnapTrade client, for the one sign-in that may use it. The key is the
+ * owner's own SnapTrade login, so every other user gets null, exactly as on a
+ * deployment that has no key.
+ */
+const snapTradeFor = (deps: ServerDeps, user: AuthUser): SnapTradeClient | null =>
+  deps.snapTrade !== null && user.email?.toLowerCase() === deps.snapTrade.ownerEmail.toLowerCase()
+    ? deps.snapTrade.client
+    : null;
+
+/** Whether `connectionId` is the connection of one of the user's own SnapTrade accounts. */
+async function ownsSnapTradeConnection(deps: ServerDeps, userId: string, connectionId: string): Promise<boolean> {
+  const { accounts } = await deps.db.listAccounts(userId);
+  return accounts.some(
+    ({ account }) => account.adapter === 'snaptrade' && account.adapterData.connectionId === connectionId
+  );
 }
 
 /** The direct Robinhood account of the selected account's owner; every user is created with one. */
