@@ -20,22 +20,39 @@
 -- (20261111210000_accounts_contract.sql) removes the old columns, the old table
 -- and these triggers; it must wait until the new code is the only code running.
 --
--- Apply by hand in one transaction:
+-- Apply by hand:
 --   psql "<database URL>" -X -1 -v ON_ERROR_STOP=1 -f <this file>
 -- Safe to run again: a second run adds nothing and never overwrites an account.
--- Takes ACCESS EXCLUSIVE on trades and users for the length of the transaction
--- (well under a second at ten thousand trades); lock_timeout makes it give up
--- rather than queue behind a long query and stall the trader.
+--
+-- The whole step is ONE statement, the DO block below, so it applies entirely
+-- or not at all however psql is invoked: a failure partway cannot leave
+-- accounts backfilled without the triggers that keep them current. The flags
+-- above are still the way to run it; ON_ERROR_STOP is what makes psql exit
+-- non-zero. The body is left unindented so it reads as the SQL it is.
 
-set lock_timeout = '5s';
-
-do $$
+do $expand$
 begin
-  if to_regclass('public.accounts') is not null and to_regclass('public.broker_connections') is null then
-    raise exception 'the accounts contract step has already run here; the expand step must not run after it';
-  end if;
-end
-$$;
+
+-- Give up rather than queue behind a long query and stall the trader.
+set local lock_timeout = '5s';
+
+if to_regclass('public.accounts') is not null and to_regclass('public.broker_connections') is null then
+  raise exception 'the accounts contract step has already run here; the expand step must not run after it';
+end if;
+
+-- Every table this step alters, locked up front and held to the end (well
+-- under a second at ten thousand trades). trades and broker_connections
+-- before users: an insert into either holds its own table and then needs
+-- users for the foreign-key check, so taking users first deadlocks with it and
+-- Postgres aborts the insert, which for trades is an order with no row.
+-- Locking first also closes the gap between the backfill and the triggers: a
+-- token or settings write made meanwhile waits, then lands with them in place.
+lock table public.trades, public.broker_connections in access exclusive mode;
+-- A second run only.
+if to_regclass('public.accounts') is not null then
+  lock table public.accounts in access exclusive mode;
+end if;
+lock table public.users in access exclusive mode;
 
 -- =============================================================================
 -- accounts: one row per real brokerage account, the same columns for every
@@ -109,6 +126,11 @@ create unique index if not exists accounts_one_direct_robinhood_uidx
 -- The same brokerage account is never imported twice for a user.
 create unique index if not exists accounts_user_adapter_external_uidx
   on public.accounts (user_id, adapter, external_account_id);
+-- One account per user until the contract step, which drops this: while
+-- trades_user_message_uidx stands, a second account's decision row for the
+-- same callout is refused, after its order was placed.
+create unique index if not exists accounts_one_per_user_until_contract_uidx
+  on public.accounts (user_id);
 
 -- Default-deny like every other table; the trader connects as the owner.
 alter table public.accounts enable row level security;
@@ -292,3 +314,6 @@ create or replace trigger broker_connections_sync_account
   after insert or update or delete on public.broker_connections
   for each row
   execute function public.broker_connections_sync_account();
+
+end
+$expand$;
