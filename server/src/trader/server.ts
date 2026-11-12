@@ -45,6 +45,7 @@ import {
 } from './recaps/analytics.js';
 import { readTokenStatus } from './robinhood/mcpClient.js';
 import type { McpRegistry } from './broker/registry.js';
+import { createSpacedRead, METERED_DASHBOARD_READ_INTERVAL_MS } from './broker/requestBudget.js';
 import type { AccountRow, Broker, UserBroker } from './broker/types.js';
 import type { TokenState } from './robinhood/types.js';
 import type { SnapTradeAccess, SnapTradeClient } from './snaptrade/client.js';
@@ -190,6 +191,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerAuth(fastify, deps.db);
 
   const connections = createConnectionCache(deps);
+  // The dashboard polls: the stream every 10 s per open tab, the header every
+  // minute. A request-metered account (SnapTrade) is read from its broker at
+  // most once per METERED_DASHBOARD_READ_INTERVAL_MS for each of the two, and
+  // every tab and route shares that answer. Other accounts are read each time.
+  const portfolios = createSpacedRead<PortfolioSnapshot>(METERED_DASHBOARD_READ_INTERVAL_MS);
+  const performances = createSpacedRead<PerformanceRow[]>(METERED_DASHBOARD_READ_INTERVAL_MS);
 
   // ---- Public -----------------------------------------------------------------
 
@@ -404,6 +411,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (synced.adapter !== 'snaptrade') continue;
       deps.brokers.drop(synced.id);
       connections.invalidate(synced.id);
+      portfolios.forget(synced.id);
+      performances.forget(synced.id);
     }
     const result: SnapTradeSyncResponse = { ...counts, ...found };
     log.info('SnapTrade sync', { userId: account.userId, ...result });
@@ -613,12 +622,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.status(409).send({ error: notConnectedError(deps, account) });
     }
     try {
-      const [account, positions] = await Promise.all([broker.getAccount(), broker.getPositions()]);
-      return reply.send({
-        portfolioValueUsd: account.portfolioValueUsd,
-        buyingPowerUsd: account.buyingPowerUsd,
-        openPositions: positions.filter((p) => p.quantity > 0).length,
-      });
+      return reply.send(await portfolios.read(account, () => readPortfolio(broker)));
     } catch (err) {
       return reply
         .status(503)
@@ -635,7 +639,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     try {
       const history = deps.db.listDecisions(account.id, PERFORMANCE_HISTORY_LIMIT);
       const lots = deps.db.listOpenOptionLots(account.id);
-      return reply.send({ positions: await collectPerformance(tools, history, lots) });
+      return reply.send({
+        positions: await performances.read(account, () => collectPerformance(tools, history, lots)),
+      });
     } catch (err) {
       return reply
         .status(503)
@@ -733,8 +739,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           lots = undefined;
           throw err;
         });
+        const read = { tools, history, lots };
         sendPerformance({
-          positions: await collectPerformance(tools, history, lots),
+          positions: await performances.read(account, () =>
+            collectPerformance(read.tools, read.history, read.lots)
+          ),
           error: null,
         });
       } catch (err) {
@@ -1087,6 +1096,23 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
         ? null
         : deps.brokers.for(account).broker,
     invalidate: (accountId) => void records.delete(accountId),
+  };
+}
+
+/** The dashboard header's figures. */
+interface PortfolioSnapshot {
+  readonly portfolioValueUsd: number | null;
+  readonly buyingPowerUsd: number;
+  /** Equity and option positions with a quantity above zero. */
+  readonly openPositions: number;
+}
+
+async function readPortfolio(broker: Broker): Promise<PortfolioSnapshot> {
+  const [account, positions] = await Promise.all([broker.getAccount(), broker.getPositions()]);
+  return {
+    portfolioValueUsd: account.portfolioValueUsd,
+    buyingPowerUsd: account.buyingPowerUsd,
+    openPositions: positions.filter((p) => p.quantity > 0).length,
   };
 }
 

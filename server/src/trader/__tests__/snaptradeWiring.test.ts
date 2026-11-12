@@ -7,20 +7,28 @@
  * The SnapTrade account here stores no credentials, as a real one does not.
  * No test builds the SDK client: nothing here can reach SnapTrade.
  */
-import type { InjectOptions, LightMyRequestResponse } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import type { AccountPosition, AllAccountPositionsResponse } from 'snaptrade-typescript-sdk';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { type CalloutParser, type Decision, type TradeExecutionMode, type TradeSettings } from '../../shared/types.js';
+import {
+  TradeSettingsSchema,
+  type CalloutParser,
+  type Decision,
+  type TradeExecutionMode,
+  type TradeSettings,
+} from '../../shared/types.js';
 import { deployedAdapters } from '../adapters.js';
 import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry, supportedAccounts, type McpRegistry } from '../broker/registry.js';
+import { METERED_DASHBOARD_READ_INTERVAL_MS, METERED_ORDER_READ_INTERVAL_MS } from '../broker/requestBudget.js';
 import type { AccountRow, BrokerSession, OptionInstrument } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
-import { sweepFills } from '../fills.js';
-import { resolveOptionEntry } from '../maxLoss.js';
+import { FILL_POLL_ACTIVE_MS, sweepFills } from '../fills.js';
+import { sweepLadders } from '../ladderMonitor.js';
+import { resolveOptionEntry, sweepMaxLoss, warnOfUnprotectedAccounts } from '../maxLoss.js';
 import {
   BTO_QQQ_PUT,
   TRIM_QQQ_FIRST,
@@ -71,6 +79,7 @@ const PLACED_ORDER_ID = 'option-order-1';
 
 const BALANCE_READ = 'accountInformation.getUserAccountBalance';
 const POSITIONS_READ = 'accountInformation.getAllAccountPositions';
+const ORDERS_READ = 'accountInformation.getUserAccountRecentOrders';
 const OPTION_ORDER = 'trading.placeMlegOrder';
 
 const BALANCES = [{ currency: { code: 'USD' }, cash: 10_000, buying_power: 10_000 }];
@@ -159,11 +168,16 @@ async function processCallout(world: World, fixture: DiscordMessageFixture, mode
 
 type Request = (options: InjectOptions) => Promise<LightMyRequestResponse>;
 
-/** The dashboard's routes over the world, signed in as the owner, who views `viewed`. */
-function serve(world: World, viewed: AccountRow = PAPER, snapTrade: SnapTradeAccess | null = null): Request {
+/** The dashboard's routes, signed in as the owner. */
+/** The dashboard's server over the world, with `viewed` the account its owner has selected. */
+function serverOver(world: World, viewed: AccountRow, snapTrade: SnapTradeAccess | null = null): FastifyInstance {
   const { db, events, brokers } = world;
   db.addAccount(viewed, { select: true });
-  const app = buildServer({ db, events, brokers, executionMode: 'immediate', snapTrade });
+  return buildServer({ db, events, brokers, executionMode: 'immediate', snapTrade });
+}
+
+function serve(world: World, viewed: AccountRow = PAPER, snapTrade: SnapTradeAccess | null = null): Request {
+  const app = serverOver(world, viewed, snapTrade);
   return (options) =>
     app.inject({
       ...options,
@@ -565,5 +579,237 @@ describe('prices that come from SnapTrade are per share already', () => {
 
     expect(resolveOptionEntry([], [], SPY_CALL, SPY_CALL_CONTRACTS, orders, null)).toBe(25);
     expect(resolveOptionEntry([], [], SPY_CALL, SPY_CALL_CONTRACTS, unmarked, null)).toBe(0.25);
+  });
+});
+
+describe('the request budget of a SnapTrade account', () => {
+  const ONE_MINUTE_MS = 60_000;
+  const MAX_LOSS: TradeSettings = { ...TRADING, maxLossPct: 50 };
+  /** The working order as SnapTrade lists it until it fills. */
+  const WORKING = {
+    orders: [optionOrder({ status: 'ACCEPTED', filled_quantity: '0', open_quantity: '3', execution_price: null })],
+  };
+  /** A filled option buy still held: what Max Loss, the stop rest and the ladder act on. */
+  const FILLED_LOT_MESSAGE_ID = 'msg-filled-lot';
+  const filledLot: Decision = {
+    ...workingBuy('limit', 1.6, FILLED_LOT_MESSAGE_ID),
+    order: { ...workingBuy('limit', 1.6).order!, orderId: 'filled-buy', status: 'filled', averageFillPrice: 1.59 },
+  };
+
+  const requestsOf = (world: World, call: string): number => callNames(world.sdk).filter((name) => name === call).length;
+
+  /** Sweeps as the fill monitor does while an order is open: every FILL_POLL_ACTIVE_MS, for `durationMs`. */
+  async function sweepFor(world: World, durationMs: number, mode: TradeExecutionMode = 'immediate'): Promise<void> {
+    const orderReadAt = new Map<string, number>();
+    for (let elapsed = 0; elapsed < durationMs; elapsed += FILL_POLL_ACTIVE_MS) {
+      const at = new Date(NOW.getTime() + elapsed);
+      await sweepFills(
+        { db: world.db, brokers: world.brokers, events: world.events, executionMode: mode, now: () => at },
+        undefined,
+        orderReadAt
+      );
+    }
+  }
+
+  describe('the fill monitor', () => {
+    it(`reads its orders every ${METERED_ORDER_READ_INTERVAL_MS / 1000} s while one is working: four requests a minute`, async () => {
+      const world = makeWorld({ answers: { orders: WORKING } });
+      world.db.seedDecision(PAPER.id, workingBuy('limit', 1.6));
+      world.db.seedDecision(ROBINHOOD.id, workingBuy('limit', 1.6));
+
+      await sweepFor(world, ONE_MINUTE_MS);
+
+      expect(callNames(world.sdk)).toEqual([ORDERS_READ, ORDERS_READ, ORDERS_READ, ORDERS_READ]);
+      // The Robinhood account beside it is read on every sweep, as before.
+      expect(world.robinhoodBroker.getOrders).toHaveBeenCalledTimes(ONE_MINUTE_MS / FILL_POLL_ACTIVE_MS);
+    });
+
+    it('still records the fill, on the first read that shows it', async () => {
+      const world = makeWorld({ answers: { orders: WORKING } });
+      world.db.seedDecision(PAPER.id, workingBuy('limit', 1.6));
+
+      await sweepFor(world, METERED_ORDER_READ_INTERVAL_MS);
+      expect((await decisionsOf(world.db, PAPER.id))[0]!.order!.status).toBe('accepted');
+      world.sdk.answers.orders = { orders: [optionOrder()] };
+      await sweepFor(world, FILL_POLL_ACTIVE_MS);
+
+      expect((await decisionsOf(world.db, PAPER.id))[0]!.order).toMatchObject({ status: 'filled', averageFillPrice: 1.59 });
+    });
+
+    it('reads nothing while it has no order working, whatever the other accounts have open', async () => {
+      const world = makeWorld({ answers: { orders: WORKING } });
+      world.db.seedDecision(ROBINHOOD.id, workingBuy('limit', 1.6));
+
+      await sweepFor(world, ONE_MINUTE_MS);
+
+      expect(world.sdk.calls).toEqual([]);
+      expect(world.robinhoodBroker.getOrders).toHaveBeenCalled();
+    });
+
+    it('rests no stop on it, and still rests the Robinhood one', async () => {
+      const world = makeWorld({ answers: { orders: WORKING }, paperSettings: MAX_LOSS });
+      world.db.seedSettings(ROBINHOOD.id, MAX_LOSS);
+      world.db.seedMessage({ messageId: FILLED_LOT_MESSAGE_ID, sentAt: NOW.toISOString() });
+      for (const account of [PAPER, ROBINHOOD]) world.db.seedDecision(account.id, filledLot);
+      // Something still open, so the sweep has work and reaches the stop rest.
+      world.db.seedDecision(ROBINHOOD.id, workingBuy('limit', 1.6));
+
+      await sweepFor(world, FILL_POLL_ACTIVE_MS);
+
+      expect(placedOrders(world.robinhoodBroker, 'option')).toMatchObject([{ side: 'sell', type: 'stop' }]);
+      expect(world.sdk.calls).toEqual([]);
+    });
+  });
+
+  describe('the sweeps that would read it on a timer', () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it('Max Loss leaves it out, and still scans the Robinhood account', async () => {
+      const world = makeWorld({ paperSettings: MAX_LOSS });
+      world.db.seedSettings(ROBINHOOD.id, MAX_LOSS);
+      const queued: string[] = [];
+
+      await sweepMaxLoss(
+        {
+          db: world.db,
+          brokers: world.brokers,
+          events: world.events,
+          enqueue: (accountId, run) => {
+            queued.push(accountId);
+            return run();
+          },
+          now: () => NOW,
+        },
+        new Map()
+      );
+
+      expect(queued).toEqual([ROBINHOOD.id]);
+      expect(world.robinhoodBroker.getPositions).toHaveBeenCalled();
+      expect(world.sdk.calls).toEqual([]);
+    });
+
+    it('the own-target ladder costs it nothing and sells nothing: its broker prices no option', async () => {
+      const world = makeWorld({
+        paperSettings: { ...TRADING, exitMode: 'ladder', trimLevels: [{ gainPct: 50, portionPct: 50 }] },
+      });
+      world.db.seedMessage({ messageId: FILLED_LOT_MESSAGE_ID, sentAt: NOW.toISOString() });
+      world.db.seedDecision(PAPER.id, filledLot);
+
+      const placed = await sweepLadders({
+        db: world.db,
+        brokers: world.brokers,
+        events: world.events,
+        executionMode: 'immediate',
+      });
+
+      expect(placed).toBe(0);
+      expect(world.sdk.calls).toEqual([]);
+    });
+
+    it('the monitor says so once per account when it starts, with what the account asked for', async () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const world = makeWorld({ paperSettings: { ...MAX_LOSS, exitMode: 'ladder' } });
+      world.db.seedSettings(ROBINHOOD.id, MAX_LOSS);
+
+      await warnOfUnprotectedAccounts(world);
+
+      const warnings = stderr.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((line) => line.level === 'warn');
+      expect(warnings).toMatchObject([
+        { accountId: PAPER.id, adapter: 'snaptrade', maxLossPct: 50, exitMode: 'ladder' },
+      ]);
+      expect(warnings).toHaveLength(1);
+      expect(world.sdk.calls).toEqual([]);
+    });
+  });
+
+  describe('the dashboard', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    const DASHBOARD = { positions: held(HELD_QQQ_CALL), orders: { orders: [] } };
+    /** One read of the header and one of the positions table: what an open dashboard costs per interval. */
+    const ONE_DASHBOARD_READ = [BALANCE_READ, POSITIONS_READ, POSITIONS_READ, ORDERS_READ];
+    const POLLS = 3;
+
+    async function poll(request: Request): Promise<void> {
+      for (let polled = 0; polled < POLLS; polled += 1) {
+        for (const url of ['/api/portfolio', '/api/trades/performance']) {
+          expect((await request({ method: 'GET', url })).statusCode).toBe(200);
+        }
+      }
+    }
+
+    it('however often it polls, SnapTrade is read once per interval', async () => {
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(NOW.getTime());
+      const world = makeWorld({ answers: DASHBOARD });
+      const request = serve(world);
+
+      await poll(request);
+      clock.mockReturnValue(NOW.getTime() + METERED_DASHBOARD_READ_INTERVAL_MS - 1);
+      await poll(request);
+      expect(callNames(world.sdk).sort()).toEqual([...ONE_DASHBOARD_READ].sort());
+
+      clock.mockReturnValue(NOW.getTime() + METERED_DASHBOARD_READ_INTERVAL_MS);
+      await poll(request);
+      expect(callNames(world.sdk).sort()).toEqual([...ONE_DASHBOARD_READ, ...ONE_DASHBOARD_READ].sort());
+    });
+
+    it('a Robinhood account is still read on every poll', async () => {
+      const world = makeWorld();
+
+      await poll(serve(world, ROBINHOOD));
+
+      expect(world.robinhoodBroker.getAccount).toHaveBeenCalledTimes(POLLS);
+    });
+
+    it('a failed read is not made again within the interval either', async () => {
+      const world = makeWorld({ answers: { failure: new Error('SnapTrade is down') } });
+      const request = serve(world);
+
+      for (let polled = 0; polled < POLLS; polled += 1) {
+        expect((await request({ method: 'GET', url: '/api/portfolio' })).statusCode).toBe(503);
+      }
+
+      expect(callNames(world.sdk).sort()).toEqual([BALANCE_READ, POSITIONS_READ].sort());
+    });
+
+    it('the live stream ticks every 10 s without asking SnapTrade again', async () => {
+      const STREAM_TICK_MS = 10_000;
+      const world = makeWorld({ answers: DASHBOARD });
+      const app = serverOver(world, PAPER);
+      await app.listen({ port: 0, host: '127.0.0.1' });
+      const { port } = app.server.address() as { port: number };
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      const abort = new AbortController();
+
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/stream`, {
+          signal: abort.signal,
+          headers: { authorization: `Bearer ${TOKEN}` },
+        });
+        const reader = response.body!.getReader();
+        let frames = '';
+        while (!frames.includes('event: performance')) {
+          const { value, done } = await reader.read();
+          if (done) throw new Error('stream ended early');
+          frames += new TextDecoder().decode(value);
+        }
+        expect(frames).toContain('"strike":707');
+
+        for (let elapsed = 0; elapsed < ONE_MINUTE_MS; elapsed += STREAM_TICK_MS) {
+          await vi.advanceTimersByTimeAsync(STREAM_TICK_MS);
+        }
+
+        expect(callNames(world.sdk).sort()).toEqual([ORDERS_READ, POSITIONS_READ].sort());
+      } finally {
+        abort.abort();
+        vi.useRealTimers();
+        await app.close();
+      }
+    }, 10_000);
   });
 });

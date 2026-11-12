@@ -24,6 +24,7 @@ import { normalizeOptionPremium } from './maxLoss.js';
 import { BrokerUnavailableError } from './broker/errors.js';
 import { supportedAccounts, type McpRegistry } from './broker/registry.js';
 import type { AccountRow, BrokerOrder } from './broker/types.js';
+import { isRequestMetered, METERED_ORDER_READ_INTERVAL_MS, readIsDue } from './broker/requestBudget.js';
 
 const log = createLogger('trader:fills');
 
@@ -59,10 +60,11 @@ export interface SweepResult {
 export function startFillMonitor(deps: FillMonitorDeps): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  const orderReadAt = new Map<string, number>();
   const tick = async (): Promise<void> => {
     let delay = FILL_POLL_IDLE_MS;
     try {
-      const { open } = await sweepFills(deps);
+      const { open } = await sweepFills(deps, undefined, orderReadAt);
       if (open > 0) delay = FILL_POLL_ACTIVE_MS;
     } catch (err: unknown) {
       log.error('fill sweep failed', errorFields(err));
@@ -80,9 +82,14 @@ export function startFillMonitor(deps: FillMonitorDeps): () => void {
 
 /**
  * One pass over every open order. `since` defaults to the lookback window;
- * the backfill script widens it.
+ * the backfill script widens it. `orderReadAt` is when each request-metered
+ * account's orders were last read: kept across sweeps, it spaces those reads.
  */
-export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<SweepResult> {
+export async function sweepFills(
+  deps: FillMonitorDeps,
+  since?: Date,
+  orderReadAt: Map<string, number> = new Map()
+): Promise<SweepResult> {
   const now = deps.now?.() ?? new Date();
   const rows = await deps.db.listOpenOrders(
     since ?? new Date(now.getTime() - (deps.lookbackMs ?? FILL_LOOKBACK_MS))
@@ -108,6 +115,9 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
 
   let updated = 0;
   for (const [accountId, accountRows] of byAccount) {
+    // Every sweep for most accounts; a request-metered one (SnapTrade) at most
+    // each METERED_ORDER_READ_INTERVAL_MS, and only here, where it has an order open.
+    if (!readIsDue(connected.get(accountId)!, orderReadAt, now.getTime(), METERED_ORDER_READ_INTERVAL_MS)) continue;
     try {
       updated += await syncAccount(connected.get(accountId)!, accountRows, deps, now);
     } catch (err: unknown) {
@@ -117,6 +127,11 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
   if (deps.executionMode === 'immediate') {
     for (const account of await supportedAccounts(deps.db, deps.brokers)) {
       try {
+        // ponytail: no stop is rested on a request-metered account (SnapTrade).
+        // A refused stop is sent again every sweep, one request each, and
+        // whether its broker takes a GTC option stop is unverified. Upgrade
+        // path: rest it once that is known, and remember a refusal.
+        if (isRequestMetered(account)) continue;
         const broker = deps.brokers.for(account);
         await broker.session.ensureReady();
         await restMissingStops({

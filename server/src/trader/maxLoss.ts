@@ -21,6 +21,7 @@ import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
 import { instrumentKey } from './broker/instrument.js';
 import { supportedAccounts, type McpRegistry } from './broker/registry.js';
+import { isRequestMetered } from './broker/requestBudget.js';
 import type {
   AccountRow,
   Broker,
@@ -121,6 +122,9 @@ export function startMaxLossMonitor(deps: MaxLossDeps): () => void {
       log.error('max-loss sweep failed', errorFields(err))
     );
   };
+  void warnOfUnprotectedAccounts(deps).catch((err: unknown) =>
+    log.error('could not list the accounts left out of Max Loss', errorFields(err))
+  );
   tick();
   const timer = setInterval(tick, MAX_LOSS_INTERVAL_MS);
   timer.unref();
@@ -135,7 +139,14 @@ export async function sweepMaxLoss(
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
 
-  const accounts = await supportedAccounts(deps.db, deps.brokers);
+  // ponytail: a request-metered account (SnapTrade) is left out. A scan reads
+  // positions and orders every 15 s, 8 of the 10 requests a minute the account
+  // is allowed, and its broker prices no option, so a scan could not see an
+  // option's loss anyway. Upgrade path: entry from the ledger lots, mark from
+  // the shared quote source, and a positions read only when those show a breach.
+  const accounts = (await supportedAccounts(deps.db, deps.brokers)).filter(
+    (account) => !isRequestMetered(account)
+  );
   await Promise.all(
     accounts.map((account) =>
       deps
@@ -148,6 +159,25 @@ export async function sweepMaxLoss(
         )
     )
   );
+}
+
+/**
+ * Said once per account when the monitor starts: a request-metered account
+ * (SnapTrade) has no Max Loss, no resting stop and no own-target exit, whatever
+ * its settings ask for. Its positions close only on the Caller's exits.
+ */
+export async function warnOfUnprotectedAccounts(deps: Pick<MaxLossDeps, 'db' | 'brokers'>): Promise<void> {
+  for (const account of await supportedAccounts(deps.db, deps.brokers)) {
+    if (!isRequestMetered(account)) continue;
+    const settings = await deps.db.getSettings(account.id);
+    log.warn('account trades without Max Loss, a resting stop or own targets: its broker meters requests', {
+      accountId: account.id,
+      adapter: account.adapter,
+      maxLossPct: settings.maxLossPct,
+      maxLossUsd: settings.maxLossUsd,
+      exitMode: settings.exitMode,
+    });
+  }
 }
 
 async function scanAccount(
