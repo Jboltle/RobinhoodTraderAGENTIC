@@ -602,6 +602,7 @@ function parseOptionOrders(result: CallToolResult): OptionOrdersResult {
       state: deepFindString(item, ['state', 'status']),
       averagePrice: deepFindNumber(item, ['average_price', 'average_fill_price', 'price']),
       quantity: deepFindNumber(item, ['processed_quantity', 'quantity', 'contracts']) ?? 0,
+      processedQuantity: deepFindNumber(item, ['processed_quantity']),
       createdAt: deepFindString(item, ['created_at', 'createdAt', 'updated_at']),
       raw: item,
     });

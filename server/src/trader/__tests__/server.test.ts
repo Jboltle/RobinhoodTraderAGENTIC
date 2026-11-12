@@ -181,6 +181,86 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(decision.reason).toContain('MCP transport closed');
   });
 
+  // Production's stop cancels all answered 403; a stop Robinhood lists as dead
+  // must not keep an approved sell from going out.
+  it('approve sells over a stop Robinhood refuses to cancel but lists as cancelled', async () => {
+    const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    const optionOrder = { symbol: 'QQQ', assetType: 'option' as const, option, orderType: 'limit' as const };
+    harness.db.seedMessage({ messageId: 'buy-lot', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'caller-1' });
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('buy-lot', {
+        at: '2026-06-11T13:00:00.000Z',
+        ticker: 'QQQ',
+        order: {
+          ...optionOrder,
+          side: 'buy',
+          quantity: 3,
+          limitPrice: 1,
+          orderId: 'buy-1',
+          status: 'filled',
+          filledQuantity: 3,
+          averageFillPrice: 1,
+          stopOrderId: 'stop-1',
+        },
+      })
+    );
+    // A trim: the pending row's own links already count as sold, so only a
+    // lot it leaves partly open is still there for the stop cancel to find.
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('msg-exit', {
+        kind: 'pending_approval',
+        ticker: 'QQQ',
+        action: 'sell',
+        order: {
+          ...optionOrder,
+          side: 'sell',
+          quantity: 1,
+          limitPrice: 1.5,
+          orderId: null,
+          status: null,
+          lots: [{ lotId: 'buy-lot', quantity: 1 }],
+        },
+      })
+    );
+    harness.configureBroker(USER.id, {
+      toolsOverrides: {
+        cancelOptionOrder: vi
+          .fn()
+          .mockRejectedValue(new Error('API error 403: {"detail":"Order cannot be cancelled at this time."}')),
+        getOptionOrders: vi.fn().mockResolvedValue({
+          orders: [
+            {
+              orderId: 'stop-1',
+              symbol: 'QQQ',
+              ...option,
+              side: 'sell',
+              state: 'cancelled',
+              averagePrice: null,
+              quantity: 0,
+              processedQuantity: 0,
+              createdAt: null,
+              raw: {},
+            },
+          ],
+          raw: {},
+        }),
+      },
+    });
+
+    const response = await send('POST', '/api/trades/msg-exit/approve', {});
+
+    expect(response.statusCode).toBe(200);
+    expect((response.json() as { decision: Decision }).decision.kind).toBe('submitted');
+    expect(harness.brokerFor(USER.id).tools.placeOptionsOrder).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ symbol: 'QQQ', side: 'sell', contracts: 1, limitPremium: 1.5 })
+    );
+    expect(harness.brokerFor(USER.id).tools.cancelOptionOrder).toHaveBeenCalledExactlyOnceWith('stop-1');
+    const rows = await harness.db.listDecisions(USER.id, 10);
+    expect(rows.find((row) => row.messageId === 'buy-lot')?.order?.stopOrderId).toBeNull();
+  });
+
   // A stale warm session must not spend money; the row must survive so the
   // user can reconnect and approve the same trade.
   it('approve 409s and keeps the trade pending when no stored connection exists', async () => {

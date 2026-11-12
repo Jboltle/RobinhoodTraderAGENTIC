@@ -101,11 +101,11 @@ describe('RobinhoodTools.getOptionOrders', () => {
     legs: [{ side: 'sell', option_type: 'call', strike_price: '707.0000', expiration_date: '2026-06-11' }],
   };
 
-  function makeOrdersMcp() {
+  function makeOrdersMcp(row: Record<string, unknown> = STOP_ROW) {
     const callTool = vi.fn(async (name: string, _args: Record<string, unknown>) =>
       name === TOOL_NAMES.accounts
         ? jsonResult({ accounts: [{ account_number: 'ACCT1', agentic_allowed: true, state: 'active' }] })
-        : jsonResult({ results: [STOP_ROW] })
+        : jsonResult({ results: [row] })
     );
     return {
       ensureReady: vi.fn(async () => undefined),
@@ -126,6 +126,18 @@ describe('RobinhoodTools.getOptionOrders', () => {
 
     expect(orderCalls(mcp)).toEqual([{ account_number: 'ACCT1', order_id: 'stop-1' }]);
     expect(result?.orders).toMatchObject([{ orderId: 'stop-1', state: 'cancelled', quantity: 0 }]);
+  });
+
+  it('reports a processed quantity only when the row carries one', async () => {
+    const partial = new RobinhoodTools(
+      makeOrdersMcp({ ...STOP_ROW, processed_quantity: '1.00000' }) as unknown as RobinhoodMcpClient
+    );
+    const { processed_quantity: _absent, ...bare } = STOP_ROW;
+    const silent = new RobinhoodTools(makeOrdersMcp(bare) as unknown as RobinhoodMcpClient);
+
+    expect((await partial.getOptionOrders('stop-1'))?.orders).toMatchObject([{ processedQuantity: 1 }]);
+    // `quantity` falls back to the order size; the processed quantity must not.
+    expect((await silent.getOptionOrders('stop-1'))?.orders).toMatchObject([{ quantity: 2, processedQuantity: null }]);
   });
 
   it('sends no order filter for the history read', async () => {

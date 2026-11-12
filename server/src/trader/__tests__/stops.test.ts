@@ -13,7 +13,7 @@ import { sweepLadders } from '../ladderMonitor.js';
 import { McpToolError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { McpRegistry } from '../rh/mcpRegistry.js';
 import type { RobinhoodTools } from '../rh/tools.js';
-import type { OptionOrder } from '../rh/types.js';
+import type { OptionOrder, OptionPosition } from '../rh/types.js';
 import { cancelStops, restMissingStops } from '../stops.js';
 import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
 
@@ -61,7 +61,8 @@ function seedLot(
   });
 }
 
-const stopOrder = (orderId: string, state: string | null, quantity = 2): OptionOrder => ({
+/** `quantity` is what the stop filled, as the parser reports `processed_quantity`. */
+const stopOrder = (orderId: string, state: string | null, quantity = 0): OptionOrder => ({
   orderId,
   symbol: 'QQQ',
   ...OPTION,
@@ -69,9 +70,12 @@ const stopOrder = (orderId: string, state: string | null, quantity = 2): OptionO
   state,
   averagePrice: null,
   quantity,
+  processedQuantity: quantity,
   createdAt: null,
   raw: {},
 });
+
+const held = (quantity: number): OptionPosition => ({ symbol: 'QQQ', ...OPTION, quantity, raw: {} });
 
 interface ToolStubs {
   readonly tools: RobinhoodTools;
@@ -155,7 +159,7 @@ describe('cancelStops — the cancel is refused', () => {
     }
   );
 
-  it.each(['confirmed', 'queued', 'partially_filled', 'pending_cancelled', 'unconfirmed', 'some_new_state', null])(
+  it.each(['confirmed', 'queued', 'partially_filled', 'pending_cancelled', 'unconfirmed', 'expired', 'some_new_state', null])(
     'keeps the id and rethrows the cancel error when the stop is %s',
     async (state) => {
       const db = createFakeDb();
@@ -185,6 +189,33 @@ describe('cancelStops — the cancel is refused', () => {
     );
 
     expect(await stopIds(db)).toEqual({ 'lot-a': 'stop-a' });
+  });
+
+  it.each(['cancelled', 'rejected', 'failed', 'voided'])(
+    'keeps the id and rethrows when a %s stop had sold part of the lot first',
+    async (state) => {
+      const db = createFakeDb();
+      seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 3, 'stop-a');
+      const { tools } = makeTools(['stop-a'], [stopOrder('stop-a', state, 2)]);
+
+      await expect(cancelStops(db, USER, tools, 'QQQ', OPTION)).rejects.toThrow(
+        /^cancel_option_order failed after 3 attempts: .*Order cannot be cancelled at this time/
+      );
+
+      expect(await stopIds(db)).toEqual({ 'lot-a': 'stop-a' });
+      expect(await db.listDecisions(USER, 10)).toHaveLength(1);
+    }
+  );
+
+  it('clears the id of a dead stop whose row carries no processed quantity', async () => {
+    const db = createFakeDb();
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 3, 'stop-a');
+    const { processedQuantity: _absent, ...row } = stopOrder('stop-a', 'cancelled', 3);
+    const { tools } = makeTools(['stop-a'], [row]);
+
+    await expect(cancelStops(db, USER, tools, 'QQQ', OPTION)).resolves.toBeUndefined();
+
+    expect(await stopIds(db)).toEqual({ 'lot-a': null });
   });
 
   it('clears both ids when the older stop is dead and the newer one cancels normally', async () => {
@@ -298,6 +329,8 @@ describe('own-target ladder over a stop that had already filled', () => {
     const tools = {
       ...stubs.tools,
       getOptionsMarkPrice: vi.fn().mockResolvedValue({ markPrice: 1.6, raw: {} }),
+      // The older lot's contracts are gone: its stop sold them.
+      getOptionPositions: vi.fn().mockResolvedValue({ positions: [held(3)], raw: {} }),
       placeOptionsOrder: place,
     } as unknown as RobinhoodTools;
     const broker = {
@@ -314,26 +347,96 @@ describe('own-target ladder over a stop that had already filled', () => {
     expect(place).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ side: 'sell', contracts: 3, orderType: 'limit', limitPremium: 1.5 })
     );
-    expect((await db.listDecisions(USER, 10)).find((row) => row.messageId === 'ladder:lot-new:50')?.order?.lots).toEqual([
+    expect((await db.listDecisions(USER, 10)).find((row) => row.messageId.startsWith('ladder:lot-new:50:'))?.order?.lots).toEqual([
       { lotId: 'lot-new', quantity: 3, gainPct: 50 },
     ]);
   });
 });
 
 describe('restMissingStops', () => {
-  it('logs the status Robinhood returned for the placed stop', async () => {
+  function restSetup(positions: readonly OptionPosition[] | Error): {
+    db: FakeDb;
+    tools: RobinhoodTools;
+    place: ReturnType<typeof vi.fn>;
+    read: ReturnType<typeof vi.fn>;
+  } {
     const db = createFakeDb();
     db.seedSettings(USER, { maxLossPct: 80 });
-    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
-    const tools = {
-      placeOptionsOrder: vi.fn().mockResolvedValue({ orderId: 'stop-a', status: 'unconfirmed', raw: {} }),
-    } as unknown as RobinhoodTools;
+    let stops = 0;
+    const place = vi.fn(async () => ({ orderId: `stop-${(stops += 1)}`, status: 'unconfirmed', raw: {} }));
+    const read = vi.fn(async () => {
+      if (positions instanceof Error) throw positions;
+      return { positions, raw: {} };
+    });
+    const tools = { placeOptionsOrder: place, getOptionPositions: read } as unknown as RobinhoodTools;
+    return { db, tools, place, read };
+  }
+  const rest = (db: FakeDb, tools: RobinhoodTools): Promise<void> =>
+    restMissingStops({ userId: USER, db, tools, executionMode: 'immediate' });
 
-    const lines = await logged(() => restMissingStops({ userId: USER, db, tools, executionMode: 'immediate' }));
+  it('logs the status Robinhood returned for the placed stop', async () => {
+    const { db, tools } = restSetup([held(2)]);
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+
+    const lines = await logged(() => rest(db, tools));
 
     expect(lines).toContainEqual(
-      expect.objectContaining({ message: 'rested max-loss stop', orderId: 'stop-a', status: 'unconfirmed' })
+      expect.objectContaining({ message: 'rested max-loss stop', orderId: 'stop-1', status: 'unconfirmed' })
     );
-    expect(await stopIds(db)).toEqual({ 'lot-a': 'stop-a' });
+    expect(await stopIds(db)).toEqual({ 'lot-a': 'stop-1' });
+  });
+
+  it('reads positions once, and not at all when no lot needs a stop', async () => {
+    const { db, tools, place, read } = restSetup([held(5)]);
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+    seedLot(db, 'lot-b', '2026-06-11T14:00:00.000Z', 3, null);
+
+    await rest(db, tools);
+    expect(read).toHaveBeenCalledOnce();
+    expect(place).toHaveBeenCalledTimes(2);
+
+    await rest(db, tools);
+    expect(read).toHaveBeenCalledOnce();
+    expect(place).toHaveBeenCalledTimes(2);
+  });
+
+  it('rests no stop on a lot the account does not hold', async () => {
+    const { db, tools, place } = restSetup([]);
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+
+    await rest(db, tools);
+
+    expect(place).not.toHaveBeenCalled();
+    expect(await stopIds(db)).toEqual({ 'lot-a': null });
+  });
+
+  it('caps the stop to what the account holds', async () => {
+    const { db, tools, place } = restSetup([held(1)]);
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 3, null);
+
+    await rest(db, tools);
+
+    expect(place).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ orderType: 'stop_market', contracts: 1 }));
+  });
+
+  it('gives a short position to the newest lot, never more than held in total', async () => {
+    const { db, tools, place } = restSetup([held(3)]);
+    seedLot(db, 'lot-stale', '2026-06-10T13:00:00.000Z', 2, null);
+    seedLot(db, 'lot-new', '2026-06-11T14:00:00.000Z', 3, null);
+
+    await rest(db, tools);
+
+    expect(place).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ contracts: 3 }));
+    expect(await stopIds(db)).toEqual({ 'lot-stale': null, 'lot-new': 'stop-1' });
+  });
+
+  it('rests nothing when the positions read fails', async () => {
+    const { db, tools, place } = restSetup(new Error('get_option_positions failed after 3 attempts: fetch failed'));
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+
+    await expect(rest(db, tools)).rejects.toThrow(/get_option_positions failed/);
+
+    expect(place).not.toHaveBeenCalled();
+    expect(await stopIds(db)).toEqual({ 'lot-a': null });
   });
 });

@@ -7,7 +7,7 @@ import { createLogger, errorFields } from '../shared/logger.js';
 import { optionLabel, type Decision, type SubmittedOrder, type TradeExecutionMode } from '../shared/types.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
-import { contractsAtLevel } from './lots.js';
+import { contractsAtLevel, heldByLot } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
 import type { McpRegistry } from './rh/mcpRegistry.js';
 import { BrokerUnavailableError } from './rh/mcpClient.js';
@@ -16,6 +16,10 @@ import { cancelStops } from './stops.js';
 const log = createLogger('trader:ladder');
 
 export const LADDER_INTERVAL_MS = 15_000;
+
+// ponytail: lots already reported as not held, kept for the process so a stale
+// lot logs once and not every sweep. Upgrade path: close such lots in the ledger.
+const unheldLogged = new Set<string>();
 
 export interface LadderDeps {
   readonly db: TraderDb;
@@ -55,6 +59,8 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
   const broker = deps.brokers.for(userId);
   await broker.mcp.ensureReady();
   const lots = await deps.db.listOpenOptionLots(userId);
+  // Read on the first due level, so a sweep with nothing to sell adds no call.
+  let held: Map<string, number> | null = null;
   let placed = 0;
   for (const lot of lots) {
     if (lot.entryPrice <= 0) continue;
@@ -69,9 +75,26 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
       if (due < 1) continue;
       const target = lot.entryPrice * (1 + level.gainPct / 100);
       if (mark < target) continue;
-      const quantity = Math.min(due, lot.openQty);
-      if (quantity < 1) continue;
-      const messageId = `ladder:${lot.lotId}:${level.gainPct}`;
+      // The ledger alone can claim contracts sold in the Robinhood app. A
+      // failed read throws: nothing is cancelled or sold on a guess.
+      held ??= heldByLot(lots, (await broker.tools.getOptionPositions()).positions);
+      const quantity = Math.min(due, lot.openQty, held.get(lot.lotId) ?? 0);
+      if (quantity < 1) {
+        if (!unheldLogged.has(lot.lotId)) {
+          unheldLogged.add(lot.lotId);
+          log.info('ladder skipped lot: account does not hold the contract', {
+            userId,
+            lotId: lot.lotId,
+            symbol: lot.symbol,
+            option: optionLabel(lot.option),
+            openQty: lot.openQty,
+          });
+        }
+        break;
+      }
+      // Unique per placement: recordDecision drops a repeated id, and a level
+      // whose sell died is placed again.
+      const messageId = `ladder:${lot.lotId}:${level.gainPct}:${Date.now()}`;
       const order: SubmittedOrder = {
         symbol: lot.symbol,
         side: 'sell',

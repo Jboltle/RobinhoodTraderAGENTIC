@@ -19,6 +19,7 @@ import {
   type SubmittedOrder,
   type TradeExecutionMode,
 } from '../../shared/types.js';
+import { openOptionPosition } from '../lots.js';
 import type { RobinhoodTools } from '../rh/tools.js';
 import type { OptionPosition, PlaceOrderResult } from '../rh/types.js';
 
@@ -339,17 +340,7 @@ async function findOpenOptionPosition(
   symbol: string,
   option: OptionContract
 ): Promise<OptionPosition | null> {
-  const result = await tools.getOptionPositions();
-  return (
-    result.positions.find(
-      (p) =>
-        p.symbol.toUpperCase() === symbol &&
-        p.optionType === option.optionType &&
-        p.expiration === option.expiration &&
-        Math.abs(p.strike - option.strike) < 0.0001 &&
-        p.quantity > 0
-    ) ?? null
-  );
+  return openOptionPosition((await tools.getOptionPositions()).positions, symbol, option);
 }
 
 function resolveExitContracts(callout: Callout, risk: RiskAllow, heldContracts: number): number {

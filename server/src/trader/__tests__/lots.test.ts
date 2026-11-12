@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { allocateFifo, contractsAtLevel, entryMismatch, openOptionLots, stopTrigger, type LotRow } from '../lots.js';
+import { allocateFifo, contractsAtLevel, entryMismatch, heldByLot, openOptionLots, stopTrigger, type LotRow } from '../lots.js';
 import type { SubmittedOrder } from '../../shared/types.js';
 
 const OPTION = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
@@ -101,5 +101,31 @@ describe('entryMismatch', () => {
 describe('stopTrigger', () => {
   it('sets an 80% max loss at 20% of the fill', () => {
     expect(stopTrigger(1.34, 80)).toBeCloseTo(0.268);
+  });
+});
+
+describe('heldByLot', () => {
+  const lots = openOptionLots([
+    buy('old', 'caller-1', 2, '2026-06-10T13:00:00.000Z'),
+    buy('new', 'caller-1', 3, '2026-06-11T13:00:00.000Z'),
+  ]);
+  const position = (quantity: number, strike = 707) => ({ symbol: 'QQQ', ...OPTION, strike, quantity, raw: {} });
+  const heldQty = (...positions: ReturnType<typeof position>[]) => Object.fromEntries(heldByLot(lots, positions));
+
+  it('covers every lot when the account holds at least what the lots claim', () => {
+    expect(heldQty(position(5))).toEqual({ old: 2, new: 3 });
+    expect(heldQty(position(9))).toEqual({ old: 2, new: 3 });
+  });
+
+  it('hands a short position to the newest lot first, never more than held in total', () => {
+    expect(heldQty(position(4))).toEqual({ old: 1, new: 3 });
+    expect(heldQty(position(3))).toEqual({ old: 0, new: 3 });
+    expect(heldQty(position(1))).toEqual({ old: 0, new: 1 });
+  });
+
+  it('gives nothing to lots of a contract the account does not hold', () => {
+    expect(heldQty()).toEqual({ old: 0, new: 0 });
+    expect(heldQty(position(5, 708))).toEqual({ old: 0, new: 0 });
+    expect(heldQty(position(0))).toEqual({ old: 0, new: 0 });
   });
 });

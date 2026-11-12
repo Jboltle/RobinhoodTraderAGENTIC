@@ -6,7 +6,7 @@
 import { createLogger } from '../shared/logger.js';
 import { optionLabel, type Decision, type OptionContract, type TradeExecutionMode } from '../shared/types.js';
 import type { TraderDb } from './db.js';
-import { stopTrigger, type OpenOptionLot } from './lots.js';
+import { heldByLot, stopTrigger, type OpenOptionLot } from './lots.js';
 import { roundPremiumToTick, type RobinhoodTools } from './rh/tools.js';
 import type { OptionOrder } from './rh/types.js';
 
@@ -21,11 +21,12 @@ const FILLED_STOP_STATE = 'filled';
  * cancel succeeds.
  *
  * A failed cancel says nothing about the stop, so its state is read back by id:
- * - dead (never filled): the id is cleared and the remaining lots carry on;
+ * - dead, nothing filled: the id is cleared and the remaining lots carry on;
  * - filled: the lot is closed by the stop's own sell, the id is cleared, and
  *   this call still throws, so the caller places nothing;
- * - anything else (working, unknown, not listed, unreadable): the id stays and
- *   the cancel error is rethrown. A sell next to a live stop can sell twice.
+ * - anything else (working, dead after a partial fill, unknown, not listed,
+ *   unreadable): the id stays and the cancel error is rethrown. A sell next to
+ *   a live stop can sell twice, and one sized on an overstated lot oversells.
  */
 export async function cancelStops(
   db: TraderDb,
@@ -57,6 +58,7 @@ export async function cancelStops(
         orderId: lot.stopOrderId,
         state: stop?.state ?? null,
         stopQuantity: stop?.quantity ?? null,
+        processedQuantity: stop?.processedQuantity ?? null,
         error: err instanceof Error ? err.message : String(err),
       });
       if (stop !== null && state === FILLED_STOP_STATE) {
@@ -76,6 +78,9 @@ export async function cancelStops(
         );
       }
       if (state === null || !DEAD_STOP_STATES.has(state)) throw err;
+      // Dead after selling part of the lot: clearing the id would leave the
+      // ledger claiming contracts that stop already sold.
+      if ((stop?.processedQuantity ?? 0) > 0) throw err;
     }
     await db.updateOrder(userId, lot.messageId, { ...lot.buyOrder, stopOrderId: null });
   }
@@ -149,15 +154,21 @@ export async function restMissingStops(args: {
   if (settings.maxLossPct == null || settings.maxLossPct <= 0) return;
 
   const lots = await args.db.listOpenOptionLots(args.userId);
+  // Read on the first lot that needs a stop. A failed read throws out of this
+  // call: no stop is rested on the ledger's word alone.
+  let held: Map<string, number> | null = null;
   for (const lot of lots) {
     if (lot.stopOrderId || lot.entryPrice <= 0 || lot.openQty < 1) continue;
+    held ??= heldByLot(lots, (await args.tools.getOptionPositions()).positions);
+    const contracts = held.get(lot.lotId) ?? 0;
+    if (contracts < 1) continue;
     try {
       const placed = await args.tools.placeOptionsOrder({
         symbol: lot.symbol,
         optionType: lot.option.optionType,
         strike: lot.option.strike,
         expiration: lot.option.expiration,
-        contracts: lot.openQty,
+        contracts,
         side: 'sell',
         orderType: 'stop_market',
         stopPrice: roundPremiumToTick(stopTrigger(lot.entryPrice, settings.maxLossPct), 'sell', null),
@@ -168,7 +179,7 @@ export async function restMissingStops(args: {
       log.info('rested max-loss stop', {
         userId: args.userId,
         symbol: lot.symbol,
-        contracts: lot.openQty,
+        contracts,
         orderId: placed.orderId,
         status: placed.status,
       });
