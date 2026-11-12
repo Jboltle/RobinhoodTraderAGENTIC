@@ -6,7 +6,7 @@ An invite-only, multi-tenant system. One Discord ingest fans out to each signed-
 - **`server/src/trader/`** — a Fastify HTTP service whose poller drains unprocessed `messages` rows, uses an LLM to extract a structured trade callout **once** per message, then runs it per connected user: their settings, their risk state, their [Robinhood Trading MCP](https://agent.robinhood.com/mcp/trading) session (Streamable HTTP + OAuth).
 - **`client/`** — a TanStack Start dashboard. Users sign in with their invited email, connect their own Robinhood account, edit their own limits, and watch their own feed.
 
-All state lives in Postgres (Railway in production). Users, per-user trades, per-user settings, encrypted per-user broker tokens — and now the raw Discord archive — are rows, not files. **The database is the entire interface between capture and trading** ([ADR-0001](docs/adr/0001-database-as-integration-boundary.md)): the Listener only writes, the trader only polls, and nothing forwards anything anywhere.
+All state lives in Postgres (Railway in production). Users, their brokerage accounts, per-account trades, per-account settings, encrypted per-account broker tokens — and now the raw Discord archive — are rows, not files. **The database is the entire interface between capture and trading** ([ADR-0001](docs/adr/0001-database-as-integration-boundary.md)): the Listener only writes, the trader only polls, and nothing forwards anything anywhere.
 
 ## Self-bot risk — read before setting DISCORD_USER_TOKEN
 
@@ -33,13 +33,13 @@ Discord Gateway ──▶ Listener (Python, user token) ──INSERT──▶ me
 browser (client/) ──session token──▶ /api/* ──owner connection──▶ Postgres
 ```
 
-One parse serves everyone, which is the cost saving that matters as users are added. Users then run concurrently — separate Robinhood sessions — while each user's own messages stay serialized so no account ever has two orders in flight. Every message gets a **disposition** (`callout`, `not_callout`, `failed`, `missed`, `recap`) recorded on its row; a Callout is simply a message whose disposition says so, with its parse attached. If the trader is down, messages pile up unprocessed and the poller's first drain on boot is the catch-up — anything older than the **2-minute** staleness window is recorded as *missed* rather than executed at a price that has since moved. The system is Discord-read-only: the dashboard is the only output surface.
+One parse serves everyone, which is the cost saving that matters as accounts are added. The outcome is then decided once per connected account (a user can hold more than one), each under its own settings and against its own lots. Accounts run concurrently — separate broker sessions — while each account's own messages stay serialized so no account ever has two orders in flight. Every message gets a **disposition** (`callout`, `not_callout`, `failed`, `missed`, `recap`) recorded on its row; a Callout is simply a message whose disposition says so, with its parse attached. If the trader is down, messages pile up unprocessed and the poller's first drain on boot is the catch-up — anything older than the **2-minute** staleness window is recorded as *missed* rather than executed at a price that has since moved. The system is Discord-read-only: the dashboard is the only output surface.
 
 ### Access model
 
 - Every route is behind a Fastify `preHandler` that resolves the bearer token to a live row in `sessions`. The only public ones are `/health` and `/api/auth/login`.
 - Sign-in is the email alone, and nothing is ever emailed. `POST /api/auth/login` takes an email; if it belongs to an account, or is on the `allowed_emails` invite list (the account is created at that first sign-in), it returns a random session token that lasts 30 days, and only the token's SHA-256 is stored. Any other email gets a 403. **The email is the whole credential: anyone who knows a user's email can sign in as them, trades included**, so treat each user's email as the key to their account.
-- [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that talks to the database, and every per-user method takes `userId` as its first argument so a caller cannot forget to scope a query.
+- [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that talks to the database. Settings, trades and broker tokens belong to an account, and every method that touches them takes `accountId` as its first argument so a caller cannot forget to scope a query. A route never takes an account from the request: the session resolves to the user's selected account (`requireAccount` in [`server/src/trader/auth.ts`](server/src/trader/auth.ts)), which is always one of their own.
 - RLS stays on with default-deny for every table, but nothing is exposed through a public data API: the browser only ever talks to the trader, which connects as the table owner.
 
 ### Schema (`supabase/migrations/`)
@@ -47,10 +47,10 @@ One parse serves everyone, which is the cost saving that matters as users are ad
 | Table | Scope | Holds |
 | --- | --- | --- |
 | `messages` | shared | The raw Discord archive (Listener-written) + the trader's verdict: `disposition`, `parse`, `processed_at`. The poller's work queue, the idempotency ledger, and the feed source, all in one table. |
-| `trades` | per-user | One decision row per callout per user. Denormalized so it reads standalone. |
-| `settings` | per-user | One `jsonb` payload — the full resolved settings. Authoritative; no env or file layer behind it. |
+| `users` | per-user | Who can sign in: `id`, `email`, and `selected_account_id`, the account the dashboard and Settings show. |
+| `accounts` | per-account | One row per brokerage account, owned by a user: how it is reached (`adapter`, `institution`, `adapter_data`), its trade settings as typed columns (authoritative; no env or file layer behind them), and its broker tokens in `credentials`, AES-256-GCM encrypted under `RH_TOKENS_VAULT_KEY`, so the database only ever holds ciphertext. Every user has one direct Robinhood account from their first sign-in. |
+| `trades` | per-account | One decision row per callout per account. Denormalized so it reads standalone. |
 | `allowed_emails` | shared | The signup gate. |
-| `broker_connections` | per-user | Robinhood tokens, AES-256-GCM encrypted under `RH_TOKENS_VAULT_KEY`. The database only ever holds ciphertext. |
 | `user_emails` | view | `user_id` + `email` from `auth.users`. The join for identifying a User. |
 
 Daily trade counts and per-ticker cooldowns are **derived** from `trades` with two count queries rather than stored, so a restart no longer resets the daily cap.
@@ -143,9 +143,9 @@ cd client
 bun run dev      # http://localhost:3001
 ```
 
-On the sign-in screen, enter that email, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per user. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
+On the sign-in screen, enter that email, then connect Robinhood from the dashboard — there is no boot-time OAuth prompt any more, because tokens are per account. The connect dialog warns about two things worth knowing up front: the "can't reach this page" error after consent is expected (Robinhood only allows loopback redirects, so the redirect dead-ends on your own machine and you paste the URL back), and connecting burns that Robinhood account's Claude Code slot.
 
-On restart the trader reconnects every user who already had stored tokens, so their MCP session is warm before the first callout rather than during it.
+On restart the trader reconnects every account that already had stored tokens, so its MCP session is warm before the first callout rather than during it.
 
 `GET /health` is public and returns `{ ok }` — it is a liveness signal, not an auth report. Per-user Robinhood state is at `GET /api/broker/status`.
 
@@ -231,7 +231,7 @@ ROBINHOOD_OAUTH_CALLBACK_HOST=0.0.0.0
 
 Restart `npm run dev` after changing the redirect URI and use the newly printed Robinhood auth URL.
 
-If Robinhood says the agent is already connected but this app never continues, that user's `broker_connections` row may hold only partial OAuth state and no usable tokens. Drop it and start again:
+If Robinhood says the agent is already connected but this app never continues, that user's Robinhood account may hold only partial OAuth state and no usable tokens. Clear it and start again (the account, its settings and its trades stay):
 
 ```bash
 npm run auth:reset you@example.com   # email or user id
@@ -279,11 +279,11 @@ QQQ 707C 2026-06-11
 
 In `approval` mode every user gets an approval-required outcome and no order is submitted. Switch to `TRADE_EXECUTION_MODE=immediate` only when you want passed callouts to submit live orders.
 
-One thing that surprises people: the pipeline fans out to users who have a `broker_connections` row, so if nobody has connected Robinhood yet, a callout is parsed and stored but produces no per-user outcomes. Connect at least one account before wondering where the decisions went.
+One thing that surprises people: the pipeline fans out to accounts that have stored broker credentials, so if nobody has connected Robinhood yet, a callout is parsed and stored but produces no per-account outcomes. Connect at least one account before wondering where the decisions went.
 
 ## Deployment
 
-Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries Node, running the trader's TypeScript through tsx, and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -f <file>`; the files are guarded to run on both that database and the local stack. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
+Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries Node, running the trader's TypeScript through tsx, and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -X -1 -v ON_ERROR_STOP=1 -f <file>` (one transaction, stop at the first error); the files are guarded to run on both that database and the local stack. The accounts migration is two files: `20261111200000_accounts_expand.sql` only adds, is safe while the previous trader code is still running and is what the accounts code needs; `20261111210000_accounts_contract.sql` drops the old columns and `broker_connections`, and is applied only once the accounts code is the only code running and will not be rolled back. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
 
 Production configuration lives only in Railway variables; no `.env` file ships in either image. The complete set each service reads (`npm run env:audit` in `server/` checks the code against `.env.example`):
 
@@ -317,14 +317,24 @@ Staging services sleep when idle (Railway app sleeping, on for the trader and th
 
 The generated `*.up.railway.app` addresses are created with `railway domain`; they are not in the file. The staging site signs in by email address alone, like production, and holds a copy of every user's history and settings.
 
-Staging's database is a clone of production taken on demand, without the broker tokens or sessions. `pg_dump` must be at least the server's major version, 18 (`brew install libpq`, which is not put on `PATH`):
+Staging's database is a clone of production taken on demand, without the broker tokens or sessions: `accounts` is copied without its `credentials` column, and the script stops if a stored broker login reached the target. `pg_dump` must be at least the server's major version, 18 (`brew install libpq`, which is not put on `PATH`):
 
 ```bash
 PATH="$(brew --prefix libpq)/bin:$PATH" SOURCE_DB_URL="<production public URL>" TARGET_DB_URL="<staging public URL>" \
   server/scripts/seed-staging.sh
 ```
 
-The closing row counts must show `broker_connections` and `sessions` at zero.
+The closing row counts must show `sessions` at zero.
+
+The clone has production's schema. While `staging` is ahead of `main` by a migration, a fresh clone is missing it and the staging trader will not start against it, so list the files production has not had yet and the script applies them after the copy, each in one transaction:
+
+```bash
+POST_CLONE_MIGRATIONS="supabase/migrations/20261111200000_accounts_expand.sql supabase/migrations/20261111210000_accounts_contract.sql" \
+  PATH="$(brew --prefix libpq)/bin:$PATH" SOURCE_DB_URL="<production public URL>" TARGET_DB_URL="<staging public URL>" \
+  server/scripts/seed-staging.sh
+```
+
+Drop a file from the list once production has had it (the expand step refuses to run after the contract step, and neither is needed once production has both).
 
 Local staging, using the Homebrew Postgres already on the box:
 
@@ -360,7 +370,7 @@ Per user, not per environment. Each user owns one row in `settings`, edited from
 
 `maxTradesPerDay` and `cooldownSeconds` are enforced against the `trades` table rather than an in-process counter, so they hold across restarts. They are checked when the callout arrives, which for an approval-mode trade is not when it is submitted — approving a backlog can therefore outrun the daily cap.
 
-The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch enforced in front of every broker write (`guardWrites` in [`server/src/trader/broker/writeGuard.ts`](server/src/trader/broker/writeGuard.ts), applied to each broker the registry opens) and at the gates that lead to it. It can only tighten: a trader booted in `approval` mode parks every callout-driven trade regardless of the user's own `executionMode` and rejects the dashboard's Approve button with a 409, so no callout ever submits; Max Loss, which the user opted into as protection, still flattens. `read_only` goes further and stops every broker write, Max Loss included — a breach is logged, not sold — which is what a staging deployment or a historical replay runs with. Unset means `immediate`: the per-user setting decides. The mode is logged once at boot (`execution policy`).
+The one remaining env-level control is `TRADE_EXECUTION_MODE`, a global kill-switch enforced in front of every broker write (`guardWrites` in [`server/src/trader/broker/writeGuard.ts`](server/src/trader/broker/writeGuard.ts), applied to each broker the registry opens) and at the gates that lead to it. It can only tighten: a trader booted in `approval` mode parks every callout-driven trade regardless of the account's own `executionMode` and rejects the dashboard's Approve button with a 409, so no callout ever submits; Max Loss, which the user opted into as protection, still flattens. `read_only` goes further and stops every broker write, Max Loss included — a breach is logged, not sold — which is what a staging deployment or a historical replay runs with. Unset means `immediate`: the per-account setting decides. The mode is logged once at boot (`execution policy`).
 
 ## Project layout
 
@@ -378,9 +388,9 @@ server/
 │       ├── poller.ts  the consumer loop: unprocessed messages -> pipeline (catch-up included)
 │       ├── server.ts  Fastify routes: GET /health, /api/*
 │       ├── auth.ts    Supabase JWT preHandler; the public-route list lives here
-│       ├── db.ts      the only database client; every per-user method takes userId first
-│       ├── pipeline/  parse-once + per-user fan-out, riskFilter, execute, summarize
-│       ├── broker/    per-user broker registry, shared broker errors, tick rounding
+│       ├── db.ts      the only database client; every per-account method takes accountId first
+│       ├── pipeline/  parse-once + per-account fan-out, riskFilter, execute, summarize
+│       ├── broker/    per-account broker registry, shared broker errors, tick rounding
 │       └── robinhood/ MCP client, OAuth, token crypto, tool wrappers
 supabase/
 ├── config.toml        local stack config (ports shifted off the CLI defaults)
