@@ -283,7 +283,7 @@ One thing that surprises people: the pipeline fans out to accounts that have sto
 
 ## Deployment
 
-Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries Node, running the trader's TypeScript through tsx, and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -X -1 -v ON_ERROR_STOP=1 -f <file>` (one transaction, stop at the first error); the files are guarded to run on both that database and the local stack. The accounts migration is two files: `20261111200000_accounts_expand.sql` only adds, is safe while the previous trader code is still running and is what the accounts code needs; `20261111210000_accounts_contract.sql` drops the old columns and `broker_connections`, and is applied only once the accounts code is the only code running and will not be rolled back. Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
+Owned separately — see `server/docker-compose.yml` and `server/Dockerfile.server` (the image carries Node, running the trader's TypeScript through tsx, and the uv binary for the Listener; uv provisions its own CPython). In outline: the trader and the Listener run as one process tree so the single `/health` keep-alive ping also keeps the Discord Gateway socket alive, the dashboard deploys as a separate service (a UI deploy must never restart the gateway session or warm broker sessions), and production data lives in the Railway project's Postgres service. The trader's `SUPABASE_DB_URL` there is `${{Postgres.DATABASE_URL}}`, the private-network URL, so database traffic is never billed as egress. A new file in `supabase/migrations/` is applied to Railway by hand with `psql "<public database URL>" -X -1 -v ON_ERROR_STOP=1 -f <file>` (one transaction, stop at the first error); the files are guarded to run on both that database and the local stack. The accounts migration has its own procedure, [below](#accounts-migration-production). Run exactly one instance: one gateway session per token, and the poller assumes no sibling.
 
 Production configuration lives only in Railway variables; no `.env` file ships in either image. The complete set each service reads (`npm run env:audit` in `server/` checks the code against `.env.example`):
 
@@ -291,6 +291,46 @@ Production configuration lives only in Railway variables; no `.env` file ships i
 | --- | --- |
 | trader + Listener | `SUPABASE_DB_URL`, `RH_TOKENS_VAULT_KEY`, `DISCORD_USER_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_ALLOWED_AUTHOR_IDS`, `DISCORD_RECAP_CHANNEL_IDS`, `JEV_API_KEY`, `LLM_MODEL`, `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`), `TRADE_EXECUTION_MODE`, `NODE_ENV=production`; optional `LOG_LEVEL`, `JEV_MODEL`, `DECISION_ENGINE`, `KEEP_ALIVE_URL`, `FILL_LOOKBACK_DAYS` |
 | dashboard | `API_URL` only. It is read at runtime by `client/server.ts`; nothing is baked into the bundle, and no secret belongs on this service. |
+
+### Accounts migration (production)
+
+Three files. Each is one statement, so it applies entirely or not at all, and it gives up after 5 seconds rather than queue behind a lock; a failed run changes nothing and can be repeated.
+
+- `supabase/migrations/20261111200000_accounts_expand.sql` adds `accounts` and the triggers that carry the previous code's writes onto it.
+- `supabase/migrations/20261111210000_accounts_contract.sql` drops the old settings columns and `broker_connections`.
+- `supabase/rollback/accounts_reverse_copy.sql` is the rollback. It is not a migration and nothing applies it automatically.
+
+Every step runs outside market hours with PostgreSQL 18 client tools. To apply a file is `psql "<public database URL>" -X -1 -v ON_ERROR_STOP=1 -f <file>`, and only exit status 0 is success.
+
+1. **Back up.** `pg_dump "<public database URL>" -Fc -f <path outside the repository>`. The dump holds the encrypted broker logins and the sessions.
+2. **Stop the trader.** Note `select count(*) from public.broker_connections` (8 when this was written), then `railway down --service RobinhoodTradingServer --environment production --yes`, which removes the most recent deployment. Confirm the previous code cannot come back: the service shows no active deployment, `/health` no longer answers, nothing is merged to `main` before step 5 (a merge deploys), no local process holds production's `SUPABASE_DB_URL`, and this lists no application connection:
+
+   ```sql
+   select pid, client_addr, application_name, state from pg_stat_activity
+    where datname = current_database() and pid <> pg_backend_pid();
+   ```
+
+3. **Expand.** Apply `supabase/migrations/20261111200000_accounts_expand.sql`.
+4. **Verify.** The first query must return no rows, the second `0`, the third the count noted in step 2:
+
+   ```sql
+   select u.email
+     from public.users u
+     left join public.accounts a on a.user_id = u.id and a.adapter = 'robinhood'
+     left join public.broker_connections b on b.user_id = u.id
+    where a.id is null
+       or a.credentials is distinct from b.encrypted_tokens
+       or u.selected_account_id is distinct from a.id
+       or (u.execution_mode, u.max_trades_per_day, u.followed_caller_ids, u.max_loss_pct, u.exit_mode)
+          is distinct from
+          (a.execution_mode, a.max_trades_per_day, a.followed_caller_ids, a.max_loss_pct, a.exit_mode);
+   select count(*) from public.trades where account_id is null;
+   select count(*) from public.accounts where credentials is not null;
+   ```
+
+5. **Deploy the accounts code** (merge `staging` to `main`) with `RH_TOKENS_VAULT_KEY` unchanged: the logins were copied as ciphertext, and only that key opens them. The trader's boot log must show `restoring broker sessions` with `accounts` at the third number from step 4.
+6. **Rollback, only before step 7.** The accounts code writes `accounts` alone, so the old columns and `broker_connections` go stale from its first write: old settings, a refresh token Robinhood has retired, a disconnected user still traded for. Stop the trader as in step 2, apply `supabase/rollback/accounts_reverse_copy.sql`, run the first query of step 4 again (no rows), then deploy the previous code. Never start the previous code against this database any other way.
+7. **Contract**, once the accounts code will not be rolled back, and before any deploy that can create a second account for a user (until this step a unique index refuses one): stop the trader as in step 2, apply `supabase/migrations/20261111210000_accounts_contract.sql`, redeploy. From here there is no rollback: the previous code fails on its first settings read, and the reverse copy refuses to run.
 
 ### Staging
 
@@ -317,7 +357,7 @@ Staging services sleep when idle (Railway app sleeping, on for the trader and th
 
 The generated `*.up.railway.app` addresses are created with `railway domain`; they are not in the file. The staging site signs in by email address alone, like production, and holds a copy of every user's history and settings.
 
-Staging's database is a clone of production taken on demand, without the broker tokens or sessions: `accounts` is copied without its `credentials` column, and the script stops if a stored broker login reached the target. `pg_dump` must be at least the server's major version, 18 (`brew install libpq`, which is not put on `PATH`):
+Staging's database is a clone of production taken on demand, without the broker tokens or sessions: `accounts` is copied without its `credentials` column, and if a stored broker login or a session reaches the target all the same, the script removes it there and fails. `pg_dump` must be at least the server's major version, 18 (`brew install libpq`, which is not put on `PATH`):
 
 ```bash
 PATH="$(brew --prefix libpq)/bin:$PATH" SOURCE_DB_URL="<production public URL>" TARGET_DB_URL="<staging public URL>" \
