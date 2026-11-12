@@ -1,5 +1,25 @@
-import type { OrderSide } from '../../shared/types.js';
+import type { AssetType, OptionContract, OrderSide } from '../../shared/types.js';
 import type { OptionMinTicks } from '../robinhood/types.js';
+import type { Instrument } from './types.js';
+
+/** The instrument a stored order, lot or position row names. */
+export function instrumentOf(order: {
+  readonly symbol: string;
+  readonly assetType: AssetType;
+  readonly option: OptionContract | null;
+}): Instrument {
+  if (order.assetType !== 'option') return { kind: 'equity', symbol: order.symbol };
+  if (order.option === null) {
+    throw new Error(`options order for ${order.symbol} is missing its contract details`);
+  }
+  return {
+    kind: 'option',
+    symbol: order.symbol,
+    optionType: order.option.optionType,
+    strike: order.option.strike,
+    expiration: order.option.expiration,
+  };
+}
 
 // =============================================================================
 // Price grid rounding
