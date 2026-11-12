@@ -18,10 +18,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision } from '../../shared/types.js';
 import type { StoredCallout } from '../db.js';
-import { fakeTokens } from './fakeDb.js';
+import { fakeTokens, firstAccountId } from './fakeDb.js';
 import { equityPosition, makeHarness, markReads, optionPosition, type Harness } from './harness.js';
 
 const USER = { id: 'user-1', email: 'user@example.com' };
+/** The account USER's routes act on; never USER's own id. */
+const ACCOUNT_ID = firstAccountId(USER.id);
 const TOKEN = 'a-valid-token';
 
 const decisionFixture = (messageId: string, overrides: Partial<Decision> = {}): Decision => ({
@@ -83,7 +85,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
   const seedPending = (messageId = 'msg-pending') => {
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture(messageId, {
         kind: 'pending_approval',
         reason: 'Approval required: BUY 4 AAPL (market). No order submitted.',
@@ -96,7 +98,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
   // Approving submits over the broker, which serves only with a stored
   // connection of record.
   beforeEach(() => {
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
   });
 
   it('approve submits the sized order and flips the row to submitted', async () => {
@@ -109,14 +111,14 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(decision.kind).toBe('submitted');
     expect(decision.order).toMatchObject({ orderId: 'eq-001', status: 'queued', quantity: 4 });
 
-    expect(harness.fakeBroker(USER.id).placeOrder).toHaveBeenCalledWith(
+    expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).toHaveBeenCalledWith(
       expect.objectContaining({
         instrument: { kind: 'equity', symbol: 'AAPL' },
         side: 'buy',
         quantity: 4,
       })
     );
-    expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('submitted');
+    expect((await harness.db.listDecisions(ACCOUNT_ID, 10))[0]!.kind).toBe('submitted');
   });
 
   it("approving an option sell cancels the lot's resting stop, then places the sell", async () => {
@@ -129,7 +131,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
     };
     harness.db.seedMessage({ messageId: 'buy-QQQ', sentAt: '2026-07-14T14:00:00.000Z' });
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('buy-QQQ', {
         at: '2026-07-14T14:00:00.000Z',
         ticker: 'QQQ',
@@ -146,7 +148,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
       })
     );
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('msg-pending-sell', {
         kind: 'pending_approval',
         ticker: 'QQQ',
@@ -165,7 +167,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
     const response = await send('POST', '/api/trades/msg-pending-sell/approve', {});
 
     expect((response.json() as { decision: Decision }).decision.kind).toBe('submitted');
-    const broker = harness.fakeBroker(USER.id);
+    const broker = harness.fakeBroker(ACCOUNT_ID);
     expect(broker.cancelOrder.mock.calls).toEqual([['stop-1']]);
     expect(broker.placeOrder).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ side: 'sell', quantity: 1, type: 'market' })
@@ -182,15 +184,15 @@ describe('/api/trades/:messageId/approve|reject', () => {
     async (executionMode) => {
       harness = makeHarness({ executionMode });
       harness.db.addUser(USER, TOKEN);
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
       const messageId = seedPending();
 
       const response = await send('POST', `/api/trades/${messageId}/approve`, {});
 
       expect(response.statusCode).toBe(409);
       expect((response.json() as { error: string }).error).toContain(executionMode);
-      expect(harness.fakeBroker(USER.id).placeOrder).not.toHaveBeenCalled();
-      expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
+      expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).not.toHaveBeenCalled();
+      expect((await harness.db.listDecisions(ACCOUNT_ID, 10))[0]!.kind).toBe('pending_approval');
     }
   );
 
@@ -201,8 +203,8 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
     expect(response.statusCode).toBe(200);
     expect((response.json() as { decision: Decision }).decision.kind).toBe('rejected');
-    expect(harness.fakeBroker(USER.id).placeOrder).not.toHaveBeenCalled();
-    expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('rejected');
+    expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).not.toHaveBeenCalled();
+    expect((await harness.db.listDecisions(ACCOUNT_ID, 10))[0]!.kind).toBe('rejected');
   });
 
   // The compare-and-set on kind='pending_approval' is what makes this safe;
@@ -214,11 +216,11 @@ describe('/api/trades/:messageId/approve|reject', () => {
     const second = await send('POST', `/api/trades/${messageId}/approve`, {});
 
     expect(second.statusCode).toBe(404);
-    expect(harness.fakeBroker(USER.id).placeOrder).toHaveBeenCalledOnce();
+    expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).toHaveBeenCalledOnce();
   });
 
   it('404s for a callout with no pending row', async () => {
-    harness.db.seedDecision(USER.id, decisionFixture('msg-done', { kind: 'submitted' }));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('msg-done', { kind: 'submitted' }));
 
     expect((await send('POST', '/api/trades/msg-done/approve', {})).statusCode).toBe(404);
     expect((await send('POST', '/api/trades/never-seen/approve', {})).statusCode).toBe(404);
@@ -226,7 +228,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
   it('a broker failure records execution_failed instead of leaving the row pending', async () => {
     const messageId = seedPending();
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       overrides: {
         placeOrder: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
       },
@@ -244,15 +246,15 @@ describe('/api/trades/:messageId/approve|reject', () => {
   // user can reconnect and approve the same trade.
   it('approve 409s and keeps the trade pending when no stored connection exists', async () => {
     const messageId = seedPending();
-    await harness.db.deleteBrokerTokens(USER.id);
-    harness.configureBroker(USER.id, { connected: true });
+    await harness.db.deleteBrokerTokens(ACCOUNT_ID);
+    harness.configureBroker(ACCOUNT_ID, { connected: true });
 
     const response = await send('POST', `/api/trades/${messageId}/approve`, {});
 
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
-    expect(harness.fakeBroker(USER.id).placeOrder).not.toHaveBeenCalled();
-    expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
+    expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).not.toHaveBeenCalled();
+    expect((await harness.db.listDecisions(ACCOUNT_ID, 10))[0]!.kind).toBe('pending_approval');
   });
 });
 
@@ -310,8 +312,8 @@ describe('/api/settings', () => {
 
 describe('GET /api/decisions', () => {
   it('returns the caller\u2019s decisions newest-first', async () => {
-    harness.db.seedDecision(USER.id, decisionFixture('older', { at: '2026-07-14T10:00:00.000Z' }));
-    harness.db.seedDecision(USER.id, decisionFixture('newer', { at: '2026-07-14T12:00:00.000Z' }));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('older', { at: '2026-07-14T10:00:00.000Z' }));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('newer', { at: '2026-07-14T12:00:00.000Z' }));
 
     const response = await get('/api/decisions');
     expect(response.statusCode).toBe(200);
@@ -321,8 +323,8 @@ describe('GET /api/decisions', () => {
   });
 
   it('honours ?limit= and rejects invalid limits', async () => {
-    harness.db.seedDecision(USER.id, decisionFixture('one', { at: '2026-07-14T10:00:00.000Z' }));
-    harness.db.seedDecision(USER.id, decisionFixture('two', { at: '2026-07-14T11:00:00.000Z' }));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('one', { at: '2026-07-14T10:00:00.000Z' }));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('two', { at: '2026-07-14T11:00:00.000Z' }));
 
     const limited = await get('/api/decisions?limit=1');
     expect((limited.json() as { decisions: Decision[] }).decisions).toHaveLength(1);
@@ -338,7 +340,7 @@ describe('GET /api/callouts', () => {
   it('attaches the caller\u2019s outcome to each shared callout', async () => {
     harness.db.seedCallout(calloutFixture('msg-acted', '2026-07-15T14:30:00.000Z'));
     harness.db.seedCallout(calloutFixture('msg-untouched', '2026-07-15T14:00:00.000Z'));
-    harness.db.seedDecision(USER.id, decisionFixture('msg-acted'));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('msg-acted'));
 
     const response = await get('/api/callouts');
     expect(response.statusCode).toBe(200);
@@ -413,12 +415,12 @@ describe('GET /api/callouts', () => {
     });
     expect(theirs.statusCode).toBe(200);
 
-    harness.db.seedDecision(OTHER.id, decisionFixture('msg-1'));
+    harness.db.seedDecision(firstAccountId(OTHER.id), decisionFixture('msg-1'));
     const revalidate = () =>
       harness.as(TOKEN, { method: 'GET', url: '/api/callouts', headers: { 'if-none-match': etag } });
     expect((await revalidate()).statusCode).toBe(304);
 
-    harness.db.seedDecision(USER.id, decisionFixture('msg-1'));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('msg-1'));
     const changed = await revalidate();
     expect(changed.statusCode).toBe(200);
     expect(changed.json()).toMatchObject({ callouts: [{ decision: { kind: 'submitted' } }] });
@@ -523,12 +525,12 @@ describe('GET /api/book', () => {
 describe('GET /api/trades/performance', () => {
   // Broker data serves only with a stored connection of record.
   beforeEach(() => {
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
   });
 
   it('409s instead of serving when no stored connection exists', async () => {
-    await harness.db.deleteBrokerTokens(USER.id);
-    harness.configureBroker(USER.id, {
+    await harness.db.deleteBrokerTokens(ACCOUNT_ID);
+    harness.configureBroker(ACCOUNT_ID, {
       connected: true,
       positions: [equityPosition('AAPL', 10)],
     });
@@ -539,14 +541,14 @@ describe('GET /api/trades/performance', () => {
   });
 
   it('joins open positions with the caller\u2019s submitted orders and live quotes', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       positions: [equityPosition('AAPL', 10), optionPosition('QQQ', 'put', 710, '2026-06-08', 2)],
       equityMark: 165,
       optionMark: 1.94,
     });
 
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('eq', {
         order: {
           symbol: 'AAPL',
@@ -562,7 +564,7 @@ describe('GET /api/trades/performance', () => {
       })
     );
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('opt', {
         ticker: 'QQQ',
         order: {
@@ -598,7 +600,7 @@ describe('GET /api/trades/performance', () => {
   });
 
   it('entry price comes from the buy even when a sell decision is newer', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       positions: [equityPosition('AAPL', 5)],
       equityMark: 165,
     });
@@ -615,11 +617,11 @@ describe('GET /api/trades/performance', () => {
       status: 'queued',
     });
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('buy', { at: '2026-07-14T14:00:00.000Z', order: equityOrder('buy', 150) })
     );
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('trim', { at: '2026-07-14T15:00:00.000Z', order: equityOrder('sell', 160) })
     );
 
@@ -630,7 +632,7 @@ describe('GET /api/trades/performance', () => {
   });
 
   it('prefers the broker-reported cost basis over the submitted limit price', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       // The position row's average cost must beat the limit.
       positions: [
         equityPosition('AAPL', 10, 148.5),
@@ -658,7 +660,7 @@ describe('GET /api/trades/performance', () => {
     });
 
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('eq', {
         order: {
           symbol: 'AAPL',
@@ -674,7 +676,7 @@ describe('GET /api/trades/performance', () => {
       })
     );
     harness.db.seedDecision(
-      USER.id,
+      ACCOUNT_ID,
       decisionFixture('opt', {
         ticker: 'QQQ',
         order: {
@@ -705,7 +707,7 @@ describe('GET /api/trades/performance', () => {
   });
 
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       overrides: {
         getPositions: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
       },
@@ -719,24 +721,24 @@ describe('GET /api/trades/performance', () => {
 
 describe('GET /api/portfolio', () => {
   beforeEach(() => {
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
   });
 
   // The regression this guards: the broker_connections row was removed but a
   // warm in-memory session kept feeding the dashboard that user's account.
   it('409s and evicts the stale warm session when the stored connection is gone', async () => {
-    await harness.db.deleteBrokerTokens(USER.id);
-    harness.configureBroker(USER.id, { connected: true, portfolioValueUsd: 25_431.5 });
-    harness.brokerFor(USER.id);
+    await harness.db.deleteBrokerTokens(ACCOUNT_ID);
+    harness.configureBroker(ACCOUNT_ID, { connected: true, portfolioValueUsd: 25_431.5 });
+    harness.brokerFor(ACCOUNT_ID);
 
     const response = await get('/api/portfolio');
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
-    expect(harness.brokers.existing(USER.id)).toBeUndefined();
+    expect(harness.brokers.existing(ACCOUNT_ID)).toBeUndefined();
   });
 
   it('returns portfolio value and counts only open positions', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       portfolioValueUsd: 25_431.5,
       positions: [
         equityPosition('AAPL', 10),
@@ -751,7 +753,7 @@ describe('GET /api/portfolio', () => {
   });
 
   it('returns 503 when Robinhood MCP is unavailable', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       overrides: {
         getAccount: vi.fn().mockRejectedValue(new Error('MCP transport closed')),
       },
@@ -769,11 +771,11 @@ describe('GET /api/portfolio', () => {
 
 describe('/api/broker', () => {
   it('status reports the pending auth URL while disconnected', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       authUrl: 'https://robinhood.com/mcp/trading?state=abc',
       authPending: true,
     });
-    harness.brokerFor(USER.id); // the registry only reports sessions that exist
+    harness.brokerFor(ACCOUNT_ID); // the registry only reports sessions that exist
 
     const response = await get('/api/broker/status');
     expect(response.statusCode).toBe(200);
@@ -794,7 +796,7 @@ describe('/api/broker', () => {
 
   it('status reports the stored database connection when no live session exists', async () => {
     // Fresh process: tokens in broker_connections, nothing in the registry.
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
     expect((await get('/api/broker/status')).json()).toMatchObject({
       connected: true,
       tokenState: 'valid',
@@ -803,7 +805,7 @@ describe('/api/broker', () => {
     // Refresh-only material still counts: the SDK refreshes on connect.
     harness = makeHarness();
     harness.db.addUser(USER, TOKEN);
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('', 'refresh-token'));
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('', 'refresh-token'));
     expect((await get('/api/broker/status')).json()).toMatchObject({
       connected: true,
       tokenState: 'refreshable',
@@ -813,40 +815,40 @@ describe('/api/broker', () => {
   it('status reports disconnected and evicts the warm session when the row is gone', async () => {
     // A session that outlived its broker_connections row (operator reset,
     // disconnect made elsewhere) must not keep the dashboard looking healthy.
-    harness.configureBroker(USER.id, { connected: true });
-    harness.brokerFor(USER.id);
+    harness.configureBroker(ACCOUNT_ID, { connected: true });
+    harness.brokerFor(ACCOUNT_ID);
 
     const response = await get('/api/broker/status');
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ connected: false, tokenState: 'missing' });
-    expect(harness.brokers.existing(USER.id)).toBeUndefined();
+    expect(harness.brokers.existing(ACCOUNT_ID)).toBeUndefined();
   });
 
   it('status leaves a pending OAuth session alone even though no tokens are stored', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       connected: false,
       authPending: true,
       authUrl: 'https://robinhood.com/mcp/trading?state=abc',
     });
-    harness.brokerFor(USER.id);
+    harness.brokerFor(ACCOUNT_ID);
 
     const response = await get('/api/broker/status');
     expect(response.json()).toMatchObject({
       connected: false,
       authUrl: 'https://robinhood.com/mcp/trading?state=abc',
     });
-    expect(harness.brokers.existing(USER.id)).toBeDefined();
+    expect(harness.brokers.existing(ACCOUNT_ID)).toBeDefined();
   });
 
   it('connect with force tears down the current session and starts fresh', async () => {
-    harness.configureBroker(USER.id, { connected: true });
-    const before = harness.brokerFor(USER.id);
+    harness.configureBroker(ACCOUNT_ID, { connected: true });
+    const before = harness.brokerFor(ACCOUNT_ID);
 
     const response = await send('POST', '/api/broker/connect', { force: true });
 
     expect(response.statusCode).toBe(200);
-    expect(harness.brokers.existing(USER.id)).toBeDefined();
-    expect(harness.brokers.existing(USER.id)).not.toBe(before);
+    expect(harness.brokers.existing(ACCOUNT_ID)).toBeDefined();
+    expect(harness.brokers.existing(ACCOUNT_ID)).not.toBe(before);
   });
 
   it('connect 400s on a malformed force flag', async () => {
@@ -854,7 +856,7 @@ describe('/api/broker', () => {
   });
 
   it('connect returns the authorization URL to open', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       authUrl: 'https://robinhood.com/mcp/trading?state=abc',
     });
 
@@ -867,15 +869,15 @@ describe('/api/broker', () => {
   });
 
   it('connect short-circuits when the session is already live', async () => {
-    harness.configureBroker(USER.id, { connected: true });
+    harness.configureBroker(ACCOUNT_ID, { connected: true });
 
     const response = await send('POST', '/api/broker/connect', {});
     expect(response.json()).toEqual({ connected: true, authUrl: null });
   });
 
   it('callback extracts code and state from the pasted redirect URL', async () => {
-    harness.configureBroker(USER.id, { authPending: true });
-    const broker = harness.brokerFor(USER.id);
+    harness.configureBroker(ACCOUNT_ID, { authPending: true });
+    const broker = harness.brokerFor(ACCOUNT_ID);
 
     const response = await send('POST', '/api/broker/callback', {
       redirectUrl: '  http://127.0.0.1:8788/oauth/callback?code=the-code&state=the-state ',
@@ -886,8 +888,8 @@ describe('/api/broker', () => {
   });
 
   it('callback 400s on an unparseable URL and on a URL without a code', async () => {
-    harness.configureBroker(USER.id, { authPending: true });
-    harness.brokerFor(USER.id);
+    harness.configureBroker(ACCOUNT_ID, { authPending: true });
+    harness.brokerFor(ACCOUNT_ID);
 
     expect((await send('POST', '/api/broker/callback', { redirectUrl: 'not a url' })).statusCode).toBe(400);
     expect(
@@ -904,8 +906,8 @@ describe('/api/broker', () => {
     const url = 'http://127.0.0.1:8788/oauth/callback?code=x&state=y';
     expect((await send('POST', '/api/broker/callback', { redirectUrl: url })).statusCode).toBe(409);
 
-    harness.configureBroker(USER.id, { authPending: false });
-    harness.brokerFor(USER.id);
+    harness.configureBroker(ACCOUNT_ID, { authPending: false });
+    harness.brokerFor(ACCOUNT_ID);
     expect((await send('POST', '/api/broker/callback', { redirectUrl: url })).statusCode).toBe(409);
   });
 
@@ -915,11 +917,11 @@ describe('/api/broker', () => {
     harness = makeHarness({ executionMode: 'read_only' });
     harness.db.addUser(USER, TOKEN);
     // A session that would otherwise hand out an auth URL and accept the code.
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       authUrl: 'https://robinhood.com/mcp/trading?state=abc',
       authPending: true,
     });
-    const broker = harness.brokerFor(USER.id);
+    const broker = harness.brokerFor(ACCOUNT_ID);
 
     const connect = await send('POST', '/api/broker/connect', { force: true });
     expect(connect.statusCode).toBe(409);
@@ -927,7 +929,7 @@ describe('/api/broker', () => {
       'cannot be connected from this environment'
     );
     expect(broker.session.ensureConnected).not.toHaveBeenCalled();
-    expect(harness.brokers.existing(USER.id)).toBe(broker);
+    expect(harness.brokers.existing(ACCOUNT_ID)).toBe(broker);
 
     const callback = await send('POST', '/api/broker/callback', {
       redirectUrl: 'http://127.0.0.1:8788/oauth/callback?code=x&state=y',
@@ -937,13 +939,13 @@ describe('/api/broker', () => {
   });
 
   it('disconnect drops the stored tokens and the live session', async () => {
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('abc'));
-    harness.brokerFor(USER.id);
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('abc'));
+    harness.brokerFor(ACCOUNT_ID);
 
     const response = await send('POST', '/api/broker/disconnect', {});
     expect(response.statusCode).toBe(200);
-    expect(await harness.db.getBrokerTokens(USER.id)).toBeNull();
-    expect(harness.brokers.existing(USER.id)).toBeUndefined();
+    expect(await harness.db.getBrokerTokens(ACCOUNT_ID)).toBeNull();
+    expect(harness.brokers.existing(ACCOUNT_ID)).toBeUndefined();
   });
 
   // The banner polls status on every page and the dashboard polls portfolio:
@@ -959,8 +961,8 @@ describe('/api/broker', () => {
     });
 
     const connect = () => {
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
-      harness.configureBroker(USER.id, { connected: true, portfolioValueUsd: 25_431.5 });
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+      harness.configureBroker(ACCOUNT_ID, { connected: true, portfolioValueUsd: 25_431.5 });
     };
 
     it('repeat polls read the row once', async () => {
@@ -987,7 +989,7 @@ describe('/api/broker', () => {
 
     it('a disconnect shows on the next poll even with no warm session to drop', async () => {
       // Fresh process: the row is known, nothing in the registry changes.
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
       expect((await get('/api/broker/status')).json()).toMatchObject({ connected: true });
 
       await send('POST', '/api/broker/disconnect', {});
@@ -995,13 +997,13 @@ describe('/api/broker', () => {
     });
 
     it('a finished OAuth flow shows on the next poll without a new session object', async () => {
-      harness.configureBroker(USER.id, { authPending: true, authUrl: 'https://robinhood.com/a' });
-      const broker = harness.brokerFor(USER.id);
+      harness.configureBroker(ACCOUNT_ID, { authPending: true, authUrl: 'https://robinhood.com/a' });
+      const broker = harness.brokerFor(ACCOUNT_ID);
       expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
       expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
       expect(reads('getBrokerTokens')).toBe(1);
 
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
       vi.mocked(broker.session.isAuthPending).mockReturnValue(false);
       vi.mocked(broker.session.isConnected).mockReturnValue(true);
       expect((await get('/api/broker/status')).json()).toMatchObject({
@@ -1017,11 +1019,11 @@ describe('/api/broker', () => {
       expect((await get('/api/portfolio')).statusCode).toBe(200);
 
       // auth:reset deletes the row from another process; the registry never hears of it.
-      await harness.db.deleteBrokerTokens(USER.id);
+      await harness.db.deleteBrokerTokens(ACCOUNT_ID);
       vi.advanceTimersByTime(CONNECTION_CHECK_MS);
       expect((await get('/api/portfolio')).statusCode).toBe(409);
       expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
-      expect(harness.brokers.existing(USER.id)).toBeUndefined();
+      expect(harness.brokers.existing(ACCOUNT_ID)).toBeUndefined();
     });
 
     it('the connection check alone does not re-read an unchanged row', async () => {
@@ -1043,7 +1045,7 @@ describe('/api/broker', () => {
     // Operators pause trading by editing users.execution_mode in SQL.
     it('status reports an execution mode edited straight in the database', async () => {
       expect((await get('/api/broker/status')).json()).toMatchObject({ executionMode: 'approval' });
-      harness.db.seedSettings(USER.id, { executionMode: 'immediate' });
+      harness.db.seedSettings(ACCOUNT_ID, { executionMode: 'immediate' });
       expect((await get('/api/broker/status')).json()).toMatchObject({ executionMode: 'immediate' });
     });
   });
@@ -1057,8 +1059,8 @@ describe('GET /api/stream', () => {
   // inject() can't consume a never-ending hijacked stream, so listen on an
   // ephemeral port and read real SSE frames over http.
   it('streams a decisions snapshot, live pushes, and performance frames', async () => {
-    harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
-    harness.db.seedDecision(USER.id, decisionFixture('seed', { reason: 'seed' }));
+    harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+    harness.db.seedDecision(ACCOUNT_ID, decisionFixture('seed', { reason: 'seed' }));
 
     await harness.app.listen({ port: 0, host: '127.0.0.1' });
     const { port } = harness.app.server.address() as { port: number };
@@ -1088,12 +1090,12 @@ describe('GET /api/stream', () => {
       expect(buffer).toContain('"positions":[]');
 
       // A new decision pushes a fresh decisions frame.
-      harness.db.seedDecision(USER.id, decisionFixture('live', { reason: 'live-push' }));
-      harness.events.emitDecision(USER.id, decisionFixture('live', { reason: 'live-push' }));
+      harness.db.seedDecision(ACCOUNT_ID, decisionFixture('live', { reason: 'live-push' }));
+      harness.events.emitDecision(ACCOUNT_ID, decisionFixture('live', { reason: 'live-push' }));
       await readUntil((t) => t.includes('"reason":"live-push"'));
 
       // Lifecycle stage events are forwarded as `stage` frames.
-      harness.events.emitStage(USER.id, {
+      harness.events.emitStage(ACCOUNT_ID, {
         messageId: 'msg-live',
         ticker: 'AAPL',
         stage: 'executing',
@@ -1109,11 +1111,11 @@ describe('GET /api/stream', () => {
   // performance frame must be the not-connected error, never account data
   // from a leftover warm session.
   it('performance frames report not-connected instead of serving a stale session', async () => {
-    harness.configureBroker(USER.id, {
+    harness.configureBroker(ACCOUNT_ID, {
       connected: true,
       positions: [equityPosition('AAPL', 10)],
     });
-    harness.brokerFor(USER.id);
+    harness.brokerFor(ACCOUNT_ID);
 
     await harness.app.listen({ port: 0, host: '127.0.0.1' });
     const { port } = harness.app.server.address() as { port: number };
@@ -1179,9 +1181,9 @@ describe('GET /api/stream', () => {
     };
 
     it('a tick re-fetches only live prices; connect and decisions read history and the row', async () => {
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
       let price = 150;
-      harness.configureBroker(USER.id, {
+      harness.configureBroker(ACCOUNT_ID, {
         positions: [equityPosition('AAPL', 10)],
         equityMark: () => price++,
       });
@@ -1197,13 +1199,13 @@ describe('GET /api/stream', () => {
           await vi.advanceTimersByTimeAsync(TICK_MS);
           await stream.readUntil(`"currentPrice":${next}`);
         }
-        expect(markReads(harness.fakeBroker(USER.id), 'equity')).toHaveLength(4);
+        expect(markReads(harness.fakeBroker(ACCOUNT_ID), 'equity')).toHaveLength(4);
         expect(reads('getBrokerTokens')).toBe(1);
         expect(reads('listDecisions')).toBe(2);
 
         // A logged decision pushes its snapshot now and re-reads both on the next tick.
-        harness.db.seedDecision(USER.id, decisionFixture('live', { reason: 'live-push' }));
-        harness.events.emitDecision(USER.id, decisionFixture('live', { reason: 'live-push' }));
+        harness.db.seedDecision(ACCOUNT_ID, decisionFixture('live', { reason: 'live-push' }));
+        harness.events.emitDecision(ACCOUNT_ID, decisionFixture('live', { reason: 'live-push' }));
         await stream.readUntil('"reason":"live-push"');
         await vi.advanceTimersByTimeAsync(TICK_MS);
         await stream.readUntil('"currentPrice":154');
@@ -1215,12 +1217,12 @@ describe('GET /api/stream', () => {
     }, 10_000);
 
     it('a disconnect stops performance data on the very next tick', async () => {
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
-      harness.configureBroker(USER.id, {
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+      harness.configureBroker(ACCOUNT_ID, {
         connected: true,
         positions: [equityPosition('AAPL', 10)],
       });
-      const broker = harness.fakeBroker(USER.id);
+      const broker = harness.fakeBroker(ACCOUNT_ID);
       const stream = await openStream();
       try {
         await stream.readUntil('"symbol":"AAPL"');
@@ -1237,8 +1239,8 @@ describe('GET /api/stream', () => {
     }, 10_000);
 
     it('a row removed out of process stops performance data after the connection check', async () => {
-      harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
-      harness.configureBroker(USER.id, {
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+      harness.configureBroker(ACCOUNT_ID, {
         connected: true,
         positions: [equityPosition('AAPL', 10)],
       });
@@ -1247,18 +1249,18 @@ describe('GET /api/stream', () => {
         await stream.readUntil('"symbol":"AAPL"');
 
         // auth:reset deletes the row from another process; the registry never hears of it.
-        await harness.db.deleteBrokerTokens(USER.id);
+        await harness.db.deleteBrokerTokens(ACCOUNT_ID);
         await vi.advanceTimersByTimeAsync(CONNECTION_CHECK_MS);
         await vi.advanceTimersByTimeAsync(TICK_MS);
         await stream.readUntil('"error":"Robinhood is not connected"');
-        expect(harness.brokers.existing(USER.id)).toBeUndefined();
+        expect(harness.brokers.existing(ACCOUNT_ID)).toBeUndefined();
       } finally {
         await stream.close();
       }
     }, 10_000);
 
     it('a stream opened before connecting shows positions once Robinhood connects', async () => {
-      harness.configureBroker(USER.id, { authPending: true });
+      harness.configureBroker(ACCOUNT_ID, { authPending: true });
       const stream = await openStream();
       try {
         await stream.readUntil('"error":"Robinhood is not connected"');
@@ -1267,8 +1269,8 @@ describe('GET /api/stream', () => {
         expect(reads('getBrokerTokens')).toBe(1);
 
         // OAuth finishes: tokens stored and the session connected.
-        harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
-        harness.configureBroker(USER.id, {
+        harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+        harness.configureBroker(ACCOUNT_ID, {
           connected: true,
           positions: [equityPosition('AAPL', 10)],
         });

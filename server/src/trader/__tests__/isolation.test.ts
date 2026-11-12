@@ -25,7 +25,7 @@ import {
 } from '../pipeline/__tests__/fixtures/discordMessages.js';
 import { createMessageProcessor, type MessageProcessor } from '../pipeline/index.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
-import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
+import { createFakeDb, fakeAccount, fakeTokens, firstAccountId, type FakeDb } from './fakeDb.js';
 import {
   equityPosition,
   makeFakeBroker,
@@ -38,6 +38,9 @@ import {
 
 const USER_A = { id: 'user-a', email: 'a@example.com' };
 const USER_B = { id: 'user-b', email: 'b@example.com' };
+/** Each user's account: what every row and broker session is keyed by, never the user id. */
+const ACCOUNT_A = firstAccountId(USER_A.id);
+const ACCOUNT_B = firstAccountId(USER_B.id);
 const TOKEN_A = 'token-for-a';
 const TOKEN_B = 'token-for-b';
 
@@ -97,23 +100,23 @@ beforeEach(() => {
   harness.db.addUser(USER_A, TOKEN_A);
   harness.db.addUser(USER_B, TOKEN_B);
 
-  harness.db.seedSettings(USER_A.id, { maxTradesPerDay: 1, blockedTickers: ['NVDA'] });
-  harness.db.seedDecision(USER_A.id, A_TRADE);
-  harness.db.seedDecision(USER_A.id, A_PENDING);
-  harness.db.seedBrokerTokens(USER_A.id, fakeTokens('a-access-token', 'a-refresh-token'));
+  harness.db.seedSettings(ACCOUNT_A, { maxTradesPerDay: 1, blockedTickers: ['NVDA'] });
+  harness.db.seedDecision(ACCOUNT_A, A_TRADE);
+  harness.db.seedDecision(ACCOUNT_A, A_PENDING);
+  harness.db.seedBrokerTokens(ACCOUNT_A, fakeTokens('a-access-token', 'a-refresh-token'));
   // B holds their own connection: broker data only serves with a stored
   // connection of record, and a disconnected B would turn the portfolio and
   // performance checks below into vacuous 409s.
-  harness.db.seedBrokerTokens(USER_B.id, fakeTokens('b-access-token'));
+  harness.db.seedBrokerTokens(ACCOUNT_B, fakeTokens('b-access-token'));
   harness.db.seedCallout(SHARED_CALLOUT);
 
-  harness.configureBroker(USER_A.id, {
+  harness.configureBroker(ACCOUNT_A, {
     connected: true,
     authUrl: 'https://robinhood.com/mcp/trading?state=a-only',
     portfolioValueUsd: 42_424.42,
     positions: [equityPosition('NVDA', 7)],
   });
-  harness.configureBroker(USER_B.id, { connected: false, portfolioValueUsd: 0 });
+  harness.configureBroker(ACCOUNT_B, { connected: false, portfolioValueUsd: 0 });
 });
 
 /** Every authenticated endpoint, as B would call it. */
@@ -171,9 +174,9 @@ describe('user B cannot see user A', () => {
       for (const fingerprint of A_FINGERPRINTS) {
         expect(body).not.toContain(fingerprint);
       }
-      expect(harness.db.calls.map((c) => c.scopeId)).not.toContain(USER_A.id);
+      expect(harness.db.calls.map((c) => c.scopeId)).not.toContain(ACCOUNT_A);
       for (const call of harness.db.calls) {
-        expect(call.scopeId).toBe(USER_B.id);
+        expect(call.scopeId).toBe(ACCOUNT_B);
       }
     });
   }
@@ -231,8 +234,8 @@ describe('user B cannot see user A', () => {
     });
 
     expect(response.statusCode).toBe(404);
-    expect(harness.fakeBroker(USER_B.id).placeOrder).not.toHaveBeenCalled();
-    expect(harness.fakeBroker(USER_A.id).placeOrder).not.toHaveBeenCalled();
+    expect(harness.fakeBroker(ACCOUNT_B).placeOrder).not.toHaveBeenCalled();
+    expect(harness.fakeBroker(ACCOUNT_A).placeOrder).not.toHaveBeenCalled();
 
     const asA = await harness.as(TOKEN_A, { method: 'GET', url: '/api/decisions' });
     const pending = (asA.json() as { decisions: Decision[] }).decisions.find(
@@ -252,7 +255,7 @@ describe('user B cannot see user A', () => {
 
   it("B disconnecting leaves A's broker tokens in place", async () => {
     await harness.as(TOKEN_B, { method: 'POST', url: '/api/broker/disconnect' });
-    expect(await harness.db.getBrokerTokens(USER_A.id)).not.toBeNull();
+    expect(await harness.db.getBrokerTokens(ACCOUNT_A)).not.toBeNull();
   });
 
   it("B's portfolio and performance come from B's empty account", async () => {
@@ -295,13 +298,13 @@ describe('user B cannot see user A', () => {
       expect(buffer).toContain('event: decisions\ndata: []');
 
       // A trades while B is listening; B's stream must stay silent about it.
-      harness.events.emitStage(USER_A.id, {
+      harness.events.emitStage(ACCOUNT_A, {
         messageId: 'msg-shared',
         ticker: 'NVDA',
         stage: 'executing',
       });
-      harness.events.emitDecision(USER_A.id, A_TRADE);
-      harness.events.emitStage(USER_B.id, {
+      harness.events.emitDecision(ACCOUNT_A, A_TRADE);
+      harness.events.emitStage(ACCOUNT_B, {
         messageId: 'msg-own',
         ticker: 'TSLA',
         stage: 'executing',

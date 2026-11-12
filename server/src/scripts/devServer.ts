@@ -23,6 +23,7 @@ const log = createLogger('dev-server');
 
 const PORT = 3000;
 const USER = { id: 'dev-user', email: 'dev@example.com' };
+const ACCOUNT_ID = 'dev-account';
 const BUYING_POWER_USD = 25_000;
 const PORTFOLIO_VALUE_USD = 31_480;
 const EQUITY_PRICE = 172.5;
@@ -31,10 +32,10 @@ const OPTION_MARK = 2.4;
 const db = createFakeDb();
 
 // The account the seeded decisions below belong to; sign in with its email.
-db.addUser(USER, 'dev-token');
+db.addUser(USER, 'dev-token', ACCOUNT_ID);
 // Broker data now serves only with a stored connection of record; without
 // this the sandbox portfolio/performance would answer 409 "not connected".
-db.seedBrokerTokens(USER.id, fakeTokens('dev-access-token', 'dev-refresh-token'));
+db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('dev-access-token', 'dev-refresh-token'));
 
 // A roster to exercise the Following picker. Deliberately more than a handful:
 // the bug this sandbox exists to check is a fresh account copying everyone.
@@ -91,7 +92,7 @@ function seedPending(
     action: order.side,
     order,
   };
-  db.seedDecision(USER.id, decision);
+  db.seedDecision(ACCOUNT_ID, decision);
 }
 
 seedPending(
@@ -164,7 +165,7 @@ db.seedCallout({
   parse: null,
   parseStatus: 'parsed',
 });
-db.seedDecision(USER.id, {
+db.seedDecision(ACCOUNT_ID, {
   at: minutesAgo(90),
   messageId: 'dev-msg-0',
   kind: 'risk_rejected',

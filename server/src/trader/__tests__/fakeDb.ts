@@ -7,9 +7,10 @@
  * records every scoped call, which is what isolation.test.ts asserts against:
  * no endpoint may query an id other than the caller's.
  *
- * A user's first account takes the user's own id unless the test names another
- * (addUser's third argument), so a single-account fixture needs one identifier.
- * Tests about the user/account distinction give the two different ids.
+ * An account's id is never its owner's user id, not even for a user's first
+ * account: code that hands a user id where an account id belongs then reads
+ * another scope and the test fails. A fixture names the account it means
+ * (firstAccountId, or addUser's third argument), never the user.
  */
 import { createHash } from 'node:crypto';
 
@@ -88,8 +89,11 @@ export interface ScopedCall {
   readonly scopeId: string;
 }
 
-/** A direct Robinhood account row, owned by the user of the same id unless told otherwise. */
-export const fakeAccount = (id: string, userId: string = id): AccountRow => ({
+/** The id addUser gives a user's first account when the test names none. */
+export const firstAccountId = (userId: string): string => `account-of-${userId}`;
+
+/** A direct Robinhood account row; its owner is a user of another id unless told otherwise. */
+export const fakeAccount = (id: string, userId: string = `owner-of-${id}`): AccountRow => ({
   id,
   userId,
   adapter: 'robinhood',
@@ -115,7 +119,7 @@ export interface FakeDb extends TraderDb {
   readonly calls: ScopedCall[];
   /**
    * Register a user with a never-expiring session for `accessToken`, and their
-   * direct Robinhood account (selected), whose id is the user's unless given.
+   * direct Robinhood account (selected): firstAccountId(user.id) unless given.
    */
   addUser(user: AuthUser, accessToken: string, accountId?: string): void;
   /** Add a further account to its user; `select` makes it the one their routes act on. */
@@ -192,7 +196,7 @@ export function createFakeDb(): FakeDb {
   return {
     calls,
 
-    addUser(user, accessToken, accountId = user.id) {
+    addUser(user, accessToken, accountId = firstAccountId(user.id)) {
       sessions.set(accessToken, { user, expiresAt: null });
       if (user.email) usersByEmail.set(user.email.toLowerCase(), user);
       accounts.set(accountId, fakeAccount(accountId, user.id));
@@ -580,7 +584,9 @@ export function createFakeDb(): FakeDb {
       if (!allowedEmails.has(normalized)) return null;
       const created: AuthUser = { id: `user-${usersByEmail.size + 1}`, email: normalized };
       usersByEmail.set(normalized, created);
-      ensureAccount(created.id);
+      const accountId = firstAccountId(created.id);
+      accounts.set(accountId, fakeAccount(accountId, created.id));
+      selectedAccounts.set(created.id, accountId);
       return created;
     },
     async getSelectedAccount(userId) {

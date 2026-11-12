@@ -7,6 +7,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { firstAccountId } from './fakeDb.js';
 import { makeHarness, type Harness } from './harness.js';
 
 const USER = { id: 'user-1', email: 'user@example.com' };
@@ -53,7 +54,7 @@ describe('unauthenticated /api requests are rejected', () => {
       payload: JSON.stringify({ maxTradesPerDay: 99 }),
     });
     expect(response.statusCode).toBe(401);
-    expect((await harness.db.getSettings(USER.id)).maxTradesPerDay).toBe(10);
+    expect((await harness.db.getSettings(firstAccountId(USER.id))).maxTradesPerDay).toBe(10);
   });
 
   it('a valid token gets through to the same route', async () => {
