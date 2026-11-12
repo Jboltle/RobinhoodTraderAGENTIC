@@ -1,16 +1,20 @@
 /**
  * The SnapTrade calls the connect flow makes, behind an interface a test can
- * fake. Order placing is not here: it is the adapter's (./adapter.ts).
+ * fake. Order placing is not here: it is the adapter's (./adapter.ts), which
+ * is handed the same SDK instance (SnapTradeDeployment.brokerClient).
  *
  * The key is a SnapTrade *Personal* key: it is the owner's own SnapTrade
  * login, so there is no registered user, user id or user secret, and only the
  * owner's dashboard sign-in may use it (SnapTradeAccess.ownerEmail).
  *
- * The real client is built once, in trader/index.ts, and handed to the server
- * as a dependency. Nothing else constructs it, so a test never reaches
- * SnapTrade whatever the environment holds.
+ * The real client is built once per process, by the entry point
+ * (trader/index.ts, scripts/backfillFills.ts), and handed on as a dependency.
+ * Nothing else constructs it, so a test never reaches SnapTrade whatever the
+ * environment holds.
  */
 import { Snaptrade, SnaptradeAuth } from 'snaptrade-typescript-sdk';
+
+import type { SnapTradeBrokerClient } from './broker.js';
 
 const TRADE_CONNECTION_TYPE = 'trade';
 const PORTAL_VERSION = 'v4';
@@ -67,16 +71,34 @@ export interface SnapTradeKeys {
   readonly ownerEmail: string | null;
 }
 
-/** Null when any of the three is absent: the feature is then off, not broken. */
-export function createSnapTradeAccess(keys: SnapTradeKeys): SnapTradeAccess | null {
-  const { clientId, consumerKey, ownerEmail } = keys;
-  if (!clientId || !consumerKey || !ownerEmail) return null;
-  return { client: createSnapTradeClient(clientId, consumerKey), ownerEmail };
+/** What a deployment holding the three SnapTrade settings has. */
+export interface SnapTradeDeployment {
+  /** The connect flow's client and who may use it. */
+  readonly access: SnapTradeAccess;
+  /** The same SDK instance, as the broker adapter (./adapter.ts) places orders through it. */
+  readonly brokerClient: SnapTradeBrokerClient;
 }
 
-function createSnapTradeClient(clientId: string, consumerKey: string): SnapTradeClient {
+/**
+ * Null when any of the three is absent: SnapTrade is then off, not broken.
+ * One SDK instance serves the connect flow and the adapter.
+ */
+export function createSnapTrade(keys: SnapTradeKeys): SnapTradeDeployment | null {
+  const { clientId, consumerKey, ownerEmail } = keys;
+  if (!clientId || !consumerKey || !ownerEmail) return null;
   const sdk = new Snaptrade({ auth: SnaptradeAuth.personalApiKey({ clientId, consumerKey }) });
+  return { access: { client: createSnapTradeClient(sdk), ownerEmail }, brokerClient: sdk };
+}
 
+/** The connect half alone, under the same rule. */
+export function createSnapTradeAccess(keys: SnapTradeKeys): SnapTradeAccess | null {
+  return createSnapTrade(keys)?.access ?? null;
+}
+
+/** The SDK client on a Personal key: its calls take no user id or user secret. */
+type PersonalSdk = Snaptrade<ReturnType<typeof SnaptradeAuth.personalApiKey>>;
+
+function createSnapTradeClient(sdk: PersonalSdk): SnapTradeClient {
   return {
     async portalLink(reconnectConnectionId) {
       const login = await sdk.authentication.loginSnapTradeUser({

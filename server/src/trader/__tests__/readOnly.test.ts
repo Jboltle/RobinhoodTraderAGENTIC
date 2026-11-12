@@ -21,8 +21,10 @@ import { submitOrder } from '../pipeline/execute.js';
 import { RobinhoodBroker } from '../robinhood/broker.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { RobinhoodTools, TOOL_NAMES } from '../robinhood/tools.js';
+import { createSnapTradeAdapter } from '../snaptrade/adapter.js';
+import { fakeSnapTradeClient } from '../snaptrade/__tests__/fakeClient.js';
 import { cancelStops, restMissingStops } from '../stops.js';
-import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
+import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from './harness.js';
 
 const USER = 'user-1';
@@ -75,9 +77,19 @@ function robinhoodAdapter(): AdapterUnderTest {
   };
 }
 
+/** The real SnapTrade adapter over an SDK client that records every call and answers none. */
+function snapTradeAdapter(): AdapterUnderTest {
+  const sdk = fakeSnapTradeClient();
+  return {
+    broker: createSnapTradeAdapter(sdk.client).open(fakeSnapTradeAccount('account-paper', USER)).broker,
+    callsReachingBroker: () => sdk.calls.length,
+  };
+}
+
 const ADAPTERS = [
   ['the shared fake', fakeAdapter],
   ['Robinhood', robinhoodAdapter],
+  ['SnapTrade', snapTradeAdapter],
 ] as const;
 
 const registryOver = (adapter: AdapterUnderTest, mode: TradeExecutionMode): Broker =>

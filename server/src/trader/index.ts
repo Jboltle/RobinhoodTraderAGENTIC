@@ -14,8 +14,8 @@ import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
 import { createQuoteSource } from './broker/quotes.js';
 import { createMcpRegistry, restoreSessions } from './broker/registry.js';
-import { createRobinhoodAdapter } from './robinhood/adapter.js';
-import { createSnapTradeAccess } from './snaptrade/client.js';
+import { deployedAdapters } from './adapters.js';
+import { createSnapTrade } from './snaptrade/client.js';
 import { buildServer } from './server.js';
 
 const log = createLogger('trader');
@@ -25,7 +25,18 @@ async function main(): Promise<void> {
 
   const db = createTraderDb();
   const events = new TraderEvents();
-  const brokers = createMcpRegistry([createRobinhoodAdapter(db)], config.tradeExecutionMode);
+  // Other brokers, through SnapTrade: off unless all three SnapTrade variables
+  // are set. With them the owner can connect one (the dashboard's "Other
+  // broker") and its accounts trade through the SnapTrade adapter.
+  const snapTrade = createSnapTrade({
+    clientId: config.snaptradeClientId,
+    consumerKey: config.snaptradeConsumerKey,
+    ownerEmail: config.snaptradeOwnerEmail,
+  });
+  const brokers = createMcpRegistry(
+    deployedAdapters(db, snapTrade?.brokerClient ?? null),
+    config.tradeExecutionMode
+  );
   const quotes = createQuoteSource({ db, brokers });
 
   // DECISION_ENGINE=parser rolls the trade path back to the LLM parser.
@@ -48,16 +59,9 @@ async function main(): Promise<void> {
     executionMode,
   });
 
-  // Connecting other brokers (the dashboard's "Other broker"): off unless all
-  // three SnapTrade variables are set. No order goes through this client.
-  const snapTrade = createSnapTradeAccess({
-    clientId: config.snaptradeClientId,
-    consumerKey: config.snaptradeConsumerKey,
-    ownerEmail: config.snaptradeOwnerEmail,
-  });
-  log.info('snaptrade connect', { enabled: snapTrade !== null });
+  log.info('snaptrade', { enabled: snapTrade !== null });
 
-  const fastify = buildServer({ db, events, brokers, executionMode, snapTrade });
+  const fastify = buildServer({ db, events, brokers, executionMode, snapTrade: snapTrade?.access ?? null });
 
   // Listen before anything else: on a deployed box the OAuth flow can only
   // complete via the dashboard hitting /api/broker/*, so the port must be open

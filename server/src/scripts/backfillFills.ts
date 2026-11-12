@@ -9,13 +9,14 @@
  * Read-only against the broker, safe under every TRADE_EXECUTION_MODE. Accounts
  * whose broker session needs consent are skipped and reported.
  */
-import { assertConfigValid } from '../shared/config.js';
+import { assertConfigValid, config } from '../shared/config.js';
 import { createLogger, errorFields } from '../shared/logger.js';
+import { deployedAdapters } from '../trader/adapters.js';
 import { createTraderDb } from '../trader/db.js';
 import { TraderEvents } from '../trader/events.js';
 import { sweepFills } from '../trader/fills.js';
 import { createMcpRegistry } from '../trader/broker/registry.js';
-import { createRobinhoodAdapter } from '../trader/robinhood/adapter.js';
+import { createSnapTrade } from '../trader/snaptrade/client.js';
 
 const log = createLogger('scripts:backfill-fills');
 const DEFAULT_DAYS = 90;
@@ -30,7 +31,13 @@ async function main(): Promise<void> {
   const before = await db.listOpenOrders(since);
   log.info('backfill start', { since: since.toISOString(), openOrders: before.length });
 
-  const result = await sweepFills({ db, brokers: createMcpRegistry([createRobinhoodAdapter(db)], 'read_only'), events: new TraderEvents() }, since);
+  const snapTrade = createSnapTrade({
+    clientId: config.snaptradeClientId,
+    consumerKey: config.snaptradeConsumerKey,
+    ownerEmail: config.snaptradeOwnerEmail,
+  });
+  const brokers = createMcpRegistry(deployedAdapters(db, snapTrade?.brokerClient ?? null), 'read_only');
+  const result = await sweepFills({ db, brokers, events: new TraderEvents() }, since);
   const after = await db.listOpenOrders(since);
   log.info('backfill done', { ...result, stillOpen: after.length });
   for (const row of after) {

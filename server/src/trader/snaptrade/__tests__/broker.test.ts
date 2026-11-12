@@ -33,6 +33,7 @@ import { isTerminalOrderState } from '../../../shared/types.js';
 import { BrokerUnavailableError, SymbolNotFoundError } from '../../broker/errors.js';
 import type { Instrument, OrderRequest } from '../../broker/types.js';
 import { SnapTradeBroker, type SnapTradeBrokerClient } from '../broker.js';
+import { fakeSnapTradeClient, type FakeSnapTradeAnswers, type RecordedCall } from './fakeClient.js';
 import {
   equityOrderPlaced,
   equityQuote,
@@ -73,49 +74,14 @@ function positionsOf(...results: AccountPosition[]): AllAccountPositionsResponse
 export type SdkClientFits = Snaptrade<PersonalApiKeyAuth> extends SnapTradeBrokerClient ? true : never;
 const SDK_CLIENT_FITS: SdkClientFits = true;
 
-interface Answers {
-  readonly balances: Balance[];
-  readonly positions: AllAccountPositionsResponse;
-  readonly orders: RecentOrdersResponse;
-  readonly quotes: SymbolsQuotesInner[];
-  readonly optionOrder: MlegOrderResponse;
-  readonly equityOrder: AccountOrderRecord;
-  readonly cancel: CancelOrderResponse;
-  /** Thrown by every call in place of an answer. */
-  readonly failure: unknown;
-}
-
-type RecordedCall = readonly [call: string, request: unknown];
-
 interface Fake {
   readonly broker: SnapTradeBroker;
   /** Every SDK call the broker made, in order. */
   readonly calls: RecordedCall[];
 }
 
-function fake(answers: Partial<Answers> = {}): Fake {
-  const calls: RecordedCall[] = [];
-  const answer =
-    <T>(name: string, data: T | undefined) =>
-    async (request: unknown): Promise<{ data: T }> => {
-      calls.push([name, request]);
-      if ('failure' in answers) throw answers.failure;
-      if (data === undefined) throw new Error(`the test gave no answer for ${name}`);
-      return { data };
-    };
-  const client: SnapTradeBrokerClient = {
-    accountInformation: {
-      getUserAccountBalance: answer('accountInformation.getUserAccountBalance', answers.balances),
-      getAllAccountPositions: answer('accountInformation.getAllAccountPositions', answers.positions),
-      getUserAccountRecentOrders: answer('accountInformation.getUserAccountRecentOrders', answers.orders),
-    },
-    trading: {
-      getUserAccountQuotes: answer('trading.getUserAccountQuotes', answers.quotes),
-      placeMlegOrder: answer('trading.placeMlegOrder', answers.optionOrder),
-      placeForceOrder: answer('trading.placeForceOrder', answers.equityOrder),
-      cancelOrder: answer('trading.cancelOrder', answers.cancel),
-    },
-  };
+function fake(answers: FakeSnapTradeAnswers = {}): Fake {
+  const { client, calls } = fakeSnapTradeClient(answers);
   return { broker: new SnapTradeBroker(client, ACCOUNT_ID), calls };
 }
 
