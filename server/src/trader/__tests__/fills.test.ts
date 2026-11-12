@@ -208,6 +208,99 @@ describe('sweepFills', () => {
   });
 });
 
+describe('sweepFills — resting Max Loss stops', () => {
+  const HELD = { symbol: 'SPY', ...CONTRACT, quantity: 3, raw: {} };
+
+  function restSetup(opts: { orders?: OptionOrder[]; positions: () => Promise<unknown> }) {
+    const base = setup({ orders: opts.orders });
+    base.db.seedSettings(USER, { maxLossPct: 80 });
+    let stops = 0;
+    const place = vi.fn(async () => ({ orderId: `stop-${(stops += 1)}`, status: 'unconfirmed', raw: {} }));
+    const positions = vi.fn(opts.positions);
+    Object.assign(base.tools, { placeOptionsOrder: place, getOptionPositions: positions });
+    const ensureReady = base.deps.brokers.for(USER).mcp.ensureReady as ReturnType<typeof vi.fn>;
+    const deps: FillMonitorDeps = { ...base.deps, executionMode: 'immediate' };
+    return { ...base, deps, place, positions, ensureReady };
+  }
+
+  function seedBuy(db: ReturnType<typeof createFakeDb>, order: SubmittedOrder): void {
+    db.seedMessage({ messageId: `msg-${order.orderId}`, sentAt: '2026-10-21T15:18:00.000Z', authorId: 'caller-1' });
+    db.seedDecision(USER, submitted(order));
+  }
+
+  it('a fill the positions read does not show yet gets its stop on the next idle sweep', async () => {
+    const shown: unknown[][] = [[], [HELD]];
+    const { db, deps, place } = restSetup({
+      orders: [liveOrder()],
+      positions: async () => ({ positions: shown.shift() ?? [HELD], raw: {} }),
+    });
+    seedBuy(db, placed());
+
+    expect(await sweepFills(deps)).toEqual({ open: 1, updated: 1 });
+    expect(place).not.toHaveBeenCalled();
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+    expect(place).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ side: 'sell', orderType: 'stop_market', contracts: 3 })
+    );
+    expect((await db.listOpenOptionLots(USER))[0]?.stopOrderId).toBe('stop-1');
+  });
+
+  it('a fill whose positions read failed gets its stop on the next idle sweep', async () => {
+    let reads = 0;
+    const { db, deps, place } = restSetup({
+      orders: [liveOrder()],
+      positions: async () => {
+        if ((reads += 1) === 1) throw new Error('get_option_positions failed after 3 attempts: fetch failed');
+        return { positions: [HELD], raw: {} };
+      },
+    });
+    seedBuy(db, placed());
+
+    await sweepFills(deps);
+    expect(place).not.toHaveBeenCalled();
+
+    await sweepFills(deps);
+    expect(place).toHaveBeenCalledOnce();
+  });
+
+  it('an idle sweep reaches for no session when the user has no lot', async () => {
+    const { deps, positions, ensureReady } = restSetup({ positions: async () => ({ positions: [], raw: {} }) });
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+    expect(ensureReady).not.toHaveBeenCalled();
+    expect(positions).not.toHaveBeenCalled();
+  });
+
+  it('an idle sweep reaches for no session when every lot without a stop is on an expired contract', async () => {
+    const { db, deps, positions, place, ensureReady } = restSetup({
+      positions: async () => ({ positions: [], raw: {} }),
+    });
+    const expired = { ...CONTRACT, expiration: '2026-10-20' };
+    seedBuy(db, placed({ option: expired, status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }));
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+    expect(ensureReady).not.toHaveBeenCalled();
+    expect(positions).not.toHaveBeenCalled();
+    expect(place).not.toHaveBeenCalled();
+  });
+
+  it('an idle sweep costs one positions read while a held lot has no stop it can rest', async () => {
+    const { db, deps, positions, place, ensureReady } = restSetup({
+      positions: async () => ({ positions: [], raw: {} }),
+    });
+    seedBuy(db, placed({ status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }));
+
+    await sweepFills(deps);
+
+    expect(ensureReady).toHaveBeenCalledOnce();
+    expect(positions).toHaveBeenCalledOnce();
+    expect(place).not.toHaveBeenCalled();
+  });
+});
+
 describe('applyBrokerState', () => {
   it('returns the same reference when the broker reports nothing new', () => {
     const order = placed({ status: 'filled', filledQuantity: 3, averageFillPrice: 0.86, filledAt: NOW.toISOString() });

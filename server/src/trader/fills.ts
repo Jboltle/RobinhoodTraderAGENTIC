@@ -29,7 +29,7 @@ const log = createLogger('trader:fills');
 
 /** Tick while any order is open: a market order fills in seconds. */
 export const FILL_POLL_ACTIVE_MS = 5_000;
-/** Tick while nothing is open: one cheap indexed query. */
+/** Tick while nothing is open: database reads only, unless a held lot is missing its stop. */
 export const FILL_POLL_IDLE_MS = 30_000;
 /**
  * How far back the sweep looks by default. A day order dies at the close, so
@@ -87,7 +87,6 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
   const rows = await deps.db.listOpenOrders(
     since ?? new Date(now.getTime() - (deps.lookbackMs ?? FILL_LOOKBACK_MS))
   );
-  if (rows.length === 0) return { open: 0, updated: 0 };
 
   // Only users with a connection of record, as Max Loss does: reaching for a
   // disconnected user's session would start an OAuth flow nobody asked for.
@@ -116,12 +115,16 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
     for (const userId of await deps.db.listBrokerUserIds()) {
       try {
         const broker = deps.brokers.for(userId);
-        await broker.mcp.ensureReady();
+        // Runs with no order open too: a stop that could not be rested in the
+        // sweep that saw the fill (position not shown yet, read failed, sell
+        // failed after its stop was cancelled) is rested by a later one.
         await restMissingStops({
           userId,
           db: deps.db,
           tools: broker.tools,
           executionMode: deps.executionMode,
+          now,
+          ensureReady: () => broker.mcp.ensureReady(),
         });
       } catch (err: unknown) {
         if (err instanceof BrokerUnavailableError) continue;

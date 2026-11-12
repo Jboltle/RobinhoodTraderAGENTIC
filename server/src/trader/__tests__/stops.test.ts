@@ -371,8 +371,10 @@ describe('restMissingStops', () => {
     const tools = { placeOptionsOrder: place, getOptionPositions: read } as unknown as RobinhoodTools;
     return { db, tools, place, read };
   }
-  const rest = (db: FakeDb, tools: RobinhoodTools): Promise<void> =>
-    restMissingStops({ userId: USER, db, tools, executionMode: 'immediate' });
+  /** The contract's expiration day, mid-session in New York. */
+  const EXPIRATION_DAY = new Date('2026-06-11T15:00:00.000Z');
+  const rest = (db: FakeDb, tools: RobinhoodTools, now: Date = EXPIRATION_DAY): Promise<void> =>
+    restMissingStops({ userId: USER, db, tools, executionMode: 'immediate', now });
 
   it('logs the status Robinhood returned for the placed stop', async () => {
     const { db, tools } = restSetup([held(2)]);
@@ -428,6 +430,35 @@ describe('restMissingStops', () => {
 
     expect(place).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ contracts: 3 }));
     expect(await stopIds(db)).toEqual({ 'lot-stale': null, 'lot-new': 'stop-1' });
+  });
+
+  it('rests no stop and reads no positions for a lot on an expired contract', async () => {
+    const { db, tools, place, read } = restSetup([held(2)]);
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+
+    // 03:59 UTC on the 12th is still the 11th in New York.
+    await rest(db, tools, new Date('2026-06-12T04:01:00.000Z'));
+
+    expect(read).not.toHaveBeenCalled();
+    expect(place).not.toHaveBeenCalled();
+    expect(await stopIds(db)).toEqual({ 'lot-a': null });
+
+    await rest(db, tools, new Date('2026-06-12T03:59:00.000Z'));
+    expect(place).toHaveBeenCalledOnce();
+  });
+
+  it('readies the session only when a lot needs a stop', async () => {
+    const { db, tools } = restSetup([held(2)]);
+    const ensureReady = vi.fn().mockResolvedValue(undefined);
+    const run = (): Promise<void> =>
+      restMissingStops({ userId: USER, db, tools, executionMode: 'immediate', now: EXPIRATION_DAY, ensureReady });
+
+    await run();
+    expect(ensureReady).not.toHaveBeenCalled();
+
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+    await run();
+    expect(ensureReady).toHaveBeenCalledOnce();
   });
 
   it('rests nothing when the positions read fails', async () => {

@@ -6,7 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision, OptionContract, TradeSettings } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
-import { sweepLadders, type LadderDeps } from '../ladderMonitor.js';
+import {
+  LADDER_INTERVAL_MS,
+  MAX_LADDER_PLACEMENTS_PER_DAY,
+  startLadderMonitor,
+  sweepLadders,
+  type LadderDeps,
+} from '../ladderMonitor.js';
+import { startOfDay } from '../pipeline/riskFilter.js';
 import type { RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { McpRegistry } from '../rh/mcpRegistry.js';
 import type { RobinhoodTools } from '../rh/tools.js';
@@ -183,6 +190,113 @@ describe('ladder — one sell per level', () => {
   });
 });
 
+describe('ladder — one level per lot per sweep', () => {
+  it('sells one level per sweep when the mark is past two targets', async () => {
+    const { db, deps, place } = setup({ trimLevels: FIRST_QUARTER, positions: [held(4)], mark: 2.5 });
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 4);
+
+    expect(await sweep(deps)).toBe(1);
+    expect(place).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ contracts: 1, limitPremium: 1.25 }));
+
+    expect(await sweep(deps)).toBe(1);
+    expect(place).toHaveBeenLastCalledWith(expect.objectContaining({ contracts: 3, limitPremium: 2 }));
+    expect(place).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('ladder — a level whose sells keep dying', () => {
+  const SWEEPS = 12;
+  const boundLines = (lines: Record<string, unknown>[], lotId: string): Record<string, unknown>[] =>
+    lines.filter((line) => line.lotId === lotId && String(line.message).includes('left alone'));
+
+  it('stops placing a level once its sells were rejected the daily maximum of times', async () => {
+    let sells = 0;
+    const place = vi.fn(async () => ({ orderId: `sell-${(sells += 1)}`, status: 'rejected', raw: {} }));
+    const { db, deps } = setup({
+      trimLevels: FIRST_QUARTER,
+      positions: [held(4)],
+      toolsOverrides: { placeOptionsOrder: place as unknown as RobinhoodTools['placeOptionsOrder'] },
+    });
+    seedLot(db, 'lot-rejected', '2026-06-11T13:00:00.000Z', 4);
+
+    const lines = await logged(async () => {
+      for (let i = 0; i < SWEEPS; i += 1) await sweep(deps);
+    });
+
+    expect(place).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY);
+    expect(await ladderRows(db)).toHaveLength(MAX_LADDER_PLACEMENTS_PER_DAY);
+    // The buy and the placements, nothing more: the daily trade cap is not used up.
+    expect(await db.countSubmittedSince(USER, startOfDay())).toBe(1 + MAX_LADDER_PLACEMENTS_PER_DAY);
+    expect(boundLines(lines, 'lot-rejected')).toHaveLength(1);
+    expect(boundLines(lines, 'lot-rejected')[0]).toMatchObject({ level: 'warn', gainPct: 25 });
+  });
+
+  it('counts a submit that throws, records it as failed, and keeps it out of the daily trade cap', async () => {
+    const place = vi.fn().mockRejectedValue(new Error('place_option_order failed after 3 attempts: fetch failed'));
+    const { db, deps, positions } = setup({
+      trimLevels: FIRST_QUARTER,
+      positions: [held(4)],
+      toolsOverrides: { placeOptionsOrder: place },
+    });
+    seedLot(db, 'lot-throws', '2026-06-11T13:00:00.000Z', 4);
+
+    for (let i = 0; i < SWEEPS; i += 1) expect(await sweep(deps)).toBe(0);
+
+    expect(place).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY);
+    const rows = await ladderRows(db);
+    expect(rows).toHaveLength(MAX_LADDER_PLACEMENTS_PER_DAY);
+    for (const row of rows) {
+      expect(row).toMatchObject({ kind: 'execution_failed', action: 'sell', order: { status: 'failed' } });
+      expect(row.reason).toContain('fetch failed');
+    }
+    expect(await db.countSubmittedSince(USER, startOfDay())).toBe(1);
+    expect((await db.listOpenOptionLots(USER))[0]).toMatchObject({ openQty: 4, soldAtGain: {} });
+    // A level that is left alone costs no positions read either.
+    expect(positions).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY);
+  });
+
+  it('counts each level on its own: the next level is still sold', async () => {
+    let sells = 0;
+    let markPrice = 1.3;
+    const place = vi.fn(async () => ({ orderId: `sell-${(sells += 1)}`, status: 'rejected', raw: {} }));
+    const { db, deps } = setup({
+      trimLevels: FIRST_QUARTER,
+      positions: [held(4)],
+      toolsOverrides: {
+        placeOptionsOrder: place as unknown as RobinhoodTools['placeOptionsOrder'],
+        getOptionsMarkPrice: (async () => ({ markPrice, raw: {} })) as unknown as RobinhoodTools['getOptionsMarkPrice'],
+      },
+    });
+    seedLot(db, 'lot-two-levels', '2026-06-11T13:00:00.000Z', 4);
+    for (let i = 0; i < SWEEPS; i += 1) await sweep(deps);
+    expect(place).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY);
+
+    markPrice = 2.5;
+    await sweep(deps);
+
+    expect(place).toHaveBeenLastCalledWith(expect.objectContaining({ contracts: 3, limitPremium: 2 }));
+    expect(place).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY + 1);
+  });
+
+  it('places the level again the next day', async () => {
+    let sells = 0;
+    const place = vi.fn(async () => ({ orderId: `sell-${(sells += 1)}`, status: 'rejected', raw: {} }));
+    const { db, deps } = setup({
+      trimLevels: FIRST_QUARTER,
+      positions: [held(4)],
+      toolsOverrides: { placeOptionsOrder: place as unknown as RobinhoodTools['placeOptionsOrder'] },
+    });
+    seedLot(db, 'lot-next-day', '2026-06-11T13:00:00.000Z', 4);
+    for (let i = 0; i < SWEEPS; i += 1) await sweep(deps);
+    expect(place).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY);
+
+    vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+    await sweep(deps);
+
+    expect(place).toHaveBeenCalledTimes(MAX_LADDER_PLACEMENTS_PER_DAY + 1);
+  });
+});
+
 describe('ladder — only contracts the account holds', () => {
   const ALL_AT_25 = [{ gainPct: 25, portionPct: 100 }];
 
@@ -254,11 +368,20 @@ describe('ladder — only contracts the account holds', () => {
     });
     seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 4, 'stop-a');
 
-    expect(await sweep(deps)).toBe(0);
+    const lines = await logged(async () => {
+      expect(await sweep(deps)).toBe(0);
+    });
 
     expect(cancel).not.toHaveBeenCalled();
     expect(place).not.toHaveBeenCalled();
     expect(await ladderRows(db)).toHaveLength(0);
+    // The failure ends the user's sweep; it is not read as "holds nothing".
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        message: 'ladder sweep skipped user',
+        error: expect.stringContaining('get_option_positions failed'),
+      })
+    );
   });
 });
 
@@ -301,5 +424,44 @@ describe('ladder — over a stop Robinhood refuses to cancel', () => {
     );
     expect(await ladderRows(db)).toHaveLength(1);
     expect((await db.listDecisions(USER, 10)).find((row) => row.messageId === 'lot-a')?.order?.stopOrderId).toBeNull();
+  });
+});
+
+describe('ladder monitor — overlapping ticks', () => {
+  const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+  it('skips a tick while the previous sweep is still running', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'], now: new Date('2026-06-11T15:00:00.000Z') });
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const mark = vi.fn(async () => {
+      await gate;
+      return { markPrice: 1.3, raw: {} };
+    });
+    const { db, deps, place } = setup({
+      trimLevels: FIRST_QUARTER,
+      positions: [held(4)],
+      toolsOverrides: { getOptionsMarkPrice: mark as unknown as RobinhoodTools['getOptionsMarkPrice'] },
+    });
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 4);
+    const stop = startLadderMonitor(deps);
+
+    vi.advanceTimersByTime(LADDER_INTERVAL_MS);
+    await settle();
+    vi.advanceTimersByTime(LADDER_INTERVAL_MS);
+    await settle();
+    release();
+    await settle();
+
+    expect(mark).toHaveBeenCalledOnce();
+    expect(place).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ contracts: 1 }));
+
+    // The guard clears with the sweep: the next tick runs.
+    vi.advanceTimersByTime(LADDER_INTERVAL_MS);
+    await settle();
+    expect(mark).toHaveBeenCalledTimes(2);
+    stop();
   });
 });

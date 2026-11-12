@@ -39,6 +39,8 @@ export interface OpenOptionLot {
   readonly buyOrder: SubmittedOrder;
   /** Contracts already sold at each own-target gain, including working sells. */
   readonly soldAtGain: Readonly<Record<number, number>>;
+  /** Every own-target sell tried for this lot and when, dead and failed ones included. */
+  readonly ownTargetSells: readonly { readonly gainPct: number; readonly at: string }[];
 }
 
 export interface TrimLevel {
@@ -74,9 +76,18 @@ function buyFilledQty(order: SubmittedOrder): number {
 export function openOptionLots(rows: readonly LotRow[]): OpenOptionLot[] {
   const consumed = new Map<string, number>();
   const byGain = new Map<string, Map<number, number>>();
+  const ownTargetSells = new Map<string, { gainPct: number; at: string }[]>();
   for (const row of rows) {
-    if (row.action === 'buy' || !row.order?.lots || !countsAsSold(row.order)) continue;
+    if (row.action === 'buy' || !row.order?.lots) continue;
+    const sold = countsAsSold(row.order);
     for (const link of row.order.lots) {
+      if (link.gainPct !== undefined) {
+        ownTargetSells.set(link.lotId, [
+          ...(ownTargetSells.get(link.lotId) ?? []),
+          { gainPct: link.gainPct, at: row.at },
+        ]);
+      }
+      if (!sold) continue;
       consumed.set(link.lotId, (consumed.get(link.lotId) ?? 0) + link.quantity);
       if (link.gainPct === undefined) continue;
       const gains = byGain.get(link.lotId) ?? new Map<number, number>();
@@ -107,6 +118,7 @@ export function openOptionLots(rows: readonly LotRow[]): OpenOptionLot[] {
       stopOrderId: order.stopOrderId ?? null,
       buyOrder: order,
       soldAtGain: gains ? Object.fromEntries(gains) : {},
+      ownTargetSells: ownTargetSells.get(row.id) ?? [],
     });
   }
   return lots.sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.lotId.localeCompare(b.lotId));

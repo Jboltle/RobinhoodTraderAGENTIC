@@ -5,6 +5,7 @@
  */
 import { createLogger } from '../shared/logger.js';
 import { optionLabel, type Decision, type OptionContract, type TradeExecutionMode } from '../shared/types.js';
+import { isoDateEt } from './book/ladder.js';
 import type { TraderDb } from './db.js';
 import { heldByLot, stopTrigger, type OpenOptionLot } from './lots.js';
 import { roundPremiumToTick, type RobinhoodTools } from './rh/tools.js';
@@ -147,6 +148,10 @@ export async function restMissingStops(args: {
   readonly db: TraderDb;
   readonly tools: RobinhoodTools;
   readonly executionMode: TradeExecutionMode;
+  /** Decides which contracts have expired. Defaults to the clock. */
+  readonly now?: Date;
+  /** Connects the user's session; called only once a lot needs a stop. */
+  readonly ensureReady?: () => Promise<void>;
 }): Promise<void> {
   if (args.executionMode !== 'immediate') return;
   if (typeof args.tools.placeOptionsOrder !== 'function') return;
@@ -157,9 +162,16 @@ export async function restMissingStops(args: {
   // Read on the first lot that needs a stop. A failed read throws out of this
   // call: no stop is rested on the ledger's word alone.
   let held: Map<string, number> | null = null;
+  const today = isoDateEt(args.now ?? new Date());
   for (const lot of lots) {
     if (lot.stopOrderId || lot.entryPrice <= 0 || lot.openQty < 1) continue;
-    held ??= heldByLot(lots, (await args.tools.getOptionPositions()).positions);
+    // An expired contract needs no stop, and its lot never closes: without
+    // this, one stale lot would cost a positions read on every sweep for ever.
+    if (lot.option.expiration < today) continue;
+    if (held === null) {
+      await args.ensureReady?.();
+      held = heldByLot(lots, (await args.tools.getOptionPositions()).positions);
+    }
     const contracts = held.get(lot.lotId) ?? 0;
     if (contracts < 1) continue;
     try {
