@@ -31,7 +31,7 @@ import {
   viewOf,
   type BookPeriod,
 } from './book/ladder.js';
-import type { ApprovalOutcome, StoredCallout, TraderDb } from './db.js';
+import type { ApprovalOutcome, StoredCallout, TraderDb, UnusableAccount } from './db.js';
 import type { TraderEvents } from './events.js';
 import { resolveEquityEntry, resolveOptionEntry } from './maxLoss.js';
 import { submitOrder } from './pipeline/execute.js';
@@ -83,6 +83,8 @@ const AUTH_URL_POLL_MS = 100;
 const READ_ONLY_CONNECT_ERROR =
   'Robinhood cannot be connected from this environment (TRADE_EXECUTION_MODE=read_only)';
 const NO_ROBINHOOD_ACCOUNT_ERROR = 'this user has no Robinhood account to connect';
+const UNUSABLE_ACCOUNT_ERROR =
+  'that account cannot be used: its saved connection details cannot be read. Nothing was changed.';
 
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
 const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
@@ -124,6 +126,11 @@ export interface AccountsResponse {
   readonly selectedAccountId: string;
   /** One entry per adapter the user has an account through. */
   readonly brokers: BrokerEntry[];
+  /**
+   * Accounts whose saved details cannot be read: shown, so they do not vanish
+   * from the menu, but never selectable. Absent when there are none.
+   */
+  readonly unusableAccounts?: UnusableAccount[];
 }
 
 export interface ServerDeps {
@@ -185,6 +192,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const parsed = SelectAccountBodySchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: 'body must be { accountId: string }' });
+    }
+    // An unusable account is never what the screens show: the session would
+    // fall back to another account while this answered that it was selected.
+    const { unusable } = await deps.db.listAccounts(user.id);
+    if (unusable.some((account) => account.id === parsed.data.accountId)) {
+      return reply.status(409).send({ error: UNUSABLE_ACCOUNT_ERROR });
     }
     // Someone else's account answers exactly as one that does not exist.
     if (!(await deps.db.selectAccount(user.id, parsed.data.accountId))) {
@@ -689,7 +702,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
  * database keeps one row per account; this shape is built on read.
  */
 async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<AccountsResponse> {
-  const listings = await deps.db.listAccounts(selected.userId);
+  const { accounts: listings, unusable } = await deps.db.listAccounts(selected.userId);
   const followsEveryone = listings.some((listing) => listing.followedCallerIds === null);
   const rosterSize = followsEveryone ? (await deps.db.listCallers()).length : 0;
 
@@ -723,7 +736,11 @@ async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<Acc
   if (Object.keys(snapTradeAccounts).length > 0) {
     brokers.push({ adapter: 'snaptrade', accounts: snapTradeAccounts });
   }
-  return { selectedAccountId: selected.id, brokers };
+  return {
+    selectedAccountId: selected.id,
+    brokers,
+    ...(unusable.length > 0 ? { unusableAccounts: unusable } : {}),
+  };
 }
 
 /** The direct Robinhood account of the selected account's owner; every user is created with one. */
@@ -732,8 +749,8 @@ async function directRobinhoodAccount(
   selected: AccountRow
 ): Promise<AccountRow | null> {
   if (selected.adapter === 'robinhood') return selected;
-  const listings = await deps.db.listAccounts(selected.userId);
-  return listings.find(({ account }) => account.adapter === 'robinhood')?.account ?? null;
+  const { accounts } = await deps.db.listAccounts(selected.userId);
+  return accounts.find(({ account }) => account.adapter === 'robinhood')?.account ?? null;
 }
 
 /** What a route answers when the account it was asked about has no connection of record. */

@@ -142,6 +142,8 @@ export interface FakeDb extends TraderDb {
    * user does not own, or null where the selected account was deleted.
    */
   corruptSelection(userId: string, accountId: string | null): void;
+  /** Make the account's row unreadable, as adapter_data its adapter cannot use would. */
+  corruptAccount(accountId: string): void;
   /** The account row for an id, created as a direct Robinhood account when unknown. */
   account(accountId: string): AccountRow;
   seedSettings(accountId: string, settings: TradeSettings): void;
@@ -165,6 +167,8 @@ export function createFakeDb(): FakeDb {
   const accounts = new Map<string, AccountRow>();
   /** User id -> the account their routes act on. */
   const selectedAccounts = new Map<string, string>();
+  /** Accounts whose row cannot be read (corruptAccount). */
+  const unreadable = new Set<string>();
   const settings = new Map<string, ResolvedTradeSettings>();
   const trades: Array<{ accountId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
@@ -184,11 +188,14 @@ export function createFakeDb(): FakeDb {
   };
   const decisionsFor = (accountId: string): Decision[] =>
     trades.filter((row) => row.accountId === accountId).map((row) => row.decision);
-  // The selected account, or the user's oldest when that selection is not theirs.
+  // The selected account, or the user's oldest readable one when that
+  // selection is not theirs or cannot be read.
   const selectedAccountOf = (userId: string): AccountRow | null => {
+    const readable = (account: AccountRow | undefined): account is AccountRow =>
+      account?.userId === userId && !unreadable.has(account.id);
     const selected = accounts.get(selectedAccounts.get(userId) ?? '');
-    if (selected?.userId === userId) return selected;
-    return [...accounts.values()].find((account) => account.userId === userId) ?? null;
+    if (readable(selected)) return selected;
+    return [...accounts.values()].find(readable) ?? null;
   };
   // Seeding or opening an account nobody registered creates it, as the
   // pipeline and monitor tests do: they never sign a user in.
@@ -224,6 +231,9 @@ export function createFakeDb(): FakeDb {
     corruptSelection(userId, accountId) {
       if (accountId === null) selectedAccounts.delete(userId);
       else selectedAccounts.set(userId, accountId);
+    },
+    corruptAccount(accountId) {
+      unreadable.add(accountId);
     },
     account: ensureAccount,
     seedSettings(accountId, value) {
@@ -383,7 +393,7 @@ export function createFakeDb(): FakeDb {
     // ---- Shared --------------------------------------------------------------
 
     async listConnectedAccounts() {
-      return [...brokerTokens.keys()].map(ensureAccount);
+      return [...brokerTokens.keys()].map(ensureAccount).filter((account) => !unreadable.has(account.id));
     },
     async listOpenOrders(since) {
       return trades
@@ -606,17 +616,23 @@ export function createFakeDb(): FakeDb {
       return selectedAccountOf(userId);
     },
     async listAccounts(userId) {
-      return [...accounts.values()]
-        .filter((account) => account.userId === userId)
-        .map((account) => {
-          const resolved = settings.get(account.id) ?? TradeSettingsSchema.parse({});
-          return {
-            account,
-            connected: brokerTokens.has(account.id),
-            executionMode: resolved.executionMode,
-            followedCallerIds: resolved.followedCallerIds,
-          };
-        });
+      const owned = [...accounts.values()].filter((account) => account.userId === userId);
+      return {
+        accounts: owned
+          .filter((account) => !unreadable.has(account.id))
+          .map((account) => {
+            const resolved = settings.get(account.id) ?? TradeSettingsSchema.parse({});
+            return {
+              account,
+              connected: brokerTokens.has(account.id),
+              executionMode: resolved.executionMode,
+              followedCallerIds: resolved.followedCallerIds,
+            };
+          }),
+        unusable: owned
+          .filter((account) => unreadable.has(account.id))
+          .map(({ id, label, institution, isPaper }) => ({ id, label, institution, isPaper })),
+      };
     },
     async selectAccount(userId, accountId) {
       // Mirrors the real UPDATE: matched among this user's own accounts only.

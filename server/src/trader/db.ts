@@ -197,8 +197,9 @@ export interface AuthUser {
 export interface AuthSession {
   readonly user: AuthUser;
   /**
-   * The account the user selected, or their oldest when that selection is
-   * gone. Never another user's. Null only for a user with no account at all.
+   * The account the user selected, or their oldest usable one when that
+   * selection is gone or its row cannot be read. Never another user's. Null
+   * only for a user with no usable account at all.
    */
   readonly account: AccountRow | null;
 }
@@ -211,6 +212,23 @@ export interface AccountListing {
   readonly executionMode: ExecutionMode;
   /** Null = follows every Caller. */
   readonly followedCallerIds: readonly string[] | null;
+}
+
+/**
+ * An account whose row cannot be read: its adapter_data is not what its
+ * adapter needs. Listed so it does not vanish; never selected or acted on.
+ */
+export interface UnusableAccount {
+  readonly id: string;
+  readonly label: string;
+  readonly institution: string;
+  readonly isPaper: boolean;
+}
+
+export interface AccountListings {
+  /** Oldest first. */
+  readonly accounts: AccountListing[];
+  readonly unusable: UnusableAccount[];
 }
 
 /** A placed order whose broker state is not yet terminal, with the account that placed it. */
@@ -354,8 +372,8 @@ export interface TraderDb {
   userForSignIn(email: string): Promise<AuthUser | null>;
   /** AuthSession.account for a user known by id rather than by token (the CLI scripts). */
   getSelectedAccount(userId: string): Promise<AccountRow | null>;
-  /** Every account the user owns, oldest first. Never another user's. */
-  listAccounts(userId: string): Promise<AccountListing[]>;
+  /** Every account the user owns. Never another user's. */
+  listAccounts(userId: string): Promise<AccountListings>;
   /**
    * Make one of the user's own accounts the one their dashboard and Settings
    * show. False, with nothing written, when `accountId` is not an account of
@@ -990,41 +1008,31 @@ class DrizzleTraderDb implements TraderDb {
   }
 
   async getSelectedAccount(userId: string): Promise<AccountRow | null> {
-    const [row] = await this.db
+    const rows = await this.db
       .select(accountColumns)
       .from(accounts)
       .innerJoin(users, eq(users.id, accounts.userId))
       .where(eq(accounts.userId, userId))
-      .orderBy(...SELECTED_ACCOUNT_FIRST)
-      .limit(1);
-    return row ? toAccount(row) : null;
+      .orderBy(...SELECTED_ACCOUNT_FIRST);
+    return readAccountRows(rows).readable[0]?.account ?? null;
   }
 
-  async listAccounts(userId: string): Promise<AccountListing[]> {
+  async listAccounts(userId: string): Promise<AccountListings> {
     const rows = await this.db
       .select({ ...accountColumns, connected: sql<boolean>`${accounts.credentials} is not null` })
       .from(accounts)
       .where(eq(accounts.userId, userId))
       .orderBy(asc(accounts.createdAt), asc(accounts.id));
-    // One unreadable row must not hide the user's other accounts.
-    return rows.flatMap((row) => {
-      try {
-        return [
-          {
-            account: toAccount(row),
-            connected: row.connected,
-            executionMode: row.executionMode,
-            followedCallerIds: row.followedCallerIds,
-          },
-        ];
-      } catch (err: unknown) {
-        log.error('skipping an account whose row cannot be read', {
-          accountId: row.id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return [];
-      }
-    });
+    const { readable, unreadable } = readAccountRows(rows);
+    return {
+      accounts: readable.map(({ row, account }) => ({
+        account,
+        connected: row.connected,
+        executionMode: row.executionMode,
+        followedCallerIds: row.followedCallerIds,
+      })),
+      unusable: unreadable.map(({ id, label, institution, isPaper }) => ({ id, label, institution, isPaper })),
+    };
   }
 
   async selectAccount(userId: string, accountId: string): Promise<boolean> {
@@ -1071,19 +1079,23 @@ class DrizzleTraderDb implements TraderDb {
 
   async verifyAccessToken(token: string): Promise<AuthSession | null> {
     // Joined to the user's own accounts only, so a selection can never resolve
-    // to someone else's account.
-    const [row] = await this.db
+    // to someone else's account. Every one of them is read, selected first:
+    // a selected row that cannot be read falls back to the next instead of
+    // failing the session, which would answer 401 on every route, the one
+    // that selects another account included.
+    const rows = await this.db
       .select({ id: users.id, email: users.email, account: accountColumns })
       .from(sessions)
       .innerJoin(users, eq(users.id, sessions.userId))
       .leftJoin(accounts, eq(accounts.userId, users.id))
       .where(and(eq(sessions.tokenHash, hashSessionToken(token)), gt(sessions.expiresAt, new Date())))
-      .orderBy(...SELECTED_ACCOUNT_FIRST)
-      .limit(1);
-    if (!row) return null;
+      .orderBy(...SELECTED_ACCOUNT_FIRST);
+    const [first] = rows;
+    if (!first) return null;
+    const accountRows = rows.flatMap((row) => (row.account ? [row.account] : []));
     return {
-      user: { id: row.id, email: row.email },
-      account: row.account ? toAccount(row.account) : null,
+      user: { id: first.id, email: first.email },
+      account: readAccountRows(accountRows).readable[0]?.account ?? null,
     };
   }
 }
@@ -1121,8 +1133,43 @@ const SnapTradeAdapterDataSchema = z.object({
   maskedAccountNumber: z.string().nullable(),
 });
 
+/** The columns an AccountRow is read from. */
+export type AccountIdentityRecord = Pick<
+  AccountRecord,
+  'id' | 'userId' | 'adapter' | 'institution' | 'externalAccountId' | 'label' | 'isPaper' | 'needsReconnect' | 'adapterData'
+>;
+
+/** Account ids already reported unreadable, so a row read on every request is logged once per process. */
+const reportedUnreadable = new Set<string>();
+
+/**
+ * Splits account rows, in the order given, into the ones that can be read and
+ * the ones that cannot. One unreadable row must never fail the read of the
+ * rest: not a user's other accounts, and not their session.
+ */
+export function readAccountRows<Row extends AccountIdentityRecord>(
+  rows: readonly Row[]
+): { readonly readable: Array<{ readonly row: Row; readonly account: AccountRow }>; readonly unreadable: Row[] } {
+  const readable: Array<{ readonly row: Row; readonly account: AccountRow }> = [];
+  const unreadable: Row[] = [];
+  for (const row of rows) {
+    try {
+      readable.push({ row, account: toAccount(row) });
+    } catch (err: unknown) {
+      unreadable.push(row);
+      if (reportedUnreadable.has(row.id)) continue;
+      reportedUnreadable.add(row.id);
+      log.error('an account row cannot be read; it is listed as unusable and never acted on', {
+        accountId: row.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return { readable, unreadable };
+}
+
 /** Throws when adapter_data does not have the shape its adapter needs. */
-function toAccount(row: AccountRecord): AccountRow {
+function toAccount(row: AccountIdentityRecord): AccountRow {
   const identity = {
     id: row.id,
     userId: row.userId,
