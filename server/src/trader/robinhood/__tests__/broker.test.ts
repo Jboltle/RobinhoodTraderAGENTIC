@@ -229,6 +229,19 @@ describe('RobinhoodBroker reads', () => {
     expect(wire.at(-1)).toStrictEqual({ name: 'get_option_instruments', args: { ids: OPTION_ID } });
   });
 
+  // cost_basis is the position's total cost, not a per-share price.
+  it('getPositions never takes cost_basis for the average price of a stock row', async () => {
+    const { tools } = connect({
+      [TOOL_NAMES.positions]: {
+        results: [{ symbol: 'AAPL', quantity: '10.0000', cost_basis: '1485.0000' }],
+      },
+    });
+
+    expect(await new RobinhoodBroker(tools).getPositions('equity')).toStrictEqual([
+      { instrument: { kind: 'equity', symbol: 'AAPL' }, quantity: 10, averageEntryPrice: null },
+    ]);
+  });
+
   it("getPositions('option') reads only option positions, as exit sizing does", async () => {
     const { tools, wire } = connect();
 
