@@ -22,6 +22,7 @@
     "eval:parse": "tsx src/scripts/parseEval.ts",
     "env:audit": "tsx src/scripts/envAudit.ts",
     "fills:backfill": "tsx src/scripts/backfillFills.ts",
+    "snaptrade:check": "tsx src/scripts/snaptradeCheck.ts",
     "typecheck": "tsc -p . --noEmit"
   },
   "dependencies": {
