@@ -7,8 +7,25 @@ const PERIOD_PNL_LABEL: Record<BookPeriod, string> = {
   all: 'All-time P&L',
 }
 
-/** The 2x2 strip at the top of the book: P&L, winners, losers, win rate. */
-export function KpiGrid({ summary, period }: { summary: BookSummary; period: BookPeriod }) {
+/** Shown in place of a figure that has not loaded: a zero would read as a real one. */
+const NOT_LOADED = '—'
+
+/**
+ * The 2x2 strip at the top of the book: P&L, winners, losers, win rate.
+ * `summary` is null until the book has loaded.
+ */
+export function KpiGrid({ summary, period }: { summary: BookSummary | null; period: BookPeriod }) {
+  if (summary === null) {
+    return (
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {[PERIOD_PNL_LABEL[period], 'Winners', 'Losers', 'Win rate'].map((label) => (
+          // The non-breaking space holds the detail line's height, so the
+          // cards do not jump when the figures arrive.
+          <Kpi key={label} label={label} value={NOT_LOADED} tone="text-ink-400" detail={'\u00a0'} />
+        ))}
+      </div>
+    )
+  }
   const decided = summary.winners.count + summary.losers.count
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">

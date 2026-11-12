@@ -115,12 +115,18 @@ function Dashboard() {
               Live prices unavailable ({(performance.error as Error).message})
             </p>
           )}
-          <TradesTable
-            decisions={decisions.data ?? []}
-            positions={performance.data ?? []}
-            callouts={callouts.data ?? []}
-            callers={callers.data ?? []}
-          />
+          {/* Absent until the stream's first snapshot: "No trades yet"
+              before that would be a claim about an account not yet read. */}
+          {decisions.data ? (
+            <TradesTable
+              decisions={decisions.data}
+              positions={performance.data ?? []}
+              callouts={callouts.data ?? []}
+              callers={callers.data ?? []}
+            />
+          ) : (
+            <EmptyState>Loading…</EmptyState>
+          )}
         </div>
       </section>
 
@@ -192,7 +198,9 @@ function Book({
   const callerById = useMemo(() => new Map(callers.map((c) => [c.authorId, c])), [callers])
   const open = filterByCaller(book.data?.open ?? [], selection, followedCallerIds)
   const closed = filterByCaller(book.data?.closed ?? [], selection, followedCallerIds)
-  const summary = summarizeBook(open, closed)
+  // Null until the book has loaded: an empty book and no book yet (first
+  // load, or just after an account switch emptied the cache) are different.
+  const summary = book.data ? summarizeBook(open, closed) : null
   const needle = tickerFilter.trim().toUpperCase()
   const visibleOpen = needle ? open.filter((p) => p.ticker.includes(needle)) : open
 
@@ -232,7 +240,7 @@ function Book({
 
       <div>
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <SectionTitle inline>Open {open.length}</SectionTitle>
+          <SectionTitle inline>Open {book.data ? open.length : '—'}</SectionTitle>
           <input
             type="search"
             value={tickerFilter}
@@ -280,7 +288,7 @@ function Book({
 
       <div>
         <SectionTitle>
-          {CLOSED_HEADING[period]} {closed.length}
+          {CLOSED_HEADING[period]} {book.data ? closed.length : '—'}
         </SectionTitle>
         {book.isSuccess && closed.length === 0 && <EmptyState>Nothing closed in this period.</EmptyState>}
         {closed.length > 0 && (
