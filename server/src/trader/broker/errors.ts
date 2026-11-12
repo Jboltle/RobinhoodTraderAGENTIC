@@ -17,8 +17,9 @@ export class SymbolNotFoundError extends Error {
 
 /**
  * A broker write was attempted on a read-only deployment
- * (TRADE_EXECUTION_MODE=read_only). Raised before any broker call, so a
- * staging process can run the whole pipeline and never place or cancel an order.
+ * (TRADE_EXECUTION_MODE=read_only), or under paper_only on an account that is
+ * not paper. Raised before any broker call, so a staging process can run the
+ * whole pipeline and never place or cancel a real-money order.
  */
 export class BrokerWritesDisabledError extends Error {
   override readonly name = 'BrokerWritesDisabledError';

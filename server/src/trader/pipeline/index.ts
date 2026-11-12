@@ -16,6 +16,7 @@ import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js';
 import { instrumentOf } from '../broker/instrument.js';
+import { executionModeFor } from '../broker/paperAccount.js';
 import type { QuoteSource } from '../broker/quotes.js';
 import { supportedAccounts, type McpRegistry } from '../broker/registry.js';
 import type { AccountRow, Broker } from '../broker/types.js';
@@ -626,9 +627,9 @@ export async function runForAccount(
     // row carries the sized order so the dashboard can show what is at stake.
     // A review reason (Jev unsure, or an ambiguous contract) parks the trade
     // even for accounts that otherwise trade immediately, and so does a
-    // deployment whose TRADE_EXECUTION_MODE is anything but immediate: the
-    // kill switch can only tighten what the user chose.
-    const heldByDeployment = deps.executionMode !== 'immediate';
+    // deployment whose TRADE_EXECUTION_MODE is anything but immediate for
+    // this account: the kill switch can only tighten what the user chose.
+    const heldByDeployment = executionModeFor(deps.executionMode, account) !== 'immediate';
     if (settings.executionMode === 'approval' || callout.reviewReason || heldByDeployment) {
       const receipt = summarizePendingApproval(sized);
       const held = heldByDeployment ? `Held by TRADE_EXECUTION_MODE=${deps.executionMode}` : null;

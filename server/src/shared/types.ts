@@ -34,8 +34,10 @@ export type ExecutionMode = (typeof EXECUTION_MODES)[number];
  * a user's own `executionMode`: `approval` parks every callout-driven trade and
  * refuses the Approve button; `read_only` additionally stops every broker
  * write, Max Loss included, so a staging deployment can never place an order.
+ * `paper_only` is `read_only` for every account except a paper one, which
+ * trades as under `immediate` (broker/paperAccount.ts decides which is which).
  */
-export const TRADE_EXECUTION_MODES = ['immediate', 'approval', 'read_only'] as const;
+export const TRADE_EXECUTION_MODES = ['immediate', 'approval', 'read_only', 'paper_only'] as const;
 export type TradeExecutionMode = (typeof TRADE_EXECUTION_MODES)[number];
 
 /** Who decides whether a message is a trade: hosted Jev, or the LLM parser it replaced. */

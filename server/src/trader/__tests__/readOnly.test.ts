@@ -111,6 +111,23 @@ describe.each(ADAPTERS)('read_only deployment over %s', (_name, makeAdapter) => 
   );
 });
 
+// registryOver opens a direct Robinhood account: never a paper account.
+describe.each(ADAPTERS)('paper_only deployment over %s, for an account that is not paper', (_name, makeAdapter) => {
+  it('refuses every order and every cancel before the adapter is reached', async () => {
+    const adapter = makeAdapter();
+    const broker = registryOver(adapter, 'paper_only');
+
+    for (const order of WRITES) {
+      await expect(broker.placeOrder(order)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    }
+    await expect(broker.cancelOrder(RESTING_STOP_ID)).rejects.toBeInstanceOf(
+      BrokerWritesDisabledError
+    );
+
+    expect(adapter.callsReachingBroker()).toBe(0);
+  });
+});
+
 describe('read_only refusal', () => {
   it('names what would have been written, in the words the order refusal always used', async () => {
     const broker = registryOver(fakeAdapter(), 'read_only');
@@ -199,6 +216,20 @@ describe('a registry over several adapters', () => {
       expect(fake.placeOrder).not.toHaveBeenCalled();
       expect(fake.cancelOrder).not.toHaveBeenCalled();
     }
+  });
+
+  it("paper_only refuses every write on the Robinhood account and hands the paper account its adapter's own broker", async () => {
+    const { brokers, behind } = setup('paper_only');
+
+    const { broker } = brokers.for(ROBINHOOD_ACCOUNT);
+    for (const order of WRITES) {
+      await expect(broker.placeOrder(order)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    }
+    await expect(broker.cancelOrder(RESTING_STOP_ID)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    expect(behind.robinhood.placeOrder).not.toHaveBeenCalled();
+    expect(behind.robinhood.cancelOrder).not.toHaveBeenCalled();
+
+    expect(brokers.for(PAPER_ACCOUNT).broker).toBe(behind.snaptrade);
   });
 
   it('an account whose adapter this deployment does not have is unavailable, not opened by another', () => {

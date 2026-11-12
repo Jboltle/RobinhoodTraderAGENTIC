@@ -10,6 +10,7 @@ import { createLogger } from '../../shared/logger.js';
 import type { TradeExecutionMode } from '../../shared/types.js';
 import type { TraderDb } from '../db.js';
 import { BrokerUnavailableError } from './errors.js';
+import { executionModeFor, type AccountExecutionMode } from './paperAccount.js';
 import type { AccountRow, BrokerAdapter, UserBroker } from './types.js';
 import { guardWrites } from './writeGuard.js';
 
@@ -33,9 +34,16 @@ export function createMcpRegistry(
   // process lifetime, each holding an open MCP transport. Fine at invite-only
   // scale. Upgrade path: an LRU that closes the transport on eviction.
   const brokers = new Map<string, UserBroker>();
+  /** The mode each held session's broker was guarded under. */
+  const guardedAs = new Map<string, AccountExecutionMode>();
 
   return {
     for(account: AccountRow): UserBroker {
+      // The guard is the account's, decided from the row in hand. A row that
+      // no longer reads as it did when its session was opened (a paper
+      // account relabelled) is opened again under the guard it has now.
+      const mode = executionModeFor(executionMode, account);
+      if (guardedAs.get(account.id) !== mode) brokers.delete(account.id);
       let broker = brokers.get(account.id);
       if (!broker) {
         const adapter = adapters.find((candidate) => candidate.id === account.adapter);
@@ -48,10 +56,11 @@ export function createMcpRegistry(
         const opened = adapter.open(account);
         broker = {
           session: opened.session,
-          broker: guardWrites(opened.broker, executionMode),
+          broker: guardWrites(opened.broker, mode),
           quotesOptions: adapter.quotesOptions,
         };
         brokers.set(account.id, broker);
+        guardedAs.set(account.id, mode);
       }
       return broker;
     },
@@ -72,6 +81,22 @@ type ConnectedAccounts = Pick<TraderDb, 'listConnectedAccounts'>;
  */
 export async function supportedAccounts(db: ConnectedAccounts, brokers: McpRegistry): Promise<AccountRow[]> {
   return (await db.listConnectedAccounts()).filter((account) => brokers.supports(account));
+}
+
+/**
+ * The supported accounts the deployment lets trade without a click: the ones
+ * the stop rest and the own-target ladder act on. Under a mode that holds
+ * every account alike nothing is read.
+ */
+export async function unheldAccounts(
+  db: ConnectedAccounts,
+  brokers: McpRegistry,
+  deployment: TradeExecutionMode
+): Promise<AccountRow[]> {
+  if (deployment === 'approval' || deployment === 'read_only') return [];
+  return (await supportedAccounts(db, brokers)).filter(
+    (account) => executionModeFor(deployment, account) === 'immediate'
+  );
 }
 
 /**

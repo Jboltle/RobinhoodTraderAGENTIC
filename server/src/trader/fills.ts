@@ -22,7 +22,8 @@ import { restMissingStops } from './stops.js';
 import type { TraderEvents } from './events.js';
 import { normalizeOptionPremium } from './maxLoss.js';
 import { BrokerUnavailableError } from './broker/errors.js';
-import { supportedAccounts, type McpRegistry } from './broker/registry.js';
+import { executionModeFor } from './broker/paperAccount.js';
+import { supportedAccounts, unheldAccounts, type McpRegistry } from './broker/registry.js';
 import type { AccountRow, BrokerOrder } from './broker/types.js';
 
 const log = createLogger('trader:fills');
@@ -46,7 +47,7 @@ export interface FillMonitorDeps {
   /** Overrides FILL_LOOKBACK_MS for every sweep this monitor runs. */
   readonly lookbackMs?: number;
   readonly now?: () => Date;
-  /** Immediate deployments rest a broker stop on a filled option buy when Max Loss is on. */
+  /** The deployment's mode: with Max Loss on, a broker stop is rested on a filled option buy of each account it lets trade. */
   readonly executionMode?: TradeExecutionMode;
 }
 
@@ -114,8 +115,8 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
       log.warn('fill sync failed for account', { accountId, error: err instanceof Error ? err.message : String(err) });
     }
   }
-  if (deps.executionMode === 'immediate') {
-    for (const account of await supportedAccounts(deps.db, deps.brokers)) {
+  if (deps.executionMode !== undefined) {
+    for (const account of await unheldAccounts(deps.db, deps.brokers, deps.executionMode)) {
       try {
         const broker = deps.brokers.for(account);
         await broker.session.ensureReady();
@@ -123,7 +124,7 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
           accountId: account.id,
           db: deps.db,
           broker: broker.broker,
-          executionMode: deps.executionMode,
+          executionMode: executionModeFor(deps.executionMode, account),
         });
       } catch (err: unknown) {
         if (err instanceof BrokerUnavailableError) continue;
