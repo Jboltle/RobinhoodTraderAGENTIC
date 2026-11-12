@@ -252,7 +252,6 @@ export function ConnectDialog({
   // Robinhood again is handed that same link: the trader starts no second one.
   const canGoBack = robinhoodOpen && firstStep === 'choose'
   const backFromRobinhood = (): void => {
-    connect.reset()
     submit.reset()
     setAuthUrl(null)
     setRedirectUrl('')

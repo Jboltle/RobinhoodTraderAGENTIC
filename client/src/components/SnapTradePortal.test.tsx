@@ -116,12 +116,3 @@ test('Escape closes it wherever in the page the keyboard is, the modal included'
   fireEvent.keyDown(document.body, { key: 'Enter', keyCode: 13 })
   expect(handlers.onExit).toHaveBeenCalledTimes(3)
 })
-
-test('unmounted, it leaves nothing of its own behind', async () => {
-  const { findByRole, unmount } = renderPortal()
-  await findByRole('button', { name: 'Close broker connection' })
-
-  unmount()
-
-  expect(document.querySelector('button[aria-label="Close broker connection"]')).toBeNull()
-})

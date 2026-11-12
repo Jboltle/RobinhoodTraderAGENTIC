@@ -241,6 +241,11 @@ test('on a deployment that refuses the Robinhood login, choosing it shows that r
 test('Back from the Robinhood step returns to the choice, where the other broker can be chosen', async () => {
   api.connectBroker.mockRejectedValue(new Error(READ_ONLY_REFUSAL))
   const utils = renderDialog()
+  // An earlier look at the portal left its note at the choice.
+  await chooseOther(utils)
+  await inPortal(utils, 'portal: closed')
+  await utils.findByRole('status')
+
   fireEvent.click(await utils.findByRole('button', { name: /^Robinhood/ }))
   await waitFor(() => expect(utils.container.textContent).toContain(READ_ONLY_REFUSAL))
 
@@ -264,7 +269,12 @@ test('Back forgets what the Robinhood step showed; choosing Robinhood again asks
   const authorizeLink = (): Element | null => utils.container.querySelector(`a[href="${AUTH_URL}"]`)
   fireEvent.click(await utils.findByRole('button', { name: /^Robinhood/ }))
   await waitFor(() => expect(authorizeLink()).not.toBeNull())
-  fireEvent.change(utils.container.querySelector('input')!, { target: { value: 'half-typed' } })
+  // A code was handed in, and something else is half typed in the box.
+  const pasteBox = (): HTMLInputElement => utils.container.querySelector('input')!
+  fireEvent.change(pasteBox(), { target: { value: 'http://127.0.0.1:8788/oauth/callback?code=a&state=s' } })
+  fireEvent.click(utils.getByRole('button', { name: 'Finish connecting' }))
+  await waitFor(() => expect(utils.container.textContent).toContain('Code submitted'))
+  fireEvent.change(pasteBox(), { target: { value: 'half-typed' } })
 
   fireEvent.click(utils.getByRole('button', { name: 'Back' }))
   await utils.findByRole('button', { name: /^Other broker/ })
@@ -281,7 +291,8 @@ test('Back forgets what the Robinhood step showed; choosing Robinhood again asks
 
   answer({ connected: false, authUrl: AUTH_URL })
   await waitFor(() => expect(authorizeLink()).not.toBeNull())
-  expect(utils.container.querySelector('input')!.value).toBe('')
+  expect(pasteBox().value).toBe('')
+  expect(utils.container.textContent).not.toContain('Code submitted')
 })
 
 // ---- Another broker --------------------------------------------------------------

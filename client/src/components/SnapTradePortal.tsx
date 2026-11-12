@@ -28,33 +28,24 @@ interface SnapTradePortalProps {
  * A place at the top of the modal's panel for this app's own control.
  *
  * ponytail: snaptrade-react takes no header and no children, so the place is
- * made in antd's DOM, found through the iframe's id and antd's panel class.
- * Both packages are pinned and SnapTradePortal.test.tsx renders the real
- * modal, so an upgrade that moves either fails there. Upgrade path: a header
- * prop on SnapTradeReact, or our own dialog around its useWindowMessage hook.
+ * made in antd's DOM, found through the iframe's id and antd's panel class,
+ * and antd is relied on to have mounted its modal by the time this effect
+ * runs (it does so in the same commit). Both packages are pinned and
+ * SnapTradePortal.test.tsx renders the real modal, so an upgrade that changes
+ * any of that fails there. Upgrade path: a header prop on SnapTradeReact, or
+ * our own dialog around its useWindowMessage hook.
  */
 function usePanelTop(): HTMLElement | null {
   const [top, setTop] = useState<HTMLElement | null>(null)
 
   useEffect(() => {
+    const panel = document.getElementById(PORTAL_FRAME_ID)?.closest(PANEL_SELECTOR)
+    if (!panel) return
     const host = document.createElement('div')
-    const place = (): boolean => {
-      const panel = document.getElementById(PORTAL_FRAME_ID)?.closest(PANEL_SELECTOR)
-      if (!panel) return false
-      // First in the panel, so Tab reaches it before the portal's iframe.
-      panel.prepend(host)
-      setTop(host)
-      return true
-    }
-    // antd mounts its modal a render after this component.
-    const observer = new MutationObserver(() => {
-      if (place()) observer.disconnect()
-    })
-    if (!place()) observer.observe(document.body, { childList: true, subtree: true })
-    return () => {
-      observer.disconnect()
-      host.remove()
-    }
+    // First in the panel, so Tab reaches it before the portal's iframe.
+    panel.prepend(host)
+    setTop(host)
+    return () => host.remove()
   }, [])
 
   return top
