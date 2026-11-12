@@ -45,6 +45,7 @@ const accounts = (selectedAccountId: string): AccountsResponse => ({
     { adapter: 'robinhood', account: robinhood },
     { adapter: 'snaptrade', accounts: { [paper.id]: paper } },
   ],
+  canConnectSnapTrade: false,
 })
 
 describe('reading the account list', () => {

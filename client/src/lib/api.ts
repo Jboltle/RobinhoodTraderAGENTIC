@@ -476,6 +476,19 @@ export interface AccountsResponse {
   brokers: BrokerEntry[]
   /** Absent when every account can be read. */
   unusableAccounts?: UnusableAccount[]
+  /** Whether this sign-in may connect another broker (the dialog's "Other broker"). */
+  canConnectSnapTrade: boolean
+}
+
+/** POST /api/snaptrade/sync: what the sync found at SnapTrade and did here. */
+export interface SnapTradeSyncResult {
+  added: number
+  updated: number
+  disconnected: number
+  skippedReadOnlyConnections: number
+  skippedSandboxConnections: number
+  /** Connections whose accounts SnapTrade does not list yet. */
+  connectionsAwaitingAccounts: number
 }
 
 /** GET /api/broker/status: the connection state of the account being viewed. */
@@ -592,6 +605,25 @@ export const disconnectBroker = (accountId: string): Promise<void> =>
 /** POST the dead-end 127.0.0.1 redirect URL the user pasted after approving. */
 export const submitBrokerRedirect = (redirectUrl: string): Promise<void> =>
   postJson<{ ok: true }>('/api/broker/callback', { redirectUrl }).then(() => undefined)
+
+/**
+ * A fresh SnapTrade Connection Portal link, for any broker or (`reconnect`,
+ * a connection id) to repair one. It expires in five minutes: ask for it as
+ * the portal opens.
+ */
+export const fetchSnapTradeLink = (accountId: string, reconnect?: string): Promise<string> =>
+  postJson<{ url: string }>(
+    '/api/snaptrade/link',
+    reconnect === undefined ? {} : { reconnect },
+    accountId,
+  ).then((r) => r.url)
+
+/**
+ * Bring in the accounts SnapTrade lists. A new one copies the settings of
+ * `accountId`, the account being viewed, but starts in approval mode.
+ */
+export const syncSnapTrade = (accountId: string): Promise<SnapTradeSyncResult> =>
+  postJson<SnapTradeSyncResult>('/api/snaptrade/sync', {}, accountId)
 
 /** What POST /api/auth/login issues, and what lib/auth.tsx keeps. */
 export interface Session {

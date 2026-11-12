@@ -51,6 +51,7 @@ const paper: SnapTradeAccountSummary = {
 const viewingRobinhood: AccountsResponse = {
   selectedAccountId: robinhood.id,
   brokers: [{ adapter: 'robinhood', account: robinhood }],
+  canConnectSnapTrade: false,
 }
 const viewingPaper = (robinhoodConnected: boolean): AccountsResponse => ({
   selectedAccountId: paper.id,
@@ -58,6 +59,7 @@ const viewingPaper = (robinhoodConnected: boolean): AccountsResponse => ({
     { adapter: 'robinhood', account: { ...robinhood, connected: robinhoodConnected } },
     { adapter: 'snaptrade', accounts: { [paper.id]: paper } },
   ],
+  canConnectSnapTrade: false,
 })
 
 /** TanStack Query passes a context object after the variables; ignore it. */

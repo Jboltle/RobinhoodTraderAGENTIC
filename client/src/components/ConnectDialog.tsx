@@ -3,8 +3,14 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ExternalLink, X } from 'lucide-react'
 
 import { ACCOUNTS_QUERY_KEY, listAccounts, useAccounts } from '../lib/accounts'
-import { connectBroker, fetchBrokerStatus, submitBrokerRedirect } from '../lib/api'
-import type { BrokerStatus } from '../lib/api'
+import {
+  connectBroker,
+  fetchBrokerStatus,
+  fetchSnapTradeLink,
+  submitBrokerRedirect,
+  syncSnapTrade,
+} from '../lib/api'
+import type { BrokerStatus, SnapTradeSyncResult } from '../lib/api'
 
 const STATUS_POLL_MS = 5000
 const CLIPBOARD_POLL_MS = 1000
@@ -12,13 +18,41 @@ const SUCCESS_CLOSE_MS = 1500
 /** A pasted callback URL always has this; anything else in the clipboard isn't one. */
 const CALLBACK_URL_RE = /^https?:\/\/\S*[?&]code=[^&\s]+/
 
+const ROBINHOOD_TITLE = 'Connect Robinhood'
+const CHOICE_TITLE = 'Connect an account'
+const OTHER_BROKER_TITLE = 'Connect another broker'
+const PORTAL_CLOSED_NOTICE = 'The broker connection was closed before it finished. Nothing was connected.'
+const PORTAL_FAILED_NOTICE = 'The broker connection did not finish:'
+const NO_ACCOUNT_LIST_NOTICE = 'Your accounts could not be read, so nothing was started. Try again.'
+
 /**
- * The Robinhood connect/reconnect dialog, shared by the dashboard's
- * ConnectBanner, the settings page's connection section and the account menu.
- * It connects the user's direct Robinhood account whichever account is being
- * viewed; the server's connect and callback routes do the same.
+ * What the open dialog shows. `loading` waits for the account list, which
+ * says whether there is a choice to offer.
+ */
+type Step = 'loading' | 'choose' | 'robinhood' | 'other'
+
+/** The portal's code and a link for it, fetched together as the portal opens. */
+interface OpenPortal {
+  Portal: typeof import('./SnapTradePortal').default
+  url: string
+}
+
+/**
+ * The connect/reconnect dialog, shared by the dashboard's ConnectBanner, the
+ * settings page's connection section and the account menu.
  *
- * Opening it starts the flow: with `force` the server tears down the current
+ * A sign-in that may connect other brokers (the account list says so) first
+ * chooses between Robinhood and another broker; everyone else goes straight
+ * to Robinhood. Another broker is connected in SnapTrade's Connection Portal
+ * (SnapTradePortal); once it reports success the accounts are synced in and
+ * the account list is read again. `repairConnectionId` opens that portal
+ * directly, to repair one SnapTrade connection.
+ *
+ * The Robinhood flow connects the user's direct Robinhood account whichever
+ * account is being viewed; the server's connect and callback routes do the
+ * same.
+ *
+ * Choosing it starts the flow: with `force` the server tears down the current
  * session first, so a wedged-but-"connected" session gets a real retry.
  * Robinhood itself cannot be framed (X-Frame-Options: SAMEORIGIN), so the user
  * opens the consent page in a new tab from a button inside the dialog — a
@@ -35,19 +69,42 @@ export function ConnectDialog({
   open,
   force,
   onClose,
+  repairConnectionId,
 }: {
   open: boolean
   force: boolean
   onClose: () => void
+  /** Open straight into the portal, to repair this SnapTrade connection. */
+  repairConnectionId?: string
 }) {
   const queryClient = useQueryClient()
   const accounts = useAccounts({ refetchInterval: open ? STATUS_POLL_MS : false })
+
+  const [chosen, setChosen] = useState<Step | null>(null)
+  /** Why the dialog is back at the choice: the portal failed or was closed. */
+  const [notice, setNotice] = useState<string | null>(null)
+  const [portal, setPortal] = useState<OpenPortal | null>(null)
+
+  // An account list that could not be read offers no choice: every user has a
+  // Robinhood account, and that login is what this dialog always was.
+  const firstStep: Step =
+    accounts.isPending
+      ? 'loading'
+      : repairConnectionId !== undefined
+        ? 'other'
+        : accounts.data?.canConnectSnapTrade
+          ? 'choose'
+          : 'robinhood'
+  const step = open ? (chosen ?? firstStep) : null
+  const robinhoodOpen = step === 'robinhood'
+  const otherOpen = step === 'other'
+
   // Mounted closed on every page via ConnectBanner, so it polls only while
   // open: that is when `connected` flipping after the paste closes the flow.
   const status = useQuery<BrokerStatus>({
     queryKey: ['broker-status'],
     queryFn: fetchBrokerStatus,
-    refetchInterval: open ? STATUS_POLL_MS : false,
+    refetchInterval: robinhoodOpen ? STATUS_POLL_MS : false,
     retry: false,
     // The account menu mounts this outside AccountGate: closed, it asks for
     // no account's status before the list has said which account is viewed.
@@ -77,19 +134,87 @@ export function ConnectDialog({
     },
   })
 
-  // Opening the dialog is the "start connecting" gesture.
+  // Reaching the Robinhood step is the "start connecting" gesture.
   const startConnect = useRef(connect.mutate)
   startConnect.current = connect.mutate
   useEffect(() => {
-    if (open) startConnect.current({ force })
-  }, [open, force])
+    if (robinhoodOpen) startConnect.current({ force })
+  }, [robinhoodOpen, force])
 
+  // ---- Another broker, through SnapTrade --------------------------------------
+
+  // The account the screens show: a new account copies its settings.
+  const viewedAccountId = accounts.data?.selectedAccountId
+
+  const backToChoice = (message: string): void => {
+    setPortal(null)
+    setChosen('choose')
+    setNotice(message)
+  }
+  // A link that arrives after the dialog was closed opens nothing, then or
+  // at the next opening: it would be a stale one.
+  const openRef = useRef(open)
+  openRef.current = open
+
+  const openPortal = useMutation({
+    // The link lives five minutes, so it is asked for only now, together
+    // with the portal's code: antd is not in the bundle everyone downloads.
+    mutationFn: async (accountId: string): Promise<OpenPortal> => {
+      const [module, url] = await Promise.all([
+        import('./SnapTradePortal'),
+        fetchSnapTradeLink(accountId, repairConnectionId),
+      ])
+      return { Portal: module.default, url }
+    },
+    onSuccess: (opened) => {
+      if (openRef.current) setPortal(opened)
+    },
+    onError: (error: Error) => {
+      if (openRef.current) backToChoice(error.message)
+    },
+  })
+
+  const sync = useMutation({
+    mutationFn: (accountId: string) => syncSnapTrade(accountId),
+    // Done only once the list is read again: the menu then has the new accounts.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY }),
+  })
+
+  const startOther = useRef<() => void>(() => {})
+  startOther.current = () => {
+    sync.reset()
+    if (viewedAccountId === undefined) backToChoice(NO_ACCOUNT_LIST_NOTICE)
+    else openPortal.mutate(viewedAccountId)
+  }
+  useEffect(() => {
+    if (!otherOpen) return
+    // Held as a choice: a repair that succeeds clears `repairConnectionId`,
+    // and the dialog must stay on its result rather than fall back to step one.
+    setChosen('other')
+    startOther.current()
+  }, [otherOpen])
+
+  // Closed, it forgets the choice: the next opening starts from the beginning.
+  useEffect(() => {
+    if (open) return
+    setChosen(null)
+    setNotice(null)
+    setPortal(null)
+  }, [open])
+
+  // The portal is a modal of its own; this dialog steps aside while it shows.
+  const dialogShown = open && portal === null
   useEffect(() => {
     const el = dialogRef.current
     if (!el) return
-    if (open && !el.open) el.showModal()
-    if (!open && el.open) el.close()
-  }, [open])
+    if (dialogShown && !el.open) el.showModal()
+    if (!dialogShown && el.open) el.close()
+  }, [dialogShown])
+
+  const firstChoiceRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (step === 'choose' && dialogShown) firstChoiceRef.current?.focus()
+  }, [step, dialogShown])
 
   // This dialog always connects the user's direct Robinhood account, and the
   // status above describes whichever account is being viewed. While that is
@@ -101,30 +226,42 @@ export function ConnectDialog({
   const data = status.data
   const pendingUrl = authUrl ?? data?.authUrl ?? null
   const connected = viewingRobinhood ? data?.connected === true : robinhood.connected
-  const awaitingPaste = open && !connected && pendingUrl !== null && !submit.isSuccess
+  const awaitingPaste = robinhoodOpen && !connected && pendingUrl !== null && !submit.isSuccess
 
   useEffect(() => {
-    if (!connected || !open) return
+    if (!connected || !robinhoodOpen) return
     // The account menu lists this connection too.
     void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
     const timer = setTimeout(() => onCloseRef.current(), SUCCESS_CLOSE_MS)
     return () => clearTimeout(timer)
-  }, [connected, open, queryClient])
+  }, [connected, robinhoodOpen, queryClient])
 
   const clipboard = useClipboardCallback(awaitingPaste, (url) => {
     if (!submit.isPending) submit.mutate(url)
   })
 
+  const title =
+    step === 'other'
+      ? OTHER_BROKER_TITLE
+      : step === 'choose' || step === 'loading'
+        ? CHOICE_TITLE
+        : ROBINHOOD_TITLE
+  const showsRobinhood = step === null || robinhoodOpen
+
   return (
+    <>
     <dialog
       ref={dialogRef}
-      aria-label="Connect Robinhood"
-      onClose={onClose}
+      aria-label={title}
+      // Stepping aside for the portal closes the element, not the flow.
+      onClose={() => {
+        if (portal === null) onClose()
+      }}
       className="m-auto w-[calc(100%-2rem)] max-w-xl rounded-xl border border-warn/40 bg-ink-800 p-5 text-white backdrop:bg-black/60"
     >
       <div className="flex items-start justify-between gap-3">
         <h2 className="text-sm font-medium text-white">
-          {connected ? 'Connected' : 'Connect Robinhood'}
+          {showsRobinhood && connected ? 'Connected' : title}
         </h2>
         <button
           type="button"
@@ -136,7 +273,88 @@ export function ConnectDialog({
         </button>
       </div>
 
-      {connected ? (
+      {step === 'loading' && (
+        <p role="status" className="mt-3 text-xs text-ink-400">
+          Loading your accounts…
+        </p>
+      )}
+
+      {step === 'choose' && (
+        <>
+          <div role="group" aria-label="What to connect" className="mt-4 grid gap-3 sm:grid-cols-2">
+            <button
+              ref={firstChoiceRef}
+              type="button"
+              onClick={() => setChosen('robinhood')}
+              className={choiceClass}
+            >
+              <span className="text-sm font-medium text-white">
+                {robinhood?.connected ? 'Reconnect Robinhood' : 'Robinhood'}
+              </span>
+              <span className="text-xs text-ink-400">Sign in to your Robinhood account.</span>
+            </button>
+            <button type="button" onClick={() => setChosen('other')} className={choiceClass}>
+              <span className="text-sm font-medium text-white">Other broker</span>
+              <span className="text-xs text-ink-400">
+                Pick your broker and sign in to it through SnapTrade. {NEW_ACCOUNT_NOTE}
+              </span>
+            </button>
+          </div>
+          {notice !== null && (
+            <p role="alert" className="mt-3 text-xs text-loss">
+              {notice}
+            </p>
+          )}
+        </>
+      )}
+
+      {otherOpen && (
+        <div className="mt-4 flex flex-col gap-3">
+          {openPortal.isPending && (
+            <p role="status" className="text-xs text-ink-400">
+              Opening the broker connection…
+            </p>
+          )}
+          {sync.isPending && (
+            <p role="status" className="text-xs text-ink-400">
+              Broker connected. Adding its accounts…
+            </p>
+          )}
+          {sync.isError && (
+            <p role="alert" className="text-xs text-loss">
+              The broker is connected, but its accounts could not be added:{' '}
+              {(sync.error as Error).message}
+            </p>
+          )}
+          {sync.isSuccess && (
+            <p role="status" className="text-sm text-ink-400">
+              {syncSummary(sync.data)}
+            </p>
+          )}
+          {(sync.isError || sync.isSuccess) && (
+            <div className="flex flex-wrap items-center gap-3">
+              {(sync.isError || sync.data?.added === 0) && viewedAccountId !== undefined && (
+                <button
+                  type="button"
+                  onClick={() => sync.mutate(viewedAccountId)}
+                  className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-opacity hover:bg-brand/80"
+                >
+                  Sync again
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-lg border border-ink-600 px-4 py-2 text-sm text-ink-400 transition-colors hover:text-white"
+              >
+                Done
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {showsRobinhood && (connected ? (
         <p className="mt-3 text-sm text-ink-400">Robinhood is connected.</p>
       ) : (
         <div className="mt-4 flex flex-col gap-4">
@@ -211,9 +429,42 @@ export function ConnectDialog({
             </div>
           )}
         </div>
-      )}
+      ))}
     </dialog>
+
+    {open && portal !== null && (
+      <portal.Portal
+        loginLink={portal.url}
+        onSuccess={() => {
+          setPortal(null)
+          if (viewedAccountId !== undefined) sync.mutate(viewedAccountId)
+        }}
+        onError={(detail) => backToChoice(`${PORTAL_FAILED_NOTICE} ${detail}`)}
+        onExit={() => backToChoice(PORTAL_CLOSED_NOTICE)}
+      />
+    )}
+    </>
   )
+}
+
+const NEW_ACCOUNT_NOTE =
+  'A new account starts in approval mode, with the settings of the account you are viewing.'
+
+const choiceClass =
+  'flex flex-col gap-1 rounded-lg border border-ink-600 bg-ink-900 px-4 py-3 text-left transition-colors hover:border-brand focus-visible:border-brand focus-visible:outline-none'
+
+/** What a sync did, in the dialog's words. Never "added" when nothing was. */
+function syncSummary(result: SnapTradeSyncResult): string {
+  if (result.added > 0) {
+    return `Added ${result.added} ${result.added === 1 ? 'account' : 'accounts'}, now in the account menu. ${NEW_ACCOUNT_NOTE}`
+  }
+  if (result.connectionsAwaitingAccounts > 0) {
+    return 'The broker is connected, but SnapTrade does not list its accounts yet. That can take a few minutes: sync again shortly.'
+  }
+  if (result.updated > 0) {
+    return 'No new account was found. The accounts already here are up to date.'
+  }
+  return 'No account that can place trades was found at SnapTrade.'
 }
 
 /** The two things that surprise people, said before they hit the button. */

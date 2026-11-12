@@ -1,7 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { connectsThroughRobinhood, selectedAccount, useAccounts } from '../lib/accounts'
+import {
+  connectionToRepair,
+  connectsThroughRobinhood,
+  selectedAccount,
+  useAccounts,
+} from '../lib/accounts'
 import { fetchBrokerStatus } from '../lib/api'
 import type { BrokerStatus } from '../lib/api'
 import { ConnectDialog } from './ConnectDialog'
@@ -23,8 +28,9 @@ const STATUS_POLL_MS = 30_000
  * submit, and the pipeline only fans out to accounts with a stored connection.
  *
  * The Connect button is the Robinhood login, so it shows only while the
- * Robinhood account is the one being viewed; any other account gets the
- * notice alone until its own way of connecting exists.
+ * Robinhood account is the one being viewed. Another broker's account gets a
+ * Reconnect button when its brokerage login broke and this sign-in may repair
+ * it, and the notice alone otherwise.
  *
  * It also keeps the dashboard honest: the moment the server reports
  * disconnected, the broker-derived caches are dropped so account numbers and
@@ -45,6 +51,7 @@ export function ConnectBanner() {
   // Undefined when the account list could not be read: the notice then names
   // no account, and the button still says what it does.
   const account = selectedAccount(accounts.data)
+  const repairConnectionId = connectionToRepair(accounts.data)
 
   const data = status.data
   const connected = data?.connected
@@ -81,6 +88,15 @@ export function ConnectBanner() {
               Connect {account?.label ?? ROBINHOOD_LABEL}
             </button>
           )}
+          {repairConnectionId !== undefined && (
+            <button
+              type="button"
+              onClick={() => setDialogOpen(true)}
+              className="rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30"
+            >
+              Reconnect {account?.label}
+            </button>
+          )}
         </div>
       )}
 
@@ -88,6 +104,7 @@ export function ConnectBanner() {
         open={dialogOpen}
         force={false}
         onClose={() => setDialogOpen(false)}
+        repairConnectionId={repairConnectionId}
       />
     </>
   )

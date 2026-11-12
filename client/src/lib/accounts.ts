@@ -20,6 +20,8 @@ export const ACCOUNTS_QUERY_KEY = ['accounts'] as const
 /** An account together with the adapter it is reached through. */
 export interface ListedAccount extends AccountSummary {
   adapter: BrokerEntry['adapter']
+  /** The SnapTrade connection the account came from; absent on a Robinhood account. */
+  connectionId?: string
 }
 
 interface AccountsQueryOptions {
@@ -87,6 +89,15 @@ export function useSelectedAccount(): ListedAccount | undefined {
  */
 export function connectsThroughRobinhood(account: ListedAccount | undefined): boolean {
   return account === undefined || account.adapter === 'robinhood'
+}
+
+/**
+ * The SnapTrade connection to repair for the viewed account: set when its
+ * brokerage login broke and this sign-in may open the portal to fix it.
+ */
+export function connectionToRepair(response: AccountsResponse | undefined): string | undefined {
+  const account = selectedAccount(response)
+  return response?.canConnectSnapTrade && account?.needsReconnect ? account.connectionId : undefined
 }
 
 /** What an account is doing with callouts right now, in the menu's words. */

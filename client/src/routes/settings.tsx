@@ -20,6 +20,7 @@ import { TrimLadder } from '../components/book/TrimLadder'
 import { ConnectDialog } from '../components/ConnectDialog'
 import {
   ACCOUNTS_QUERY_KEY,
+  connectionToRepair,
   connectsThroughRobinhood,
   selectedAccount,
   useAccounts,
@@ -89,13 +90,16 @@ const UNNAMED_ACCOUNT = 'Account'
  * authorize-and-paste dialog only appears when Robinhood no longer accepts it.
  *
  * Connect and Reconnect are the Robinhood login, so they show only while the
- * Robinhood account is the one being viewed.
+ * Robinhood account is the one being viewed. Another broker's account shows
+ * Reconnect when its brokerage login broke: that opens SnapTrade's portal for
+ * its connection.
  */
 function BrokerSection({ account }: { account: ListedAccount | undefined }) {
   const queryClient = useQueryClient()
   const accountId = useViewedAccountId()
   const label = account?.label ?? UNNAMED_ACCOUNT
   const isRobinhood = connectsThroughRobinhood(account)
+  const repairConnectionId = connectionToRepair(useAccounts().data)
   // Kept fresh by ConnectBanner's poll (mounted on every page); this query
   // just subscribes to the same cache entry.
   const status = useQuery<BrokerStatus>({
@@ -146,6 +150,15 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
             {connected ? 'Reconnect' : 'Connect'}
           </button>
         )}
+        {repairConnectionId !== undefined && (
+          <button
+            type="button"
+            onClick={() => setDialogOpen(true)}
+            className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-brand/80"
+          >
+            Reconnect
+          </button>
+        )}
         {connected && (
           <button
             type="button"
@@ -174,6 +187,7 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
         open={dialogOpen}
         force
         onClose={() => setDialogOpen(false)}
+        repairConnectionId={repairConnectionId}
       />
     </FormSection>
   )

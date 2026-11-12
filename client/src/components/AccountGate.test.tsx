@@ -19,6 +19,7 @@ const PAPER = 'account-paper'
 const listViewing = (selectedAccountId: string): AccountsResponse => ({
   selectedAccountId,
   brokers: [],
+  canConnectSnapTrade: false,
 })
 
 const pendingOn = (accountId: string): Decision => ({

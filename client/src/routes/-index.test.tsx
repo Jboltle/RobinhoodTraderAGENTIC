@@ -16,6 +16,7 @@ import { Route } from './index'
 const listViewing = (selectedAccountId: string): AccountsResponse => ({
   selectedAccountId,
   brokers: [],
+  canConnectSnapTrade: false,
 })
 
 const api = vi.hoisted(() => ({
