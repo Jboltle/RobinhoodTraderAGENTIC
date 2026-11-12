@@ -135,6 +135,24 @@ describe('quote source: which session is asked', () => {
     expect(dead.session.ensureReady).toHaveBeenCalledOnce();
   });
 
+  it('leaves out the session behind a broker the caller watched fail', async () => {
+    const failed = readySession();
+    const next = readySession();
+    const state: QuoteSessionState = { preferredAccountId: null };
+    const { quotes } = setup({ u1: failed, u2: next }, state);
+    const first = await quotes.broker();
+    expect(first).toBe(failed.broker);
+
+    expect(await quotes.broker(first!)).toBe(next.broker);
+    expect(state.preferredAccountId).toBe('u2');
+    expect(failed.session.ensureReady).toHaveBeenCalledOnce();
+
+    // With nothing else connected there is no session left to hand out.
+    const alone = readySession();
+    const only = setup({ u1: alone }).quotes;
+    expect(await only.broker((await only.broker())!)).toBeNull();
+  });
+
   describe('with stalled sessions', () => {
     afterEach(() => {
       vi.useRealTimers();

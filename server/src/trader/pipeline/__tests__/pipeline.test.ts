@@ -884,6 +884,57 @@ describe('fan-out — which session checks the entry', () => {
     expect(decision!.kind).toBe('submitted');
     expect(placedOrders(broken.broker, 'option')).toHaveLength(1);
   });
+
+  /** Ready when picked, then every quote fails: its login was revoked under it. */
+  const sessionDyingMidCheck = (): CheckSession =>
+    readySession(
+      makeBroker({
+        equityMark: () => {
+          throw new BrokerUnavailableError('Robinhood authorization required');
+        },
+      })
+    );
+
+  it('holds a mismatching entry for approval when the first session dies mid-check and the second is healthy', async () => {
+    const dying = sessionDyingMidCheck();
+    const healthy = readySession(makeBroker());
+    const { db, deps, pick } = setupSessions(entryOn('MAMZN'), {
+      [USER]: dying,
+      [OTHER_USER]: healthy,
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    for (const userId of [USER, OTHER_USER]) {
+      const [decision] = await db.listDecisions(userId, 10);
+      expect(decision!.kind).toBe('pending_approval');
+      expect(decision!.reason).toMatch(/caller 710 strike, MAMZN at 150\.00/);
+    }
+    expect(placedOrders(dying.broker, 'option')).toHaveLength(0);
+    expect(placedOrders(healthy.broker, 'option')).toHaveLength(0);
+    // Picked twice, and the session that failed was not handed back or asked again.
+    expect(pick).toHaveBeenCalledTimes(2);
+    expect(dying.session.ensureReady).toHaveBeenCalledOnce();
+    expect(markReads(dying.broker, 'equity')).toHaveLength(1);
+    expect(markReads(healthy.broker, 'equity')).toHaveLength(1);
+  });
+
+  it('retries on one other session only: a second death leaves the entry unchecked', async () => {
+    const third = readySession(makeBroker());
+    const { db, deps, pick } = setupSessions(entryOn('MGOOG'), {
+      [USER]: sessionDyingMidCheck(),
+      [OTHER_USER]: sessionDyingMidCheck(),
+      'user-3': third,
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(pick).toHaveBeenCalledTimes(2);
+    expect(third.session.ensureReady).not.toHaveBeenCalled();
+    expect(markReads(third.broker, 'equity')).toHaveLength(0);
+    const [decision] = await db.listDecisions('user-3', 10);
+    expect(decision!.kind).toBe('submitted');
+  });
 });
 
 describe('fan-out — several users', () => {

@@ -29,8 +29,11 @@ export interface QuoteSource {
    * account's broker would begin an OAuth flow nobody asked for.
    *
    * Reads through it are live; whatever decides an order reads here.
+   *
+   * `skip` leaves out the session behind that broker: the one the caller just
+   * watched fail a call, so the pick moves on instead of handing it back.
    */
-  broker(): Promise<Broker | null>;
+  broker(skip?: Broker): Promise<Broker | null>;
   /**
    * The instrument's price, at most MARK_CACHE_MS old. Null when no session
    * can price it right now; a missing price is never remembered.
@@ -58,7 +61,7 @@ export function createQuoteSource(
   // Upgrade path: drop expired entries on a timer and share the in-flight read.
   const marks = new Map<string, CachedMark>();
 
-  async function broker(): Promise<Broker | null> {
+  async function broker(skip?: Broker): Promise<Broker | null> {
     const accounts = await deps.db.listConnectedAccounts();
     const preferred = accounts.find((account) => account.id === state.preferredAccountId);
     const ordered = preferred
@@ -71,7 +74,7 @@ export function createQuoteSource(
     for (const account of ordered) {
       try {
         const candidate = deps.brokers.for(account);
-        if (!candidate.quotesOptions) continue;
+        if (!candidate.quotesOptions || candidate.broker === skip) continue;
         await candidate.session.ensureReady(Math.max(0, deadline - Date.now()));
         state.preferredAccountId = account.id;
         return candidate.broker;

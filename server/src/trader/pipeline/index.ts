@@ -18,7 +18,7 @@ import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js
 import { instrumentOf } from '../broker/instrument.js';
 import type { QuoteSource } from '../broker/quotes.js';
 import type { McpRegistry } from '../broker/registry.js';
-import type { AccountRow } from '../broker/types.js';
+import type { AccountRow, Broker } from '../broker/types.js';
 import {
   allocateFifo,
   entryMismatch,
@@ -726,42 +726,24 @@ async function entryMismatchReason(
   const cached = entryVerdicts.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const contract = instrumentOf({ symbol: ticker, assetType: 'option', option });
-
-  let reason: string | null = null;
+  let reason: string | null;
   try {
     // Read live, not from the quote source's cache: this price decides whether
     // the entry is placed or held for approval. Picked inside the try: a
     // session that fails in a way of its own skips the check, not the message.
-    const broker = await deps.quotes.broker();
-    if (broker === null) return null;
-    let spot: number | null = null;
+    const first = await deps.quotes.broker();
+    if (first === null) return null;
     try {
-      const price = await broker.getMark({ kind: 'equity', symbol: ticker });
-      if (price !== null && price > 0) spot = price;
+      reason = await entryMismatchOn(first, ticker, option, callout.limitPrice);
     } catch (err) {
-      // No equity quote (SPX, XSP) leaves spot null and the chain check runs.
-      // A dead session fails the chain the same way, so it still aborts here.
-      if (err instanceof BrokerUnavailableError) throw err;
-    }
-    try {
-      await broker.confirmInstrument(contract);
-    } catch (err) {
-      if (err instanceof SymbolNotFoundError) {
-        reason = `no such contract: ${ticker} ${optionLabel(option)}`;
-      } else {
-        throw err;
-      }
-    }
-    if (!reason) {
-      const mark = await broker.getMark(contract).catch(() => null);
-      reason = entryMismatch({
-        ticker,
-        strike: option.strike,
-        spot,
-        callerPremium: callout.limitPrice,
-        mark,
-      });
+      if (!(err instanceof BrokerUnavailableError)) throw err;
+      // That session was ready and then failed a call: its login was revoked
+      // under it. Another account's may be healthy, so pick again without it.
+      // Once only: the pick can wait a ready timeout, and exits queue behind
+      // this check.
+      const second = await deps.quotes.broker(first);
+      if (second === null) return null;
+      reason = await entryMismatchOn(second, ticker, option, callout.limitPrice);
     }
   } catch (err: unknown) {
     if (err instanceof BrokerUnavailableError) return null;
@@ -770,6 +752,33 @@ async function entryMismatchReason(
   }
   entryVerdicts.set(cacheKey, reason);
   return reason;
+}
+
+/** One pass of the entry check through one session's broker; rejects when that session cannot answer. */
+async function entryMismatchOn(
+  broker: Broker,
+  ticker: string,
+  option: OptionContract,
+  callerPremium: number | null
+): Promise<string | null> {
+  const contract = instrumentOf({ symbol: ticker, assetType: 'option', option });
+  let spot: number | null = null;
+  try {
+    const price = await broker.getMark({ kind: 'equity', symbol: ticker });
+    if (price !== null && price > 0) spot = price;
+  } catch (err) {
+    // No equity quote (SPX, XSP) leaves spot null and the chain check runs.
+    // A dead session fails the chain the same way, so it still aborts here.
+    if (err instanceof BrokerUnavailableError) throw err;
+  }
+  try {
+    await broker.confirmInstrument(contract);
+  } catch (err) {
+    if (err instanceof SymbolNotFoundError) return `no such contract: ${ticker} ${optionLabel(option)}`;
+    throw err;
+  }
+  const mark = await broker.getMark(contract).catch(() => null);
+  return entryMismatch({ ticker, strike: option.strike, spot, callerPremium, mark });
 }
 
 async function loadSettings(accountId: string, deps: PipelineDeps): Promise<ResolvedTradeSettings> {
