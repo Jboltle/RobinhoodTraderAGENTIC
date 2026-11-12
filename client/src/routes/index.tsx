@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import type { UseQueryResult } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
 import { CalloutCard } from '../components/CalloutCard'
@@ -102,7 +103,7 @@ function Dashboard() {
 
       <Book
         callers={callers.data ?? []}
-        followedCallerIds={followedCallerIds}
+        settings={settings}
         decisionByMessageId={decisionByMessageId}
       />
 
@@ -175,11 +176,12 @@ function PendingApprovals({ decisions }: { decisions: Decision[] }) {
 
 function Book({
   callers,
-  followedCallerIds,
+  settings,
   decisionByMessageId,
 }: {
   callers: Caller[]
-  followedCallerIds: string[] | null
+  /** The viewed account's settings: whom it follows. */
+  settings: UseQueryResult<TradeSettings>
   decisionByMessageId: Map<string, Decision>
 }) {
   const [period, setPeriod] = useState<BookPeriod>('today')
@@ -196,11 +198,18 @@ function Book({
   })
 
   const callerById = useMemo(() => new Map(callers.map((c) => [c.authorId, c])), [callers])
-  const open = filterByCaller(book.data?.open ?? [], selection, followedCallerIds)
-  const closed = filterByCaller(book.data?.closed ?? [], selection, followedCallerIds)
-  // Null until the book has loaded: an empty book and no book yet (first
-  // load, or just after an account switch emptied the cache) are different.
-  const summary = book.data ? summarizeBook(open, closed) : null
+  // Whom the account follows is not known until its settings have loaded,
+  // and the book arrives first as often as not. The Following view waits for
+  // both: everyone's figures must never stand in for the account's own.
+  const awaitingSettings = selection === 'following' && settings.data === undefined
+  const entries = awaitingSettings ? undefined : book.data
+  const followedCallerIds = settings.data?.followedCallerIds ?? null
+  const open = filterByCaller(entries?.open ?? [], selection, followedCallerIds)
+  const closed = filterByCaller(entries?.closed ?? [], selection, followedCallerIds)
+  // Null until there is something to total: an empty book and no book yet
+  // (first load, or just after an account switch emptied the cache) are
+  // different.
+  const summary = entries ? summarizeBook(open, closed) : null
   const needle = tickerFilter.trim().toUpperCase()
   const visibleOpen = needle ? open.filter((p) => p.ticker.includes(needle)) : open
 
@@ -229,6 +238,11 @@ function Book({
             Book unavailable ({(book.error as Error).message})
           </p>
         )}
+        {awaitingSettings && settings.isError && (
+          <p className="rounded-md bg-warn/10 px-3 py-1.5 text-xs text-warn">
+            Followed Callers unavailable ({(settings.error as Error).message})
+          </p>
+        )}
         {book.data && (
           <span className="ml-auto text-xs text-ink-500">
             marks as of {new Date(book.data.asOf).toLocaleTimeString()}
@@ -240,7 +254,7 @@ function Book({
 
       <div>
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <SectionTitle inline>Open {book.data ? open.length : '—'}</SectionTitle>
+          <SectionTitle inline>Open {entries ? open.length : '—'}</SectionTitle>
           <input
             type="search"
             value={tickerFilter}
@@ -263,8 +277,10 @@ function Book({
             ))}
           </div>
         </div>
-        {book.isPending && <EmptyState>Loading…</EmptyState>}
-        {book.isSuccess && visibleOpen.length === 0 && (
+        {(book.isPending || (awaitingSettings && settings.isPending)) && (
+          <EmptyState>Loading…</EmptyState>
+        )}
+        {entries && book.isSuccess && visibleOpen.length === 0 && (
           <EmptyState>
             {open.length === 0
               ? 'No open entries. A Caller’s next Buy shows up here, priced every 15 s during market hours.'
@@ -288,9 +304,11 @@ function Book({
 
       <div>
         <SectionTitle>
-          {CLOSED_HEADING[period]} {book.data ? closed.length : '—'}
+          {CLOSED_HEADING[period]} {entries ? closed.length : '—'}
         </SectionTitle>
-        {book.isSuccess && closed.length === 0 && <EmptyState>Nothing closed in this period.</EmptyState>}
+        {entries && book.isSuccess && closed.length === 0 && (
+          <EmptyState>Nothing closed in this period.</EmptyState>
+        )}
         {closed.length > 0 && (
           <ul className="flex flex-col gap-2">
             {closed.map((position) => (
