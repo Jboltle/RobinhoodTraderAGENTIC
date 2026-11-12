@@ -119,6 +119,62 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('submitted');
   });
 
+  it("approving an option sell cancels the lot's resting stop, then places the sell", async () => {
+    const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    const optionOrder = {
+      symbol: 'QQQ',
+      assetType: 'option' as const,
+      limitPrice: null,
+      option: contract,
+    };
+    harness.db.seedMessage({ messageId: 'buy-QQQ', sentAt: '2026-07-14T14:00:00.000Z' });
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('buy-QQQ', {
+        at: '2026-07-14T14:00:00.000Z',
+        ticker: 'QQQ',
+        order: {
+          ...optionOrder,
+          side: 'buy',
+          quantity: 4,
+          orderType: 'limit',
+          limitPrice: 1,
+          orderId: 'buy-1',
+          status: 'filled',
+          stopOrderId: 'stop-1',
+        },
+      })
+    );
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('msg-pending-sell', {
+        kind: 'pending_approval',
+        ticker: 'QQQ',
+        action: 'sell',
+        order: {
+          ...optionOrder,
+          side: 'sell',
+          quantity: 1,
+          orderType: 'market',
+          orderId: null,
+          status: null,
+        },
+      })
+    );
+
+    const response = await send('POST', '/api/trades/msg-pending-sell/approve', {});
+
+    expect((response.json() as { decision: Decision }).decision.kind).toBe('submitted');
+    const broker = harness.fakeBroker(USER.id);
+    expect(broker.cancelOrder.mock.calls).toEqual([['stop-1']]);
+    expect(broker.placeOrder).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ side: 'sell', quantity: 1, type: 'market' })
+    );
+    expect(broker.cancelOrder.mock.invocationCallOrder[0]!).toBeLessThan(
+      broker.placeOrder.mock.invocationCallOrder[0]!
+    );
+  });
+
   // The README's promise, now enforced: a deployment held by the kill switch
   // refuses the Approve button and leaves the row pending for later.
   it.each(['approval', 'read_only'] as const)(

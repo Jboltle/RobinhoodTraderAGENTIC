@@ -15,6 +15,7 @@ import type {
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
 import {
   makeFakeBroker,
+  equityPosition,
   makeFakeRegistry,
   markReads,
   optionPosition,
@@ -332,6 +333,51 @@ describe('fan-out — TRIM exit', () => {
     expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
+  it("cancels a stop resting on the caller's lot, then places the sell", async () => {
+    const { db, deps, broker } = setup(TRIM_QQQ_FIRST.expectedCallout);
+    db.seedMessage({ messageId: 'buy-caller', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'test-author' });
+    db.seedDecision(USER, {
+      at: '2026-06-11T13:00:00.000Z',
+      messageId: 'buy-caller',
+      kind: 'submitted',
+      code: null,
+      reason: 'filled',
+      ticker: 'QQQ',
+      action: 'buy',
+      order: {
+        symbol: 'QQQ',
+        side: 'buy',
+        assetType: 'option',
+        quantity: 5,
+        orderType: 'limit',
+        limitPrice: 1,
+        option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
+        orderId: 'buy-caller',
+        status: 'filled',
+        stopOrderId: 'stop-1',
+      },
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(TRIM_QQQ_FIRST));
+
+    expect(broker.cancelOrder.mock.calls).toEqual([['stop-1']]);
+    expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 1 }]);
+    expect(broker.cancelOrder.mock.invocationCallOrder[0]!).toBeLessThan(
+      broker.placeOrder.mock.invocationCallOrder[0]!
+    );
+  });
+
+  // The shared fake filters positions by kind itself, so only the argument
+  // shows a caller that asked the broker for everything.
+  it('sizes the exit from option positions only', async () => {
+    const { broker } = await runWith(
+      envelopeFromFixture(TRIM_QQQ_FIRST),
+      TRIM_QQQ_FIRST.expectedCallout
+    );
+
+    expect(broker.getPositions.mock.calls).toEqual([['option']]);
+  });
+
   it('rejects option exits when the matching position is not open', async () => {
     const { decision, broker } = await runWith(
       envelopeFromFixture(TRIM_QQQ_FIRST),
@@ -539,6 +585,22 @@ describe('fan-out — parse consistency guardrails', () => {
     expect(decision.code).toBe('parse_inconsistent');
     expect(decision.reason).toMatch(/option premium misread/);
     expect(placedOrders(broker, 'equity')).toHaveLength(0);
+  });
+
+  it('gates an equity add on stock positions only', async () => {
+    const envelope: DiscordEnvelope = {
+      ...INCIDENT_ENVELOPE,
+      messageId: 'equity-add',
+      content: 'adding some AAPL here, 145 limit',
+    };
+    const { decision, broker } = await runWith(
+      envelope,
+      { ...BAD_EQUITY_PARSE, limitPrice: 145, isAddition: true },
+      { positions: [equityPosition('AAPL', 10)] }
+    );
+
+    expect(decision.kind).toBe('submitted');
+    expect(broker.getPositions.mock.calls).toEqual([['equity']]);
   });
 
   it('still submits a plausible equity limit buy', async () => {
