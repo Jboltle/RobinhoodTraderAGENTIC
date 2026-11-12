@@ -13,6 +13,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Callout, CalloutParser, Decision, TradeSettings } from '../../shared/types.js';
+import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry } from '../broker/registry.js';
 import type { AccountRow, BrokerAdapter } from '../broker/types.js';
@@ -119,7 +120,11 @@ beforeEach(() => {
   harness.configureBroker(ACCOUNT_B, { connected: false, portfolioValueUsd: 0 });
 });
 
-/** Every authenticated endpoint, as B would call it. */
+/**
+ * Every authenticated endpoint, as B would call it. Each request names the
+ * caller's own selected account, as the dashboard does: a change is refused
+ * without it, which would leave these checks with nothing to see.
+ */
 const B_REQUESTS = [
   { name: 'GET /api/settings', method: 'GET' as const, url: '/api/settings' },
   {
@@ -162,12 +167,11 @@ describe('user B cannot see user A', () => {
       const response = await harness.as(TOKEN_B, {
         method: request.method,
         url: request.url,
-        ...(request.payload
-          ? {
-              headers: { 'content-type': 'application/json' },
-              payload: JSON.stringify(request.payload),
-            }
-          : {}),
+        headers: {
+          [VIEWED_ACCOUNT_HEADER]: ACCOUNT_B,
+          ...(request.payload ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(request.payload ? { payload: JSON.stringify(request.payload) } : {}),
       });
 
       const body = response.body;
@@ -192,7 +196,7 @@ describe('user B cannot see user A', () => {
     await harness.as(TOKEN_B, {
       method: 'PUT',
       url: '/api/settings',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', [VIEWED_ACCOUNT_HEADER]: ACCOUNT_B },
       payload: JSON.stringify({ maxTradesPerDay: 9 }),
     });
 
@@ -229,7 +233,7 @@ describe('user B cannot see user A', () => {
     const response = await harness.as(TOKEN_B, {
       method: 'POST',
       url: '/api/trades/msg-pending/approve',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', [VIEWED_ACCOUNT_HEADER]: ACCOUNT_B },
       payload: '{}',
     });
 
@@ -254,7 +258,11 @@ describe('user B cannot see user A', () => {
   });
 
   it("B disconnecting leaves A's broker tokens in place", async () => {
-    await harness.as(TOKEN_B, { method: 'POST', url: '/api/broker/disconnect' });
+    await harness.as(TOKEN_B, {
+      method: 'POST',
+      url: '/api/broker/disconnect',
+      headers: { [VIEWED_ACCOUNT_HEADER]: ACCOUNT_B },
+    });
     expect(await harness.db.getBrokerTokens(ACCOUNT_A)).not.toBeNull();
   });
 
@@ -645,12 +653,11 @@ describe('routes act on the selected account, never on the user id', () => {
       const response = await harness.as(TOKEN_OWNER, {
         method: request.method,
         url: request.url,
-        ...(request.payload
-          ? {
-              headers: { 'content-type': 'application/json' },
-              payload: JSON.stringify(request.payload),
-            }
-          : {}),
+        headers: {
+          [VIEWED_ACCOUNT_HEADER]: ROBINHOOD.id,
+          ...(request.payload ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(request.payload ? { payload: JSON.stringify(request.payload) } : {}),
       });
 
       expect(response.statusCode).toBeLessThan(500);
@@ -690,7 +697,7 @@ describe('routes act on the selected account, never on the user id', () => {
     await harness.as(TOKEN_OWNER, {
       method: 'PUT',
       url: '/api/settings',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', [VIEWED_ACCOUNT_HEADER]: ROBINHOOD.id },
       payload: JSON.stringify({ maxTradesPerDay: 2 }),
     });
 
@@ -702,7 +709,7 @@ describe('routes act on the selected account, never on the user id', () => {
     const response = await harness.as(TOKEN_OWNER, {
       method: 'POST',
       url: '/api/trades/msg-pending/approve',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', [VIEWED_ACCOUNT_HEADER]: ROBINHOOD.id },
       payload: '{}',
     });
 

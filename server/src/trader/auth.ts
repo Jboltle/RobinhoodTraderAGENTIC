@@ -49,7 +49,8 @@ const PUBLIC_ROUTES = new Set(['/health', '/api/auth/login']);
  * can only get a request refused. It is refused when the selection has moved
  * since that page last loaded it (a switch made in another tab), so an Approve
  * or a settings save never lands on an account the user is not looking at.
- * A request without the header (curl, the scripts) is not checked.
+ * A read without the header (curl, the scripts) is not checked; a request
+ * that changes something must carry it (ACCOUNT_NOT_NAMED_CODE below).
  */
 export const VIEWED_ACCOUNT_HEADER = 'x-viewed-account';
 /** `code` on the 409 above, so the dashboard can tell it from every other 409. */
@@ -57,8 +58,34 @@ export const ACCOUNT_CHANGED_CODE = 'account_changed';
 const ACCOUNT_CHANGED_ERROR =
   'The selected account changed since this page loaded it. Nothing was done.';
 
+/**
+ * `code` on the 409 a request that changes something gets when it names no
+ * account. A page that never learned which account it shows (its account list
+ * failed to load, or its bundle predates the header) would otherwise act on
+ * whichever account is selected now: an Approve clicked on one account's card
+ * placing the other account's order.
+ */
+export const ACCOUNT_NOT_NAMED_CODE = 'account_not_named';
+const ACCOUNT_NOT_NAMED_ERROR = 'This page is out of date. Reload it and try again. Nothing was done.';
+
 /** How a stale tab finds out what is selected now, and signs out: never refused as stale. */
 const SELECTION_ROUTES = new Set(['/api/accounts', '/api/accounts/select', '/api/auth/logout']);
+
+/**
+ * The Robinhood login acts on the user's Robinhood account whichever account
+ * is selected, so it need not name one.
+ */
+const ROBINHOOD_LOGIN_ROUTES = new Set(['/api/broker/connect', '/api/broker/callback']);
+
+const READ_METHODS = new Set(['GET', 'HEAD']);
+
+/**
+ * Whether a request must name the account it believes it acts on. Every route
+ * that is not a read does, unless it is listed above: a route added later is
+ * covered without anyone remembering to list it.
+ */
+const mustNameAccount = (method: string, route: string): boolean =>
+  !READ_METHODS.has(method) && !SELECTION_ROUTES.has(route) && !ROBINHOOD_LOGIN_ROUTES.has(route);
 
 /** The acting user. Throws rather than returning null so a route cannot forget the check. */
 export function requireUser(request: FastifyRequest): AuthUser {
@@ -100,7 +127,11 @@ export function registerAuth(fastify: FastifyInstance, db: TraderDb): void {
     }
 
     const viewed = request.headers[VIEWED_ACCOUNT_HEADER];
-    if (viewed !== undefined && viewed !== session.account?.id && !SELECTION_ROUTES.has(route)) {
+    if (viewed === undefined) {
+      if (mustNameAccount(request.method, route)) {
+        return reply.status(409).send({ error: ACCOUNT_NOT_NAMED_ERROR, code: ACCOUNT_NOT_NAMED_CODE });
+      }
+    } else if (viewed !== session.account?.id && !SELECTION_ROUTES.has(route)) {
       return reply.status(409).send({ error: ACCOUNT_CHANGED_ERROR, code: ACCOUNT_CHANGED_CODE });
     }
 

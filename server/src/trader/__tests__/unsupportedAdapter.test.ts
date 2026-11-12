@@ -12,6 +12,7 @@ import {
   type Decision,
   type TradeSettings,
 } from '../../shared/types.js';
+import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { restoreSessions } from '../broker/registry.js';
 import type { OrderRequest } from '../broker/types.js';
@@ -338,7 +339,11 @@ describe('the routes, when the selected account is one whose adapter is not depl
   it('approve answers the same 409 and leaves the trade pending', async () => {
     harness.db.seedDecision(UNSUPPORTED.id, { ...openLot('filled'), messageId: PENDING_MESSAGE_ID, kind: 'pending_approval' });
 
-    const response = await harness.as(TOKEN, { method: 'POST', url: `/api/trades/${PENDING_MESSAGE_ID}/approve` });
+    const response = await harness.as(TOKEN, {
+      method: 'POST',
+      url: `/api/trades/${PENDING_MESSAGE_ID}/approve`,
+      headers: { [VIEWED_ACCOUNT_HEADER]: UNSUPPORTED.id },
+    });
 
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual(UNAVAILABLE);

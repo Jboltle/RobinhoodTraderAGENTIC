@@ -7,11 +7,11 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { Decision } from '../../shared/types.js';
-import { ACCOUNT_CHANGED_CODE, VIEWED_ACCOUNT_HEADER } from '../auth.js';
+import { ACCOUNT_CHANGED_CODE, ACCOUNT_NOT_NAMED_CODE, VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import type { AccountRow } from '../broker/types.js';
 import type { AccountsResponse } from '../server.js';
 import { fakeAccount, fakeTokens } from './fakeDb.js';
-import { makeHarness, type Harness } from './harness.js';
+import { makeHarness, placedOrders, type Harness } from './harness.js';
 
 const OWNER = { id: 'user-owner', email: 'owner@example.com' };
 const TOKEN_OWNER = 'token-for-owner';
@@ -56,8 +56,26 @@ const trade = (orderId: string): Decision => ({
   },
 });
 
+/** A sized order parked for approval, as approval mode leaves it. */
+const PENDING: Decision = {
+  ...trade('unsent'),
+  messageId: 'msg-pending',
+  kind: 'pending_approval',
+  order: { ...trade('unsent').order!, orderId: null, status: null },
+};
+
 let harness: Harness;
 
+const asPageShowing = (accountId: string, method: 'GET' | 'POST' | 'PUT', url: string, body?: unknown) =>
+  harness.as(TOKEN_OWNER, {
+    method,
+    url,
+    headers: {
+      [VIEWED_ACCOUNT_HEADER]: accountId,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { payload: JSON.stringify(body) }),
+  });
 const asOwner = (method: 'GET' | 'POST' | 'PUT', url: string, body?: unknown) =>
   harness.as(TOKEN_OWNER, {
     method,
@@ -203,7 +221,7 @@ describe('POST /api/accounts/select', () => {
   it('a settings save after a switch lands on the newly selected account only', async () => {
     await select(PAPER.id);
 
-    await asOwner('PUT', '/api/settings', { maxTradesPerDay: 2 });
+    await asPageShowing(PAPER.id, 'PUT', '/api/settings', { maxTradesPerDay: 2 });
 
     expect((await harness.db.getSettings(PAPER.id)).maxTradesPerDay).toBe(2);
     expect((await harness.db.getSettings(ROBINHOOD.id)).maxTradesPerDay).toBe(ROBINHOOD_MAX_TRADES);
@@ -337,8 +355,9 @@ describe('the Robinhood login while another account is selected', () => {
   });
 
   it('disconnect leaves the Robinhood connection alone', async () => {
-    await asOwner('POST', '/api/broker/disconnect', {});
+    const response = await asPageShowing(PAPER.id, 'POST', '/api/broker/disconnect', {});
 
+    expect(response.statusCode).toBe(200);
     expect(await harness.db.getBrokerTokens(ROBINHOOD.id)).not.toBeNull();
   });
 });
@@ -347,24 +366,6 @@ describe('the Robinhood login while another account is selected', () => {
 // The header never chooses the account; it only gets a request refused when
 // the selection has moved under that page.
 describe('a page still showing an account that is no longer selected', () => {
-  const PENDING: Decision = {
-    ...trade('unsent'),
-    messageId: 'msg-pending',
-    kind: 'pending_approval',
-    order: { ...trade('unsent').order!, orderId: null, status: null },
-  };
-
-  const asPageShowing = (accountId: string, method: 'GET' | 'POST' | 'PUT', url: string, body?: unknown) =>
-    harness.as(TOKEN_OWNER, {
-      method,
-      url,
-      headers: {
-        [VIEWED_ACCOUNT_HEADER]: accountId,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      ...(body === undefined ? {} : { payload: JSON.stringify(body) }),
-    });
-
   beforeEach(async () => {
     // Both accounts hold the same callout for approval, as a fan-out leaves them.
     harness.db.seedDecision(ROBINHOOD.id, PENDING);
@@ -422,9 +423,11 @@ describe('a page still showing an account that is no longer selected', () => {
     expect((await harness.db.getSettings(ROBINHOOD.id)).maxTradesPerDay).toBe(1);
   });
 
-  it('a request that names no account is not checked', async () => {
-    expect((await asOwner('PUT', '/api/settings', { maxTradesPerDay: 1 })).statusCode).toBe(200);
-    expect((await harness.db.getSettings(ROBINHOOD.id)).maxTradesPerDay).toBe(1);
+  it('a read that names no account is not checked', async () => {
+    const response = await asOwner('GET', '/api/settings');
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ settings: { maxTradesPerDay: ROBINHOOD_MAX_TRADES } });
   });
 
   it('naming another user\'s account gets nothing but the refusal', async () => {
@@ -435,5 +438,96 @@ describe('a page still showing an account that is no longer selected', () => {
       error: expect.stringContaining('selected account changed'),
       code: ACCOUNT_CHANGED_CODE,
     });
+  });
+});
+
+// A page that never learned which account it is showing (its account list
+// failed to load, or it runs a bundle from before the header existed) sends no
+// x-viewed-account. Whatever it does would land on whichever account is
+// selected now, so a request that changes something is refused without it.
+describe('a request that changes something, from a page that names no account', () => {
+  const ACTIONS = [
+    { name: 'approve', method: 'POST', url: '/api/trades/msg-pending/approve', body: {} },
+    { name: 'reject', method: 'POST', url: '/api/trades/msg-pending/reject', body: {} },
+    { name: 'settings save', method: 'PUT', url: '/api/settings', body: { maxTradesPerDay: 1 } },
+    { name: 'disconnect', method: 'POST', url: '/api/broker/disconnect', body: {} },
+  ] as const;
+
+  const pendingKind = async (accountId: string): Promise<string | undefined> =>
+    (await harness.db.decisionsByMessageId(accountId, ['msg-pending'])).get('msg-pending')?.kind;
+
+  beforeEach(() => {
+    // Both accounts hold the same callout for approval, as a fan-out leaves them.
+    harness.db.seedDecision(ROBINHOOD.id, PENDING);
+    harness.db.seedDecision(PAPER.id, PENDING);
+    harness.db.seedBrokerTokens(PAPER.id, fakeTokens('paper-token'));
+  });
+
+  for (const action of ACTIONS) {
+    it(`${action.name} is refused, and nothing is written or placed`, async () => {
+      harness.db.calls.length = 0;
+
+      const response = await asOwner(action.method, action.url, action.body);
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({
+        error: expect.stringContaining('Reload'),
+        code: ACCOUNT_NOT_NAMED_CODE,
+      });
+      expect(harness.db.calls).toEqual([]);
+      for (const account of [ROBINHOOD, PAPER]) {
+        expect(await pendingKind(account.id), account.id).toBe('pending_approval');
+        expect(await harness.db.getBrokerTokens(account.id), account.id).not.toBeNull();
+        expect(harness.brokers.existing(account.id), account.id).toBeUndefined();
+      }
+      expect((await harness.db.getSettings(ROBINHOOD.id)).maxTradesPerDay).toBe(ROBINHOOD_MAX_TRADES);
+      expect((await harness.db.getSettings(PAPER.id)).maxTradesPerDay).toBe(PAPER_MAX_TRADES);
+    });
+  }
+
+  it('each goes through once the page names the selected account', async () => {
+    const settings = await asPageShowing(ROBINHOOD.id, 'PUT', '/api/settings', { maxTradesPerDay: 1 });
+    expect(settings.statusCode).toBe(200);
+    expect((await harness.db.getSettings(ROBINHOOD.id)).maxTradesPerDay).toBe(1);
+
+    const approve = await asPageShowing(ROBINHOOD.id, 'POST', '/api/trades/msg-pending/approve', {});
+    expect(approve.statusCode).toBe(200);
+    expect(await pendingKind(ROBINHOOD.id)).toBe('submitted');
+
+    harness.db.seedDecision(ROBINHOOD.id, { ...PENDING, messageId: 'msg-other' });
+    const reject = await asPageShowing(ROBINHOOD.id, 'POST', '/api/trades/msg-other/reject', {});
+    expect(reject.statusCode).toBe(200);
+    expect((await harness.db.decisionsByMessageId(ROBINHOOD.id, ['msg-other'])).get('msg-other')?.kind).toBe('rejected');
+
+    const disconnect = await asPageShowing(ROBINHOOD.id, 'POST', '/api/broker/disconnect', {});
+    expect(disconnect.statusCode).toBe(200);
+    expect(await harness.db.getBrokerTokens(ROBINHOOD.id)).toBeNull();
+  });
+
+  it('with both accounts pending on one callout, approve acts on the named and selected one only', async () => {
+    const response = await asPageShowing(ROBINHOOD.id, 'POST', '/api/trades/msg-pending/approve', {});
+
+    expect(response.statusCode).toBe(200);
+    expect(placedOrders(harness.fakeBroker(ROBINHOOD.id), 'equity')).toHaveLength(1);
+    expect(await pendingKind(ROBINHOOD.id)).toBe('submitted');
+    expect(await pendingKind(PAPER.id)).toBe('pending_approval');
+    expect(harness.brokers.existing(PAPER.id)).toBeUndefined();
+
+    // The same page, once paper is selected elsewhere: the paper row is not approved through it.
+    await select(PAPER.id);
+    const stale = await asPageShowing(ROBINHOOD.id, 'POST', '/api/trades/msg-pending/approve', {});
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toMatchObject({ code: ACCOUNT_CHANGED_CODE });
+    expect(await pendingKind(PAPER.id)).toBe('pending_approval');
+    expect(harness.brokers.existing(PAPER.id)).toBeUndefined();
+  });
+
+  it('the Robinhood login, selecting and signing out need not name one', async () => {
+    harness.configureBroker(ROBINHOOD.id, { connected: true });
+
+    expect((await asOwner('POST', '/api/broker/connect', {})).statusCode).toBe(200);
+    expect((await asOwner('POST', '/api/broker/callback', { redirectUrl: 'not a url' })).statusCode).toBe(400);
+    expect((await select(PAPER.id)).statusCode).toBe(200);
+    expect((await asOwner('POST', '/api/auth/logout')).statusCode).toBe(200);
   });
 });

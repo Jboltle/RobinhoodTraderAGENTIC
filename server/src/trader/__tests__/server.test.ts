@@ -17,6 +17,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision } from '../../shared/types.js';
+import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import type { StoredCallout } from '../db.js';
 import { fakeTokens, firstAccountId } from './fakeDb.js';
 import { equityPosition, makeHarness, markReads, optionPosition, type Harness } from './harness.js';
@@ -53,11 +54,12 @@ const calloutFixture = (messageId: string, timestamp: string): StoredCallout => 
 
 let harness: Harness;
 const get = (url: string) => harness.as(TOKEN, { method: 'GET', url });
+// Names the account it acts on, as the dashboard does: a change is refused without it.
 const send = (method: 'PUT' | 'POST', url: string, body: unknown) =>
   harness.as(TOKEN, {
     method,
     url,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', [VIEWED_ACCOUNT_HEADER]: ACCOUNT_ID },
     payload: JSON.stringify(body),
   });
 
