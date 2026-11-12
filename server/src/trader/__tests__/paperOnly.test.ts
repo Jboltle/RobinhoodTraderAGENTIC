@@ -310,7 +310,9 @@ describe.each(NOT_PAPER)('paper_only: a paper account beside %s', (_name, other)
       const response = await approve(other);
 
       expect(response.statusCode).toBe(409);
-      expect((response.json() as { error: string }).error).toContain(PAPER_ONLY);
+      expect((response.json() as { error: string }).error).toBe(
+        `this deployment runs TRADE_EXECUTION_MODE=${PAPER_ONLY} and this account is not a paper account; nothing can be approved on it here`
+      );
       expect((await harness.db.listDecisions(other.id, 10))[0]!.kind).toBe('pending_approval');
       expect(writes(harness.fakeBroker(other.id))).toBe(0);
     });

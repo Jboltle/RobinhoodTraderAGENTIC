@@ -354,8 +354,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   // ---- SnapTrade connect (owner only) -----------------------------------------
   //
-  // Both routes place no order, so a read_only deployment allows them: the
-  // write guard still refuses every order on every adapter. Both are changes,
+  // Both routes place no order, so a read_only or paper_only deployment allows
+  // them: the write guard still refuses every order of every account the mode
+  // holds. Both are changes,
   // so both must name the viewed account like any other (auth.ts): the sync
   // copies that account's settings onto a new account, and the link is issued
   // from the same dialog.
@@ -471,7 +472,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // pending so it can be approved once the deployment trades again.
     if (executionModeFor(deps.executionMode, account) !== 'immediate') {
       return reply.status(409).send({
-        error: `this deployment is held by TRADE_EXECUTION_MODE=${deps.executionMode}; nothing can be approved here`,
+        error:
+          deps.executionMode === 'paper_only'
+            ? 'this deployment runs TRADE_EXECUTION_MODE=paper_only and this account is not a paper account; nothing can be approved on it here'
+            : `this deployment is held by TRADE_EXECUTION_MODE=${deps.executionMode}; nothing can be approved here`,
       });
     }
 
