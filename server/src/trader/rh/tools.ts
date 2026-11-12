@@ -171,12 +171,17 @@ export class RobinhoodTools {
    * timestamp, so this is the only source for a real cost basis and for
    * ranking contracts by when they were opened. Returns null when the server
    * doesn't advertise the tool, so callers degrade instead of throwing.
+   * `orderId` narrows the read to that order (the tool's `order_id` filter);
+   * match the id on the result, since the list shape is the same either way.
    */
-  async getOptionOrders(): Promise<OptionOrdersResult | null> {
+  async getOptionOrders(orderId?: string): Promise<OptionOrdersResult | null> {
     if (!(await this.advertisedTools()).includes(TOOL_NAMES.optionOrders)) return null;
     return this.callTool(
       TOOL_NAMES.optionOrders,
-      { account_number: await this.getDefaultAccountNumber() },
+      {
+        account_number: await this.getDefaultAccountNumber(),
+        ...(orderId !== undefined ? { order_id: orderId } : {}),
+      },
       parseOptionOrders
     );
   }

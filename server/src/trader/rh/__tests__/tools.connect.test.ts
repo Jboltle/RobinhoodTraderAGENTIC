@@ -89,3 +89,51 @@ describe('RobinhoodTools connection', () => {
     expect((err as Error).message).toMatch(/fetch failed/);
   });
 });
+
+describe('RobinhoodTools.getOptionOrders', () => {
+  // Field names are the ones parseOptionOrders reads; no live payload is on file.
+  const STOP_ROW = {
+    id: 'stop-1',
+    chain_symbol: 'QQQ',
+    state: 'cancelled',
+    processed_quantity: '0.00000',
+    quantity: '2.00000',
+    legs: [{ side: 'sell', option_type: 'call', strike_price: '707.0000', expiration_date: '2026-06-11' }],
+  };
+
+  function makeOrdersMcp() {
+    const callTool = vi.fn(async (name: string, _args: Record<string, unknown>) =>
+      name === TOOL_NAMES.accounts
+        ? jsonResult({ accounts: [{ account_number: 'ACCT1', agentic_allowed: true, state: 'active' }] })
+        : jsonResult({ results: [STOP_ROW] })
+    );
+    return {
+      ensureReady: vi.fn(async () => undefined),
+      getToolNames: () => Object.values(TOOL_NAMES),
+      getTokenStatus: async () => ({ state: 'valid', hasRefreshToken: true }),
+      callTool,
+    };
+  }
+
+  const orderCalls = (mcp: ReturnType<typeof makeOrdersMcp>): unknown[] =>
+    mcp.callTool.mock.calls.filter((call) => call[0] === TOOL_NAMES.optionOrders).map((call) => call[1]);
+
+  it('filters by order id when one is given, and reads its state', async () => {
+    const mcp = makeOrdersMcp();
+    const tools = new RobinhoodTools(mcp as unknown as RobinhoodMcpClient);
+
+    const result = await tools.getOptionOrders('stop-1');
+
+    expect(orderCalls(mcp)).toEqual([{ account_number: 'ACCT1', order_id: 'stop-1' }]);
+    expect(result?.orders).toMatchObject([{ orderId: 'stop-1', state: 'cancelled', quantity: 0 }]);
+  });
+
+  it('sends no order filter for the history read', async () => {
+    const mcp = makeOrdersMcp();
+    const tools = new RobinhoodTools(mcp as unknown as RobinhoodMcpClient);
+
+    await tools.getOptionOrders();
+
+    expect(orderCalls(mcp)).toEqual([{ account_number: 'ACCT1' }]);
+  });
+});

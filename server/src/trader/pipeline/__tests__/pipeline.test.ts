@@ -1217,3 +1217,164 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
   });
 });
 
+
+describe('fan-out — option exit over a resting Max Loss stop', () => {
+  const EXIT_ID = envelopeFromFixture(TRIM_QQQ_FIRST).messageId;
+  /** What production logged on every stop cancel, as withRetry rethrows it. */
+  const REFUSED =
+    'cancel_option_order failed after 3 attempts: Tool cancel_option_order returned error: ' +
+    'API error 403: {"detail":"Order cannot be cancelled at this time."}';
+
+  interface StopLot {
+    readonly lotId: string;
+    readonly quantity: number;
+    readonly stopOrderId: string;
+    /** Broker state of the stop when its cancel is refused; absent when the cancel works. */
+    readonly refusedState?: string;
+  }
+
+  async function exitOver(
+    lots: readonly StopLot[],
+    readError?: Error
+  ): Promise<{ decision: Decision; tools: RobinhoodTools; db: FakeDb; stopIds: (string | null)[] }> {
+    const cancelOptionOrder = vi.fn(async (orderId: string) => {
+      if (lots.some((lot) => lot.stopOrderId === orderId && lot.refusedState !== undefined)) {
+        throw new Error(REFUSED);
+      }
+    });
+    const getOptionOrders = vi.fn(async (orderId?: string) => {
+      if (readError) throw readError;
+      const orders = lots
+        .filter((lot) => lot.stopOrderId === orderId && lot.refusedState !== undefined)
+        .map((lot) => ({
+          orderId: lot.stopOrderId,
+          symbol: 'QQQ',
+          optionType: 'call' as const,
+          strike: 707,
+          expiration: '2026-06-11',
+          side: 'sell' as const,
+          state: lot.refusedState!,
+          averagePrice: null,
+          quantity: lot.quantity,
+          createdAt: null,
+          raw: {},
+        }));
+      return { orders, raw: {} };
+    });
+    const { db, deps, tools } = setup(TRIM_QQQ_FIRST.expectedCallout, { cancelOptionOrder, getOptionOrders });
+    lots.forEach((lot, index) => {
+      const at = `2026-06-11T13:0${index}:00.000Z`;
+      db.seedMessage({ messageId: lot.lotId, sentAt: at, authorId: 'test-author' });
+      db.seedDecision(USER, {
+        at,
+        messageId: lot.lotId,
+        kind: 'submitted',
+        code: null,
+        reason: 'filled',
+        ticker: 'QQQ',
+        action: 'buy',
+        order: {
+          symbol: 'QQQ',
+          side: 'buy',
+          assetType: 'option',
+          quantity: lot.quantity,
+          orderType: 'limit',
+          limitPrice: 1,
+          option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
+          orderId: `buy-${lot.lotId}`,
+          status: 'filled',
+          filledQuantity: lot.quantity,
+          averageFillPrice: 1,
+          stopOrderId: lot.stopOrderId,
+        },
+      });
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(TRIM_QQQ_FIRST));
+
+    const rows = await db.listDecisions(USER, 10);
+    return {
+      decision: rows.find((row) => row.messageId === EXIT_ID)!,
+      tools,
+      db,
+      stopIds: lots.map((lot) => rows.find((row) => row.messageId === lot.lotId)?.order?.stopOrderId ?? null),
+    };
+  }
+
+  const placed = (tools: RobinhoodTools): unknown[][] =>
+    (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls;
+
+  it('cancels the stop, clears its id and sells, without reading the order', async () => {
+    const { decision, tools, stopIds } = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order?.lots).toEqual([{ lotId: 'lot-a', quantity: 1 }]);
+    expect(placed(tools)).toHaveLength(1);
+    expect(tools.cancelOptionOrder).toHaveBeenCalledExactlyOnceWith('stop-a');
+    expect(tools.getOptionOrders).not.toHaveBeenCalled();
+    expect(stopIds).toEqual([null]);
+  });
+
+  it.each(['cancelled', 'rejected', 'failed', 'voided'])(
+    'places the very same sell when the refused stop is %s',
+    async (refusedState) => {
+      const normal = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);
+      const refused = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState }]);
+
+      expect(refused.decision.kind).toBe('submitted');
+      expect(refused.decision.order).toEqual(normal.decision.order);
+      expect(refused.decision.reason).toBe(normal.decision.reason);
+      expect(placed(refused.tools)).toEqual(placed(normal.tools));
+      expect(refused.stopIds).toEqual([null]);
+    }
+  );
+
+  it.each(['confirmed', 'queued', 'partially_filled', 'pending_cancelled'])(
+    'fails as before and sells nothing while the refused stop is %s',
+    async (refusedState) => {
+      const { decision, tools, stopIds } = await exitOver([
+        { lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState },
+      ]);
+
+      expect(decision).toMatchObject({ kind: 'execution_failed', code: 'execution_error', reason: REFUSED });
+      expect(placed(tools)).toHaveLength(0);
+      expect(stopIds).toEqual(['stop-a']);
+    }
+  );
+
+  it('fails as before and sells nothing when the stop cannot be read', async () => {
+    const { decision, tools, stopIds } = await exitOver(
+      [{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState: 'cancelled' }],
+      new Error('get_option_orders failed after 3 attempts: fetch failed')
+    );
+
+    expect(decision).toMatchObject({ kind: 'execution_failed', code: 'execution_error', reason: REFUSED });
+    expect(placed(tools)).toHaveLength(0);
+    expect(stopIds).toEqual(['stop-a']);
+  });
+
+  it('sells after the older lot\'s dead stop and the newer lot\'s live one', async () => {
+    const { decision, tools, stopIds } = await exitOver([
+      { lotId: 'lot-old', quantity: 2, stopOrderId: 'stop-old', refusedState: 'cancelled' },
+      { lotId: 'lot-new', quantity: 3, stopOrderId: 'stop-new' },
+    ]);
+
+    expect(decision.kind).toBe('submitted');
+    expect(placed(tools)).toHaveLength(1);
+    expect(stopIds).toEqual([null, null]);
+  });
+
+  it('sells nothing when the refused stop had already filled, and closes that lot', async () => {
+    const { decision, tools, db, stopIds } = await exitOver([
+      { lotId: 'lot-old', quantity: 2, stopOrderId: 'stop-old', refusedState: 'filled' },
+      { lotId: 'lot-new', quantity: 3, stopOrderId: 'stop-new' },
+    ]);
+
+    expect(decision).toMatchObject({ kind: 'execution_failed', code: 'execution_error' });
+    expect(decision.reason).toMatch(/already filled/);
+    expect(placed(tools)).toHaveLength(0);
+    // The surviving lot keeps its working stop.
+    expect(stopIds).toEqual([null, 'stop-new']);
+    expect((await db.listOpenOptionLots(USER)).map((lot) => lot.lotId)).toEqual(['lot-new']);
+  });
+});

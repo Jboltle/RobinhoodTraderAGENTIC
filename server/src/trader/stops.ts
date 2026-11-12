@@ -4,14 +4,29 @@
  * selling past the free quantity is rejected as a sell-to-open.
  */
 import { createLogger } from '../shared/logger.js';
-import type { OptionContract, TradeExecutionMode } from '../shared/types.js';
+import { optionLabel, type Decision, type OptionContract, type TradeExecutionMode } from '../shared/types.js';
 import type { TraderDb } from './db.js';
-import { stopTrigger } from './lots.js';
+import { stopTrigger, type OpenOptionLot } from './lots.js';
 import { roundPremiumToTick, type RobinhoodTools } from './rh/tools.js';
+import type { OptionOrder } from './rh/types.js';
 
 const log = createLogger('trader:stops');
 
-/** Cancel resting stops on this contract. Clears the id even if the cancel 404s. */
+/** Broker states of a stop that sold nothing and never will. */
+const DEAD_STOP_STATES: ReadonlySet<string> = new Set(['cancelled', 'canceled', 'rejected', 'failed', 'voided']);
+const FILLED_STOP_STATE = 'filled';
+
+/**
+ * Cancel resting stops on this contract, clearing each stored id once its
+ * cancel succeeds.
+ *
+ * A failed cancel says nothing about the stop, so its state is read back by id:
+ * - dead (never filled): the id is cleared and the remaining lots carry on;
+ * - filled: the lot is closed by the stop's own sell, the id is cleared, and
+ *   this call still throws, so the caller places nothing;
+ * - anything else (working, unknown, not listed, unreadable): the id stays and
+ *   the cancel error is rethrown. A sell next to a live stop can sell twice.
+ */
 export async function cancelStops(
   db: TraderDb,
   userId: string,
@@ -34,15 +49,85 @@ export async function cancelStops(
     try {
       await tools.cancelOptionOrder(lot.stopOrderId);
     } catch (err: unknown) {
+      const stop = await readStop(tools, lot.stopOrderId);
+      const state = stop?.state?.toLowerCase() ?? null;
       log.warn('stop cancel failed', {
         userId,
+        lotId: lot.lotId,
         orderId: lot.stopOrderId,
+        state: stop?.state ?? null,
+        stopQuantity: stop?.quantity ?? null,
         error: err instanceof Error ? err.message : String(err),
       });
-      throw err;
+      if (stop !== null && state === FILLED_STOP_STATE) {
+        const sold = Math.min(lot.openQty, Math.floor(stop.quantity));
+        if (sold < 1) throw err;
+        // Recorded before the id is cleared: an open lot with no stop id gets a
+        // new stop on the next fill sweep, and with this lot's contracts gone
+        // that stop would rest on a newer lot's contracts at this lot's trigger.
+        await db.recordDecision(userId, stopFillDecision(lot, lot.stopOrderId, sold));
+        await db.updateOrder(userId, lot.messageId, { ...lot.buyOrder, stopOrderId: null });
+        // The caller sized and linked its sell while this lot still looked
+        // open, so that sell is not placed. The next exit sees the closed lot.
+        throw new Error(
+          `Max Loss stop had already filled: ${sold} ${lot.symbol} ${optionLabel(lot.option)} sold at Robinhood, ` +
+            'that lot is now closed. This exit was not placed.',
+          { cause: err }
+        );
+      }
+      if (state === null || !DEAD_STOP_STATES.has(state)) throw err;
     }
     await db.updateOrder(userId, lot.messageId, { ...lot.buyOrder, stopOrderId: null });
   }
+}
+
+/** The stop as Robinhood lists it now. Null when it is not listed or cannot be read. */
+async function readStop(tools: RobinhoodTools, orderId: string): Promise<OptionOrder | null> {
+  if (typeof tools.getOptionOrders !== 'function') return null;
+  try {
+    const history = await tools.getOptionOrders(orderId);
+    // Matched by id, so a server that ignored the filter cannot lend another order's state.
+    return history?.orders.find((order) => order.orderId === orderId) ?? null;
+  } catch (err: unknown) {
+    log.warn('stop state read failed', {
+      orderId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * The stop's fill as the sell that closed `sold` contracts of its lot.
+ *
+ * ponytail: no fill price or fill time. The broker's average price has no limit
+ * to check its scale against here, and nobody watched the fill happen. Upgrade
+ * path: the fill sweep follows resting stops and records the fill as it lands.
+ */
+function stopFillDecision(lot: OpenOptionLot, stopOrderId: string, sold: number): Decision {
+  return {
+    at: new Date().toISOString(),
+    // One row per stop order: recordDecision ignores a repeat of the same id.
+    messageId: `stop:${stopOrderId}`,
+    kind: 'max_loss_exit',
+    code: null,
+    reason: `Max Loss stop filled at Robinhood: sold ${sold} ${lot.symbol} ${optionLabel(lot.option)}`,
+    ticker: lot.symbol,
+    action: 'sell',
+    order: {
+      symbol: lot.symbol,
+      side: 'sell',
+      assetType: 'option',
+      quantity: sold,
+      orderType: 'market',
+      limitPrice: null,
+      option: lot.option,
+      orderId: stopOrderId,
+      status: FILLED_STOP_STATE,
+      filledQuantity: sold,
+      lots: [{ lotId: lot.lotId, quantity: sold }],
+    },
+  };
 }
 
 /**
@@ -85,6 +170,7 @@ export async function restMissingStops(args: {
         symbol: lot.symbol,
         contracts: lot.openQty,
         orderId: placed.orderId,
+        status: placed.status,
       });
     } catch (err: unknown) {
       log.warn('max-loss stop was not accepted', {
