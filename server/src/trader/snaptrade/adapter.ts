@@ -14,10 +14,12 @@ import { SnapTradeBroker, type SnapTradeBrokerClient } from './broker.js';
  * every account, and the brokerage login lives at SnapTrade. So "ready" is
  * what the account's row said when the session was opened, at no request.
  *
- * ponytail: a snapshot. A login that breaks afterwards is found when an order
- * is refused (HTTP 402); reads keep answering from SnapTrade's cache. Upgrade
- * path: the sync drops the account from the registry when `needsReconnect`
- * changes, so the next use opens it from the new row.
+ * A snapshot, so the sync route (server.ts), which is what changes the row,
+ * drops the account from the registry: its next use opens it from the new row.
+ *
+ * ponytail: a login that breaks between two syncs is found when an order is
+ * refused (HTTP 402); reads keep answering from SnapTrade's cache. Upgrade
+ * path: SnapTrade's connection-broken webhook running the same sync.
  */
 export class SnapTradeSession implements BrokerSession {
   constructor(private readonly needsReconnect: boolean) {}

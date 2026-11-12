@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { type CalloutParser, type Decision, type TradeExecutionMode, type TradeSettings } from '../../shared/types.js';
 import { deployedAdapters } from '../adapters.js';
 import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
-import { BrokerWritesDisabledError } from '../broker/errors.js';
+import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry, supportedAccounts, type McpRegistry } from '../broker/registry.js';
 import type { AccountRow, BrokerSession } from '../broker/types.js';
@@ -28,7 +28,12 @@ import {
 import { createMessageProcessor } from '../pipeline/index.js';
 import { buildServer } from '../server.js';
 import { createSnapTradeAdapter } from '../snaptrade/adapter.js';
-import { createSnapTrade } from '../snaptrade/client.js';
+import {
+  createSnapTrade,
+  type SnapTradeAccess,
+  type SnapTradeAccount,
+  type SnapTradeConnection,
+} from '../snaptrade/client.js';
 import {
   callNames,
   fakeSnapTradeClient,
@@ -44,8 +49,8 @@ const TOKEN = 'token-for-owner';
 const ROBINHOOD = fakeAccount('account-robinhood', OWNER.id);
 /** Connected by its row alone: nothing is stored under it. */
 const PAPER = fakeSnapTradeAccount('account-paper', OWNER.id);
-/** SnapTrade's own id for the account: what every request must name. */
-const PAPER_SNAPTRADE_ID = PAPER.externalAccountId;
+/** SnapTrade's own id for the account (fakeSnapTradeAccount's): what every request must name. */
+const PAPER_SNAPTRADE_ID = `external-${PAPER.id}`;
 
 /** Auto-executing and following everyone, with the calendar guards relaxed. */
 const TRADING: TradeSettings = {
@@ -150,10 +155,10 @@ async function processCallout(world: World, fixture: DiscordMessageFixture, mode
 type Request = (options: InjectOptions) => Promise<LightMyRequestResponse>;
 
 /** The dashboard's routes over the world, signed in as the owner, who views `viewed`. */
-function serve(world: World, viewed: AccountRow = PAPER, mode: TradeExecutionMode = 'immediate'): Request {
+function serve(world: World, viewed: AccountRow = PAPER, snapTrade: SnapTradeAccess | null = null): Request {
   const { db, events, brokers } = world;
   db.addAccount(viewed, { select: true });
-  const app = buildServer({ db, events, brokers, executionMode: mode, snapTrade: null });
+  const app = buildServer({ db, events, brokers, executionMode: 'immediate', snapTrade });
   return (options) =>
     app.inject({
       ...options,
@@ -381,5 +386,89 @@ describe('the dashboard routes, viewing a SnapTrade account that stores no crede
     expect(approved.json()).toEqual(NOT_CONNECTED);
     expect((await decisionsOf(world.db, PAPER.id))[0]!.kind).toBe('pending_approval');
     expect(world.sdk.calls).toEqual([]);
+  });
+});
+
+describe('a sync that changes a SnapTrade account row', () => {
+  const CONNECTION: SnapTradeConnection = {
+    id: PAPER.adapterData.connectionId,
+    brokerageSlug: 'ALPACA-PAPER',
+    brokerageName: 'Alpaca Paper',
+    type: 'trade',
+    disabled: false,
+  };
+  const LISTED: SnapTradeAccount = {
+    id: PAPER_SNAPTRADE_ID,
+    connectionId: CONNECTION.id,
+    displayName: 'Individual',
+    maskedAccountNumber: '1234',
+    isPaper: true,
+  };
+
+  /** What SnapTrade lists right now; a test changes it between syncs. */
+  interface Listing {
+    connections: SnapTradeConnection[];
+    accounts: SnapTradeAccount[];
+  }
+
+  function syncing(world: World, listing: Listing): () => Promise<void> {
+    const request = serve(world, PAPER, {
+      ownerEmail: OWNER.email,
+      client: {
+        portalLink: async () => 'https://app.snaptrade.com/portal',
+        listConnections: async () => listing.connections,
+        listAccounts: async () => listing.accounts,
+      },
+    });
+    return async () => {
+      const response = await request({ method: 'POST', url: '/api/snaptrade/sync' });
+      expect(response.statusCode).toBe(200);
+    };
+  }
+
+  /** The account's session as its next user gets it: from the row as stored now. */
+  const sessionNow = (world: World): BrokerSession => world.brokers.for(world.db.account(PAPER.id)).session;
+
+  it('drops the cached broker, so a login found broken stops the next use and a repaired one resumes it', async () => {
+    const world = makeWorld();
+    const listing: Listing = { connections: [CONNECTION], accounts: [LISTED] };
+    const sync = syncing(world, listing);
+    const opened = world.brokers.for(PAPER);
+    await expect(opened.session.ensureReady()).resolves.toBeUndefined();
+
+    listing.connections = [{ ...CONNECTION, disabled: true }];
+    await sync();
+
+    expect(world.brokers.existing(PAPER.id)).toBeUndefined();
+    await expect(sessionNow(world).ensureReady()).rejects.toBeInstanceOf(BrokerUnavailableError);
+
+    listing.connections = [CONNECTION];
+    await sync();
+
+    expect(world.brokers.existing(PAPER.id)).toBeUndefined();
+    await expect(sessionNow(world).ensureReady()).resolves.toBeUndefined();
+    expect(world.sdk.calls).toEqual([]);
+  });
+
+  it('an account SnapTrade no longer lists is dropped too, and takes no callout', async () => {
+    const world = makeWorld();
+    const sync = syncing(world, { connections: [], accounts: [] });
+    world.brokers.for(PAPER);
+
+    await sync();
+    await processCallout(world, BTO_QQQ_PUT, 'immediate');
+
+    expect(world.brokers.existing(PAPER.id)).toBeUndefined();
+    expect(world.sdk.calls).toEqual([]);
+    expect(placedOrders(world.robinhoodBroker, 'option')).toHaveLength(1);
+  });
+
+  it('leaves the Robinhood session alone', async () => {
+    const world = makeWorld();
+    const robinhood = world.brokers.for(ROBINHOOD);
+
+    await syncing(world, { connections: [CONNECTION], accounts: [LISTED] })();
+
+    expect(world.brokers.existing(ROBINHOOD.id)).toBe(robinhood);
   });
 });

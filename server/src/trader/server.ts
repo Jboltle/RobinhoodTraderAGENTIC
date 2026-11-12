@@ -397,6 +397,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     const { rows, ...found } = plan;
     const counts = await deps.db.syncSnapTradeAccounts(account.userId, account.id, rows);
+    // A SnapTrade session answers from the row it was opened with, and a sync
+    // is what changes that row (needs reconnect, disconnected, back again).
+    // Each of the user's SnapTrade accounts is opened again on its next use.
+    for (const { account: synced } of (await deps.db.listAccounts(account.userId)).accounts) {
+      if (synced.adapter !== 'snaptrade') continue;
+      deps.brokers.drop(synced.id);
+      connections.invalidate(synced.id);
+    }
     const result: SnapTradeSyncResponse = { ...counts, ...found };
     log.info('SnapTrade sync', { userId: account.userId, ...result });
     return reply.send(result);
