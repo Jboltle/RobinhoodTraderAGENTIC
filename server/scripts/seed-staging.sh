@@ -41,8 +41,10 @@ psql "$TARGET_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "
 
 # Shared archive first (no foreign keys), then users, then the rows that
 # reference users. allowed_emails + users let the same people sign in to
-# staging; trades give the dashboard its history.
-TABLES=(messages callers recaps recap_insights allowed_emails users trades)
+# staging; trades give the dashboard its history and tracked_callouts is the
+# caller book. Every production table is listed except the two excluded above;
+# a new table has to be added here, and is left out until someone has looked.
+TABLES=(messages callers tracked_callouts recaps recap_insights allowed_emails users trades)
 
 echo "== cloning production schema"
 psql "$TARGET_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "
@@ -69,6 +71,7 @@ echo "== target row counts"
 psql "$TARGET_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "
   select 'messages' t, count(*) from messages
   union all select 'callers', count(*) from callers
+  union all select 'tracked_callouts', count(*) from tracked_callouts
   union all select 'recaps', count(*) from recaps
   union all select 'allowed_emails', count(*) from allowed_emails
   union all select 'users', count(*) from users
