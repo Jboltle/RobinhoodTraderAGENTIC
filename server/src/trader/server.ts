@@ -995,7 +995,12 @@ async function collectPerformance(
   const [positions, decisions, openLots] = await Promise.all([
     broker.getPositions(),
     history,
-    lots,
+    // Lots that cannot be read price nothing: the rows still go out, options
+    // priced from order history as they were before the ledger was read.
+    lots.catch((err: unknown): OpenOptionLot[] => {
+      log.warn('performance: ledger lots unreadable', { error: (err as Error).message });
+      return [];
+    }),
   ]);
   // Already newest-first, so find() picks the most recent entry for a position.
   const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);

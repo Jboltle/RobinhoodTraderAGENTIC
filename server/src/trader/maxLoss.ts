@@ -45,6 +45,24 @@ export const FLATTEN_RETRY_MS = 10 * 60_000;
 /** Submit-time statuses that mean the broker did not accept the close. */
 const DEAD_ORDER_STATUSES = new Set(['rejected', 'canceled', 'cancelled', 'failed', 'expired']);
 
+/**
+ * How far above its own limit a lot's stored fill can sit and still be
+ * believed. A buy cannot fill above its limit, and the stored limit is the
+ * caller's price before it is rounded to the contract's tick for the broker,
+ * so a real fill can sit a tick above it. A fill beyond this is one the
+ * read-back stored unscaled (a per-contract fill under 20x the limit: an entry
+ * approved at its old limit after the contract fell more than 80%).
+ */
+const MAX_FILL_TO_LIMIT = 2;
+
+/**
+ * How far a lot's limit may sit from the broker's own figure for that order
+ * and still stand in for a fill that was never stored. Covers ordinary price
+ * improvement; an entry approved at its old limit after the contract fell
+ * fills far under it, and the limit is then no measure of what was paid.
+ */
+const LIMIT_STANDS_FOR_FILL_WITHIN = 0.1;
+
 /** How far back we look for the buy that opened a position. Same depth as performance. */
 const ENTRY_HISTORY_LIMIT = 500;
 
@@ -488,9 +506,9 @@ export function resolveEquityEntry(
 }
 
 /**
- * Entry basis for an option position: the account's own open lots while they
- * are the account's latest buy of the contract, else the rebuild from broker
- * order history. `lots` are that account's open lots. Shared with the
+ * Entry basis for an option position: the account's own open lots where they
+ * can be shown to describe it (ledgerOptionEntry), else the rebuild from
+ * broker order history. `lots` are that account's open lots. Shared with the
  * dashboard (server.ts), so the sweep and the percent shown always agree.
  */
 export function resolveOptionEntry(
@@ -501,15 +519,19 @@ export function resolveOptionEntry(
   orders: readonly BrokerOrder[] | null,
   mark: number | null
 ): number | null {
-  const bought = boughtNewestFirst(orders, contract);
+  const buys = pricedBuysNewestFirst(orders, contract);
   return (
-    ledgerOptionEntry(lots, contract, openQuantity, bought[0]?.orderId ?? null) ??
-    rebuildOptionEntry(submitted, contract, openQuantity, bought, mark)
+    ledgerOptionEntry(lots, submitted, contract, openQuantity, buys.filter(mayHaveBought)) ??
+    rebuildOptionEntry(submitted, contract, openQuantity, buys, mark)
   );
 }
 
-/** The broker's buys of one contract that bought something, newest first. */
-function boughtNewestFirst(
+/**
+ * The broker's buy orders of one contract that carry a price, newest first.
+ * Robinhood reports an unfilled order's limit where a fill price would be, so
+ * a price alone does not mean the order bought anything.
+ */
+function pricedBuysNewestFirst(
   orders: readonly BrokerOrder[] | null,
   contract: OptionInstrument
 ): BrokerOrder[] {
@@ -528,61 +550,128 @@ function boughtNewestFirst(
 }
 
 /**
- * Entry basis from the ledger: the newest open lots of this contract covering
- * the open contracts, each weighted by what it still holds. A lot's price was
- * scaled once against its own order's limit (fills.ts), which does not move;
- * the rebuild rescales against today's mark and reads a 1.59 fill reported as
- * 159 as the entry once the mark passes 5x it. Null when the lots cannot be
- * trusted to price the position; the caller then rebuilds.
+ * False only for a buy the broker reports dead with nothing bought: it added
+ * no contracts and never will, so it says nothing about what is held. An
+ * order still working may fill between two reads, and a cancelled one may
+ * have filled in part, so both count.
+ */
+function mayHaveBought(order: BrokerOrder): boolean {
+  return order.quantity > 0 || !DEAD_ORDER_STATUSES.has(order.status?.toLowerCase() ?? '');
+}
+
+/**
+ * Entry basis from the ledger, or null when the lots cannot be shown to
+ * describe the position; the caller then rebuilds, exactly as before the
+ * ledger was read. A lot's price was scaled once against its own order's
+ * limit (fills.ts), which does not move; the rebuild rescales against today's
+ * mark and reads a 1.59 fill reported as 159 as the entry once the mark
+ * passes 5x it.
  *
- * The lots price the contract only while the broker's latest buy of it
- * (`latestBuyOrderId`) is one of them. A lot outlives its contracts when a
- * Max Loss exit, a fired broker stop or a sale in the broker's app closes
- * them, and a new buy is no lot until its fill is read back; without this
- * check a re-entry would be priced at the lot it replaced and sold at once.
- * No buy in the broker's history also means the rebuild, which then reads
- * only the submitted limits and has no fill to misread.
+ * A lot outlives its contracts when a Max Loss exit, a fired broker stop or a
+ * sale in the broker's app closes them, a new buy is no lot until its fill is
+ * read back, and a sell counts against its lot before it fills. So the lots
+ * price the position only when all of this holds:
  *
- * ponytail: newest lots cover the position (sells close the oldest first,
- * allocateFifo), and contracts the lots do not cover, bought outside the
- * system before the newest lot, take the lots' price. The basis is off by
- * the real price gap between those buys, never by the 100x scale. Upgrade
- * path: close a lot when its contracts leave the account, and replay the
- * broker's buys and sells for the rest.
+ * - The broker's latest buy of the contract (`buys`, newest first) is the
+ *   newest lot's own order. No such buy in the broker's history means the
+ *   rebuild, which then reads only submitted limits and has no fill to misread.
+ * - The newest lot still holds the whole position, and alone prices it. Or
+ *   the books balance (booksBalance) and every lot prices what it holds. Or
+ *   it is the only lot, and either its own order bought the whole position
+ *   (a sell working against it, a fill not read back yet) or the rest was
+ *   bought outside the system.
+ * - Every lot used has a price to trust (hasTrustedPrice).
  *
- * ponytail: a market buy's lot is not priced. Its fill was scaled with no
- * limit to compare against (fills.ts), so the stored price can be 100x off
- * either way; a 0.15 premium stored as 15 would sell the position at once.
- * It still covers its contracts, so an older lot is never priced in its
- * place. Ceiling: a position held only through market buys keeps the
- * rebuild's misread. Upgrade path: scale a market fill against the mark read
- * when it fills, and store that.
+ * ponytail: contracts bought outside the system before the only lot take
+ * that lot's price; the basis is off by the real gap between those buys,
+ * never by the 100x scale. "Outside" means no submitted order of ours in the
+ * history read (ENTRY_HISTORY_LIMIT rows). Upgrade path: close a lot when its
+ * contracts leave the account, and replay the broker's buys and sells.
  */
 function ledgerOptionEntry(
   lots: readonly OpenOptionLot[],
+  submitted: readonly Decision[],
   contract: OptionInstrument,
   openQuantity: number,
-  latestBuyOrderId: string | null
+  buys: readonly BrokerOrder[]
 ): number | null {
-  const ofContract = lots.filter((lot) => sameOption(lot, contract.symbol, contract));
-  if (
-    latestBuyOrderId === null ||
-    !ofContract.some((lot) => lot.buyOrder.orderId === latestBuyOrderId)
-  ) {
-    return null;
+  const ofContract = lots.filter((lot) => sameOption(lot, contract.symbol, contract)).reverse();
+  const [newest] = ofContract;
+  const [latestBuy, ...earlierBuys] = buys;
+  if (!newest || !latestBuy?.orderId || newest.buyOrder.orderId !== latestBuy.orderId) return null;
+
+  const newestCovers = newest.openQty >= openQuantity;
+  if (!newestCovers) {
+    const explained =
+      ofContract.length > 1
+        ? booksBalance(ofContract, submitted, openQuantity, earlierBuys)
+        : latestBuy.quantity >= openQuantity ||
+          !earlierBuys.some((buy) => submitted.some((d) => d.order!.orderId === buy.orderId));
+    if (!explained) return null;
   }
-  let uncovered = openQuantity;
-  let cost = 0;
-  let priced = 0;
-  for (const lot of ofContract.reverse()) {
-    if (uncovered <= 0) break;
-    const held = Math.min(lot.openQty, uncovered);
-    uncovered -= held;
-    if (lot.buyOrder.limitPrice === null || !(lot.entryPrice > 0)) continue;
-    cost += lot.entryPrice * held;
-    priced += held;
-  }
-  return priced > 0 ? cost / priced : null;
+  const priced = newestCovers ? [newest] : ofContract;
+  if (!priced.every((lot) => hasTrustedPrice(lot, buys))) return null;
+  const contracts = priced.reduce((sum, lot) => sum + lot.openQty, 0);
+  return priced.reduce((sum, lot) => sum + lot.entryPrice * lot.openQty, 0) / contracts;
+}
+
+/**
+ * True when several lots of one contract account for the position exactly,
+ * with nothing that could hide a lot whose contracts are gone: the lots hold
+ * what the account holds, each is filled in full, every contract they show
+ * as sold was sold by a filled sell (a working or parked one is still held),
+ * and every earlier buy the broker shows is one of them.
+ */
+function booksBalance(
+  lots: readonly OpenOptionLot[],
+  submitted: readonly Decision[],
+  openQuantity: number,
+  earlierBuys: readonly BrokerOrder[]
+): boolean {
+  const lotIds = new Set(lots.map((lot) => lot.lotId));
+  const soldPerLots = lots.reduce((sum, lot) => sum + lot.originalQty - lot.openQty, 0);
+  const soldAndFilled = submitted
+    .filter((d) => d.order!.side === 'sell' && d.order!.status?.toLowerCase() === 'filled')
+    .flatMap((d) => d.order!.lots ?? [])
+    .filter((link) => lotIds.has(link.lotId))
+    .reduce((sum, link) => sum + link.quantity, 0);
+  return (
+    lots.reduce((sum, lot) => sum + lot.openQty, 0) === openQuantity &&
+    lots.every((lot) => lot.buyOrder.status?.toLowerCase() === 'filled') &&
+    soldPerLots === soldAndFilled &&
+    earlierBuys.every((buy) => lots.some((lot) => lot.buyOrder.orderId === buy.orderId))
+  );
+}
+
+/**
+ * A lot's price is trusted when it is a limit buy's stored fill no further
+ * above the limit than MAX_FILL_TO_LIMIT, or, with no fill stored, a limit
+ * the broker's own figure for that order bears out.
+ *
+ * ponytail: a market buy's lot has no price to trust. Its fill was scaled
+ * with no limit to compare against (fills.ts), so the stored price can be
+ * 100x off either way; a 0.15 premium stored as 15 would sell the position
+ * at once. Ceiling: a position with a market buy among its lots keeps the
+ * rebuild's misread. Upgrade path: scale a market fill against the mark read
+ * when it fills, and store that.
+ *
+ * ponytail: a fill under about 2% of its limit, reported per contract, still
+ * passes both checks 100x high. Upgrade path: apply the limit bound where
+ * the fill is stored (fills.ts), so the lot never holds such a price.
+ */
+function hasTrustedPrice(lot: OpenOptionLot, buys: readonly BrokerOrder[]): boolean {
+  const { limitPrice, averageFillPrice, orderId } = lot.buyOrder;
+  if (limitPrice === null || !(lot.entryPrice > 0)) return false;
+  if (averageFillPrice != null) return lot.entryPrice <= limitPrice * MAX_FILL_TO_LIMIT;
+  // No fill was stored, so the lot's price is its limit: believed only next
+  // to the broker's figure for the same order, read at either scale.
+  const reported = buys.find((buy) => buy.orderId === orderId)?.fillPrice;
+  return (
+    reported != null &&
+    [reported, reported / OPTION_MULTIPLIER].some(
+      (fill) => Math.abs(limitPrice / fill - 1) <= LIMIT_STANDS_FOR_FILL_WITHIN
+    )
+  );
 }
 
 /**

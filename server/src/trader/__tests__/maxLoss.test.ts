@@ -689,16 +689,20 @@ describe('sweepMaxLoss entry price from the account ledger', () => {
   const MAX_LOSS_PCT = 50;
   const EARLIER = '2026-09-08T13:00:00.000Z';
   const LATER = '2026-09-08T14:00:00.000Z';
-  /** A filled buy in the broker's order history. `orderId` defaults to the one submittedBuy stores. */
+  /**
+   * A buy in the broker's order history, filled unless `status` says otherwise.
+   * `orderId` defaults to the one submittedBuy stores; `quantity` is what the
+   * order has bought so far, as Robinhood's processed_quantity reports it.
+   */
   const brokerBuy = (
     fillPrice: number,
-    opts: { orderId?: string; quantity?: number; createdAt?: string } = {}
+    opts: { orderId?: string; quantity?: number; createdAt?: string; status?: string } = {}
   ): BrokerOrder => ({
     orderId: opts.orderId ?? 'buy-1',
     instrument: SPY_CALL,
     side: 'buy',
     quantity: opts.quantity ?? 2,
-    status: 'filled',
+    status: opts.status ?? 'filled',
     fillPrice,
     createdAt: opts.createdAt ?? LATER,
   });
@@ -710,6 +714,17 @@ describe('sweepMaxLoss entry price from the account ledger', () => {
   /** A limit buy of the contract, placed as `orderId` at `at`. */
   const buyAt = (orderId: string, at: string, limitPrice: number, quantity = 2): Decision =>
     submittedBuy('SPY', limitPrice, CONTRACT, { messageId: orderId, at, quantity });
+  const BETWEEN = '2026-09-08T13:30:00.000Z';
+  const AFTER = '2026-09-08T14:20:00.000Z';
+  /** A sell of `quantity` contracts linked to a lot, as the pipeline and the ladder record one. */
+  const seedLinkedSell = (db: FakeDb, lotId: string, quantity: number, status: string): void => {
+    const sell = buyAt(`sell-${lotId}`, AFTER, 1.5, quantity);
+    db.seedDecision(USER, {
+      ...sell,
+      action: 'sell',
+      order: { ...sell.order!, side: 'sell', orderId: sell.messageId, status, lots: [{ lotId, quantity }] },
+    });
+  };
 
   it('does not sell a winner whose lot filled at 1.59 while order history reports 159', async () => {
     const { db, broker, flattening, deps } = setupMonitor({
@@ -985,7 +1000,9 @@ describe('sweepMaxLoss entry price from the account ledger', () => {
       expect(placedOrders(broker, 'option')).toHaveLength(0);
     });
 
-    it('beside a priced lot: the priced lot prices the position', async () => {
+    // The priced lot does not speak for the contracts the unpriced one bought,
+    // so the position keeps production's pricing, its misread above 5x included.
+    it('beside a priced lot: the position is priced from broker history, as without a lot', async () => {
       const { db, broker, flattening, deps } = setupMonitor({
         maxLossPct: MAX_LOSS_PCT,
         optionPositions: holding(4),
@@ -1001,6 +1018,80 @@ describe('sweepMaxLoss entry price from the account ledger', () => {
       });
       seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), { ...MARKET_BUY, orderId: 'buy-late' });
 
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 4, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $159.00)');
+    });
+
+    it.each([
+      { cap: 'a 50% limit', settings: { maxLossPct: MAX_LOSS_PCT } },
+      { cap: 'a $300 cap', settings: { maxLossUsd: 300 } },
+    ])('a market add below the entry is not priced at the entry ($cap)', async ({ settings }) => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        ...settings,
+        optionPositions: holding(4),
+        markFor: () => 0.79,
+        orders: [
+          brokerBuy(159, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(80, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, LIMIT), {
+        orderId: 'buy-early',
+        averageFillPrice: PAID,
+      });
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), {
+        ...MARKET_BUY,
+        orderId: 'buy-late',
+        averageFillPrice: 0.8,
+      });
+
+      // (2 x 1.59 + 2 x 0.80) / 4 = 1.195: 0.79 is -34%, a $162 loss. At the
+      // entry's 1.59 for all four it would read -50.3% and $320.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('a market add above the entry raises the basis the loss is measured from', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(4),
+        markFor: () => 0.74,
+        orders: [
+          brokerBuy(100, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(200, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 1), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), {
+        ...MARKET_BUY,
+        orderId: 'buy-late',
+        averageFillPrice: 2,
+      });
+
+      // (2 x 1.00 + 2 x 2.00) / 4 = 1.50: 0.74 is -50.7%. At the entry's 1.00 it would read -26%.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 4, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.50)');
+    });
+
+    it('an older lot with no price at all, under a priced one that does not cover the position', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(4),
+        markFor: () => 0.79,
+        orders: [
+          brokerBuy(80, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(159, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, LIMIT), { ...MARKET_BUY, orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), { orderId: 'buy-late', averageFillPrice: PAID });
+
+      // 1.195 across the four, as above; the priced lot alone would read -50.3%.
       await sweepMaxLoss(deps, flattening);
 
       expect(placedOrders(broker, 'option')).toHaveLength(0);
@@ -1038,6 +1129,359 @@ describe('sweepMaxLoss entry price from the account ledger', () => {
     await sweepMaxLoss(deps, flattening);
     expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 4, type: 'market' }]);
     expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.50)');
+  });
+
+  // A lot outlives its contracts when a Max Loss exit, a fired stop or a sale
+  // in the broker's app closes them. In each case below an older lot of the
+  // contract is such a leftover, and the account holds more contracts than
+  // the newest lot still shows.
+  describe('an older lot that no longer describes the position', () => {
+    // Three leftover contracts leave the lots holding more than the account;
+    // two leave the totals equal by coincidence.
+    const LEFTOVER_CONTRACTS = [3, 2];
+
+    it.each(LEFTOVER_CONTRACTS)(
+      'a sell still working on the re-entry does not pull in a leftover lot of %i',
+      async (leftover) => {
+        const { db, broker, flattening, deps } = setupMonitor({
+          maxLossPct: MAX_LOSS_PCT,
+          optionPositions: holding(4),
+          markFor: () => 1.5,
+          orders: [
+            brokerBuy(600, { orderId: 'buy-early', quantity: leftover, createdAt: EARLIER }),
+            brokerBuy(100, { orderId: 'buy-late', quantity: 4, createdAt: LATER }),
+          ],
+        });
+        seedLot(db, USER, buyAt('buy-early', EARLIER, 6, leftover), { orderId: 'buy-early' });
+        seedLot(db, USER, buyAt('buy-late', LATER, 1, 4), { orderId: 'buy-late' });
+        // An own-target limit sell of two, not filled yet: the ledger already counts them sold.
+        seedLinkedSell(db, 'buy-late', 2, 'confirmed');
+
+        // +50% on the 1.00 re-entry. With two contracts priced at the leftover's 6.00 it reads 3.50.
+        await sweepMaxLoss(deps, flattening);
+
+        expect(placedOrders(broker, 'option')).toHaveLength(0);
+      }
+    );
+
+    it.each([
+      { outside: 1, held: 3 },
+      { outside: 3, held: 5 },
+    ])(
+      'a buy of $outside outside the system before the re-entry does not pull in the leftover lot',
+      async ({ outside, held }) => {
+        const { db, broker, flattening, deps } = setupMonitor({
+          maxLossPct: MAX_LOSS_PCT,
+          optionPositions: holding(held),
+          markFor: () => 0.95,
+          orders: [
+            brokerBuy(400, { orderId: 'buy-early', quantity: 3, createdAt: EARLIER }),
+            brokerBuy(105, { orderId: 'app-buy', quantity: outside, createdAt: BETWEEN }),
+            brokerBuy(100, { orderId: 'buy-late', createdAt: LATER }),
+          ],
+        });
+        seedLot(db, USER, buyAt('buy-early', EARLIER, 4, 3), { orderId: 'buy-early' });
+        seedLot(db, USER, buyAt('buy-late', LATER, 1), { orderId: 'buy-late' });
+
+        // Bought at 1.00 and 1.05: 0.95 is about -7%. With the leftover's 4.00 mixed in it reads 2.00 or more.
+        await sweepMaxLoss(deps, flattening);
+
+        expect(placedOrders(broker, 'option')).toHaveLength(0);
+      }
+    );
+
+    it.each(LEFTOVER_CONTRACTS)(
+      'a re-entry whose last fills are not read back yet does not pull in a leftover lot of %i',
+      async (leftover) => {
+        const { db, broker, flattening, deps } = setupMonitor({
+          maxLossPct: MAX_LOSS_PCT,
+          optionPositions: holding(4),
+          markFor: () => 1,
+          orders: [
+            brokerBuy(400, { orderId: 'buy-early', quantity: leftover, createdAt: EARLIER }),
+            brokerBuy(100, { orderId: 'buy-late', quantity: 4, createdAt: LATER }),
+          ],
+        });
+        seedLot(db, USER, buyAt('buy-early', EARLIER, 4, leftover), { orderId: 'buy-early' });
+        // Four ordered; the ledger has read back the first two.
+        seedLot(db, USER, buyAt('buy-late', LATER, 1, 4), {
+          orderId: 'buy-late',
+          status: 'partially_filled',
+          filledQuantity: 2,
+        });
+
+        // Flat on the 1.00 re-entry. With two contracts at the leftover's 4.00 it reads 2.50.
+        await sweepMaxLoss(deps, flattening);
+
+        expect(placedOrders(broker, 'option')).toHaveLength(0);
+      }
+    );
+
+    it('a market re-entry plus one contract bought outside is not priced at the leftover lot', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(3),
+        markFor: () => 1,
+        orders: [
+          brokerBuy(400, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(105, { orderId: 'app-buy', quantity: 1, createdAt: BETWEEN }),
+          brokerBuy(100, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), {
+        orderType: 'market',
+        limitPrice: null,
+        orderId: 'buy-late',
+        averageFillPrice: 1,
+      });
+
+      // Bought at 1.00 and 1.05; the leftover's 4.00 alone would read -75%.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('a cheap leftover lot does not hide a real loss on the re-entry', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(4),
+        markFor: () => 0.95,
+        orders: [
+          brokerBuy(50, { orderId: 'buy-early', quantity: 3, createdAt: EARLIER }),
+          brokerBuy(200, { orderId: 'buy-late', quantity: 4, createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 0.5, 3), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, 2, 4), { orderId: 'buy-late' });
+      seedLinkedSell(db, 'buy-late', 2, 'confirmed');
+
+      // -52.5% on the 2.00 re-entry. With two contracts at the leftover's 0.50 it reads 1.25, -24%.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 4, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $2.00)');
+    });
+
+    it('contracts of the older lot sold outside the system leave the lots holding more than the account', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(3),
+        markFor: () => 1.5,
+        orders: [
+          brokerBuy(600, { orderId: 'buy-early', quantity: 3, createdAt: EARLIER }),
+          brokerBuy(100, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 6, 3), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, 1), { orderId: 'buy-late' });
+
+      // One left at 6.00 and two at 1.00: 2.67, so 1.50 is -44%. Weighted by
+      // what the lots still show (3 and 2) it reads 4.00, -62.5%.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('contracts of an earlier lot still held under a working sell are not priced at the re-entry', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(5),
+        markFor: () => 1.9,
+        orders: [
+          brokerBuy(600, { orderId: 'buy-early', quantity: 3, createdAt: EARLIER }),
+          brokerBuy(100, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 6, 3), { orderId: 'buy-early' });
+      // Not filled, so the three are still held; the ledger shows that lot closed.
+      seedLinkedSell(db, 'buy-early', 3, 'confirmed');
+      seedLot(db, USER, buyAt('buy-late', LATER, 1), { orderId: 'buy-late' });
+
+      // Three at 6.00 and two at 1.00: 4.00, so 1.90 is -52.5%. At the re-entry's 1.00 it reads +90%.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 5, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $4.00)');
+    });
+
+    it('a sell still working on a re-entry whose earlier lot a filled sell closed: the re-entry prices the position', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => WINNING_MARK,
+        orders: [
+          brokerBuy(400, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(159, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+      seedLinkedSell(db, 'buy-early', 2, 'filled');
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), { orderId: 'buy-late', averageFillPrice: PAID });
+      // An own-target limit sell of one, not filled yet: both contracts are still held.
+      seedLinkedSell(db, 'buy-late', 1, 'confirmed');
+
+      // The broker's own order bought both contracts held, so they are the re-entry's.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it("a newest lot whose order is not among the broker's buys is priced from broker history", async () => {
+      const { db, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => 1.85,
+        orders: [brokerBuy(380, { orderId: 'buy-early', createdAt: EARLIER })],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, 1), { orderId: 'buy-late', averageFillPrice: 1 });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $3.80)');
+    });
+
+    it('a leftover lot does not unseat the newest lot while that lot covers the position', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => 5.5,
+        orders: [
+          brokerBuy(600, { orderId: 'buy-early', quantity: 3, createdAt: EARLIER }),
+          brokerBuy(100, { orderId: 'buy-late', quantity: 4, createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 6, 3), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, 1, 4), { orderId: 'buy-late' });
+      seedLinkedSell(db, 'buy-late', 2, 'filled');
+
+      // +450% on the 1.00 re-entry: where broker history alone reads the fill as 100.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+  });
+
+  // A held entry approved at its original limit after the contract fell more
+  // than 80% fills far under that limit, and the read-back stores a
+  // per-contract fill under 20x the limit as it is reported.
+  describe("a lot's stored fill against its own limit", () => {
+    it('a fill stored far above the limit is not believed', async () => {
+      let mark = 0.3;
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => mark,
+        orders: [brokerBuy(30.4)],
+      });
+      // Filled at 0.304, reported as 30.4 and stored as 30.40.
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: 30.4 });
+
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+      mark = 0.15;
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $0.30)');
+    });
+
+    it('a fill one tick above the stored limit is believed', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        // Above 5x the fill, where broker history alone reads it as 165.
+        markFor: () => 8.5,
+        orders: [brokerBuy(165)],
+      });
+      // The limit is placed rounded to the contract's tick; the stored one is not.
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: 1.65 });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('a limit stands in for a fill never stored when the broker reports that fill per share', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => 0.79,
+        orders: [brokerBuy(1.55)],
+      });
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT));
+
+      await sweepMaxLoss(deps, flattening);
+
+      // -50.6% of the 1.60 limit; -49% of the 1.55 the broker shows.
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.60)');
+    });
+
+    it('a limit far above what the broker shows was paid does not stand in for a fill never stored', async () => {
+      let mark = 0.3;
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => mark,
+        orders: [brokerBuy(30.4)],
+      });
+      // Filled at 0.304 and never read back: the lot's only price is its 1.60 limit.
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT));
+
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+      mark = 0.15;
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $0.30)');
+    });
+  });
+
+  describe('a later buy order of the contract that is not a lot', () => {
+    it('an add cancelled before it bought anything does not unseat the lot', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => WINNING_MARK,
+        orders: [
+          REPORTED_AS_159,
+          // Robinhood reports an unfilled order's limit where a fill price would be.
+          brokerBuy(1.2, { orderId: 'add', status: 'cancelled', quantity: 0, createdAt: AFTER }),
+        ],
+      });
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: PAID });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    // Each of these may have added contracts the ledger does not hold as a
+    // lot, so the position is priced as production prices it: from the
+    // broker's 3.80 fill, not the lot's 4.00 limit.
+    it.each([
+      { order: 'still filling', status: 'partially_filled', quantity: 1 },
+      { order: 'cancelled after a partial fill', status: 'cancelled', quantity: 1 },
+      { order: 'working, nothing filled yet', status: 'queued', quantity: 0 },
+    ])('an order $order keeps the position on broker history', async ({ status, quantity }) => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => 1.85,
+        orders: [
+          brokerBuy(380, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(150, { orderId: 'buy-late', status, quantity, createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $3.80)');
+    });
   });
 
   it("another contract's lot does not price this one", async () => {

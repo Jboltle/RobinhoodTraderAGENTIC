@@ -755,6 +755,35 @@ describe('GET /api/trades/performance', () => {
     expect(option.pctChange).toBeCloseTo(((8 - 1.59) / 1.59) * 100);
   });
 
+  it('still answers when the ledger lots cannot be read, pricing options from order history', async () => {
+    harness.configureBroker(ACCOUNT_ID, {
+      positions: [equityPosition('AAPL', 10, 100), optionPosition('SPY', 'call', 772, '2026-10-21', 2)],
+      equityMark: 110,
+      optionMark: 1.5,
+      orders: [
+        {
+          orderId: 'opt-001',
+          instrument: { kind: 'option', symbol: 'SPY', optionType: 'call', strike: 772, expiration: '2026-10-21' },
+          side: 'buy',
+          status: 'filled',
+          fillPrice: 159,
+          quantity: 2,
+          createdAt: '2026-07-14T14:00:00.000Z',
+        },
+      ],
+    });
+    vi.spyOn(harness.db, 'listOpenOptionLots').mockRejectedValueOnce(new Error('db down'));
+
+    const response = await get('/api/trades/performance');
+
+    expect(response.statusCode).toBe(200);
+    const { positions } = response.json() as {
+      positions: Array<{ symbol: string; entryPrice: number; pctChange: number }>;
+    };
+    expect(positions.find((p) => p.symbol === 'AAPL')).toMatchObject({ entryPrice: 100, currentPrice: 110 });
+    expect(positions.find((p) => p.symbol === 'SPY')).toMatchObject({ entryPrice: 1.59, currentPrice: 1.5 });
+  });
+
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
     harness.configureBroker(ACCOUNT_ID, {
       overrides: {
@@ -1283,6 +1312,55 @@ describe('GET /api/stream', () => {
         await vi.advanceTimersByTimeAsync(TICK_MS);
         await stream.readUntil('"currentPrice":152');
         expect(reads('listOpenOptionLots')).toBe(2);
+      } finally {
+        await stream.close();
+      }
+    }, 10_000);
+
+    it('a failed read of the ledger lots still sends the rows, and the next tick reads the lots again', async () => {
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+      const contract = { optionType: 'call', strike: 772, expiration: '2026-10-21' } as const;
+      harness.configureBroker(ACCOUNT_ID, {
+        positions: [optionPosition('SPY', 'call', 772, '2026-10-21', 2)],
+        optionMark: 8,
+        orders: [
+          {
+            orderId: 'opt-001',
+            instrument: { kind: 'option', symbol: 'SPY', ...contract },
+            side: 'buy',
+            status: 'filled',
+            fillPrice: 159,
+            quantity: 2,
+            createdAt: '2026-07-14T14:00:00.000Z',
+          },
+        ],
+      });
+      harness.db.seedMessage({ messageId: 'lot', sentAt: '2026-07-14T14:00:00.000Z' });
+      harness.db.seedDecision(
+        ACCOUNT_ID,
+        decisionFixture('lot', {
+          ticker: 'SPY',
+          order: {
+            symbol: 'SPY',
+            side: 'buy',
+            assetType: 'option',
+            quantity: 2,
+            orderType: 'limit',
+            limitPrice: 1.6,
+            option: contract,
+            orderId: 'opt-001',
+            status: 'filled',
+            averageFillPrice: 1.59,
+          },
+        })
+      );
+      vi.spyOn(harness.db, 'listOpenOptionLots').mockRejectedValueOnce(new Error('db down'));
+      const stream = await openStream();
+      try {
+        // Without the lots the row is priced from order history, as it was before the ledger.
+        await stream.readUntil('"entryPrice":159');
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"entryPrice":1.59');
       } finally {
         await stream.close();
       }
