@@ -3,13 +3,13 @@
  * readers that have no account of their own to ask, and how long getMark keeps
  * a price before asking again.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BrokerUnavailableError } from '../broker/errors.js';
 import { createQuoteSource, MARK_CACHE_MS, type QuoteSessionState } from '../broker/quotes.js';
 import { createMcpRegistry } from '../broker/registry.js';
 import type { Instrument } from '../broker/types.js';
-import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import { READY_TIMEOUT_MS, type RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { createFakeDb, fakeTokens } from './fakeDb.js';
 import { makeFakeBroker, makeFakeRegistry, markReads, type FakeBroker } from './harness.js';
 
@@ -36,6 +36,19 @@ const readySession = (broker: FakeBroker = makeFakeBroker()): Session => ({
 const sessionNeedingConsent = (): Session => ({
   session: {
     ensureReady: vi.fn().mockRejectedValue(new BrokerUnavailableError('needs consent')),
+  } as unknown as RobinhoodMcpClient,
+  broker: makeFakeBroker(),
+});
+
+/** Never connects: rejects once the wait it was given runs out, as the real client does. */
+const stalledSession = (): Session => ({
+  session: {
+    ensureReady: vi.fn(
+      (timeoutMs: number) =>
+        new Promise<void>((_, reject) => {
+          setTimeout(() => reject(new BrokerUnavailableError('connection timed out')), timeoutMs);
+        })
+    ),
   } as unknown as RobinhoodMcpClient,
   broker: makeFakeBroker(),
 });
@@ -120,6 +133,54 @@ describe('quote source: which session is asked', () => {
     // The remembered session is tried first: the dead one is not asked again.
     expect(await quotes.broker()).toBe(live.broker);
     expect(dead.session.ensureReady).toHaveBeenCalledOnce();
+  });
+
+  describe('with stalled sessions', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Runs the pick to the end on the fake clock: what it found and how long it waited. */
+    async function timedPick(
+      sessions: Record<string, Session>
+    ): Promise<{ picked: unknown; waitedMs: number }> {
+      vi.useFakeTimers();
+      const startedAt = Date.now();
+      const pick = setup(sessions)
+        .quotes.broker()
+        .then((picked) => ({ picked, waitedMs: Date.now() - startedAt }));
+      await vi.runAllTimersAsync();
+      return pick;
+    }
+
+    it('waits one ready timeout in total, not one per stalled session', async () => {
+      const outcome = await timedPick({
+        u1: stalledSession(),
+        u2: stalledSession(),
+        u3: stalledSession(),
+      });
+
+      expect(outcome).toEqual({ picked: null, waitedMs: READY_TIMEOUT_MS });
+    });
+
+    it('still finds a ready session behind the stalled ones within that one timeout', async () => {
+      const live = readySession();
+      const stalled = [stalledSession(), stalledSession()] as const;
+
+      const outcome = await timedPick({ u1: stalled[0], u2: stalled[1], u3: live });
+
+      expect(outcome).toEqual({ picked: live.broker, waitedMs: READY_TIMEOUT_MS });
+      expect(stalled[0].session.ensureReady).toHaveBeenCalledWith(READY_TIMEOUT_MS);
+      expect(stalled[1].session.ensureReady).toHaveBeenCalledWith(0);
+    });
+
+    it('does not wait at all when the first session is ready', async () => {
+      const live = readySession();
+
+      const outcome = await timedPick({ u1: live, u2: stalledSession() });
+
+      expect(outcome).toEqual({ picked: live.broker, waitedMs: 0 });
+    });
   });
 
   it('asks only sessions whose adapter quotes options', async () => {

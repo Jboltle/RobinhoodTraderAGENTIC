@@ -9,6 +9,7 @@
 import type { TraderDb } from '../db.js';
 import { BrokerUnavailableError } from './errors.js';
 import { instrumentKey } from './instrument.js';
+import { READY_TIMEOUT_MS } from '../robinhood/mcpClient.js';
 import type { McpRegistry } from './registry.js';
 import type { Broker, Instrument } from './types.js';
 
@@ -63,11 +64,15 @@ export function createQuoteSource(
     const ordered = preferred
       ? [preferred, ...accounts.filter((account) => account !== preferred)]
       : accounts;
+    // One ready timeout for the whole pick, not one per stalled session: the
+    // entry check waits here on the serial poller, ahead of every queued exit.
+    // A connected session answers at once whatever is left of it.
+    const deadline = Date.now() + READY_TIMEOUT_MS;
     for (const account of ordered) {
       try {
         const candidate = deps.brokers.for(account);
         if (!candidate.quotesOptions) continue;
-        await candidate.session.ensureReady();
+        await candidate.session.ensureReady(Math.max(0, deadline - Date.now()));
         state.preferredAccountId = account.id;
         return candidate.broker;
       } catch (err) {
