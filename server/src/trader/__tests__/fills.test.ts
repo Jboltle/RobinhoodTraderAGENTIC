@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision, SubmittedOrder } from '../../shared/types.js';
+import { brokerStops } from '../brokerStops.js';
 import { TraderEvents } from '../events.js';
 import { applyBrokerState, sweepFills, type FillMonitorDeps } from '../fills.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
@@ -210,6 +211,65 @@ describe('sweepFills', () => {
 
 describe('sweepFills — resting Max Loss stops', () => {
   const HELD = { symbol: 'SPY', ...CONTRACT, quantity: 3, raw: {} };
+
+  beforeEach(() => {
+    brokerStops.enabled = true;
+  });
+  afterEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  describe('with Robinhood-side stops off (production)', () => {
+    beforeEach(() => {
+      brokerStops.enabled = false;
+    });
+
+    it('a filled buy gets no stop, on the sweep that sees the fill or on a later one', async () => {
+      const { db, deps, place, positions } = restSetup({
+        orders: [liveOrder()],
+        positions: async () => ({ positions: [HELD], raw: {} }),
+      });
+      seedBuy(db, placed());
+
+      expect(await sweepFills(deps)).toEqual({ open: 1, updated: 1 });
+      expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+      expect(place).not.toHaveBeenCalled();
+      expect(positions).not.toHaveBeenCalled();
+      expect((await db.listOpenOptionLots(USER))[0]?.stopOrderId).toBeNull();
+    });
+
+    it('an idle sweep is the open-orders query and nothing else', async () => {
+      const { db, deps, ensureReady, tools } = restSetup({ positions: async () => ({ positions: [HELD], raw: {} }) });
+      seedBuy(db, placed({ status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }));
+      const users = vi.spyOn(db, 'listBrokerUserIds');
+      const settings = vi.spyOn(db, 'getSettings');
+      const ledger = vi.spyOn(db, 'listOpenOptionLots');
+
+      expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+      expect(users).not.toHaveBeenCalled();
+      expect(settings).not.toHaveBeenCalled();
+      expect(ledger).not.toHaveBeenCalled();
+      expect(ensureReady).not.toHaveBeenCalled();
+      expect(tools.getOptionOrders).not.toHaveBeenCalled();
+    });
+
+    it('an active sweep lists users once, for the fill sync only', async () => {
+      const { db, deps } = restSetup({
+        orders: [liveOrder()],
+        positions: async () => ({ positions: [HELD], raw: {} }),
+      });
+      seedBuy(db, placed());
+      const users = vi.spyOn(db, 'listBrokerUserIds');
+      const settings = vi.spyOn(db, 'getSettings');
+
+      await sweepFills(deps);
+
+      expect(users).toHaveBeenCalledOnce();
+      expect(settings).not.toHaveBeenCalled();
+    });
+  });
 
   function restSetup(opts: { orders?: OptionOrder[]; positions: () => Promise<unknown> }) {
     const base = setup({ orders: opts.orders });

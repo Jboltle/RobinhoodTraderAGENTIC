@@ -5,9 +5,10 @@
  * this time", and the stored id was never cleared, so every later sell on that
  * contract failed. The stop's own state decides what a refused cancel means.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { OptionContract } from '../../shared/types.js';
+import { brokerStops } from '../brokerStops.js';
 import { TraderEvents } from '../events.js';
 import { sweepLadders } from '../ladderMonitor.js';
 import { McpToolError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
@@ -126,8 +127,62 @@ async function logged(run: () => Promise<unknown>): Promise<Record<string, unkno
   return lines;
 }
 
+// Every describe below is the stop feature itself, so it runs switched on.
+beforeEach(() => {
+  brokerStops.enabled = true;
+});
+
 afterEach(() => {
+  brokerStops.enabled = false;
   vi.restoreAllMocks();
+});
+
+describe('Robinhood-side stops off (production)', () => {
+  beforeEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  it('cancelStops does nothing: no cancel, no order read, no throw, the stored id stays', async () => {
+    const db = createFakeDb();
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, 'stop-a');
+    const { tools, cancel, read } = makeTools(['stop-a'], [stopOrder('stop-a', 'confirmed')]);
+    const ledger = vi.spyOn(db, 'listOpenOptionLots');
+
+    await expect(cancelStops(db, USER, tools, 'QQQ', OPTION)).resolves.toBeUndefined();
+
+    expect(cancel).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(ledger).not.toHaveBeenCalled();
+    ledger.mockRestore();
+    expect(await stopIds(db)).toEqual({ 'lot-a': 'stop-a' });
+  });
+
+  it('restMissingStops does nothing: no stop, no positions read, no session, no database read', async () => {
+    const db = createFakeDb();
+    db.seedSettings(USER, { maxLossPct: 80 });
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 2, null);
+    const place = vi.fn();
+    const read = vi.fn();
+    const ensureReady = vi.fn();
+    const settings = vi.spyOn(db, 'getSettings');
+    const ledger = vi.spyOn(db, 'listOpenOptionLots');
+    const tools = { placeOptionsOrder: place, getOptionPositions: read } as unknown as RobinhoodTools;
+
+    await restMissingStops({
+      userId: USER,
+      db,
+      tools,
+      executionMode: 'immediate',
+      now: new Date('2026-06-11T15:00:00.000Z'),
+      ensureReady,
+    });
+
+    expect(place).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(ensureReady).not.toHaveBeenCalled();
+    expect(settings).not.toHaveBeenCalled();
+    expect(ledger).not.toHaveBeenCalled();
+  });
 });
 
 describe('cancelStops — the cancel succeeds', () => {

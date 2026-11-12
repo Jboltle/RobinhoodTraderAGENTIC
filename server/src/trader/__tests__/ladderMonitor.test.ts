@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision, OptionContract, TradeSettings } from '../../shared/types.js';
+import { brokerStops } from '../brokerStops.js';
 import { TraderEvents } from '../events.js';
 import {
   LADDER_INTERVAL_MS,
@@ -386,6 +387,63 @@ describe('ladder — only contracts the account holds', () => {
 });
 
 describe('ladder — over a stop Robinhood refuses to cancel', () => {
+  beforeEach(() => {
+    brokerStops.enabled = true;
+  });
+  afterEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  it('with Robinhood-side stops off: sells the level with no cancel attempt and leaves the stored id', async () => {
+    brokerStops.enabled = false;
+    const cancel = vi.fn().mockRejectedValue(new Error('API error 403: Order cannot be cancelled at this time.'));
+    const read = vi.fn();
+    const { db, deps, place } = setup({
+      trimLevels: [{ gainPct: 25, portionPct: 100 }],
+      positions: [held(2)],
+      toolsOverrides: { cancelOptionOrder: cancel, getOptionOrders: read },
+    });
+    seedLot(db, 'lot-off', '2026-06-11T13:00:00.000Z', 2, 'stop-a');
+
+    expect(await sweep(deps)).toBe(1);
+
+    expect(place).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ side: 'sell', contracts: 2, orderType: 'limit', limitPremium: 1.25 })
+    );
+    expect(cancel).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(await ladderRows(db)).toHaveLength(1);
+    expect((await db.listDecisions(USER, 10)).find((row) => row.messageId === 'lot-off')?.order?.stopOrderId).toBe(
+      'stop-a'
+    );
+  });
+
+  // The same two cases run with stops off in "only contracts the account
+  // holds"; there a cancel can never happen, so they are pinned here too.
+  it('does not cancel the stop of a lot the account no longer holds', async () => {
+    const { db, deps, place, cancel } = setup({ trimLevels: [{ gainPct: 25, portionPct: 100 }], positions: [] });
+    seedLot(db, 'lot-gone-stopped', '2026-06-11T13:00:00.000Z', 4, 'stop-a');
+
+    expect(await sweep(deps)).toBe(0);
+
+    expect(cancel).not.toHaveBeenCalled();
+    expect(place).not.toHaveBeenCalled();
+    expect((await db.listOpenOptionLots(USER))[0]?.stopOrderId).toBe('stop-a');
+  });
+
+  it('does not cancel the stop when the positions read fails', async () => {
+    const { db, deps, place, cancel } = setup({
+      trimLevels: [{ gainPct: 25, portionPct: 100 }],
+      positions: new Error('get_option_positions failed after 3 attempts: fetch failed'),
+    });
+    seedLot(db, 'lot-a', '2026-06-11T13:00:00.000Z', 4, 'stop-a');
+
+    expect(await sweep(deps)).toBe(0);
+
+    expect(cancel).not.toHaveBeenCalled();
+    expect(place).not.toHaveBeenCalled();
+  });
+
   it('sells and records the level when the refused stop is dead', async () => {
     const refused = new Error(
       'cancel_option_order failed after 3 attempts: Tool cancel_option_order returned error: ' +

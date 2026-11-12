@@ -3,7 +3,7 @@
  * with a mocked parser, stubbed Robinhood tools and the in-memory db.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   Callout,
@@ -13,6 +13,7 @@ import type {
   TradeSettings,
 } from '../../../shared/types.js';
 import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js';
+import { brokerStops } from '../../brokerStops.js';
 import { TraderEvents } from '../../events.js';
 import type { McpRegistry, UserBroker } from '../../rh/mcpRegistry.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../../rh/mcpClient.js';
@@ -1303,6 +1304,28 @@ describe('fan-out — option exit over a resting Max Loss stop', () => {
 
   const placed = (tools: RobinhoodTools): unknown[][] =>
     (tools.placeOptionsOrder as ReturnType<typeof vi.fn>).mock.calls;
+
+  beforeEach(() => {
+    brokerStops.enabled = true;
+  });
+  afterEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  it('with Robinhood-side stops off: no cancel attempt, the same sell, the stored id left alone', async () => {
+    const on = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);
+    brokerStops.enabled = false;
+    // A stop whose cancel Robinhood would refuse: with the switch on this exit fails.
+    const off = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState: 'confirmed' }]);
+
+    expect(off.decision.kind).toBe('submitted');
+    expect(off.decision.order).toEqual(on.decision.order);
+    expect(off.decision.reason).toBe(on.decision.reason);
+    expect(placed(off.tools)).toEqual(placed(on.tools));
+    expect(off.tools.cancelOptionOrder).not.toHaveBeenCalled();
+    expect(off.tools.getOptionOrders).not.toHaveBeenCalled();
+    expect(off.stopIds).toEqual(['stop-a']);
+  });
 
   it('cancels the stop, clears its id and sells, without reading the order', async () => {
     const { decision, tools, stopIds } = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);

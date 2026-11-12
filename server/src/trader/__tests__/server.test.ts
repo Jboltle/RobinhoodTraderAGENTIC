@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision } from '../../shared/types.js';
 import type { StoredCallout } from '../db.js';
+import { brokerStops } from '../brokerStops.js';
 import { fakeTokens } from './fakeDb.js';
 import { makeHarness, type Harness } from './harness.js';
 
@@ -62,6 +63,10 @@ const send = (method: 'PUT' | 'POST', url: string, body: unknown) =>
 beforeEach(() => {
   harness = makeHarness();
   harness.db.addUser(USER, TOKEN);
+});
+
+afterEach(() => {
+  brokerStops.enabled = false;
 });
 
 // ---------------------------------------------------------------------------
@@ -184,6 +189,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
   // Production's stop cancels all answered 403; a stop Robinhood lists as dead
   // must not keep an approved sell from going out.
   it('approve sells over a stop Robinhood refuses to cancel but lists as cancelled', async () => {
+    brokerStops.enabled = true;
     const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
     const optionOrder = { symbol: 'QQQ', assetType: 'option' as const, option, orderType: 'limit' as const };
     harness.db.seedMessage({ messageId: 'buy-lot', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'caller-1' });
@@ -259,6 +265,65 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(harness.brokerFor(USER.id).tools.cancelOptionOrder).toHaveBeenCalledExactlyOnceWith('stop-1');
     const rows = await harness.db.listDecisions(USER.id, 10);
     expect(rows.find((row) => row.messageId === 'buy-lot')?.order?.stopOrderId).toBeNull();
+  });
+
+  it('with Robinhood-side stops off: approve sells with no cancel attempt and leaves the stored stop id', async () => {
+    const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    const optionOrder = { symbol: 'QQQ', assetType: 'option' as const, option, orderType: 'limit' as const };
+    harness.db.seedMessage({ messageId: 'buy-lot', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'caller-1' });
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('buy-lot', {
+        at: '2026-06-11T13:00:00.000Z',
+        ticker: 'QQQ',
+        order: {
+          ...optionOrder,
+          side: 'buy',
+          quantity: 3,
+          limitPrice: 1,
+          orderId: 'buy-1',
+          status: 'filled',
+          filledQuantity: 3,
+          averageFillPrice: 1,
+          stopOrderId: 'stop-1',
+        },
+      })
+    );
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('msg-exit', {
+        kind: 'pending_approval',
+        ticker: 'QQQ',
+        action: 'sell',
+        order: {
+          ...optionOrder,
+          side: 'sell',
+          quantity: 1,
+          limitPrice: 1.5,
+          orderId: null,
+          status: null,
+          lots: [{ lotId: 'buy-lot', quantity: 1 }],
+        },
+      })
+    );
+    // A stop still working at Robinhood: its cancel would be refused and, switched on, the approve would fail.
+    const cancelOptionOrder = vi
+      .fn()
+      .mockRejectedValue(new Error('API error 403: {"detail":"Order cannot be cancelled at this time."}'));
+    const getOptionOrders = vi.fn().mockResolvedValue({ orders: [], raw: {} });
+    harness.configureBroker(USER.id, { toolsOverrides: { cancelOptionOrder, getOptionOrders } });
+
+    const response = await send('POST', '/api/trades/msg-exit/approve', {});
+
+    expect(response.statusCode).toBe(200);
+    expect((response.json() as { decision: Decision }).decision.kind).toBe('submitted');
+    expect(harness.brokerFor(USER.id).tools.placeOptionsOrder).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ symbol: 'QQQ', side: 'sell', contracts: 1, limitPremium: 1.5 })
+    );
+    expect(cancelOptionOrder).not.toHaveBeenCalled();
+    expect(getOptionOrders).not.toHaveBeenCalled();
+    const rows = await harness.db.listDecisions(USER.id, 10);
+    expect(rows.find((row) => row.messageId === 'buy-lot')?.order?.stopOrderId).toBe('stop-1');
   });
 
   // A stale warm session must not spend money; the row must survive so the

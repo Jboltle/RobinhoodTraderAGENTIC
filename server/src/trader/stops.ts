@@ -6,6 +6,7 @@
 import { createLogger } from '../shared/logger.js';
 import { optionLabel, type Decision, type OptionContract, type TradeExecutionMode } from '../shared/types.js';
 import { isoDateEt } from './book/ladder.js';
+import { brokerStops } from './brokerStops.js';
 import type { TraderDb } from './db.js';
 import { heldByLot, stopTrigger, type OpenOptionLot } from './lots.js';
 import { roundPremiumToTick, type RobinhoodTools } from './rh/tools.js';
@@ -28,6 +29,8 @@ const FILLED_STOP_STATE = 'filled';
  * - anything else (working, dead after a partial fill, unknown, not listed,
  *   unreadable): the id stays and the cancel error is rethrown. A sell next to
  *   a live stop can sell twice, and one sized on an overstated lot oversells.
+ *
+ * Does nothing while brokerStops is off: callers go straight to their sell.
  */
 export async function cancelStops(
   db: TraderDb,
@@ -36,6 +39,7 @@ export async function cancelStops(
   symbol: string,
   option: OptionContract | null
 ): Promise<void> {
+  if (!brokerStops.enabled) return;
   if (!option || typeof tools.cancelOptionOrder !== 'function') return;
   const lots = await db.listOpenOptionLots(userId);
   for (const lot of lots) {
@@ -142,6 +146,8 @@ function stopFillDecision(lot: OpenOptionLot, stopOrderId: string, sold: number)
  *
  * ponytail: the gap between a cancel and the next sweep leaves the remainder
  * without a stop for one poll. Upgrade path: re-rest in the same turn as the sell.
+ *
+ * Does nothing while brokerStops is off.
  */
 export async function restMissingStops(args: {
   readonly userId: string;
@@ -153,6 +159,7 @@ export async function restMissingStops(args: {
   /** Connects the user's session; called only once a lot needs a stop. */
   readonly ensureReady?: () => Promise<void>;
 }): Promise<void> {
+  if (!brokerStops.enabled) return;
   if (args.executionMode !== 'immediate') return;
   if (typeof args.tools.placeOptionsOrder !== 'function') return;
   const settings = await args.db.getSettings(args.userId);

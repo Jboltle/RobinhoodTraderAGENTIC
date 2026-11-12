@@ -14,6 +14,7 @@ import {
   type SubmittedOrder,
   type TradeExecutionMode,
 } from '../shared/types.js';
+import { brokerStops } from './brokerStops.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { BrokerWritesDisabledError, submitOrder } from './pipeline/execute.js';
@@ -166,7 +167,8 @@ async function scanUser(
       ? await tools.getOptionOrders().catch(() => null)
       : null;
 
-  const openLots = await deps.db.listOpenOptionLots(userId).catch(() => []);
+  // With broker stops off no lot is read, so no position is left to a stop.
+  const openLots = brokerStops.enabled ? await deps.db.listOpenOptionLots(userId).catch(() => []) : [];
   const openKeys = new Set<string>();
 
   for (const position of equity.positions) {

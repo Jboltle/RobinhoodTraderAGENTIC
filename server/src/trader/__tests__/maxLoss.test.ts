@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Decision, SubmittedOrder, TradeExecutionMode } from '../../shared/types.js';
 import { TradeSettingsSchema } from '../../shared/types.js';
+import { brokerStops } from '../brokerStops.js';
 import { TraderEvents } from '../events.js';
 import {
   EQUITY_MULTIPLIER,
@@ -365,6 +366,54 @@ describe('sweepMaxLoss', () => {
     await sweepMaxLoss(deps, flattening); // guard went stale → close re-sent
 
     expect(tools.placeOptionsOrder).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('sweepMaxLoss — a position whose lot carries a stored stop id', () => {
+  const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+
+  afterEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  /** A 50% down QQQ position of 2, bought by this system, with `stop-1` stored on the buy. */
+  function setupStopped(): ReturnType<typeof setupMonitor> {
+    const monitor = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [{ symbol: 'QQQ', ...contract, quantity: 2, raw: {} }],
+      markFor: () => 0.75,
+    });
+    const buy = submittedBuy('QQQ', 1.5, contract);
+    monitor.db.seedMessage({ messageId: buy.messageId, sentAt: buy.at, authorId: 'caller-1' });
+    monitor.db.seedDecision(USER, {
+      ...buy,
+      order: { ...buy.order!, filledQuantity: 2, averageFillPrice: 1.5, stopOrderId: 'stop-1' },
+    });
+    return monitor;
+  }
+
+  it('stops off (production): evaluates it like any other position and sells the breach', async () => {
+    const { db, tools, flattening, deps } = setupStopped();
+    const ledger = vi.spyOn(db, 'listOpenOptionLots');
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(tools.placeOptionsOrder).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ symbol: 'QQQ', ...contract, contracts: 2, side: 'sell', orderType: 'market' })
+    );
+    expect((await db.listDecisions(USER, 10)).some((d) => d.kind === 'max_loss_exit')).toBe(true);
+    // As before the stop feature: the lot ledger is not read at all.
+    expect(ledger).not.toHaveBeenCalled();
+  });
+
+  it('stops on: leaves the position to its stop', async () => {
+    brokerStops.enabled = true;
+    const { db, tools, flattening, deps } = setupStopped();
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
+    expect((await db.listDecisions(USER, 10)).some((d) => d.kind === 'max_loss_exit')).toBe(false);
   });
 });
 
