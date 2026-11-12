@@ -44,11 +44,41 @@ export function setUnauthorizedHandler(handler: () => void): void {
   onUnauthorized = handler
 }
 
-/** Authorization header for the current session; throws when signed out. */
+/** Mirrors VIEWED_ACCOUNT_HEADER and ACCOUNT_CHANGED_CODE in server/src/trader/auth.ts. */
+const VIEWED_ACCOUNT_HEADER = 'x-viewed-account'
+const ACCOUNT_CHANGED_CODE = 'account_changed'
+
+// The account this page is showing, as the server last named it, and the
+// session it was named for (a different sign-in starts without one).
+let viewedAccount: { token: string; accountId: string } | null = null
+let onAccountChanged: () => void = () => {}
+
+function rememberViewedAccount(accountId: string): void {
+  const token = accessToken()
+  if (token) viewedAccount = { token, accountId }
+}
+
+/**
+ * Called when the server refuses a request because the selected account is no
+ * longer the one this page is showing (it was switched in another tab).
+ */
+export function setAccountChangedHandler(handler: () => void): void {
+  onAccountChanged = handler
+}
+
+/**
+ * Headers for the current session; throws when signed out. Besides the token
+ * they name the account this page is showing: the server acts on the selected
+ * account whatever this says, and refuses the request when the two differ, so
+ * nothing done here lands on an account that is not on screen.
+ */
 export function authHeaders(): Record<string, string> {
   const token = accessToken()
   if (!token) throw new Error('not signed in')
-  return { authorization: `Bearer ${token}` }
+  return {
+    authorization: `Bearer ${token}`,
+    ...(viewedAccount?.token === token && { [VIEWED_ACCOUNT_HEADER]: viewedAccount.accountId }),
+  }
 }
 
 export interface OptionContract {
@@ -440,7 +470,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   })
   if (!res.ok) {
     if (res.status === 401) onUnauthorized()
-    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    const body = (await res.json().catch(() => null)) as { error?: string; code?: string } | null
+    if (body?.code === ACCOUNT_CHANGED_CODE) onAccountChanged()
     throw new Error(body?.error ?? `${init.method ?? 'GET'} ${path} failed: ${res.status}`)
   }
   return res.json() as Promise<T>
@@ -477,16 +508,20 @@ export const fetchBrokerStatus = (): Promise<BrokerStatus> =>
   request<BrokerStatus>('/api/broker/status')
 
 export const fetchAccounts = (): Promise<AccountsResponse> =>
-  request<AccountsResponse>('/api/accounts')
+  request<AccountsResponse>('/api/accounts').then((accounts) => {
+    rememberViewedAccount(accounts.selectedAccountId)
+    return accounts
+  })
 
 /**
  * Switch the account the screens and Settings show and edit. Which accounts
  * trade does not change: every connected account takes its callouts.
  */
 export const selectAccount = (accountId: string): Promise<string> =>
-  postJson<{ selectedAccountId: string }>('/api/accounts/select', { accountId }).then(
-    (r) => r.selectedAccountId,
-  )
+  postJson<{ selectedAccountId: string }>('/api/accounts/select', { accountId }).then((r) => {
+    rememberViewedAccount(r.selectedAccountId)
+    return r.selectedAccountId
+  })
 
 /** Submit a trade that was sized and parked in approval mode. */
 export const approveTrade = (messageId: string): Promise<Decision> =>

@@ -10,7 +10,7 @@ import { useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { UseQueryResult } from '@tanstack/react-query'
 
-import { fetchAccounts } from './api'
+import { fetchAccounts, setAccountChangedHandler } from './api'
 import type { AccountSummary, AccountsResponse, BrokerEntry } from './api'
 
 export const ACCOUNTS_QUERY_KEY = ['accounts'] as const
@@ -87,7 +87,9 @@ export function institutionName(institution: string): string {
 
 /**
  * Drop every cached answer when the viewed account changes, whatever changed
- * it: the menu here, or another tab. Queries on screen refetch for the new
+ * it: the menu here, or a switch made in another tab (which this one learns
+ * of when the account list is read again, on returning to the tab or on a
+ * request the server refuses). Queries on screen refetch for the new
  * account; the ones the stream fills (decisions, performance, trade stage)
  * empty out until the reopened stream sends that account's snapshot.
  *
@@ -110,4 +112,13 @@ export function useResetOnAccountSwitch(viewedAccountId: string | undefined): vo
       predicate: (query) => query.queryKey[0] !== ACCOUNTS_QUERY_KEY[0],
     })
   }, [queryClient, viewedAccountId])
+
+  // A switch made in another tab reaches this one as a refused request: read
+  // the list again, and the effect above takes it from there.
+  useEffect(() => {
+    setAccountChangedHandler(
+      () => void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY }),
+    )
+    return () => setAccountChangedHandler(() => {})
+  }, [queryClient])
 }

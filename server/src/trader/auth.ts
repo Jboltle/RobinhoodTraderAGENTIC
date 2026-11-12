@@ -43,6 +43,23 @@ declare module 'fastify' {
  */
 const PUBLIC_ROUTES = new Set(['/health', '/api/auth/login']);
 
+/**
+ * The dashboard names the account its screens are showing on every request.
+ * The account a route acts on still comes from the session alone; this header
+ * can only get a request refused. It is refused when the selection has moved
+ * since that page last loaded it (a switch made in another tab), so an Approve
+ * or a settings save never lands on an account the user is not looking at.
+ * A request without the header (curl, the scripts) is not checked.
+ */
+export const VIEWED_ACCOUNT_HEADER = 'x-viewed-account';
+/** `code` on the 409 above, so the dashboard can tell it from every other 409. */
+export const ACCOUNT_CHANGED_CODE = 'account_changed';
+const ACCOUNT_CHANGED_ERROR =
+  'The selected account changed since this page loaded it. Nothing was done.';
+
+/** How a stale tab finds out what is selected now, and signs out: never refused as stale. */
+const SELECTION_ROUTES = new Set(['/api/accounts', '/api/accounts/select', '/api/auth/logout']);
+
 /** The acting user. Throws rather than returning null so a route cannot forget the check. */
 export function requireUser(request: FastifyRequest): AuthUser {
   if (!request.authUser) {
@@ -64,7 +81,8 @@ export function requireAccount(request: FastifyRequest): AccountRow {
 
 export function registerAuth(fastify: FastifyInstance, db: TraderDb): void {
   fastify.addHook('preHandler', async (request, reply) => {
-    if (PUBLIC_ROUTES.has(request.routeOptions.url ?? request.url)) return;
+    const route = request.routeOptions.url ?? request.url;
+    if (PUBLIC_ROUTES.has(route)) return;
     // CORS preflight carries no Authorization header by design.
     if (request.method === 'OPTIONS') return;
 
@@ -79,6 +97,11 @@ export function registerAuth(fastify: FastifyInstance, db: TraderDb): void {
     });
     if (!session) {
       return reply.status(401).send({ error: 'invalid or expired token' });
+    }
+
+    const viewed = request.headers[VIEWED_ACCOUNT_HEADER];
+    if (viewed !== undefined && viewed !== session.account?.id && !SELECTION_ROUTES.has(route)) {
+      return reply.status(409).send({ error: ACCOUNT_CHANGED_ERROR, code: ACCOUNT_CHANGED_CODE });
     }
 
     request.authUser = session.user;

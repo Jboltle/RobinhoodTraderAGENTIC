@@ -32,6 +32,9 @@ const PROXY_REQUEST_HEADERS = [
   // Conditional revalidation: the trader answers 304 + empty body when the
   // payload hash still matches, which is most polls.
   'if-none-match',
+  // The account the page is showing; the trader refuses a request made for
+  // one that is no longer selected (server/src/trader/auth.ts).
+  'x-viewed-account',
 ] as const
 
 /** gzip a response body when the browser accepts it. Egress is billed on this hop. */

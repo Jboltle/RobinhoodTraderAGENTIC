@@ -196,6 +196,9 @@ function SettingsForm({
       void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
       return queryClient.invalidateQueries({ queryKey: ['settings'] })
     },
+    // A save is refused when another tab has switched accounts: reading the
+    // list again brings this page onto the account now selected.
+    onError: () => void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY }),
   })
 
   const set = <K extends keyof TradeSettingsInput>(

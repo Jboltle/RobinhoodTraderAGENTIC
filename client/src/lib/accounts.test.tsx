@@ -14,8 +14,11 @@ import {
 } from './accounts'
 import type { AccountSummary, AccountsResponse, SnapTradeAccountSummary } from './api'
 
-const fetchAccounts = vi.hoisted(() => vi.fn<() => Promise<AccountsResponse>>())
-vi.mock('./api', () => ({ fetchAccounts }))
+const { fetchAccounts, setAccountChangedHandler } = vi.hoisted(() => ({
+  fetchAccounts: vi.fn<() => Promise<AccountsResponse>>(),
+  setAccountChangedHandler: vi.fn<(handler: () => void) => void>(),
+}))
+vi.mock('./api', () => ({ fetchAccounts, setAccountChangedHandler }))
 
 const robinhood: AccountSummary = {
   id: 'account-robinhood',
@@ -165,5 +168,24 @@ describe('useResetOnAccountSwitch', () => {
     expect(fetchAccounts).toHaveBeenCalledTimes(2)
     expect(fetchSettings).toHaveBeenCalledTimes(1)
     expect(container.textContent).toBe('robinhood settings / robinhood decisions')
+  })
+
+  // The server refuses a request made for an account that is no longer
+  // selected; api.ts reports that through the handler registered here.
+  test('a refusal for a stale account reads the list again and follows the switch', async () => {
+    const { queryClient, container } = renderScreen()
+    queryClient.setQueryData(['decisions'], 'robinhood decisions')
+    await waitFor(() =>
+      expect(container.textContent).toBe('robinhood settings / robinhood decisions'),
+    )
+    const onAccountChanged = setAccountChangedHandler.mock.calls.at(-1)![0]
+
+    // Another tab has switched to paper by the time the refusal arrives.
+    fetchAccounts.mockResolvedValue(accounts(paper.id))
+    fetchSettings.mockResolvedValue('paper settings')
+    onAccountChanged()
+
+    await waitFor(() => expect(container.textContent).toBe('paper settings / no decisions'))
+    expect(fetchAccounts).toHaveBeenCalledTimes(2)
   })
 })
