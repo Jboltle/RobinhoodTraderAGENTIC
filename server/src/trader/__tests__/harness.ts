@@ -11,7 +11,8 @@ import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fas
 
 import type { TradeExecutionMode } from '../../shared/types.js';
 import { TraderEvents } from '../events.js';
-import type { McpRegistry, UserBroker } from '../robinhood/mcpRegistry.js';
+import type { McpRegistry } from '../broker/registry.js';
+import type { UserBroker } from '../broker/types.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import type { RobinhoodTools } from '../robinhood/tools.js';
 import { buildServer } from '../server.js';

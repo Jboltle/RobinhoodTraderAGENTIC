@@ -17,8 +17,8 @@ import { createLogger, errorFields } from '../../shared/logger.js';
 import type { TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { isRegularUsTradingHours } from '../pipeline/riskFilter.js';
-import { BrokerUnavailableError } from '../robinhood/mcpClient.js';
-import type { McpRegistry } from '../robinhood/mcpRegistry.js';
+import { BrokerUnavailableError } from '../broker/errors.js';
+import type { McpRegistry } from '../broker/registry.js';
 import type { RobinhoodTools } from '../robinhood/tools.js';
 import {
   applyMark,

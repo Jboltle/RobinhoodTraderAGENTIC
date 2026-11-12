@@ -12,7 +12,8 @@ import { startLadderMonitor } from './ladderMonitor.js';
 import { startMaxLossMonitor } from './maxLoss.js';
 import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
-import { createMcpRegistry } from './robinhood/mcpRegistry.js';
+import { createMcpRegistry } from './broker/registry.js';
+import { createRobinhoodAdapter } from './robinhood/adapter.js';
 import { buildServer } from './server.js';
 
 const log = createLogger('trader');
@@ -22,7 +23,7 @@ async function main(): Promise<void> {
 
   const db = createTraderDb();
   const events = new TraderEvents();
-  const brokers = createMcpRegistry(db);
+  const brokers = createMcpRegistry(createRobinhoodAdapter(db));
 
   // DECISION_ENGINE=parser rolls the trade path back to the LLM parser.
   const parser =

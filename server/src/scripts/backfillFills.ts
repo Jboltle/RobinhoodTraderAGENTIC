@@ -14,7 +14,8 @@ import { createLogger, errorFields } from '../shared/logger.js';
 import { createTraderDb } from '../trader/db.js';
 import { TraderEvents } from '../trader/events.js';
 import { sweepFills } from '../trader/fills.js';
-import { createMcpRegistry } from '../trader/robinhood/mcpRegistry.js';
+import { createMcpRegistry } from '../trader/broker/registry.js';
+import { createRobinhoodAdapter } from '../trader/robinhood/adapter.js';
 
 const log = createLogger('scripts:backfill-fills');
 const DEFAULT_DAYS = 90;
@@ -29,7 +30,7 @@ async function main(): Promise<void> {
   const before = await db.listOpenOrders(since);
   log.info('backfill start', { since: since.toISOString(), openOrders: before.length });
 
-  const result = await sweepFills({ db, brokers: createMcpRegistry(db), events: new TraderEvents() }, since);
+  const result = await sweepFills({ db, brokers: createMcpRegistry(createRobinhoodAdapter(db)), events: new TraderEvents() }, since);
   const after = await db.listOpenOrders(since);
   log.info('backfill done', { ...result, stillOpen: after.length });
   for (const row of after) {

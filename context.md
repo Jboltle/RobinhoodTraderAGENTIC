@@ -14,7 +14,7 @@ Three parts: `server/src/bot/` (Discord gateway, forwards HMAC-signed envelopes)
 - Invite-only multi-tenant, NOT self-hosted-per-person any more. Supabase Auth email/password; signup gated server-side against `allowed_emails`.
 - Runtime = Node (TypeScript via tsx) for the server, Bun for the client; Bun leaks on postgres.js over TLS (docs/reports/2026-10-20-bun-tls-upgrade-leak.md). vitest for tests, `tsc -p . --noEmit` typecheck.
 - LLM: ONE factory in `server/src/shared/llm.ts` via TanStack AI adapters. Backend is inferred from `LLM_MODEL` by the adapter router in that file; `requiredString('LLM_MODEL')`.
-- MCP client: hand-rolled wrapper, one instance **per user** in `robinhood/mcpRegistry.ts` (`Map`, ponytail-marked unbounded, LRU is the upgrade path).
+- MCP client: hand-rolled wrapper, one instance **per user** in `broker/registry.ts` (`Map`, ponytail-marked unbounded, LRU is the upgrade path).
 - Data access: `server/src/trader/db.ts` is the ONLY module that constructs a Supabase client. Service-role key (bypasses RLS). Every per-user method takes `userId` first so scoping can't be forgotten.
 - RLS on, default-deny (no policies + grants revoked) on all five tables. Mandatory, not defense in depth: anon key ships in the client bundle and PostgREST is public. Browser's anon key is auth-only.
 - Settings: one `jsonb` row per user in `settings`. Defaults live in `TradeSettingsSchema` `.default()` values — no env layer, no file layer, no `resolveSettings`.

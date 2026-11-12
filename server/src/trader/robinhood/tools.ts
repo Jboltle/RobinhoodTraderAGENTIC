@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 
 import { createLogger } from '../../shared/logger.js';
 import type { OptionContract, OptionType, OrderSide } from '../../shared/types.js';
+import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js';
+import { roundPremiumToTick } from '../broker/instrument.js';
 import type { RobinhoodMcpClient } from './mcpClient.js';
-import { BrokerUnavailableError, McpToolError, assertTokenForTrade } from './mcpClient.js';
+import { McpToolError, assertTokenForTrade } from './mcpClient.js';
 import type {
   BuyingPowerResult,
   CallToolResult,
@@ -41,14 +43,6 @@ export const TOOL_NAMES = {
   placeOptionsOrder: 'place_option_order',
   cancelOptionOrder: 'cancel_option_order',
 } as const;
-
-/**
- * The broker was reached and has no usable quote for the symbol — the one
- * failure that really means "not a tradable ticker".
- */
-export class SymbolNotFoundError extends Error {
-  override readonly name = 'SymbolNotFoundError';
-}
 
 // =============================================================================
 // Public client
@@ -710,40 +704,6 @@ function parseMinTicks(value: unknown): OptionMinTicks | null {
   if (aboveTick === null || belowTick === null || cutoffPrice === null) return null;
   if (aboveTick <= 0 || belowTick <= 0) return null;
   return { aboveTick, belowTick, cutoffPrice };
-}
-
-// =============================================================================
-// Price grid rounding
-// =============================================================================
-
-/**
- * The standard US options grid (penny below $3, nickel above), used when the
- * instrument row carries no `min_ticks`. Exact for penny-program symbols and
- * never produces sub-penny prices, which is the failure seen in the wild.
- */
-const DEFAULT_MIN_TICKS: OptionMinTicks = { aboveTick: 0.05, belowTick: 0.01, cutoffPrice: 3 };
-
-const TICK_EPSILON = 1e-9;
-
-/**
- * Snap a per-contract premium onto the instrument's price grid. Buys round up
- * and sells round down so the rounded order is always at least as marketable
- * as the requested one (cost: under one tick per contract).
- */
-export function roundPremiumToTick(
-  premium: number,
-  side: OrderSide,
-  minTicks: OptionMinTicks | null
-): number {
-  const grid = minTicks ?? DEFAULT_MIN_TICKS;
-  const tick = premium < grid.cutoffPrice ? grid.belowTick : grid.aboveTick;
-  const steps =
-    side === 'buy'
-      ? Math.ceil(premium / tick - TICK_EPSILON)
-      : Math.floor(premium / tick + TICK_EPSILON);
-  // A sell floored to zero is off-grid too; the smallest valid price is one tick.
-  const snapped = Math.max(tick, steps * tick);
-  return Number(snapped.toFixed(4));
 }
 
 function parsePlaceOrder(result: CallToolResult): PlaceOrderResult {

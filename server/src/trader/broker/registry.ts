@@ -6,14 +6,7 @@
  * Holding the clients here also keeps each user's pending OAuth flow separate,
  * so two people can connect at the same time.
  */
-import type { BrokerTokenStore } from './types.js';
-import { RobinhoodMcpClient } from './mcpClient.js';
-import { RobinhoodTools } from './tools.js';
-
-export interface UserBroker {
-  readonly mcp: RobinhoodMcpClient;
-  readonly tools: RobinhoodTools;
-}
+import type { BrokerAdapter, UserBroker } from './types.js';
 
 export interface McpRegistry {
   /** The user's broker session, created on first use. */
@@ -23,7 +16,7 @@ export interface McpRegistry {
   drop(userId: string): void;
 }
 
-export function createMcpRegistry(db: BrokerTokenStore): McpRegistry {
+export function createMcpRegistry(adapter: BrokerAdapter): McpRegistry {
   // ponytail: unbounded — one entry per user who has ever traded this process
   // lifetime, each holding an open MCP transport. Fine at invite-only scale.
   // Upgrade path: an LRU that closes the transport on eviction.
@@ -33,8 +26,7 @@ export function createMcpRegistry(db: BrokerTokenStore): McpRegistry {
     for(userId: string): UserBroker {
       let broker = brokers.get(userId);
       if (!broker) {
-        const mcp = new RobinhoodMcpClient({ userId, db });
-        broker = { mcp, tools: new RobinhoodTools(mcp) };
+        broker = adapter.open(userId);
         brokers.set(userId, broker);
       }
       return broker;

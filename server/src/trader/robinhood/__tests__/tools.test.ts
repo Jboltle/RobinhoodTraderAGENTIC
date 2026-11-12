@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { roundPremiumToTick } from '../tools.js';
+import { roundPremiumToTick } from '../../broker/instrument.js';
 import type { OptionMinTicks } from '../types.js';
 
 // SPY/QQQ-style penny-program instrument: $0.01 everywhere.

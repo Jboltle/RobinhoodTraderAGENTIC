@@ -6,8 +6,9 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { BrokerUnavailableError, McpToolError, type RobinhoodMcpClient } from '../mcpClient.js';
-import { RobinhoodTools, SymbolNotFoundError, TOOL_NAMES } from '../tools.js';
+import { BrokerUnavailableError, SymbolNotFoundError } from '../../broker/errors.js';
+import { McpToolError, type RobinhoodMcpClient } from '../mcpClient.js';
+import { RobinhoodTools, TOOL_NAMES } from '../tools.js';
 import type { CallToolResult } from '../types.js';
 
 function jsonResult(value: unknown): CallToolResult {

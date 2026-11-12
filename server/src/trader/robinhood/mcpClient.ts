@@ -7,6 +7,7 @@ import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import { config } from '../../shared/config.js';
 import { createLogger } from '../../shared/logger.js';
+import { BrokerUnavailableError } from '../broker/errors.js';
 import { awaitAuthorizationCode } from './oauthCallback.js';
 import { SupabaseOAuthProvider } from './oauthProvider.js';
 import type { BrokerTokenStore, CallToolResult, TokenStatus, ToolInputSchema } from './types.js';
@@ -44,15 +45,6 @@ export function assertTokenForTrade(status: TokenStatus): void {
   if (status.state === 'missing') {
     throw new Error('Robinhood token is missing; connect before placing a trade');
   }
-}
-
-/**
- * The user's Robinhood session cannot serve a call right now: not authorized,
- * waiting on an interactive OAuth consent, or the connect timed out. Distinct
- * from a broker that answered — callers must never read this as "bad ticker".
- */
-export class BrokerUnavailableError extends Error {
-  override readonly name = 'BrokerUnavailableError';
 }
 
 /** A tool call the broker answered with isError — it was reached and said no. */

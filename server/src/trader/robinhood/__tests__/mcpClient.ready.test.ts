@@ -6,7 +6,8 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { BrokerUnavailableError, RobinhoodMcpClient } from '../mcpClient.js';
+import { BrokerUnavailableError } from '../../broker/errors.js';
+import { RobinhoodMcpClient } from '../mcpClient.js';
 import type { BrokerTokenStore } from '../types.js';
 
 type Internals = {

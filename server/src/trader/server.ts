@@ -42,7 +42,8 @@ import {
   isoDateDaysAgo,
 } from './recaps/analytics.js';
 import { readTokenStatus } from './robinhood/mcpClient.js';
-import type { McpRegistry, UserBroker } from './robinhood/mcpRegistry.js';
+import type { McpRegistry } from './broker/registry.js';
+import type { UserBroker } from './broker/types.js';
 import type { RobinhoodTools } from './robinhood/tools.js';
 import type { TokenState } from './robinhood/types.js';
 

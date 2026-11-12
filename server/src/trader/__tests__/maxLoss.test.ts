@@ -14,8 +14,10 @@ import {
   weightedAverageEntry,
   type MaxLossDeps,
 } from '../maxLoss.js';
-import type { McpRegistry, UserBroker } from '../robinhood/mcpRegistry.js';
-import { BrokerUnavailableError, type RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import type { McpRegistry } from '../broker/registry.js';
+import type { UserBroker } from '../broker/types.js';
+import { BrokerUnavailableError } from '../broker/errors.js';
+import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import type { RobinhoodTools } from '../robinhood/tools.js';
 import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
 
