@@ -9,6 +9,9 @@ export default defineRailway((ctx) => {
   // has never heard of comes up without a Listener and unable to trade.
   const isProd = ctx.isEnvironment("production");
   const branch = isProd ? "main" : "staging";
+  // Staging services sleep when idle and wake on the next request; production
+  // never sleeps. Absent rather than false for production, which has no such key.
+  const sleepWhenIdle = isProd ? {} : { sleepApplication: true };
 
   const Postgres = postgres("Postgres", { region: "us-east4-eqdc4a" });
   // Spread, not replace: the import overwrote the region postgres() had just set,
@@ -27,7 +30,7 @@ export default defineRailway((ctx) => {
     healthcheck: "/health",
     preDeploy: [],
     replicas: { "us-east4-eqdc4a": 1 },
-    deploy: { limitOverride: { containers: { cpu: 0.5, memoryBytes: 1000000000 } } },
+    deploy: { limitOverride: { containers: { cpu: 0.5, memoryBytes: 1000000000 } }, ...sleepWhenIdle },
     networking: { privateNetworkEndpoint: "robinhoodtradingserver" },
     // Production only. Railway rejects edge caching on a service with no public
     // address, and a new environment has none until `railway domain` is run, so
@@ -53,11 +56,12 @@ export default defineRailway((ctx) => {
     },
   });
   const RobinhoodTraderWebsite = service("RobinhoodTraderWebsite", {
-    source: github("Jboltle/RobinhoodTraderAGENTIC", { branch, checkSuites: true, rootDirectory: "/" }),
+    // Production's site waits for CI before deploying; staging's does not.
+    source: github("Jboltle/RobinhoodTraderAGENTIC", { branch, checkSuites: isProd, rootDirectory: "/" }),
     build: { buildCommand: "", buildEnvironment: "V3", builder: "DOCKERFILE", dockerfilePath: "/Dockerfile.client", watchPatterns: ["/client/**"] },
     healthcheck: "/health",
     replicas: { "us-east4-eqdc4a": 1 },
-    deploy: { limitOverride: { containers: { cpu: 1, memoryBytes: 1000000000 } }, restartPolicyMaxRetries: 5 },
+    deploy: { limitOverride: { containers: { cpu: 1, memoryBytes: 1000000000 } }, restartPolicyMaxRetries: 5, ...sleepWhenIdle },
     networking: { privateNetworkEndpoint: "robinhoodtraderagentic" },
     ...(isProd ? { cdn: { defaultTtlSeconds: 86400, enabled: true } } : {}), // as on the trader
     env: {

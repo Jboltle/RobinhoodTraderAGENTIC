@@ -313,6 +313,8 @@ What keeps staging apart from production:
 - **Own database.** `SUPABASE_DB_URL` is `${{Postgres.DATABASE_URL}}`, the Postgres in the same environment.
 - **Own trader behind the dashboard.** Staging's `API_URL` is `https://${{RobinhoodTradingServer.RAILWAY_PUBLIC_DOMAIN}}`, the trader in the same environment. Production's is a fixed address held in Railway.
 
+Staging services sleep when idle (Railway app sleeping, on for the trader and the dashboard) and wake on the next request. A sleeping trader picks up no `messages` rows, so request its `/health` before inserting a test row. Staging has no edge caching, and its dashboard deploys without waiting for CI.
+
 The generated `*.up.railway.app` addresses are created with `railway domain`; they are not in the file. The staging site signs in by email address alone, like production, and holds a copy of every user's history and settings.
 
 Staging's database is a clone of production taken on demand, without the broker tokens or sessions. `pg_dump` must be at least the server's major version, 18 (`brew install libpq`, which is not put on `PATH`):
