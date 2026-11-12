@@ -6,8 +6,14 @@
  */
 import { describe, expect, it } from 'vitest';
 
+import { TradeSettingsSchema, type Decision, type SubmittedOrder } from '../../../shared/types.js';
+import { createFakeDb, type FakeDb } from '../../__tests__/fakeDb.js';
 import { SymbolNotFoundError } from '../../broker/errors.js';
+import { roundPremiumToTick } from '../../broker/instrument.js';
 import type { Instrument, OrderRequest } from '../../broker/types.js';
+import { stopTrigger } from '../../lots.js';
+import { submitOrder } from '../../pipeline/execute.js';
+import { cancelStops, restMissingStops } from '../../stops.js';
 import { RobinhoodBroker } from '../broker.js';
 import type { RobinhoodMcpClient } from '../mcpClient.js';
 import { RobinhoodTools, TOOL_NAMES } from '../tools.js';
@@ -516,5 +522,163 @@ describe('RobinhoodBroker writes', () => {
       { name: 'cancel_option_order', args: { account_number: ACCOUNT, order_id: 'stop-1' } },
     ]);
     expect(wire).toStrictEqual(await legacyWire((t) => t.cancelOptionOrder('stop-1')));
+  });
+});
+
+/**
+ * The callers that write, run over a real RobinhoodBroker: each must put on the
+ * wire exactly what its pre-port body did when it called RobinhoodTools itself.
+ */
+describe("the trader's write paths over RobinhoodBroker", () => {
+  const USER = 'user-1';
+  const CONTRACT = { optionType: 'call' as const, strike: 772, expiration: '2026-10-21' };
+  const ENTRY_FILL = 1;
+  const MAX_LOSS_PCT = 80;
+  const LOT_CONTRACTS = 4;
+  const LOT_MESSAGE_ID = 'buy-SPY';
+
+  const sized = (overrides: Partial<SubmittedOrder> = {}): SubmittedOrder => ({
+    symbol: 'SPY',
+    side: 'buy',
+    assetType: 'option',
+    quantity: 3,
+    orderType: 'limit',
+    limitPrice: 0.195,
+    option: CONTRACT,
+    orderId: null,
+    status: null,
+    ...overrides,
+  });
+
+  /** One filled four-contract lot, bought at 1.00, with Max Loss at 80%. */
+  function dbWithLot(stopOrderId?: string): FakeDb {
+    const db = createFakeDb();
+    db.seedSettings(USER, TradeSettingsSchema.parse({ maxLossPct: MAX_LOSS_PCT }));
+    db.seedMessage({ messageId: LOT_MESSAGE_ID, sentAt: '2026-10-21T15:18:06.000Z' });
+    const bought: Decision = {
+      at: '2026-10-21T15:18:06.000Z',
+      messageId: LOT_MESSAGE_ID,
+      kind: 'submitted',
+      code: null,
+      reason: 'bought',
+      ticker: 'SPY',
+      action: 'buy',
+      order: sized({
+        quantity: LOT_CONTRACTS,
+        limitPrice: ENTRY_FILL,
+        orderId: 'buy-1',
+        status: 'filled',
+        ...(stopOrderId !== undefined ? { stopOrderId } : {}),
+      }),
+    };
+    db.seedDecision(USER, bought);
+    return db;
+  }
+
+  it('submitOrder places a limit option entry as it did', async () => {
+    const { tools, wire } = connect();
+
+    await submitOrder(sized(), new RobinhoodBroker(tools));
+
+    expect(wire.at(-1)!.args).toMatchObject({ type: 'limit', quantity: '3', price: '0.2' });
+    expect(wire).toStrictEqual(
+      await legacyWire((t) =>
+        t.placeOptionsOrder({
+          symbol: 'SPY',
+          ...CONTRACT,
+          contracts: 3,
+          side: 'buy',
+          orderType: 'limit',
+          limitPremium: 0.195,
+        })
+      )
+    );
+  });
+
+  it('submitOrder places the Max Loss market close as it did', async () => {
+    const { tools, wire } = connect();
+
+    await submitOrder(
+      sized({ side: 'sell', quantity: 2, orderType: 'market', limitPrice: null }),
+      new RobinhoodBroker(tools)
+    );
+
+    expect(wire.at(-1)!.name).toBe('place_option_order');
+    expect(wire.at(-1)!.args).toMatchObject({ type: 'market', quantity: '2' });
+    expect(wire.at(-1)!.args).not.toHaveProperty('price');
+    expect(wire).toStrictEqual(
+      await legacyWire((t) =>
+        t.placeOptionsOrder({
+          symbol: 'SPY',
+          ...CONTRACT,
+          contracts: 2,
+          side: 'sell',
+          orderType: 'market',
+        })
+      )
+    );
+  });
+
+  it('submitOrder places a stock order as it did', async () => {
+    const { tools, wire } = connect();
+
+    await submitOrder(
+      sized({ symbol: 'AAPL', assetType: 'equity', option: null, quantity: 4, limitPrice: 150.25 }),
+      new RobinhoodBroker(tools)
+    );
+
+    expect(wire.at(-1)!.name).toBe('place_equity_order');
+    expect(wire).toStrictEqual(
+      await legacyWire((t) =>
+        t.placeOrder({ symbol: 'AAPL', side: 'buy', orderType: 'limit', quantity: 4, limitPrice: 150.25 })
+      )
+    );
+  });
+
+  it('restMissingStops rests the stop it did and records its id on the lot', async () => {
+    const { tools, wire } = connect();
+    const db = dbWithLot();
+
+    await restMissingStops({
+      userId: USER,
+      db,
+      broker: new RobinhoodBroker(tools),
+      executionMode: 'immediate',
+    });
+
+    expect(wire.at(-1)!.args).toMatchObject({
+      type: 'stop_market',
+      quantity: String(LOT_CONTRACTS),
+      time_in_force: 'gtc',
+      stop_price: '0.2',
+    });
+    expect(wire).toStrictEqual(
+      await legacyWire((t) =>
+        t.placeOptionsOrder({
+          symbol: 'SPY',
+          ...CONTRACT,
+          contracts: LOT_CONTRACTS,
+          side: 'sell',
+          orderType: 'stop_market',
+          stopPrice: roundPremiumToTick(stopTrigger(ENTRY_FILL, MAX_LOSS_PCT), 'sell', null),
+          timeInForce: 'gtc',
+        })
+      )
+    );
+    expect((await db.listOpenOptionLots(USER))[0]!.stopOrderId).toBe('opt-ord-9');
+  });
+
+  it('cancelStops cancels the resting stop as it did and clears it from the lot', async () => {
+    const { tools, wire } = connect();
+    const db = dbWithLot('stop-1');
+
+    await cancelStops(db, USER, new RobinhoodBroker(tools), 'SPY', CONTRACT);
+
+    expect(wire).toStrictEqual(await legacyWire((t) => t.cancelOptionOrder('stop-1')));
+    expect(wire.at(-1)).toStrictEqual({
+      name: 'cancel_option_order',
+      args: { account_number: ACCOUNT, order_id: 'stop-1' },
+    });
+    expect((await db.listOpenOptionLots(USER))[0]!.stopOrderId).toBeNull();
   });
 });
