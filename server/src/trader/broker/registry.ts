@@ -34,7 +34,11 @@ export function createMcpRegistry(
         // Guarded once, when the session is opened: everything downstream holds
         // the guarded Broker, and its identity stays stable per session.
         const opened = adapter.open(userId);
-        broker = { ...opened, broker: guardWrites(opened.broker, executionMode) };
+        broker = {
+          session: opened.session,
+          broker: guardWrites(opened.broker, executionMode),
+          quotesOptions: adapter.quotesOptions,
+        };
         brokers.set(userId, broker);
       }
       return broker;

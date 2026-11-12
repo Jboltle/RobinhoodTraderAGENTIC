@@ -16,6 +16,7 @@ import type { MessageDisposition, TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js';
 import { instrumentOf } from '../broker/instrument.js';
+import type { QuoteSource } from '../broker/quotes.js';
 import type { McpRegistry } from '../broker/registry.js';
 import {
   allocateFifo,
@@ -46,6 +47,8 @@ export interface PipelineDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
+  /** Prices the entry check, through whichever connected session can quote options. */
+  readonly quotes: QuoteSource;
   /** The deployment's TRADE_EXECUTION_MODE; required so no wiring can forget the kill switch. */
   readonly executionMode: TradeExecutionMode;
 }
@@ -719,9 +722,10 @@ async function entryMismatchReason(
   const cached = entryVerdicts.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const [firstUserId] = await deps.db.listBrokerUserIds();
-  if (firstUserId === undefined) return null;
-  const { broker } = deps.brokers.for(firstUserId);
+  // Read live, not from the quote source's cache: this price decides whether
+  // the entry is placed or held for approval.
+  const broker = await deps.quotes.broker();
+  if (broker === null) return null;
   const contract = instrumentOf({ symbol: ticker, assetType: 'option', option });
 
   let reason: string | null = null;

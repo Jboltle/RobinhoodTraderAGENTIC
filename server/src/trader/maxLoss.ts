@@ -18,12 +18,12 @@ import type { TraderEvents } from './events.js';
 import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
+import { instrumentKey } from './broker/instrument.js';
 import type { McpRegistry } from './broker/registry.js';
 import type {
   Broker,
   BrokerOrder,
   BrokerPosition,
-  Instrument,
   OptionInstrument,
 } from './broker/types.js';
 
@@ -152,7 +152,7 @@ async function scanUser(
 
   const positions = await broker.getPositions();
   const held = new Set(
-    positions.filter((p) => p.quantity > 0).map((p) => positionKey(p.instrument))
+    positions.filter((p) => p.quantity > 0).map((p) => instrumentKey(p.instrument))
   );
   const submitted = await entryHistory(userId, deps, entries, held);
   const orders = await broker.getOrders().catch(() => null);
@@ -162,7 +162,7 @@ async function scanUser(
 
   for (const position of positions) {
     const { instrument } = position;
-    const key = positionKey(instrument);
+    const key = instrumentKey(instrument);
     if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
     // A resting broker stop is this position's Max Loss. Selling here too would
     // double-close it. ponytail: the dollar cap does not fire while that stop
@@ -373,12 +373,6 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
 
 export function lossEnabled(maxLossPct: number | null, maxLossUsd: number | null): boolean {
   return (maxLossPct !== null && maxLossPct > 0) || (maxLossUsd !== null && maxLossUsd > 0);
-}
-
-function positionKey(instrument: Instrument): string {
-  const symbol = instrument.symbol.toUpperCase();
-  if (instrument.kind === 'equity') return `eq:${symbol}`;
-  return `opt:${symbol}:${instrument.optionType}:${instrument.strike}:${instrument.expiration}`;
 }
 
 /** One buy lot: unit price paid and units bought. Callers pass lots newest-first. */

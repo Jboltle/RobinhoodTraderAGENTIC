@@ -29,6 +29,7 @@ import {
   BrokerWritesDisabledError,
   SymbolNotFoundError,
 } from '../../broker/errors.js';
+import { createQuoteSource } from '../../broker/quotes.js';
 import { guardWrites } from '../../broker/writeGuard.js';
 import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
 import { JevCalloutDecider } from '../decide.js';
@@ -81,13 +82,25 @@ function makeBroker(options: FakeBrokerOptions = {}): FakeBroker {
 }
 
 const makeMcp = (): RobinhoodMcpClient =>
-  ({ isConnected: vi.fn().mockReturnValue(true) }) as unknown as RobinhoodMcpClient;
+  ({
+    isConnected: vi.fn().mockReturnValue(true),
+    ensureReady: vi.fn().mockResolvedValue(undefined),
+  }) as unknown as RobinhoodMcpClient;
 
 function makeRegistry(brokerByUser: Map<string, FakeBroker>): McpRegistry {
   return makeFakeRegistry((userId) => ({
     session: makeMcp(),
     broker: brokerByUser.get(userId) ?? makeBroker(),
   }));
+}
+
+/** The registry and the quote source over it, wired as trader/index.ts does. */
+function makeBrokerDeps(
+  db: FakeDb,
+  brokerByUser: Map<string, FakeBroker>
+): Pick<PipelineDeps, 'brokers' | 'quotes'> {
+  const brokers = makeRegistry(brokerByUser);
+  return { brokers, quotes: createQuoteSource({ db, brokers }) };
 }
 
 function makeParser(callout: Callout | Error): CalloutParser {
@@ -127,7 +140,7 @@ function setup(
     parser: makeParser(callout),
     db,
     events,
-    brokers: makeRegistry(brokerByUser),
+    ...makeBrokerDeps(db, brokerByUser),
     executionMode: 'immediate',
   };
   return { db, deps, broker: brokerByUser.get(users[0]!)!, events };
@@ -651,6 +664,55 @@ describe('fan-out — error paths', () => {
     expect(broker.getAccount).not.toHaveBeenCalled();
   });
 
+  // The entry check borrows whichever connected session is ready, so one
+  // user's expired login does not leave everyone else's entry unchecked.
+  it('checks the entry through the next ready session when the first needs consent', async () => {
+    // A ticker no other test checks: entry verdicts are kept per message and contract.
+    const callout: Callout = { ...BTO_QQQ_PUT.expectedCallout, ticker: 'MNVDA' };
+    const db = createFakeDb();
+    const brokerByUser = new Map<string, FakeBroker>([
+      [USER, makeBroker()],
+      [
+        OTHER_USER,
+        makeBroker({
+          overrides: {
+            confirmInstrument: vi
+              .fn()
+              .mockRejectedValue(new SymbolNotFoundError('no option instrument matched MNVDA')),
+          },
+        }),
+      ],
+    ]);
+    for (const userId of [USER, OTHER_USER]) {
+      db.seedBrokerTokens(userId, fakeTokens(`token-${userId}`));
+      db.seedSettings(userId, { ...TRADING_SETTINGS });
+    }
+    const needsConsent = {
+      isConnected: vi.fn().mockReturnValue(false),
+      ensureReady: vi.fn().mockRejectedValue(new BrokerUnavailableError('authorization required')),
+    } as unknown as RobinhoodMcpClient;
+    const brokers = makeFakeRegistry((userId) => ({
+      session: userId === USER ? needsConsent : makeMcp(),
+      broker: brokerByUser.get(userId)!,
+    }));
+
+    await createMessageProcessor({
+      parser: makeParser(callout),
+      db,
+      events: new TraderEvents(),
+      brokers,
+      quotes: createQuoteSource({ db, brokers }),
+      executionMode: 'immediate',
+    }).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(brokerByUser.get(USER)!.confirmInstrument).not.toHaveBeenCalled();
+    const [decision] = await db.listDecisions(OTHER_USER, 10);
+    expect(decision!.kind).toBe('pending_approval');
+    expect(decision!.code).toBe('price_mismatch');
+    expect(decision!.reason).toMatch(/no such contract/);
+    expect(placedOrders(brokerByUser.get(OTHER_USER)!, 'option')).toHaveLength(0);
+  });
+
   it('records broker_unavailable, not ticker_invalid, when the Robinhood session is down', async () => {
     const { decision, broker } = await runWith(
       envelopeFromFixture(BTO_QQQ_PUT),
@@ -772,7 +834,7 @@ describe('fan-out — several users', () => {
       parser: makeParser(BTO_QQQ_PUT.expectedCallout),
       db,
       events: new TraderEvents(),
-      brokers: makeRegistry(brokerByUser),
+      ...makeBrokerDeps(db, brokerByUser),
       executionMode: 'immediate',
     }).process(envelopeFromFixture(BTO_QQQ_PUT));
 

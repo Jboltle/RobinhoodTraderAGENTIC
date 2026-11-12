@@ -176,6 +176,7 @@ db.seedDecision(USER.id, {
 });
 
 const broker: UserBroker = {
+  quotesOptions: true,
   session: {
     isConnected: () => true,
     getPendingAuthUrl: () => null,

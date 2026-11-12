@@ -81,8 +81,10 @@ const ADAPTERS = [
 ] as const;
 
 const registryOver = (adapter: AdapterUnderTest, mode: TradeExecutionMode): Broker =>
-  createMcpRegistry({ open: () => ({ session: SESSION, broker: adapter.broker }) }, mode).for(USER)
-    .broker;
+  createMcpRegistry(
+    { quotesOptions: true, open: () => ({ session: SESSION, broker: adapter.broker }) },
+    mode
+  ).for(USER).broker;
 
 describe.each(ADAPTERS)('read_only deployment over %s', (_name, makeAdapter) => {
   it('refuses every order and every cancel before the adapter is reached', async () => {

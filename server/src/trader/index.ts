@@ -12,6 +12,7 @@ import { startLadderMonitor } from './ladderMonitor.js';
 import { startMaxLossMonitor } from './maxLoss.js';
 import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
+import { createQuoteSource } from './broker/quotes.js';
 import { createMcpRegistry } from './broker/registry.js';
 import { createRobinhoodAdapter } from './robinhood/adapter.js';
 import { buildServer } from './server.js';
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
   const db = createTraderDb();
   const events = new TraderEvents();
   const brokers = createMcpRegistry(createRobinhoodAdapter(db), config.tradeExecutionMode);
+  const quotes = createQuoteSource({ db, brokers });
 
   // DECISION_ENGINE=parser rolls the trade path back to the LLM parser.
   const parser =
@@ -41,6 +43,7 @@ async function main(): Promise<void> {
     db,
     events,
     brokers,
+    quotes,
     executionMode,
   });
 
@@ -93,7 +96,7 @@ async function main(): Promise<void> {
 
   // The tracked-callout book: marks, simulated ladder fills and expiry
   // settlement for every Caller entry. Read-only like the fill monitor.
-  startBookMonitor({ db, brokers, events });
+  startBookMonitor({ db, quotes, events });
 
   // Max Loss: process-lifetime flatten loop. Independent of the dashboard.
   startMaxLossMonitor({

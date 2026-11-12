@@ -4,9 +4,11 @@
  * contracts past expiry. Same shape as the Max Loss loop (maxLoss.ts).
  *
  * Marks are borrowed from ONE connected user's Robinhood session: the book is
- * shared data and quotes are the same for everyone, so the first session that
- * is ready this sweep serves the whole book. Read-only, so it runs under every
- * TRADE_EXECUTION_MODE.
+ * shared data and quotes are the same for everyone, so the shared quote source
+ * (broker/quotes.ts) picks the session that serves the whole book this sweep.
+ * Each mark is read live rather than from that source's 15 s cache: the sweep
+ * runs on the same 15 s, and a cached price would be re-applied every other
+ * sweep. Read-only, so it runs under every TRADE_EXECUTION_MODE.
  *
  * ponytail: quotes are fetched one contract at a time (two MCP calls each),
  * which is ~30 contracts per 15 s sweep before a sweep overruns its interval.
@@ -17,9 +19,8 @@ import { createLogger, errorFields } from '../../shared/logger.js';
 import type { TraderDb } from '../db.js';
 import type { TraderEvents } from '../events.js';
 import { isRegularUsTradingHours } from '../pipeline/riskFilter.js';
-import { BrokerUnavailableError } from '../broker/errors.js';
 import { instrumentOf } from '../broker/instrument.js';
-import type { McpRegistry } from '../broker/registry.js';
+import type { QuoteSource } from '../broker/quotes.js';
 import type { Broker } from '../broker/types.js';
 import {
   applyMark,
@@ -36,7 +37,7 @@ export const BOOK_INTERVAL_MS = 15_000;
 
 export interface BookMonitorDeps {
   readonly db: TraderDb;
-  readonly brokers: McpRegistry;
+  readonly quotes: QuoteSource;
   readonly events: TraderEvents;
   readonly now?: () => Date;
 }
@@ -47,16 +48,10 @@ export interface BookSweepResult {
   readonly settled: number;
 }
 
-/** Which user's session served quotes last; tried first next sweep. */
-export interface QuoteSessionState {
-  preferredUserId: string | null;
-}
-
 /** Boot + interval. Returns a stop function for tests. */
 export function startBookMonitor(deps: BookMonitorDeps): () => void {
-  const state: QuoteSessionState = { preferredUserId: null };
   const tick = (): void => {
-    void sweepBook(deps, state).catch((err: unknown) =>
+    void sweepBook(deps).catch((err: unknown) =>
       log.error('book sweep failed', errorFields(err))
     );
   };
@@ -70,10 +65,7 @@ export function startBookMonitor(deps: BookMonitorDeps): () => void {
  * One pass: settle what has expired (any hour), then during regular hours
  * mark what is still open. One book event per sweep that changed anything.
  */
-export async function sweepBook(
-  deps: BookMonitorDeps,
-  state: QuoteSessionState = { preferredUserId: null }
-): Promise<BookSweepResult> {
+export async function sweepBook(deps: BookMonitorDeps): Promise<BookSweepResult> {
   const now = deps.now?.() ?? new Date();
   const at = now.toISOString();
   const today = isoDateEt(now);
@@ -94,7 +86,7 @@ export async function sweepBook(
 
   let marked = 0;
   if (live.length > 0 && isRegularUsTradingHours(now)) {
-    const broker = await quoteSession(deps, state);
+    const broker = await deps.quotes.broker();
     if (broker === null) {
       log.warn('no connected broker session to quote the book', { open: live.length });
     } else {
@@ -109,34 +101,6 @@ export async function sweepBook(
 
   if (settled > 0 || marked > 0) deps.events.emitBook();
   return { open: open.length, marked, settled };
-}
-
-/**
- * The first connected user's ready session, the last one that worked first.
- * A session that needs consent is skipped, not started: reaching for a
- * disconnected user's broker would begin an OAuth flow nobody asked for.
- */
-async function quoteSession(
-  deps: BookMonitorDeps,
-  state: QuoteSessionState
-): Promise<Broker | null> {
-  const userIds = await deps.db.listBrokerUserIds();
-  const ordered =
-    state.preferredUserId !== null && userIds.includes(state.preferredUserId)
-      ? [state.preferredUserId, ...userIds.filter((id) => id !== state.preferredUserId)]
-      : userIds;
-  for (const userId of ordered) {
-    const broker = deps.brokers.for(userId);
-    try {
-      await broker.session.ensureReady();
-      state.preferredUserId = userId;
-      return broker.broker;
-    } catch (err) {
-      if (!(err instanceof BrokerUnavailableError)) throw err;
-    }
-  }
-  state.preferredUserId = null;
-  return null;
 }
 
 function markFor(broker: Broker, position: TrackedPosition): Promise<number | null> {

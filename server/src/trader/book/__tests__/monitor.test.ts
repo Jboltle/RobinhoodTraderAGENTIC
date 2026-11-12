@@ -4,6 +4,7 @@ import { createFakeDb, fakeTokens, type FakeDb } from '../../__tests__/fakeDb.js
 import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from '../../__tests__/harness.js';
 import { TraderEvents } from '../../events.js';
 import { BrokerUnavailableError } from '../../broker/errors.js';
+import { createQuoteSource, type QuoteSessionState } from '../../broker/quotes.js';
 import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
 import { openPosition } from '../ladder.js';
 import { sweepBook, type BookMonitorDeps } from '../monitor.js';
@@ -40,10 +41,12 @@ function makeBroker(options: StubOptions = {}): StubBroker {
 function makeDeps(
   db: FakeDb,
   brokers: Record<string, StubBroker>,
-  now: Date
+  now: Date,
+  state?: QuoteSessionState
 ): BookMonitorDeps & { events: TraderEvents } {
   const registry = makeFakeRegistry((userId) => brokers[userId]!);
-  return { db, brokers: registry, events: new TraderEvents(), now: () => now };
+  const quotes = createQuoteSource({ db, brokers: registry }, state);
+  return { db, quotes, events: new TraderEvents(), now: () => now };
 }
 
 const seedOpen = (db: FakeDb, messageId: string, expiration = '2026-10-23') =>
@@ -89,7 +92,7 @@ describe('sweepBook', () => {
     const live = makeBroker({ markPrice: 0.55 });
     const state = { preferredUserId: null };
 
-    await sweepBook(makeDeps(db, { u1: dead, u2: live }, RTH), state);
+    await sweepBook(makeDeps(db, { u1: dead, u2: live }, RTH, state));
 
     expect(dead.broker.getMark).not.toHaveBeenCalled();
     expect(live.broker.getMark).toHaveBeenCalledTimes(1);

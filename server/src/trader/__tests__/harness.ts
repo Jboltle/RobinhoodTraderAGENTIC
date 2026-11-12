@@ -14,6 +14,7 @@ import { TraderEvents } from '../events.js';
 import { createMcpRegistry, type McpRegistry } from '../broker/registry.js';
 import type {
   Broker,
+  BrokerAdapter,
   BrokerOrder,
   BrokerPosition,
   Instrument,
@@ -113,9 +114,9 @@ export const markReads = (broker: FakeBroker, kind: Instrument['kind']): Instrum
 
 /** The production registry over fake sessions and brokers. */
 export const makeFakeRegistry = (
-  open: (userId: string) => UserBroker,
+  open: BrokerAdapter['open'],
   executionMode: TradeExecutionMode = 'immediate'
-): McpRegistry => createMcpRegistry({ open }, executionMode);
+): McpRegistry => createMcpRegistry({ quotesOptions: true, open }, executionMode);
 
 // =============================================================================
 // HTTP harness

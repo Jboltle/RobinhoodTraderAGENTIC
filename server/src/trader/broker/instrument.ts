@@ -21,6 +21,13 @@ export function instrumentOf(order: {
   };
 }
 
+/** One string per instrument: the same contract always yields the same key. */
+export function instrumentKey(instrument: Instrument): string {
+  const symbol = instrument.symbol.toUpperCase();
+  if (instrument.kind === 'equity') return `eq:${symbol}`;
+  return `opt:${symbol}:${instrument.optionType}:${instrument.strike}:${instrument.expiration}`;
+}
+
 // =============================================================================
 // Price grid rounding
 // =============================================================================

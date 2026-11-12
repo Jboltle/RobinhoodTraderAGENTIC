@@ -92,9 +92,13 @@ export interface Broker {
 export interface UserBroker {
   readonly session: RobinhoodMcpClient;
   readonly broker: Broker;
+  /** Its adapter's `quotesOptions`, stamped on by the registry. */
+  readonly quotesOptions: boolean;
 }
 
 /** Opens one user's broker session; the registry holds the result per user. */
 export interface BrokerAdapter {
-  open(userId: string): UserBroker;
+  /** Whether this broker can price option contracts; the shared quote source asks only these. */
+  readonly quotesOptions: boolean;
+  open(userId: string): Omit<UserBroker, 'quotesOptions'>;
 }
