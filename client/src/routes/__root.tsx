@@ -188,7 +188,9 @@ function AccountSummaryCard() {
   return (
     <div className="rounded-xl border border-ink-600 bg-ink-800 p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
-        <p className="truncate text-sm font-medium text-white">{account?.label ?? '—'}</p>
+        <p className="truncate text-sm font-medium text-white" title={account?.label}>
+          {account?.label ?? '—'}
+        </p>
         {account && <AccountBadge isPaper={account.isPaper} />}
       </div>
       <p className="text-xs text-ink-400">Portfolio Balance</p>

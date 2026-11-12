@@ -442,10 +442,20 @@ export type BrokerEntry =
   | { adapter: 'robinhood'; account: AccountSummary }
   | { adapter: 'snaptrade'; accounts: Record<string, SnapTradeAccountSummary> }
 
+/** An account whose saved details the server cannot read: listed, never selectable. */
+export interface UnusableAccount {
+  id: string
+  label: string
+  institution: string
+  isPaper: boolean
+}
+
 /** GET /api/accounts: the user's accounts and the one the screens show. */
 export interface AccountsResponse {
   selectedAccountId: string
   brokers: BrokerEntry[]
+  /** Absent when every account can be read. */
+  unusableAccounts?: UnusableAccount[]
 }
 
 /** GET /api/broker/status: the connection state of the account being viewed. */

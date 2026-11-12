@@ -10,15 +10,17 @@ import {
   listAccounts,
   useAccounts,
 } from '../lib/accounts'
-import type { ListedAccount } from '../lib/accounts'
 import { selectAccount } from '../lib/api'
-import type { AccountsResponse } from '../lib/api'
+import type { AccountSummary, AccountsResponse } from '../lib/api'
 import { signOut, useAuth } from '../lib/auth'
 import { ConnectDialog } from './ConnectDialog'
 
 const MENU_ID = 'account-menu'
 const ITEM_SELECTOR = '[role^="menuitem"]'
 const VIEWED_ITEM_SELECTOR = '[role="menuitemradio"][aria-checked="true"]'
+
+/** What the menu says about an account whose saved details the server cannot read. */
+const UNUSABLE_STATE = 'Unavailable'
 
 const itemClass =
   'flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm text-ink-400 transition-colors hover:bg-ink-700/60 hover:text-white focus-visible:bg-ink-700 focus-visible:text-white'
@@ -152,9 +154,24 @@ export function AccountMenu() {
             <AccountItem
               key={account.id}
               account={account}
+              state={accountState(account)}
+              needsAttention={account.needsReconnect || !account.connected}
               viewed={account.id === viewedAccountId}
-              busy={switchAccount.isPending}
+              disabled={switchAccount.isPending}
               onChoose={() => choose(account.id)}
+            />
+          ))}
+          {/* Still menu items, so the arrow keys reach them and a screen
+              reader announces each as unavailable instead of the account
+              silently missing from the list. */}
+          {(accounts.data?.unusableAccounts ?? []).map((account) => (
+            <AccountItem
+              key={account.id}
+              account={account}
+              state={UNUSABLE_STATE}
+              needsAttention
+              viewed={false}
+              disabled
             />
           ))}
         </div>
@@ -220,16 +237,21 @@ export function AccountMenu() {
 
 function AccountItem({
   account,
+  state,
+  needsAttention,
   viewed,
-  busy,
+  disabled,
   onChoose,
 }: {
-  account: ListedAccount
+  account: Pick<AccountSummary, 'label' | 'institution' | 'isPaper'>
+  /** What the account is doing with callouts, or why it cannot be chosen. */
+  state: string
+  needsAttention: boolean
   viewed: boolean
-  busy: boolean
-  onChoose: () => void
+  disabled: boolean
+  /** Absent for an account that can never be chosen. */
+  onChoose?: () => void
 }) {
-  const needsAttention = account.needsReconnect || !account.connected
   return (
     // aria-disabled rather than disabled: a disabled button drops focus, and
     // with it the arrow keys, while a switch is in flight.
@@ -237,9 +259,9 @@ function AccountItem({
       type="button"
       role="menuitemradio"
       aria-checked={viewed}
-      aria-disabled={busy}
+      aria-disabled={disabled}
       tabIndex={-1}
-      className={itemClass}
+      className={onChoose ? itemClass : `${itemClass} cursor-not-allowed opacity-60`}
       onClick={onChoose}
     >
       <Check
@@ -248,12 +270,14 @@ function AccountItem({
       />
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-2">
-          <span className="truncate font-medium text-white">{account.label}</span>
+          <span className="truncate font-medium text-white" title={account.label}>
+            {account.label}
+          </span>
           <AccountBadge isPaper={account.isPaper} />
         </span>
         <span className="block truncate text-xs">
           {institutionName(account.institution)} ·{' '}
-          <span className={needsAttention ? 'text-warn' : undefined}>{accountState(account)}</span>
+          <span className={needsAttention ? 'text-warn' : undefined}>{state}</span>
         </span>
       </span>
     </button>

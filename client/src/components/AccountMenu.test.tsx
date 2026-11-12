@@ -11,6 +11,7 @@ import type {
   BrokerConnectResult,
   BrokerStatus,
   SnapTradeAccountSummary,
+  UnusableAccount,
 } from '../lib/api'
 
 const api = vi.hoisted(() => ({
@@ -57,6 +58,13 @@ const paper: SnapTradeAccountSummary = {
   followedCallerCount: 0,
   externalAccountId: 'snaptrade-account-1',
   connectionId: 'connection-1',
+}
+/** A row the server could not read: listed, with none of what a usable account reports. */
+const unreadable: UnusableAccount = {
+  id: 'account-unreadable',
+  label: 'Alpaca Paper (staging test)',
+  institution: 'alpaca-paper',
+  isPaper: true,
 }
 const accounts = (selectedAccountId: string): AccountsResponse => ({
   selectedAccountId,
@@ -267,4 +275,43 @@ test('still offers Settings and Sign out when the account list cannot be read', 
   await waitFor(() => expect(menu.textContent).toContain('Accounts unavailable (trader unreachable)'))
   expect(within(menu).queryAllByRole('menuitemradio')).toHaveLength(0)
   expect(within(menu).getAllByRole('menuitem')).toHaveLength(3)
+})
+
+test('an account that cannot be read is listed as unavailable and cannot be chosen', async () => {
+  api.fetchAccounts.mockResolvedValue({ ...accounts(robinhood.id), unusableAccounts: [unreadable] })
+  const utils = renderMenu()
+  const menu = utils.getByRole('menu')
+  await waitFor(() => expect(within(menu).getAllByRole('menuitemradio')).toHaveLength(3))
+
+  const [first, second, unusable] = within(menu).getAllByRole('menuitemradio')
+  expect(unusable.textContent).toContain(unreadable.label)
+  expect(unusable.textContent).toContain('PAPER')
+  expect(unusable.textContent).toContain('Alpaca Paper · Unavailable')
+  expect(unusable.getAttribute('aria-disabled')).toBe('true')
+  expect(unusable.getAttribute('aria-checked')).toBe('false')
+  // The accounts that can be chosen are not disabled by it.
+  expect(first.getAttribute('aria-disabled')).toBe('false')
+  expect(second.getAttribute('aria-disabled')).toBe('false')
+
+  openMenu(menu)
+  fireEvent.click(unusable)
+
+  expect(api.selectAccount).not.toHaveBeenCalled()
+  expect(hidePopover).not.toHaveBeenCalled()
+  expect(first.getAttribute('aria-checked')).toBe('true')
+
+  // The arrow keys still reach it, so it is announced rather than skipped.
+  expect(document.activeElement).toBe(first)
+  fireEvent.keyDown(menu, { key: 'ArrowDown' })
+  fireEvent.keyDown(menu, { key: 'ArrowDown' })
+  expect(document.activeElement).toBe(unusable)
+})
+
+test('a label too long for its row can be read in full', async () => {
+  api.fetchAccounts.mockResolvedValue({ ...accounts(robinhood.id), unusableAccounts: [unreadable] })
+  const utils = renderMenu()
+  const menu = utils.getByRole('menu')
+
+  await waitFor(() => expect(within(menu).getByTitle(unreadable.label).textContent).toBe(unreadable.label))
+  expect(within(menu).getByTitle(paper.label).textContent).toBe(paper.label)
 })
