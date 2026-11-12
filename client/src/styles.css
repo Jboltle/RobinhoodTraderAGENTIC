@@ -35,3 +35,31 @@ body {
   color: #ffffff;
   -webkit-font-smoothing: antialiased;
 }
+
+/* The account menu (components/AccountMenu.tsx) is a native popover, which the
+   browser centres in the viewport by default. It drops from the profile
+   circle instead, right edges aligned.
+   ponytail: where CSS anchor positioning is missing, the menu sits at a fixed
+   spot under the header's right edge (the header is 4rem tall with 2rem of
+   side padding), which is only where the circle is while the page is scrolled
+   to the top. Upgrade path: position it from the button's bounding box. */
+.account-menu-button {
+  anchor-name: --account-menu;
+}
+
+.account-menu {
+  inset: auto;
+  top: 4rem;
+  right: 2rem;
+  margin: 0;
+}
+
+@supports (position-area: bottom) {
+  .account-menu {
+    position-anchor: --account-menu;
+    position-area: bottom span-left;
+    top: auto;
+    right: auto;
+    margin-top: 0.5rem;
+  }
+}

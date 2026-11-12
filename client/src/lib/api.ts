@@ -388,7 +388,37 @@ export interface BookResponse {
 export const fetchBook = (period: BookPeriod): Promise<BookResponse> =>
   request<BookResponse>(`/api/book?period=${period}`)
 
-/** GET /api/broker/status: the caller's Robinhood connection state. */
+/** One of the user's brokerage accounts, as GET /api/accounts lists it. */
+export interface AccountSummary {
+  id: string
+  label: string
+  /** Which broker holds it: 'robinhood', 'alpaca-paper', … */
+  institution: string
+  isPaper: boolean
+  connected: boolean
+  needsReconnect: boolean
+  executionMode: TradeSettings['executionMode']
+  /** An account that follows every Caller counts the whole roster. */
+  followedCallerCount: number
+}
+
+export interface SnapTradeAccountSummary extends AccountSummary {
+  externalAccountId: string
+  connectionId: string
+}
+
+/** How an account is reached. A later adapter adds one variant. */
+export type BrokerEntry =
+  | { adapter: 'robinhood'; account: AccountSummary }
+  | { adapter: 'snaptrade'; accounts: Record<string, SnapTradeAccountSummary> }
+
+/** GET /api/accounts: the user's accounts and the one the screens show. */
+export interface AccountsResponse {
+  selectedAccountId: string
+  brokers: BrokerEntry[]
+}
+
+/** GET /api/broker/status: the connection state of the account being viewed. */
 export interface BrokerStatus {
   connected: boolean
   /** Authorization URL awaiting consent; null when none is pending. */
@@ -445,6 +475,18 @@ export const fetchPortfolio = (): Promise<PortfolioSummary> =>
 
 export const fetchBrokerStatus = (): Promise<BrokerStatus> =>
   request<BrokerStatus>('/api/broker/status')
+
+export const fetchAccounts = (): Promise<AccountsResponse> =>
+  request<AccountsResponse>('/api/accounts')
+
+/**
+ * Switch the account the screens and Settings show and edit. Which accounts
+ * trade does not change: every connected account takes its callouts.
+ */
+export const selectAccount = (accountId: string): Promise<string> =>
+  postJson<{ selectedAccountId: string }>('/api/accounts/select', { accountId }).then(
+    (r) => r.selectedAccountId,
+  )
 
 /** Submit a trade that was sized and parked in approval mode. */
 export const approveTrade = (messageId: string): Promise<Decision> =>

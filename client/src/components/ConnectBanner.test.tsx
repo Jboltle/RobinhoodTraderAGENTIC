@@ -5,16 +5,60 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { ConnectBanner } from './ConnectBanner'
 import { ConnectDialog } from './ConnectDialog'
-import type { BrokerConnectResult, BrokerStatus } from '../lib/api'
+import type {
+  AccountSummary,
+  AccountsResponse,
+  BrokerConnectResult,
+  BrokerStatus,
+  SnapTradeAccountSummary,
+} from '../lib/api'
 
-const { fetchBrokerStatus, connectBroker, submitBrokerRedirect } = vi.hoisted(() => ({
+const { fetchBrokerStatus, connectBroker, submitBrokerRedirect, fetchAccounts } = vi.hoisted(() => ({
   fetchBrokerStatus: vi.fn<() => Promise<BrokerStatus>>(),
   connectBroker: vi.fn<(options: { force: boolean }) => Promise<BrokerConnectResult>>(),
   submitBrokerRedirect: vi.fn<(url: string) => Promise<void>>(),
+  fetchAccounts: vi.fn<() => Promise<AccountsResponse>>(),
 }))
-vi.mock('../lib/api', () => ({ fetchBrokerStatus, connectBroker, submitBrokerRedirect }))
+vi.mock('../lib/api', () => ({
+  fetchBrokerStatus,
+  connectBroker,
+  submitBrokerRedirect,
+  fetchAccounts,
+}))
 
 const AUTH_URL = 'https://robinhood.com/mcp/trading?state=abc'
+
+const robinhood: AccountSummary = {
+  id: 'account-robinhood',
+  label: 'Robinhood',
+  institution: 'robinhood',
+  isPaper: false,
+  connected: false,
+  needsReconnect: false,
+  executionMode: 'immediate',
+  followedCallerCount: 1,
+}
+const paper: SnapTradeAccountSummary = {
+  ...robinhood,
+  id: 'account-paper',
+  label: 'Alpaca Paper',
+  institution: 'alpaca-paper',
+  isPaper: true,
+  externalAccountId: 'snaptrade-account-1',
+  connectionId: 'connection-1',
+}
+/** The user's accounts with the Robinhood one viewed: the only case before account switching. */
+const viewingRobinhood: AccountsResponse = {
+  selectedAccountId: robinhood.id,
+  brokers: [{ adapter: 'robinhood', account: robinhood }],
+}
+const viewingPaper = (robinhoodConnected: boolean): AccountsResponse => ({
+  selectedAccountId: paper.id,
+  brokers: [
+    { adapter: 'robinhood', account: { ...robinhood, connected: robinhoodConnected } },
+    { adapter: 'snaptrade', accounts: { [paper.id]: paper } },
+  ],
+})
 
 /** TanStack Query passes a context object after the variables; ignore it. */
 const submittedUrls = (): string[] =>
@@ -68,6 +112,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   submitBrokerRedirect.mockResolvedValue(undefined)
   connectBroker.mockResolvedValue({ connected: false, authUrl: AUTH_URL })
+  fetchAccounts.mockResolvedValue(viewingRobinhood)
   vi.stubGlobal('open', vi.fn())
   stubDialog()
 })
@@ -254,4 +299,62 @@ test('a disconnected status clears cached portfolio and performance data', async
     expect(utils.queryClient.getQueryData(['portfolio'])).toBeUndefined(),
   )
   expect(utils.queryClient.getQueryData(['performance'])).toBeUndefined()
+})
+
+// ---- More than one account: the banner is about the viewed account, the
+// dialog is always the direct Robinhood login. ---------------------------------
+
+test('names the viewed account, with no Robinhood login offered for another broker', async () => {
+  fetchBrokerStatus.mockResolvedValue(disconnected)
+  fetchAccounts.mockResolvedValue(viewingPaper(true))
+  const { container, queryByRole } = renderBanner()
+
+  await waitFor(() =>
+    expect(container.textContent).toContain('Alpaca Paper not connected'),
+  )
+  expect(container.textContent).not.toContain('Robinhood not connected')
+  expect(queryByRole('button', { name: /^Connect/ })).toBeNull()
+  expect(container.querySelector('dialog')!.open).toBe(false)
+})
+
+function renderOpenDialog() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  return {
+    queryClient,
+    ...render(
+      <QueryClientProvider client={queryClient}>
+        <ConnectDialog open force={false} onClose={() => {}} />
+      </QueryClientProvider>,
+    ),
+  }
+}
+
+test('the dialog follows the Robinhood account while another account is viewed', async () => {
+  // The viewed (paper) account stays disconnected throughout.
+  fetchBrokerStatus.mockResolvedValue(disconnected)
+  fetchAccounts.mockResolvedValue(viewingPaper(false))
+  const utils = renderOpenDialog()
+  await waitFor(() =>
+    expect(utils.container.querySelector(`a[href="${AUTH_URL}"]`)).not.toBeNull(),
+  )
+
+  fetchAccounts.mockResolvedValue(viewingPaper(true))
+  await utils.queryClient.invalidateQueries({ queryKey: ['accounts'] })
+
+  await waitFor(() =>
+    expect(utils.container.textContent).toContain('Robinhood is connected.'),
+  )
+})
+
+test('a connected viewed account is not mistaken for a connected Robinhood', async () => {
+  fetchBrokerStatus.mockResolvedValue({ ...disconnected, connected: true })
+  fetchAccounts.mockResolvedValue(viewingPaper(false))
+  const utils = renderOpenDialog()
+
+  await waitFor(() =>
+    expect(utils.container.querySelector(`a[href="${AUTH_URL}"]`)).not.toBeNull(),
+  )
+  expect(utils.container.textContent).not.toContain('Robinhood is connected.')
 })

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ExternalLink, X } from 'lucide-react'
 
+import { ACCOUNTS_QUERY_KEY, listAccounts, useAccounts } from '../lib/accounts'
 import { connectBroker, fetchBrokerStatus, submitBrokerRedirect } from '../lib/api'
 import type { BrokerStatus } from '../lib/api'
 
@@ -13,7 +14,9 @@ const CALLBACK_URL_RE = /^https?:\/\/\S*[?&]code=[^&\s]+/
 
 /**
  * The Robinhood connect/reconnect dialog, shared by the dashboard's
- * ConnectBanner and the settings page's Robinhood section.
+ * ConnectBanner, the settings page's connection section and the account menu.
+ * It connects the user's direct Robinhood account whichever account is being
+ * viewed; the server's connect and callback routes do the same.
  *
  * Opening it starts the flow: with `force` the server tears down the current
  * session first, so a wedged-but-"connected" session gets a real retry.
@@ -46,6 +49,7 @@ export function ConnectDialog({
     refetchInterval: open ? STATUS_POLL_MS : false,
     retry: false,
   })
+  const accounts = useAccounts({ refetchInterval: open ? STATUS_POLL_MS : false })
 
   const [redirectUrl, setRedirectUrl] = useState('')
   const [authUrl, setAuthUrl] = useState<string | null>(null)
@@ -84,16 +88,25 @@ export function ConnectDialog({
     if (!open && el.open) el.close()
   }, [open])
 
+  // This dialog always connects the user's direct Robinhood account, and the
+  // status above describes whichever account is being viewed. While that is
+  // another account, Robinhood's state is read from the account list instead.
+  const robinhood = listAccounts(accounts.data).find((account) => account.adapter === 'robinhood')
+  const viewingRobinhood =
+    robinhood === undefined || robinhood.id === accounts.data?.selectedAccountId
+
   const data = status.data
   const pendingUrl = authUrl ?? data?.authUrl ?? null
-  const connected = data?.connected === true
+  const connected = viewingRobinhood ? data?.connected === true : robinhood.connected
   const awaitingPaste = open && !connected && pendingUrl !== null && !submit.isSuccess
 
   useEffect(() => {
     if (!connected || !open) return
+    // The account menu lists this connection too.
+    void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
     const timer = setTimeout(() => onCloseRef.current(), SUCCESS_CLOSE_MS)
     return () => clearTimeout(timer)
-  }, [connected, open])
+  }, [connected, open, queryClient])
 
   const clipboard = useClipboardCallback(awaitingPaste, (url) => {
     if (!submit.isPending) submit.mutate(url)

@@ -29,7 +29,11 @@ interface PerformanceEvent {
   error: string | null
 }
 
-export function useTraderStream(enabled: boolean): void {
+/**
+ * The server's stream follows the account that was selected when it opened,
+ * so a change of `viewedAccountId` closes it and opens a new one.
+ */
+export function useTraderStream(enabled: boolean, viewedAccountId: string | undefined): void {
   const queryClient = useQueryClient()
 
   useEffect(() => {
@@ -37,7 +41,7 @@ export function useTraderStream(enabled: boolean): void {
     const abort = new AbortController()
     void streamUntilAborted(queryClient, abort.signal)
     return () => abort.abort()
-  }, [queryClient, enabled])
+  }, [queryClient, enabled, viewedAccountId])
 }
 
 async function streamUntilAborted(
@@ -53,9 +57,11 @@ async function streamUntilAborted(
       if (!response.ok || !response.body) {
         throw new Error(`stream failed: ${response.status}`)
       }
-      await readFrames(response.body, (event, data) =>
-        applyEvent(queryClient, event, data),
-      )
+      await readFrames(response.body, (event, data) => {
+        // A frame already read when the stream was closed belongs to the
+        // account that was being viewed then; it must not reach the cache.
+        if (!signal.aborted) applyEvent(queryClient, event, data)
+      })
     } catch {
       // Server restart, sleep, token refresh mid-flight: retry until unmounted.
     }

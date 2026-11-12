@@ -15,8 +15,16 @@ import {
   type TradeSettings,
   type TradeSettingsInput,
 } from '../lib/api'
+import { AccountBadge } from '../components/AccountMenu'
 import { TrimLadder } from '../components/book/TrimLadder'
 import { ConnectDialog } from '../components/ConnectDialog'
+import {
+  ACCOUNTS_QUERY_KEY,
+  connectsThroughRobinhood,
+  selectedAccount,
+  useAccounts,
+  type ListedAccount,
+} from '../lib/accounts'
 import { discordDefaultAvatarUrl, toggleCaller } from '../lib/following'
 import { saveSettings } from '../lib/settingsSync'
 
@@ -26,14 +34,17 @@ export const Route = createFileRoute('/settings')({
 })
 
 function SettingsPage() {
-  // The form initializes from this user's saved settings; saving needs the
-  // trader anyway, so an unreachable trader is a hard error here.
+  // The form initializes from the viewed account's saved settings; saving
+  // needs the trader anyway, so an unreachable trader is a hard error here.
   const settings = useQuery({
     queryKey: ['settings'],
     queryFn: fetchSettings,
   })
+  // Undefined only when the account list could not be read.
+  const accounts = useAccounts()
+  const account = selectedAccount(accounts.data)
 
-  if (settings.isPending) {
+  if (settings.isPending || accounts.isPending) {
     return (
       <div className="rounded-xl border border-ink-600 bg-ink-800 px-4 py-6 text-center text-sm text-ink-400">
         Loading settings…
@@ -49,24 +60,40 @@ function SettingsPage() {
   }
   return (
     <div className="flex max-w-2xl flex-col gap-6">
-      <BrokerSection />
-      <SettingsForm initial={settings.data} defaults={settings.data} />
+      <BrokerSection account={account} />
+      {/* Keyed by account: the form keeps what was typed in local state, and
+          one account's values must never be left on screen to be saved onto
+          another. */}
+      <SettingsForm
+        key={account?.id}
+        account={account}
+        initial={settings.data}
+        defaults={settings.data}
+      />
     </div>
   )
 }
 
 // =============================================================================
-// Robinhood connection
+// The viewed account's connection
 // =============================================================================
+
+/** What the page calls the account when the list could not be read. */
+const UNNAMED_ACCOUNT = 'Account'
 
 /**
  * Connection status plus the manual recovery actions. Reconnect always forces
  * a fresh session server-side, so it also unwedges a connection the status
  * still calls healthy: saved authorization is retried first, and the
  * authorize-and-paste dialog only appears when Robinhood no longer accepts it.
+ *
+ * Connect and Reconnect are the Robinhood login, so they show only while the
+ * Robinhood account is the one being viewed.
  */
-function BrokerSection() {
+function BrokerSection({ account }: { account: ListedAccount | undefined }) {
   const queryClient = useQueryClient()
+  const label = account?.label ?? UNNAMED_ACCOUNT
+  const isRobinhood = connectsThroughRobinhood(account)
   // Kept fresh by ConnectBanner's poll (mounted on every page); this query
   // just subscribes to the same cache entry.
   const status = useQuery<BrokerStatus>({
@@ -78,14 +105,16 @@ function BrokerSection() {
 
   const disconnect = useMutation({
     mutationFn: disconnectBroker,
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['broker-status'] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['broker-status'] })
+      void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
+    },
   })
 
   const connected = status.data?.connected === true
 
   return (
-    <FormSection title="Robinhood connection">
+    <FormSection title={`${label} connection`}>
       <div className="flex items-center gap-2.5">
         <span
           className={`size-2 rounded-full ${connected ? 'bg-gain' : 'animate-pulse bg-warn'}`}
@@ -101,18 +130,20 @@ function BrokerSection() {
 
       <p className="-mt-1 text-xs leading-relaxed text-ink-400">
         Trading and live account data stop when this connection breaks.
-        Reconnect retries with your saved authorization and only asks you to
-        authorize again when Robinhood no longer accepts it.
+        {isRobinhood &&
+          ' Reconnect retries with your saved authorization and only asks you to authorize again when Robinhood no longer accepts it.'}
       </p>
 
       <div className="flex flex-wrap items-center gap-3">
-        <button
-          type="button"
-          onClick={() => setDialogOpen(true)}
-          className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-brand/80"
-        >
-          {connected ? 'Reconnect' : 'Connect'}
-        </button>
+        {isRobinhood && (
+          <button
+            type="button"
+            onClick={() => setDialogOpen(true)}
+            className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-brand/80"
+          >
+            {connected ? 'Reconnect' : 'Connect'}
+          </button>
+        )}
         {connected && (
           <button
             type="button"
@@ -120,7 +151,7 @@ function BrokerSection() {
             onClick={() => {
               if (
                 window.confirm(
-                  'Disconnect Robinhood? Trading stops until you connect again.',
+                  `Disconnect ${label}? Trading stops until you connect again.`,
                 )
               )
                 disconnect.mutate()
@@ -147,9 +178,11 @@ function BrokerSection() {
 }
 
 function SettingsForm({
+  account,
   initial,
   defaults,
 }: {
+  account: ListedAccount | undefined
   initial: TradeSettingsInput
   defaults: TradeSettings | undefined
 }) {
@@ -158,8 +191,11 @@ function SettingsForm({
 
   const mutation = useMutation({
     mutationFn: saveSettings,
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ['settings'] }),
+    onSuccess: () => {
+      // The account menu shows the execution mode and whether anyone is followed.
+      void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
+      return queryClient.invalidateQueries({ queryKey: ['settings'] })
+    },
   })
 
   const set = <K extends keyof TradeSettingsInput>(
@@ -184,10 +220,19 @@ function SettingsForm({
       }}
     >
       <header>
-        <h1 className="text-2xl font-semibold text-white">Trade Settings</h1>
+        <h1 className="flex flex-wrap items-center gap-3 text-2xl font-semibold text-white">
+          Trade Settings
+          {account && (
+            <span className="flex items-center gap-2 text-base font-medium text-ink-400">
+              {account.label}
+              <AccountBadge isPaper={account.isPaper} />
+            </span>
+          )}
+        </h1>
         <p className="mt-2 text-sm text-ink-400">
-          These apply to your account only, and to every callout from the next
-          one onwards. Blank fields fall back to the built-in default.
+          These apply to {account ? account.label : 'this account'} only, and
+          to every callout from the next one onwards. Blank fields fall back to
+          the built-in default.
         </p>
       </header>
 
@@ -217,7 +262,7 @@ function SettingsForm({
           it, and so is a Small, Medium or Lotto you set above it.
         </p>
 
-        <SizingPreview form={form} />
+        <SizingPreview form={form} accountLabel={account?.label ?? UNNAMED_ACCOUNT} />
 
         <SizingRow
           asset="Stock"
@@ -380,7 +425,13 @@ function SizingRow({
  * against the largest of them, plus the total that a full day of trading at
  * the daily cap could deploy.
  */
-function SizingPreview({ form }: { form: TradeSettingsInput }) {
+function SizingPreview({
+  form,
+  accountLabel,
+}: {
+  form: TradeSettingsInput
+  accountLabel: string
+}) {
   // Shares the dashboard's cache; `retry: false` so a disconnected broker
   // degrades to percentages immediately instead of after three attempts.
   const portfolio = useQuery({
@@ -413,7 +464,7 @@ function SizingPreview({ form }: { form: TradeSettingsInput }) {
         <span className="text-xs font-medium text-white">One trade costs</span>
         <span className="text-xs text-ink-400">
           {buyingPower === null
-            ? 'connect Robinhood to see dollar amounts'
+            ? `connect ${accountLabel} to see dollar amounts`
             : `of ${USD.format(buyingPower)} buying power`}
         </span>
       </div>

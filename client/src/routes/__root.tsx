@@ -7,13 +7,15 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { TanStackRouterDevtoolsPanel } from '@tanstack/react-router-devtools'
 import { TanStackDevtools } from '@tanstack/react-devtools'
-import { CalendarDays, ChartColumn, LayoutDashboard, LogOut, Search, Settings } from 'lucide-react'
+import { CalendarDays, ChartColumn, LayoutDashboard, Search, Settings } from 'lucide-react'
 
 import TanStackQueryDevtools from '../integrations/tanstack-query/devtools'
 
+import { AccountBadge, AccountMenu } from '../components/AccountMenu'
 import { AuthScreen } from '../components/AuthScreen'
 import { ConnectBanner } from '../components/ConnectBanner'
-import { signOut, useAuth } from '../lib/auth'
+import { useAccounts, useResetOnAccountSwitch, useSelectedAccount } from '../lib/accounts'
+import { useAuth } from '../lib/auth'
 import { useTraderStream } from '../lib/stream'
 
 import appCss from '../styles.css?url'
@@ -95,9 +97,14 @@ function RootDocument({ children }: { children: React.ReactNode }) {
  */
 function AuthGate({ children }: { children: React.ReactNode }) {
   const { session, isLoading } = useAuth()
+  const accounts = useAccounts({ enabled: session !== null })
+  const viewedAccountId = accounts.data?.selectedAccountId
+  useResetOnAccountSwitch(viewedAccountId)
   // The stream is the only thing that opens a connection on its own, so it
-  // waits for a session rather than reconnecting in a loop against a 401.
-  useTraderStream(session !== null)
+  // waits for a session rather than reconnecting in a loop against a 401. It
+  // also waits for the account list to answer (or fail), so it opens once, on
+  // the account being viewed, and a switch reopens it on the new one.
+  useTraderStream(session !== null && !accounts.isPending, viewedAccountId)
 
   if (isLoading) {
     return (
@@ -114,8 +121,8 @@ function AuthGate({ children }: { children: React.ReactNode }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <TopHeader />
         <main className="mx-auto w-full max-w-6xl flex-1 px-8 py-6">
-          {/* On every app open with a session, check the user's stored
-              Robinhood connection and prompt to connect when there is none —
+          {/* On every app open with a session, check the viewed account's
+              stored connection and prompt to connect when there is none —
               whichever route they landed on. */}
           <ConnectBanner />
           {children}
@@ -162,6 +169,7 @@ function SideNav() {
 }
 
 function AccountSummaryCard() {
+  const account = useSelectedAccount()
   // No queryFn: the cache is hydrated and kept live by the SSE stream
   // (lib/stream.ts), same as the dashboard route.
   const performance = useQuery<PerformanceRow[]>({
@@ -179,6 +187,10 @@ function AccountSummaryCard() {
 
   return (
     <div className="rounded-xl border border-ink-600 bg-ink-800 p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <p className="truncate text-sm font-medium text-white">{account?.label ?? '—'}</p>
+        {account && <AccountBadge isPaper={account.isPaper} />}
+      </div>
       <p className="text-xs text-ink-400">Portfolio Balance</p>
       <p className="mt-1 text-2xl font-semibold tabular-nums">
         {performance.isSuccess
@@ -197,7 +209,6 @@ function AccountSummaryCard() {
 }
 
 function TopHeader() {
-  const { email } = useAuth()
   return (
     <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-ink-600 bg-ink-900 px-8">
       <span className="text-sm font-medium text-ink-400 md:hidden">
@@ -225,18 +236,7 @@ function TopHeader() {
           className="w-full bg-transparent text-sm text-white placeholder:text-ink-400 focus:outline-none"
         />
       </label>
-      <div className="flex items-center gap-3">
-        <span className="truncate text-xs text-ink-400 max-sm:hidden">{email}</span>
-        <button
-          type="button"
-          onClick={() => void signOut()}
-          title="Sign out"
-          className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-ink-400 transition-colors hover:bg-ink-700/60 hover:text-white"
-        >
-          <LogOut className="size-4" />
-          <span className="max-sm:hidden">Sign out</span>
-        </button>
-      </div>
+      <AccountMenu />
     </header>
   )
 }

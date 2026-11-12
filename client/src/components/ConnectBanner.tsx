@@ -1,9 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
+import { connectsThroughRobinhood, selectedAccount, useAccounts } from '../lib/accounts'
 import { fetchBrokerStatus } from '../lib/api'
 import type { BrokerStatus } from '../lib/api'
 import { ConnectDialog } from './ConnectDialog'
+
+const UNKNOWN_ACCOUNT_LABEL = 'Account'
+/** What the dialog connects, whichever account is viewed. */
+const ROBINHOOD_LABEL = 'Robinhood'
 
 // Idle watchdog cadence. A disconnect made in this app invalidates the query
 // at once, and ConnectDialog polls fast while a connect is in flight, so this
@@ -11,11 +16,15 @@ import { ConnectDialog } from './ConnectDialog'
 const STATUS_POLL_MS = 30_000
 
 /**
- * The app's Robinhood connection watchdog, mounted on every signed-in page.
+ * The viewed account's connection watchdog, mounted on every signed-in page.
  *
- * Prompts to connect whenever this user has no connection on record,
- * regardless of execution mode: approval-mode trades also need Robinhood to
- * submit, and the pipeline only fans out to users with a stored connection.
+ * Prompts to connect whenever that account has no connection on record,
+ * regardless of execution mode: approval-mode trades also need the broker to
+ * submit, and the pipeline only fans out to accounts with a stored connection.
+ *
+ * The Connect button is the Robinhood login, so it shows only while the
+ * Robinhood account is the one being viewed; any other account gets the
+ * notice alone until its own way of connecting exists.
  *
  * It also keeps the dashboard honest: the moment the server reports
  * disconnected, the broker-derived caches are dropped so account numbers and
@@ -32,6 +41,10 @@ export function ConnectBanner() {
   })
 
   const [dialogOpen, setDialogOpen] = useState(false)
+  const accounts = useAccounts()
+  // Undefined when the account list could not be read: the notice then names
+  // no account, and the button still says what it does.
+  const account = selectedAccount(accounts.data)
 
   const data = status.data
   const connected = data?.connected
@@ -47,7 +60,8 @@ export function ConnectBanner() {
     }
   }, [connected, queryClient])
 
-  if (!data) return null
+  // Waits for the account list too, so the notice never names the wrong account.
+  if (!data || accounts.isPending) return null
   if (connected && !dialogOpen) return null
 
   return (
@@ -55,14 +69,18 @@ export function ConnectBanner() {
       {!connected && (
         <div className="mb-6 flex flex-wrap items-center gap-3 rounded-xl border border-warn/40 bg-warn/10 px-5 py-4">
           <span className="size-2 animate-pulse rounded-full bg-warn" />
-          <span className="text-sm font-medium text-white">Robinhood not connected</span>
-          <button
-            type="button"
-            onClick={() => setDialogOpen(true)}
-            className="rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30"
-          >
-            Connect Robinhood
-          </button>
+          <span className="text-sm font-medium text-white">
+            {account?.label ?? UNKNOWN_ACCOUNT_LABEL} not connected
+          </span>
+          {connectsThroughRobinhood(account) && (
+            <button
+              type="button"
+              onClick={() => setDialogOpen(true)}
+              className="rounded-md bg-warn/20 px-3 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/30"
+            >
+              Connect {account?.label ?? ROBINHOOD_LABEL}
+            </button>
+          )}
         </div>
       )}
 
