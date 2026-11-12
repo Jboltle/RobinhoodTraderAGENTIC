@@ -4,7 +4,7 @@
  * fan-out and of every monitor, named once at boot, and never in the way of
  * the accounts this deployment can trade.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   TradeSettingsSchema,
@@ -22,8 +22,17 @@ import { sweepMaxLoss } from '../maxLoss.js';
 import { BTO_QQQ_PUT, envelopeFromFixture } from '../pipeline/__tests__/fixtures/discordMessages.js';
 import { createMessageProcessor } from '../pipeline/index.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import type { AccountsResponse } from '../server.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
-import { makeFakeBroker, makeFakeRegistry, optionPosition, placedOrders, type FakeBroker } from './harness.js';
+import {
+  makeFakeBroker,
+  makeFakeRegistry,
+  makeHarness,
+  optionPosition,
+  placedOrders,
+  type FakeBroker,
+  type Harness,
+} from './harness.js';
 
 const OWNER = 'user-owner';
 const ROBINHOOD = fakeAccount('account-robinhood', OWNER);
@@ -296,5 +305,60 @@ describe('the monitors, with a connected account whose adapter is not deployed',
     expect(asked.mock.calls.map(([account]) => account.id)).not.toContain(UNSUPPORTED.id);
     expect(opened).toEqual([ROBINHOOD.id]);
     expect(robinhoodBroker.getOrders).toHaveBeenCalledOnce();
+  });
+});
+
+describe('the routes, when the selected account is one whose adapter is not deployed', () => {
+  const USER = { id: OWNER, email: 'owner@example.com' };
+  const TOKEN = 'token-for-owner';
+  const PENDING_MESSAGE_ID = 'msg-pending';
+  const UNAVAILABLE = { error: `${UNSUPPORTED.label} is not available on this deployment` };
+
+  let harness: Harness;
+  const get = (url: string) => harness.as(TOKEN, { method: 'GET', url });
+
+  beforeEach(() => {
+    // The harness registry holds the Robinhood adapter alone.
+    harness = makeHarness();
+    harness.db.addUser(USER, TOKEN, ROBINHOOD.id);
+    harness.db.addAccount(UNSUPPORTED, { select: true });
+    for (const account of [ROBINHOOD, UNSUPPORTED]) {
+      harness.db.seedBrokerTokens(account.id, fakeTokens(`token-${account.id}`));
+    }
+  });
+
+  it('portfolio and performance answer the not-connected 409, naming the reason', async () => {
+    for (const url of ['/api/portfolio', '/api/trades/performance']) {
+      const response = await get(url);
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual(UNAVAILABLE);
+    }
+  });
+
+  it('approve answers the same 409 and leaves the trade pending', async () => {
+    harness.db.seedDecision(UNSUPPORTED.id, { ...openLot('filled'), messageId: PENDING_MESSAGE_ID, kind: 'pending_approval' });
+
+    const response = await harness.as(TOKEN, { method: 'POST', url: `/api/trades/${PENDING_MESSAGE_ID}/approve` });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual(UNAVAILABLE);
+    expect((await harness.db.listDecisions(UNSUPPORTED.id, 10))[0]!.kind).toBe('pending_approval');
+  });
+
+  it('the account reads as not connected in the status and in the account list', async () => {
+    expect((await get('/api/broker/status')).json()).toMatchObject({ connected: false });
+
+    const { brokers } = (await get('/api/accounts')).json() as AccountsResponse;
+    expect(brokers).toMatchObject([
+      { adapter: 'robinhood', account: { id: ROBINHOOD.id, connected: true } },
+      { adapter: 'snaptrade', accounts: { [UNSUPPORTED.id]: { connected: false } } },
+    ]);
+  });
+
+  it('no session is opened for it', async () => {
+    await get('/api/portfolio');
+    await get('/api/trades/performance');
+
+    expect(harness.brokers.existing(UNSUPPORTED.id)).toBeUndefined();
   });
 });

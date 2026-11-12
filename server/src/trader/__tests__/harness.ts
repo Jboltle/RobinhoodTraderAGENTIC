@@ -112,13 +112,18 @@ export const placedOrders = (broker: FakeBroker, kind: Instrument['kind']): Orde
 export const markReads = (broker: FakeBroker, kind: Instrument['kind']): Instrument[] =>
   broker.getMark.mock.calls.map(([instrument]) => instrument).filter((asked) => asked.kind === kind);
 
-/** The production registry over fake sessions and brokers, opened by account id. */
+/**
+ * The production registry over fake sessions and brokers, opened by account
+ * id. It holds the Robinhood adapter alone, as every deployment so far does,
+ * unless `adapterIds` names more.
+ */
 export const makeFakeRegistry = (
   open: (accountId: string) => ReturnType<BrokerAdapter['open']>,
-  executionMode: TradeExecutionMode = 'immediate'
+  executionMode: TradeExecutionMode = 'immediate',
+  adapterIds: readonly BrokerAdapter['id'][] = ['robinhood']
 ): McpRegistry =>
   createMcpRegistry(
-    [{ id: 'robinhood', quotesOptions: true, open: (account) => open(account.id) }],
+    adapterIds.map((id) => ({ id, quotesOptions: id === 'robinhood', open: (account) => open(account.id) })),
     executionMode
   );
 
@@ -149,6 +154,8 @@ export interface Harness {
 export interface HarnessOptions {
   /** Deployment kill switch under test; defaults to the mode that lets Approve submit. */
   readonly executionMode?: TradeExecutionMode;
+  /** The adapters this deployment has; the Robinhood one alone unless given. */
+  readonly adapters?: readonly BrokerAdapter['id'][];
 }
 
 export function makeHarness(options: HarnessOptions = {}): Harness {
@@ -163,7 +170,7 @@ export function makeHarness(options: HarnessOptions = {}): Harness {
     const broker = makeFakeBroker(options);
     fakes.set(accountId, broker);
     return { session: makeSessionStub(options), broker };
-  }, executionMode);
+  }, executionMode, options.adapters);
 
   const app = buildServer({ db, events, brokers, executionMode });
 

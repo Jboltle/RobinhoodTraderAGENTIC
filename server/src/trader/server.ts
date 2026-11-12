@@ -220,7 +220,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // disconnected instead of pretending off in-memory state.
     const tokenState = await connections.state(account);
     return reply.send({
-      connected: tokenState === 'valid' || tokenState === 'refreshable',
+      // An account this deployment has no adapter for is not connected here,
+      // whatever it has stored.
+      connected: deps.brokers.supports(account) && (tokenState === 'valid' || tokenState === 'refreshable'),
       authUrl: deps.brokers.existing(account.id)?.session.getPendingAuthUrl() ?? null,
       tokenState,
       executionMode: (await deps.db.getSettings(account.id)).executionMode,
@@ -372,7 +374,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // run against a stale one. The row stays pending — reconnect, then approve.
     const broker = await connectedBrokerTools(deps, account);
     if (broker === null) {
-      return reply.status(409).send({ error: notConnectedError(account) });
+      return reply.status(409).send({ error: notConnectedError(deps, account) });
     }
 
     const approvedAt = new Date().toISOString();
@@ -514,7 +516,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const account = requireAccount(request);
     const broker = await connections.tools(account);
     if (broker === null) {
-      return reply.status(409).send({ error: notConnectedError(account) });
+      return reply.status(409).send({ error: notConnectedError(deps, account) });
     }
     try {
       const [account, positions] = await Promise.all([broker.getAccount(), broker.getPositions()]);
@@ -534,7 +536,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const account = requireAccount(request);
     const tools = await connectedBrokerTools(deps, account);
     if (tools === null) {
-      return reply.status(409).send({ error: notConnectedError(account) });
+      return reply.status(409).send({ error: notConnectedError(deps, account) });
     }
     try {
       const history = deps.db.listDecisions(account.id, PERFORMANCE_HISTORY_LIMIT);
@@ -621,7 +623,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         if (tools === null) {
           // No connection of record (disconnected, or the row was removed):
           // an error frame, never data from a session that outlived its row.
-          sendPerformance({ positions: null, error: notConnectedError(account) });
+          sendPerformance({ positions: null, error: notConnectedError(deps, account) });
           return;
         }
         // A failed read is not kept: the next tick tries again.
@@ -714,7 +716,7 @@ async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<Acc
       label: account.label,
       institution: account.institution,
       isPaper: account.isPaper,
-      connected,
+      connected: connected && deps.brokers.supports(account),
       needsReconnect: account.needsReconnect,
       executionMode,
       followedCallerCount: followedCallerIds?.length ?? rosterSize,
@@ -753,8 +755,14 @@ async function directRobinhoodAccount(
   return accounts.find(({ account }) => account.adapter === 'robinhood')?.account ?? null;
 }
 
-/** What a route answers when the account it was asked about has no connection of record. */
-const notConnectedError = (account: AccountRow): string => `${account.label} is not connected`;
+/**
+ * What a route answers when the account it was asked about cannot be served
+ * here: no connection of record, or no adapter for it on this deployment.
+ */
+const notConnectedError = (deps: ServerDeps, account: AccountRow): string =>
+  deps.brokers.supports(account)
+    ? `${account.label} is not connected`
+    : `${account.label} is not available on this deployment`;
 
 // =============================================================================
 // Approval
@@ -827,12 +835,14 @@ async function loadFeed(deps: ServerDeps, accountId: string): Promise<CalloutFee
  * credentials). Every route that reads or trades the account goes through
  * here, so none of them can serve from a warm in-memory session whose stored
  * connection no longer exists. Null means "not connected" — callers answer
- * 409, distinct from the 503 "broker down".
+ * 409, distinct from the 503 "broker down". An account whose adapter this
+ * deployment does not have is not connected here either.
  */
 async function connectedBrokerTools(
   deps: ServerDeps,
   account: AccountRow
 ): Promise<Broker | null> {
+  if (!deps.brokers.supports(account)) return null;
   const stored = await deps.db.getBrokerTokens(account.id);
   if (readTokenStatus(stored?.tokens).state !== 'missing') {
     return deps.brokers.for(account).broker;
@@ -925,7 +935,9 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
   return {
     state,
     tools: async (account) =>
-      (await state(account)) === 'missing' ? null : deps.brokers.for(account).broker,
+      !deps.brokers.supports(account) || (await state(account)) === 'missing'
+        ? null
+        : deps.brokers.for(account).broker,
     invalidate: (accountId) => void records.delete(accountId),
   };
 }

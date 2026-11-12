@@ -78,7 +78,8 @@ const orderIds = async (): Promise<Array<string | null | undefined>> =>
   );
 
 beforeEach(() => {
-  harness = makeHarness();
+  // A deployment that has an adapter for each of the owner's accounts.
+  harness = makeHarness({ adapters: ['robinhood', 'snaptrade'] });
   harness.db.addUser(OWNER, TOKEN_OWNER, ROBINHOOD.id);
   harness.db.addAccount(PAPER);
   harness.db.addUser(STRANGER, TOKEN_STRANGER, STRANGER_ROBINHOOD.id);
