@@ -6,7 +6,9 @@
  * Holding the clients here also keeps each user's pending OAuth flow separate,
  * so two people can connect at the same time.
  */
+import type { TradeExecutionMode } from '../../shared/types.js';
 import type { BrokerAdapter, UserBroker } from './types.js';
+import { guardWrites } from './writeGuard.js';
 
 export interface McpRegistry {
   /** The user's broker session, created on first use. */
@@ -16,7 +18,10 @@ export interface McpRegistry {
   drop(userId: string): void;
 }
 
-export function createMcpRegistry(adapter: BrokerAdapter): McpRegistry {
+export function createMcpRegistry(
+  adapter: BrokerAdapter,
+  executionMode: TradeExecutionMode
+): McpRegistry {
   // ponytail: unbounded — one entry per user who has ever traded this process
   // lifetime, each holding an open MCP transport. Fine at invite-only scale.
   // Upgrade path: an LRU that closes the transport on eviction.
@@ -26,7 +31,10 @@ export function createMcpRegistry(adapter: BrokerAdapter): McpRegistry {
     for(userId: string): UserBroker {
       let broker = brokers.get(userId);
       if (!broker) {
-        broker = adapter.open(userId);
+        // Guarded once, when the session is opened: everything downstream holds
+        // the guarded Broker, and its identity stays stable per session.
+        const opened = adapter.open(userId);
+        broker = { ...opened, broker: guardWrites(opened.broker, executionMode) };
         brokers.set(userId, broker);
       }
       return broker;

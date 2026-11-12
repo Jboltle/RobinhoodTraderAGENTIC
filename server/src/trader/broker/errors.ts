@@ -14,3 +14,16 @@ export class BrokerUnavailableError extends Error {
 export class SymbolNotFoundError extends Error {
   override readonly name = 'SymbolNotFoundError';
 }
+
+/**
+ * A broker write was attempted on a read-only deployment
+ * (TRADE_EXECUTION_MODE=read_only). Raised before any broker call, so a
+ * staging process can run the whole pipeline and never place or cancel an order.
+ */
+export class BrokerWritesDisabledError extends Error {
+  override readonly name = 'BrokerWritesDisabledError';
+
+  constructor(attempted: string) {
+    super(`read-only deployment: would have ${attempted}`);
+  }
+}

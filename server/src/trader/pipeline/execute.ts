@@ -17,7 +17,6 @@ import {
   type OrderSide,
   type RiskCheck,
   type SubmittedOrder,
-  type TradeExecutionMode,
 } from '../../shared/types.js';
 import { instrumentOf } from '../broker/instrument.js';
 import type { Broker, BrokerPosition, PlacedOrder } from '../broker/types.js';
@@ -49,21 +48,6 @@ export class ParseInconsistencyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ParseInconsistencyError';
-  }
-}
-
-/**
- * Thrown by submitOrder when the deployment runs read-only
- * (TRADE_EXECUTION_MODE=read_only). Raised before any broker call, so a
- * staging process can run the whole pipeline and never place an order.
- */
-export class BrokerWritesDisabledError extends Error {
-  constructor(order: SubmittedOrder) {
-    super(
-      `read-only deployment: would have placed ${order.side} ${order.quantity} ${order.symbol}` +
-        (order.option ? ` ${optionLabel(order.option)}` : '')
-    );
-    this.name = 'BrokerWritesDisabledError';
   }
 }
 
@@ -291,22 +275,14 @@ async function sizeOptionExit(
 }
 
 /**
- * Place an already-sized order. The only function in the codebase that writes
- * to the broker, and the only one the approve endpoint needs — everything it
- * requires is on the SubmittedOrder the sizing half produced.
+ * Place an already-sized order. The only thing the approve endpoint needs —
+ * everything it requires is on the SubmittedOrder the sizing half produced.
  *
- * `mode` is the deployment's TRADE_EXECUTION_MODE, passed in rather than read
- * from config so every caller states its policy and tests can set theirs.
- * Only `read_only` is enforced here: `approval` is a gate on how a trade
- * reaches this function, not on the write itself.
+ * A read-only deployment is refused by the Broker itself (broker/writeGuard.ts),
+ * not here; `approval` is a gate on how a trade reaches this function, not on
+ * the write.
  */
-export async function submitOrder(
-  order: SubmittedOrder,
-  broker: Broker,
-  mode: TradeExecutionMode
-): Promise<PlacedOrder> {
-  if (mode === 'read_only') throw new BrokerWritesDisabledError(order);
-
+export async function submitOrder(order: SubmittedOrder, broker: Broker): Promise<PlacedOrder> {
   return broker.placeOrder({
     instrument: instrumentOf(order),
     side: order.side,

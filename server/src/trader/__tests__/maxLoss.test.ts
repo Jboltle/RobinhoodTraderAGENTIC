@@ -583,7 +583,7 @@ function setupMonitor(opts: {
     isConnected: vi.fn().mockReturnValue(true),
     ensureReady: opts.ensureReady ?? vi.fn().mockResolvedValue(undefined),
   } as unknown as RobinhoodMcpClient;
-  const brokers = makeFakeRegistry(() => ({ session: mcp, broker }));
+  const brokers = makeFakeRegistry(() => ({ session: mcp, broker }), opts.executionMode);
   const enqueue = vi.fn(<T,>(_userId: string, run: () => Promise<T>) => run());
   const flattening = new Map<string, number>();
   const nowRef = { value: RTH };
@@ -592,7 +592,6 @@ function setupMonitor(opts: {
     brokers,
     events: new TraderEvents(),
     enqueue: enqueue as MaxLossDeps['enqueue'],
-    executionMode: opts.executionMode ?? 'immediate',
     now: () => nowRef.value,
   };
   return { db, broker, enqueue, flattening, deps, nowRef };

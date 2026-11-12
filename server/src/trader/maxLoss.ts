@@ -12,13 +12,12 @@ import {
   type Decision,
   type OptionContract,
   type SubmittedOrder,
-  type TradeExecutionMode,
 } from '../shared/types.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
-import { BrokerWritesDisabledError, submitOrder } from './pipeline/execute.js';
+import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
-import { BrokerUnavailableError } from './broker/errors.js';
+import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
 import type { McpRegistry } from './broker/registry.js';
 import type {
   Broker,
@@ -84,12 +83,6 @@ export interface MaxLossDeps {
   readonly brokers: McpRegistry;
   readonly events: TraderEvents;
   readonly enqueue: <T>(userId: string, run: () => Promise<T>) => Promise<T>;
-  /**
-   * The deployment's TRADE_EXECUTION_MODE. Max Loss is protection the user
-   * opted into, so `approval` does not hold it; `read_only` does, and a
-   * breach is then logged instead of sold.
-   */
-  readonly executionMode: TradeExecutionMode;
   readonly now?: () => Date;
 }
 
@@ -331,7 +324,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
       orderId: null,
       status: null,
     };
-    const placed = await submitOrder(sized, args.broker, args.deps.executionMode);
+    const placed = await submitOrder(sized, args.broker);
     // A dead submit-time status means nothing will fill: surface it as a
     // failure (no max_loss_exit row) so the next sweep retries the close.
     if (placed.status !== null && DEAD_ORDER_STATUSES.has(placed.status.toLowerCase())) {
@@ -357,8 +350,10 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
     log.info('max-loss flattened', { userId, key, orderId: placed.orderId });
   } catch (err) {
     if (err instanceof BrokerWritesDisabledError) {
-      // Read-only deployment: the in-flight key stays set so the same breach
-      // is logged once per FLATTEN_RETRY_MS, not once per 15 s sweep.
+      // Max Loss is protection the user opted into, so `approval` does not
+      // hold it; only a read-only deployment does, and its Broker refuses the
+      // sell. The in-flight key stays set so the same breach is logged once
+      // per FLATTEN_RETRY_MS, not once per 15 s sweep.
       log.info('max-loss breach observed; read-only deployment, not flattening', {
         userId,
         key,

@@ -639,7 +639,7 @@ export async function runForUser(
     if (sized.assetType === 'option' && sized.side === 'sell') {
       await cancelStops(deps.db, userId, broker, symbol, sized.option);
     }
-    const placed = await submitOrder(sized, broker, deps.executionMode);
+    const placed = await submitOrder(sized, broker);
     const order: SubmittedOrder = {
       ...sized,
       orderId: placed.orderId,

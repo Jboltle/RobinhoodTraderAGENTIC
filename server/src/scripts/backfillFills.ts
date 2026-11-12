@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   const before = await db.listOpenOrders(since);
   log.info('backfill start', { since: since.toISOString(), openOrders: before.length });
 
-  const result = await sweepFills({ db, brokers: createMcpRegistry(createRobinhoodAdapter(db)), events: new TraderEvents() }, since);
+  const result = await sweepFills({ db, brokers: createMcpRegistry(createRobinhoodAdapter(db), 'read_only'), events: new TraderEvents() }, since);
   const after = await db.listOpenOrders(since);
   log.info('backfill done', { ...result, stillOpen: after.length });
   for (const row of after) {

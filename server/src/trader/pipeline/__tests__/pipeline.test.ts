@@ -24,10 +24,15 @@ import {
 } from '../../__tests__/harness.js';
 import { TraderEvents } from '../../events.js';
 import type { McpRegistry } from '../../broker/registry.js';
-import { BrokerUnavailableError, SymbolNotFoundError } from '../../broker/errors.js';
+import {
+  BrokerUnavailableError,
+  BrokerWritesDisabledError,
+  SymbolNotFoundError,
+} from '../../broker/errors.js';
+import { guardWrites } from '../../broker/writeGuard.js';
 import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
 import { JevCalloutDecider } from '../decide.js';
-import { BrokerWritesDisabledError, contractsForPortion, submitOrder } from '../execute.js';
+import { contractsForPortion, submitOrder } from '../execute.js';
 import { createMessageProcessor, liveCallerContracts, type PipelineDeps } from '../index.js';
 import { ACTIONS, JevError, type Action, type JevVerdict } from '../jev.js';
 import {
@@ -1172,8 +1177,8 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
     expect(contractsForPortion(portion, held)).toBe(sold);
   });
 
-  // The one broker write path refuses before any MCP call in a read-only
-  // deployment; every other mode passes straight through to the broker.
+  // A read-only deployment's broker refuses the write before any MCP call;
+  // every other mode passes straight through to the broker.
   it('submitOrder throws BrokerWritesDisabledError under read_only and never calls the broker', async () => {
     const broker = makeBroker();
     const order = {
@@ -1188,10 +1193,12 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
       status: null,
     };
 
-    await expect(submitOrder(order, broker, 'read_only')).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    await expect(submitOrder(order, guardWrites(broker, 'read_only'))).rejects.toBeInstanceOf(
+      BrokerWritesDisabledError
+    );
     expect(placedOrders(broker, 'option')).toHaveLength(0);
 
-    await submitOrder(order, broker, 'approval');
+    await submitOrder(order, guardWrites(broker, 'approval'));
     expect(placedOrders(broker, 'option')).toHaveLength(1);
   });
 

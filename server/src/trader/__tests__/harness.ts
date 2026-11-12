@@ -112,8 +112,10 @@ export const markReads = (broker: FakeBroker, kind: Instrument['kind']): Instrum
   broker.getMark.mock.calls.map(([instrument]) => instrument).filter((asked) => asked.kind === kind);
 
 /** The production registry over fake sessions and brokers. */
-export const makeFakeRegistry = (open: (userId: string) => UserBroker): McpRegistry =>
-  createMcpRegistry({ open });
+export const makeFakeRegistry = (
+  open: (userId: string) => UserBroker,
+  executionMode: TradeExecutionMode = 'immediate'
+): McpRegistry => createMcpRegistry({ open }, executionMode);
 
 // =============================================================================
 // HTTP harness
@@ -149,20 +151,16 @@ export function makeHarness(options: HarnessOptions = {}): Harness {
   const events = new TraderEvents();
   const configured = new Map<string, BrokerStubOptions>();
   const fakes = new Map<string, FakeBroker>();
+  const executionMode = options.executionMode ?? 'immediate';
 
   const brokers = makeFakeRegistry((userId) => {
     const options = configured.get(userId) ?? {};
     const broker = makeFakeBroker(options);
     fakes.set(userId, broker);
     return { session: makeSessionStub(options), broker };
-  });
+  }, executionMode);
 
-  const app = buildServer({
-    db,
-    events,
-    brokers,
-    executionMode: options.executionMode ?? 'immediate',
-  });
+  const app = buildServer({ db, events, brokers, executionMode });
 
   return {
     app,

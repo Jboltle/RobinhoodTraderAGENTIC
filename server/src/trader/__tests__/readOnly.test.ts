@@ -1,0 +1,241 @@
+/**
+ * TRADE_EXECUTION_MODE=read_only is enforced in one place: the registry hands
+ * out every adapter's Broker behind guardWrites. These tests pin that a
+ * read-only deployment makes no write call on any adapter — including through
+ * a caller whose own policy check would have let the write through.
+ */
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  TradeSettingsSchema,
+  type Decision,
+  type OptionContract,
+  type TradeExecutionMode,
+} from '../../shared/types.js';
+import { BrokerWritesDisabledError } from '../broker/errors.js';
+import { createMcpRegistry } from '../broker/registry.js';
+import type { Broker, Instrument, OrderRequest } from '../broker/types.js';
+import { TraderEvents } from '../events.js';
+import { sweepLadders } from '../ladderMonitor.js';
+import { submitOrder } from '../pipeline/execute.js';
+import { RobinhoodBroker } from '../robinhood/broker.js';
+import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import { RobinhoodTools, TOOL_NAMES } from '../robinhood/tools.js';
+import { cancelStops, restMissingStops } from '../stops.js';
+import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
+import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from './harness.js';
+
+const USER = 'user-1';
+const CONTRACT: OptionContract = { optionType: 'call', strike: 707, expiration: '2026-06-11' };
+const QQQ_CALL: Instrument = { kind: 'option', symbol: 'QQQ', ...CONTRACT };
+const AAPL: Instrument = { kind: 'equity', symbol: 'AAPL' };
+const ENTRY_PRICE = 1;
+const LOT_MESSAGE_ID = 'buy-QQQ';
+const RESTING_STOP_ID = 'stop-1';
+
+const SESSION = { ensureReady: async () => undefined } as unknown as RobinhoodMcpClient;
+
+/** Every kind of write the trader makes: entries, exits, the Max Loss close, a resting stop. */
+const WRITES: readonly OrderRequest[] = [
+  { instrument: AAPL, side: 'buy', quantity: 4, type: 'market' },
+  { instrument: AAPL, side: 'sell', quantity: 4, type: 'limit', limitPrice: 150 },
+  { instrument: QQQ_CALL, side: 'buy', quantity: 2, type: 'limit', limitPrice: 0.97 },
+  { instrument: QQQ_CALL, side: 'sell', quantity: 2, type: 'market' },
+  { instrument: QQQ_CALL, side: 'sell', quantity: 2, type: 'stop', stopPrice: 0.5, timeInForce: 'gtc' },
+];
+
+interface AdapterUnderTest {
+  readonly broker: Broker;
+  /** How many times anything was asked of the real broker behind the adapter. */
+  readonly callsReachingBroker: () => number;
+}
+
+function fakeAdapter(): AdapterUnderTest {
+  const broker = makeFakeBroker();
+  return {
+    broker,
+    callsReachingBroker: () =>
+      broker.placeOrder.mock.calls.length + broker.cancelOrder.mock.calls.length,
+  };
+}
+
+/** The real Robinhood adapter stack over an MCP client that records every tool call. */
+function robinhoodAdapter(): AdapterUnderTest {
+  const callTool = vi.fn().mockRejectedValue(new Error('no tool call may be made'));
+  const mcp = {
+    ensureReady: async () => undefined,
+    isConnected: () => true,
+    getToolNames: () => Object.values(TOOL_NAMES),
+    getToolInputSchema: () => undefined,
+    callTool,
+  } as unknown as RobinhoodMcpClient;
+  return {
+    broker: new RobinhoodBroker(new RobinhoodTools(mcp)),
+    callsReachingBroker: () => callTool.mock.calls.length,
+  };
+}
+
+const ADAPTERS = [
+  ['the shared fake', fakeAdapter],
+  ['Robinhood', robinhoodAdapter],
+] as const;
+
+const registryOver = (adapter: AdapterUnderTest, mode: TradeExecutionMode): Broker =>
+  createMcpRegistry({ open: () => ({ session: SESSION, broker: adapter.broker }) }, mode).for(USER)
+    .broker;
+
+describe.each(ADAPTERS)('read_only deployment over %s', (_name, makeAdapter) => {
+  it('refuses every order and every cancel before the adapter is reached', async () => {
+    const adapter = makeAdapter();
+    const broker = registryOver(adapter, 'read_only');
+
+    for (const order of WRITES) {
+      await expect(broker.placeOrder(order)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    }
+    await expect(broker.cancelOrder(RESTING_STOP_ID)).rejects.toBeInstanceOf(
+      BrokerWritesDisabledError
+    );
+
+    expect(adapter.callsReachingBroker()).toBe(0);
+  });
+
+  it.each(['immediate', 'approval'] as const)(
+    '%s is not held here: the registry hands out the adapter\'s own broker',
+    (mode) => {
+      const adapter = makeAdapter();
+
+      expect(registryOver(adapter, mode)).toBe(adapter.broker);
+    }
+  );
+});
+
+describe('read_only refusal', () => {
+  it('names what would have been written, in the words the order refusal always used', async () => {
+    const broker = registryOver(fakeAdapter(), 'read_only');
+
+    await expect(broker.placeOrder(WRITES[3]!)).rejects.toThrow(
+      'read-only deployment: would have placed sell 2 QQQ 707C 2026-06-11'
+    );
+    await expect(broker.placeOrder(WRITES[0]!)).rejects.toThrow(
+      'read-only deployment: would have placed buy 4 AAPL'
+    );
+    await expect(broker.cancelOrder(RESTING_STOP_ID)).rejects.toThrow(
+      `read-only deployment: would have cancelled order ${RESTING_STOP_ID}`
+    );
+  });
+
+  it('leaves every read working', async () => {
+    const fake = makeFakeBroker({ buyingPowerUsd: 2_500, equityMark: 211, optionMark: 0.8 });
+    const broker = registryOver({ broker: fake, callsReachingBroker: () => 0 }, 'read_only');
+
+    expect((await broker.getAccount()).buyingPowerUsd).toBe(2_500);
+    expect(await broker.getMark(AAPL)).toBe(211);
+    expect(await broker.getMark(QQQ_CALL)).toBe(0.8);
+    await broker.confirmInstrument(QQQ_CALL);
+    expect(await broker.getPositions('option')).toEqual([]);
+    expect(await broker.getOrders()).toBeNull();
+
+    expect(fake.confirmInstrument).toHaveBeenCalledWith(QQQ_CALL);
+    expect(fake.getPositions).toHaveBeenCalledWith('option');
+    expect(fake.getOrders).toHaveBeenCalledOnce();
+  });
+});
+
+/**
+ * The write paths, each run as if its own `immediate` check had passed, over a
+ * registry opened read_only: the guard does not depend on any caller's policy.
+ */
+describe('read_only deployment: the write paths cannot write', () => {
+  function setup(lot: { stopOrderId?: string } = {}): {
+    db: FakeDb;
+    fake: FakeBroker;
+    broker: Broker;
+    brokers: ReturnType<typeof makeFakeRegistry>;
+  } {
+    const db = createFakeDb();
+    db.seedBrokerTokens(USER, fakeTokens('tok'));
+    db.seedSettings(USER, TradeSettingsSchema.parse({ maxLossPct: 50, exitMode: 'ladder' }));
+    db.seedMessage({ messageId: LOT_MESSAGE_ID, sentAt: '2026-06-08T14:00:00.000Z' });
+    db.seedDecision(USER, filledBuy(lot.stopOrderId));
+    // A mark far above every own-target rung, so the ladder wants to sell.
+    const fake = makeFakeBroker({ optionMark: ENTRY_PRICE * 10 });
+    const brokers = makeFakeRegistry(() => ({ session: SESSION, broker: fake }), 'read_only');
+    return { db, fake, broker: brokers.for(USER).broker, brokers };
+  }
+
+  const expectNoWrite = (fake: FakeBroker): void => {
+    expect(fake.placeOrder).not.toHaveBeenCalled();
+    expect(fake.cancelOrder).not.toHaveBeenCalled();
+  };
+
+  it('submitOrder', async () => {
+    const { fake, broker } = setup();
+
+    await expect(submitOrder(filledBuy().order!, broker)).rejects.toBeInstanceOf(
+      BrokerWritesDisabledError
+    );
+
+    expectNoWrite(fake);
+  });
+
+  it('cancelStops: the resting stop is neither cancelled nor forgotten', async () => {
+    const { db, fake, broker } = setup({ stopOrderId: RESTING_STOP_ID });
+
+    await expect(cancelStops(db, USER, broker, 'QQQ', CONTRACT)).rejects.toBeInstanceOf(
+      BrokerWritesDisabledError
+    );
+
+    expectNoWrite(fake);
+    const [lot] = await db.listOpenOptionLots(USER);
+    expect(lot!.stopOrderId).toBe(RESTING_STOP_ID);
+  });
+
+  it('restMissingStops: no stop is rested and none is recorded', async () => {
+    const { db, fake, broker } = setup();
+
+    await restMissingStops({ userId: USER, db, broker, executionMode: 'immediate' });
+
+    expectNoWrite(fake);
+    const [lot] = await db.listOpenOptionLots(USER);
+    expect(lot!.stopOrderId).toBeNull();
+  });
+
+  it('the own-target ladder: no sell is placed and none is recorded', async () => {
+    const { db, fake, brokers } = setup();
+
+    const placed = await sweepLadders({
+      db,
+      brokers,
+      events: new TraderEvents(),
+      executionMode: 'immediate',
+    });
+
+    expect(placed).toBe(0);
+    expectNoWrite(fake);
+    expect(await db.listDecisions(USER, 10)).toHaveLength(1);
+  });
+});
+
+function filledBuy(stopOrderId?: string): Decision {
+  return {
+    at: '2026-06-08T14:00:00.000Z',
+    messageId: LOT_MESSAGE_ID,
+    kind: 'submitted',
+    code: null,
+    reason: 'bought',
+    ticker: 'QQQ',
+    action: 'buy',
+    order: {
+      symbol: 'QQQ',
+      side: 'buy',
+      assetType: 'option',
+      quantity: 4,
+      orderType: 'limit',
+      limitPrice: ENTRY_PRICE,
+      option: CONTRACT,
+      orderId: 'buy-1',
+      status: 'filled',
+      ...(stopOrderId !== undefined ? { stopOrderId } : {}),
+    },
+  };
+}

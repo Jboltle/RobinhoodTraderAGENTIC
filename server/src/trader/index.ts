@@ -23,7 +23,7 @@ async function main(): Promise<void> {
 
   const db = createTraderDb();
   const events = new TraderEvents();
-  const brokers = createMcpRegistry(createRobinhoodAdapter(db));
+  const brokers = createMcpRegistry(createRobinhoodAdapter(db), config.tradeExecutionMode);
 
   // DECISION_ENGINE=parser rolls the trade path back to the LLM parser.
   const parser =
@@ -101,7 +101,6 @@ async function main(): Promise<void> {
     brokers,
     events,
     enqueue: (userId, run) => processor.enqueue(userId, run),
-    executionMode,
   });
 }
 

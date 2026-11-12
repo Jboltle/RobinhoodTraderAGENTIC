@@ -85,7 +85,7 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
         lots: [{ lotId: lot.lotId, quantity, gainPct: level.gainPct }],
       };
       await cancelStops(deps.db, userId, broker.broker, lot.symbol, lot.option);
-      const result = await submitOrder(order, broker.broker, deps.executionMode);
+      const result = await submitOrder(order, broker.broker);
       const decision: Decision = {
         at: new Date().toISOString(),
         messageId,

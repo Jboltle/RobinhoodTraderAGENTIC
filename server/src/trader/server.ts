@@ -297,7 +297,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (pending.order.assetType === 'option' && pending.order.side === 'sell') {
         await cancelStops(deps.db, userId, broker, pending.order.symbol, pending.order.option);
       }
-      const placed = await submitOrder(pending.order, broker, deps.executionMode);
+      const placed = await submitOrder(pending.order, broker);
       const order = {
         ...pending.order,
         orderId: placed.orderId,
