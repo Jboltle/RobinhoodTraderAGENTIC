@@ -43,7 +43,8 @@ import {
   type TimeInForceStrict,
 } from 'snaptrade-typescript-sdk';
 
-import { OPTION_TYPES, type OptionType } from '../shared/types.js';
+import { OPTION_TYPES } from '../shared/types.js';
+import { occSymbol as buildOccSymbol, type OptionContractFields } from '../trader/broker/instrument.js';
 
 // Loaded here and not through shared/config.ts: that module refuses to load
 // without the trader's own settings (LLM_MODEL), and these checks need none.
@@ -60,10 +61,6 @@ const REQUIRED_ENV = ['SNAPTRADE_CLIENT_ID', 'SNAPTRADE_CONSUMER_KEY', 'SNAPTRAD
 const ALPACA_PAPER_SLUG = 'ALPACA-PAPER';
 const TRADE_CONNECTION_TYPE = 'trade';
 const TEST_CONTRACTS = 1;
-
-const OCC_ROOT_WIDTH = 6;
-const OCC_STRIKE_DIGITS = 8;
-const OCC_STRIKE_SCALE = 1000;
 
 // A Personal key is allowed 10 requests a minute per account. One command
 // stays under that: at most 4 order reads, 10 seconds apart, plus the closing
@@ -127,14 +124,6 @@ interface Flags {
   account?: string;
   order?: string;
   'pick-broker'?: boolean;
-}
-
-interface OptionContract {
-  underlying: string;
-  /** ISO date, YYYY-MM-DD. */
-  expiry: string;
-  strike: number;
-  optionType: OptionType;
 }
 
 type OrderKind = 'buy' | 'stop' | 'sell';
@@ -210,38 +199,13 @@ function positiveNumber(text: string | undefined, flag: string): number {
   return value;
 }
 
-function contractFromFlags(flags: Flags): OptionContract {
+function contractFromFlags(flags: Flags): OptionContractFields {
   const { underlying, expiry, strike, type } = flags;
   const optionType = OPTION_TYPES.find((candidate) => candidate === type?.toLowerCase());
   if (!underlying || !expiry || !strike || !optionType) {
     throw new Error('A contract needs --underlying <symbol> --expiry YYYY-MM-DD --strike <price> --type call|put.');
   }
-  return { underlying, expiry, strike: positiveNumber(strike, '--strike'), optionType };
-}
-
-/**
- * The 21-character OCC symbol SnapTrade's option order takes: root padded to 6
- * with spaces, YYMMDD, C or P, strike in thousandths padded to 8 digits.
- * `AAPL  251114C00240000` is the AAPL 2025-11-14 240 call.
- */
-function buildOccSymbol(contract: OptionContract): string {
-  const root = contract.underlying.trim().toUpperCase();
-  if (!/^[A-Z0-9]{1,6}$/.test(root)) {
-    throw new Error(`underlying must be 1 to ${OCC_ROOT_WIDTH} letters or digits, got "${contract.underlying}".`);
-  }
-  const expiry = new Date(`${contract.expiry}T00:00:00Z`);
-  // The round trip rejects dates the calendar does not have (2026-02-30).
-  if (Number.isNaN(expiry.getTime()) || expiry.toISOString().slice(0, 10) !== contract.expiry) {
-    throw new Error(`expiry must be a real date as YYYY-MM-DD, got "${contract.expiry}".`);
-  }
-  const thousandths = Math.round(contract.strike * OCC_STRIKE_SCALE);
-  const strikeFits = thousandths > 0 && String(thousandths).length <= OCC_STRIKE_DIGITS;
-  if (!strikeFits || Math.abs(contract.strike * OCC_STRIKE_SCALE - thousandths) > 1e-6) {
-    throw new Error(`strike must be positive with at most 3 decimals, got ${contract.strike}.`);
-  }
-  const yymmdd = contract.expiry.slice(2).replaceAll('-', '');
-  const side = contract.optionType === 'call' ? 'C' : 'P';
-  return `${root.padEnd(OCC_ROOT_WIDTH)}${yymmdd}${side}${String(thousandths).padStart(OCC_STRIKE_DIGITS, '0')}`;
+  return { symbol: underlying, expiration: expiry, strike: positiveNumber(strike, '--strike'), optionType };
 }
 
 /** Brokers return the OCC symbol with or without the root padding. */
@@ -757,28 +721,16 @@ const COMMANDS: Record<string, (flags: Flags) => Command> = {
 // ---- Offline self-check ------------------------------------------------------
 
 function selfCheck(): void {
-  const spyCall: OptionContract = { underlying: 'spy', expiry: '2026-11-20', strike: 600, optionType: 'call' };
-  // SnapTrade's own example of the format, from the SDK's MlegTradingInstrument doc.
-  assert.equal(
-    buildOccSymbol({ underlying: 'AAPL', expiry: '2025-11-14', strike: 240, optionType: 'call' }),
-    'AAPL  251114C00240000'
-  );
+  // The symbol format itself is tested with its builder (trader/broker/__tests__/instrument.test.ts).
+  const spyCall: OptionContractFields = { symbol: 'spy', expiration: '2026-11-20', strike: 600, optionType: 'call' };
   assert.equal(buildOccSymbol(spyCall), 'SPY   261120C00600000');
-  assert.equal(buildOccSymbol({ ...spyCall, strike: 397.5, optionType: 'put' }), 'SPY   261120P00397500');
-  assert.equal(buildOccSymbol({ ...spyCall, underlying: 'GOOGL', strike: 0.5 }), 'GOOGL 261120C00000500');
-  assert.equal(buildOccSymbol(spyCall).length, 21);
-  assert.throws(() => buildOccSymbol({ ...spyCall, expiry: '2026-02-30' }), /real date/);
-  assert.throws(() => buildOccSymbol({ ...spyCall, expiry: '11/20/2026' }), /real date/);
-  assert.throws(() => buildOccSymbol({ ...spyCall, strike: 600.1234 }), /at most 3 decimals/);
-  assert.throws(() => buildOccSymbol({ ...spyCall, strike: 100_000 }), /at most 3 decimals/);
-  assert.throws(() => buildOccSymbol({ ...spyCall, underlying: 'TOOLONG' }), /underlying/);
   assert.ok(sameOcc('SPY261120C00600000', 'SPY   261120C00600000'));
   assert.ok(!sameOcc('SPY261120P00600000', 'SPY   261120C00600000'));
   assert.ok(!sameOcc(undefined, 'SPY   261120C00600000'));
 
   assert.deepEqual(contractFromFlags({ underlying: 'SPY', expiry: '2026-11-20', strike: '600', type: 'CALL' }), {
-    underlying: 'SPY',
-    expiry: '2026-11-20',
+    symbol: 'SPY',
+    expiration: '2026-11-20',
     strike: 600,
     optionType: 'call',
   });
