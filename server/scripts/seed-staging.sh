@@ -25,7 +25,8 @@
 # cannot be shared. They live in accounts.credentials, and before the accounts
 # migration in broker_connections: accounts is copied without that column and
 # broker_connections is not copied at all. sessions are excluded so a
-# production browser token never works against staging.
+# production browser token never works against staging. Should either reach
+# TARGET all the same, the closing check removes it there and the script fails.
 set -euo pipefail
 
 : "${SOURCE_DB_URL:?SOURCE_DB_URL is required (production, read-only)}"
@@ -110,7 +111,33 @@ if [[ -n "$account_columns" ]]; then
     | target_sql -c "copy public.accounts ($account_columns) from stdin"
 fi
 
-assert_target_has_no_broker_logins "copy failed, a broker login arrived"
+# The closing check. A broker login or a session on TARGET here means the copy
+# went wrong. It is removed before the script fails, in a statement that
+# commits (a raise would undo the removal), so a production ciphertext or
+# browser token never stays on staging. Nested ifs as above.
+leaked=$(target_sql -At -c "
+  create temp table leaked (what text);
+  do \$\$ begin
+    if to_regclass('public.broker_connections') is not null then
+      with removed as (delete from public.broker_connections returning 1)
+      insert into leaked select 'broker_connections rows' from removed;
+    end if;
+    if to_regclass('public.accounts') is not null then
+      with removed as (update public.accounts set credentials = null
+                        where credentials is not null returning 1)
+      insert into leaked select 'accounts with stored credentials' from removed;
+    end if;
+    if to_regclass('public.sessions') is not null then
+      with removed as (delete from public.sessions returning 1)
+      insert into leaked select 'sessions' from removed;
+    end if;
+  end \$\$;
+  select string_agg(n || ' ' || what, ', ' order by what)
+    from (select count(*) n, what from leaked group by what) found;")
+if [[ -n "$leaked" ]]; then
+  echo "copy failed: removed from TARGET_DB_URL: $leaked" >&2
+  exit 1
+fi
 
 for migration in ${POST_CLONE_MIGRATIONS:-}; do
   echo "== applying $migration"
