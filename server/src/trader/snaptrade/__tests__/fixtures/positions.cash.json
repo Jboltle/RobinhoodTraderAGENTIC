@@ -1,0 +1,85 @@
+{
+  "results": [
+    {
+      "instrument": {
+        "kind": "stock",
+        "id": "f2d10516-9aff-4338-b983-8db42a8bce91",
+        "symbol": "NVDA",
+        "raw_symbol": "NVDA",
+        "description": "NVIDIA Corporation",
+        "currency": "USD",
+        "exchange": "XNAS",
+        "figi_instrument": {
+          "figi_code": "BBG000BBK0R0",
+          "figi_share_class": "BBG001S5TZJ6"
+        }
+      },
+      "units": "12",
+      "price": "120",
+      "cost_basis": "115",
+      "currency": "USD"
+    },
+    {
+      "instrument": {
+        "kind": "stock",
+        "id": "7be63bdb-f517-4ba4-b509-b7de77d96fd3",
+        "symbol": "GOOGL",
+        "raw_symbol": "GOOGL",
+        "description": "Alphabet Inc. Class A Common Stock",
+        "currency": "USD",
+        "exchange": "XNAS",
+        "figi_instrument": {
+          "figi_code": "BBG009S4MT03",
+          "figi_share_class": "BBG009S39JY5"
+        }
+      },
+      "units": "3",
+      "price": "170",
+      "cost_basis": "165",
+      "currency": "USD"
+    },
+    {
+      "instrument": {
+        "kind": "mutualfund",
+        "id": "c45f304b-846e-4f8c-b985-34278705d90c",
+        "symbol": "FXAIX",
+        "raw_symbol": "FXAIX",
+        "description": "Fidelity 500 Index Fund",
+        "currency": "USD",
+        "exchange": "XNAS",
+        "figi_instrument": {
+          "figi_code": "BBG001P8F023",
+          "figi_share_class": "BBG001TX1Z13"
+        }
+      },
+      "units": "120.5432",
+      "price": "185.2",
+      "cost_basis": "178",
+      "currency": "USD",
+      "cash_equivalent": false
+    },
+    {
+      "instrument": {
+        "kind": "mutualfund",
+        "id": "a5530fbb-0b00-4d95-a4a8-f88362979611",
+        "symbol": "SPAXX",
+        "raw_symbol": "SPAXX",
+        "description": "Fidelity Hereford Street Trust - Fidelity Government Money Market Fund",
+        "currency": "USD",
+        "exchange": "XNAS",
+        "figi_instrument": {
+          "figi_code": "BBG000B9Y9C7",
+          "figi_share_class": "BBG001S5P6W9"
+        }
+      },
+      "units": "3500",
+      "price": "1",
+      "cost_basis": "1",
+      "currency": "USD",
+      "cash_equivalent": true
+    }
+  ],
+  "data_freshness": {
+    "as_of": "2026-11-12T07:10:11Z"
+  }
+}

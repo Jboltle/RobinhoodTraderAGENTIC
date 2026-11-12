@@ -1,0 +1,59 @@
+{
+  "results": [
+    {
+      "instrument": {
+        "kind": "stock",
+        "id": "c15a817e-7171-4940-9ae7-f7b4a95408ee",
+        "symbol": "AAPL",
+        "raw_symbol": "AAPL",
+        "description": "Apple Inc.",
+        "currency": "USD",
+        "exchange": "XNAS",
+        "figi_instrument": {
+          "figi_code": "BBG000B9Y5X2",
+          "figi_share_class": "BBG001S5N8V8"
+        }
+      },
+      "units": "5",
+      "price": "180.5",
+      "cost_basis": "175",
+      "currency": "USD"
+    },
+    {
+      "instrument": {
+        "kind": "etf",
+        "id": "ee576918-ffd1-4908-9cc5-ca2469759e83",
+        "symbol": "SPY",
+        "raw_symbol": "SPY",
+        "description": "State Street SPDR S&P 500 ETF Trust",
+        "currency": "USD",
+        "exchange": "ARCX",
+        "figi_instrument": {
+          "figi_code": "BBG000BDTF76",
+          "figi_share_class": "BBG001S72SM3"
+        }
+      },
+      "units": "15",
+      "price": "558.25",
+      "cost_basis": "540",
+      "currency": "USD"
+    },
+    {
+      "instrument": {
+        "kind": "crypto",
+        "id": "9ecfad90-10d5-431c-9878-49960a323673",
+        "symbol": "BTC",
+        "raw_symbol": "BTC",
+        "description": "Bitcoin",
+        "currency": "USD"
+      },
+      "units": "0.25",
+      "price": "59000",
+      "cost_basis": "62000",
+      "currency": "USD"
+    }
+  ],
+  "data_freshness": {
+    "as_of": "2026-11-12T07:10:12Z"
+  }
+}

@@ -1,0 +1,11 @@
+[
+  {
+    "currency": {
+      "code": "USD",
+      "name": "US Dollar",
+      "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+    },
+    "cash": 25000,
+    "buying_power": 50000
+  }
+]

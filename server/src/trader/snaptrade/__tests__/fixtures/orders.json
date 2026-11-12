@@ -1,0 +1,316 @@
+{
+  "orders": [
+    {
+      "brokerage_order_id": "sandbox-order-3",
+      "brokerage_group_order_id": null,
+      "order_role": null,
+      "status": "ACCEPTED",
+      "universal_symbol": {
+        "id": "5563d000-af45-47ba-a2ec-7be565340077",
+        "symbol": "MSFT",
+        "description": "Microsoft Corporation Common Stock",
+        "currency": {
+          "code": "USD",
+          "name": "US Dollar",
+          "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+        },
+        "exchange": {
+          "id": "ff4b2ffc-5a0e-4471-9cf5-95c0c30cdedd",
+          "code": "NASDAQ",
+          "mic_code": "XNAS",
+          "name": "NASDAQ",
+          "suffix": null,
+          "timezone": "America/New_York",
+          "start_time": "09:30:00",
+          "close_time": "16:00:00"
+        },
+        "currencies": [],
+        "type": {
+          "id": "515c27d1-8471-4dec-a234-af12184c51d4",
+          "code": "cs",
+          "description": "Common Stock",
+          "is_supported": true
+        },
+        "raw_symbol": "MSFT",
+        "logo_url": null,
+        "figi_code": "BBG000BPHFS9",
+        "figi_instrument": {
+          "figi_code": "BBG000BPHFS9",
+          "figi_share_class": "BBG001S5TD05"
+        }
+      },
+      "quote_universal_symbol": null,
+      "quote_currency": {
+        "code": "USD",
+        "name": "US Dollar",
+        "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+      },
+      "option_symbol": null,
+      "action": "BUY",
+      "total_quantity": "3.000000000000000000",
+      "open_quantity": "3.00",
+      "canceled_quantity": null,
+      "filled_quantity": "0.000000000000000000",
+      "execution_price": null,
+      "limit_price": "410.0000000000",
+      "stop_price": null,
+      "trailing_stop": null,
+      "order_type": "Limit",
+      "time_in_force": "GTC",
+      "time_placed": "2026-11-11T07:10:13.024821Z",
+      "time_updated": null,
+      "time_executed": null,
+      "expiry_date": null,
+      "child_brokerage_order_ids": null
+    },
+    {
+      "brokerage_order_id": "sandbox-order-1",
+      "brokerage_group_order_id": null,
+      "order_role": null,
+      "status": "EXECUTED",
+      "universal_symbol": {
+        "id": "c15a817e-7171-4940-9ae7-f7b4a95408ee",
+        "symbol": "AAPL",
+        "description": "Apple Inc.",
+        "currency": {
+          "code": "USD",
+          "name": "US Dollar",
+          "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+        },
+        "exchange": {
+          "id": "ff4b2ffc-5a0e-4471-9cf5-95c0c30cdedd",
+          "code": "NASDAQ",
+          "mic_code": "XNAS",
+          "name": "NASDAQ",
+          "suffix": null,
+          "timezone": "America/New_York",
+          "start_time": "09:30:00",
+          "close_time": "16:00:00"
+        },
+        "currencies": [],
+        "type": {
+          "id": "515c27d1-8471-4dec-a234-af12184c51d4",
+          "code": "cs",
+          "description": "Common Stock",
+          "is_supported": true
+        },
+        "raw_symbol": "AAPL",
+        "logo_url": "https://api.twelvedata.com/logo/apple.com",
+        "figi_code": "BBG000B9Y5X2",
+        "figi_instrument": {
+          "figi_code": "BBG000B9Y5X2",
+          "figi_share_class": "BBG001S5N8V8"
+        }
+      },
+      "quote_universal_symbol": null,
+      "quote_currency": {
+        "code": "USD",
+        "name": "US Dollar",
+        "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+      },
+      "option_symbol": null,
+      "action": "BUY",
+      "total_quantity": "10.000000000000000000",
+      "open_quantity": "0.00",
+      "canceled_quantity": null,
+      "filled_quantity": "10.000000000000000000",
+      "execution_price": "180.5000000000",
+      "limit_price": "180.5000000000",
+      "stop_price": null,
+      "trailing_stop": null,
+      "order_type": "Limit",
+      "time_in_force": "Day",
+      "time_placed": "2026-11-10T07:10:13.024821Z",
+      "time_updated": null,
+      "time_executed": "2026-11-10T07:10:13.024821Z",
+      "expiry_date": null,
+      "child_brokerage_order_ids": null
+    },
+    {
+      "brokerage_order_id": "sandbox-order-7",
+      "brokerage_group_order_id": null,
+      "order_role": null,
+      "status": "EXECUTED",
+      "universal_symbol": {
+        "id": "99cd9935-0abf-43dd-a4e2-4e4f91284026",
+        "symbol": "ETH",
+        "description": "Ethereum",
+        "currency": {
+          "code": "USD",
+          "name": "US Dollar",
+          "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+        },
+        "exchange": {
+          "id": "203f953b-8984-4560-b695-67d75922d7a5",
+          "code": "WST-CRYPTO",
+          "mic_code": null,
+          "name": "WealthSimple Trade Crypto",
+          "suffix": null,
+          "timezone": "America/New_York",
+          "start_time": "00:00:00",
+          "close_time": "23:59:59.999999"
+        },
+        "currencies": [],
+        "type": {
+          "id": "8c76d59d-1214-4412-9526-052412392387",
+          "code": "crypto",
+          "description": "Cryptocurrency",
+          "is_supported": true
+        },
+        "raw_symbol": "ETH",
+        "logo_url": null,
+        "figi_code": null,
+        "figi_instrument": null
+      },
+      "quote_universal_symbol": null,
+      "quote_currency": {
+        "code": "USD",
+        "name": "US Dollar",
+        "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+      },
+      "option_symbol": null,
+      "action": "SELL",
+      "total_quantity": "0.500000000000000000",
+      "open_quantity": "0.00",
+      "canceled_quantity": null,
+      "filled_quantity": "0.500000000000000000",
+      "execution_price": "2600.0000000000",
+      "limit_price": null,
+      "stop_price": null,
+      "trailing_stop": null,
+      "order_type": "Market",
+      "time_in_force": "GTC",
+      "time_placed": "2026-11-08T07:10:13.024821Z",
+      "time_updated": null,
+      "time_executed": "2026-11-08T07:10:13.024821Z",
+      "expiry_date": null,
+      "child_brokerage_order_ids": null
+    },
+    {
+      "brokerage_order_id": "sandbox-order-4",
+      "brokerage_group_order_id": null,
+      "order_role": null,
+      "status": "CANCELED",
+      "universal_symbol": {
+        "id": "c15a817e-7171-4940-9ae7-f7b4a95408ee",
+        "symbol": "AAPL",
+        "description": "Apple Inc.",
+        "currency": {
+          "code": "USD",
+          "name": "US Dollar",
+          "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+        },
+        "exchange": {
+          "id": "ff4b2ffc-5a0e-4471-9cf5-95c0c30cdedd",
+          "code": "NASDAQ",
+          "mic_code": "XNAS",
+          "name": "NASDAQ",
+          "suffix": null,
+          "timezone": "America/New_York",
+          "start_time": "09:30:00",
+          "close_time": "16:00:00"
+        },
+        "currencies": [],
+        "type": {
+          "id": "515c27d1-8471-4dec-a234-af12184c51d4",
+          "code": "cs",
+          "description": "Common Stock",
+          "is_supported": true
+        },
+        "raw_symbol": "AAPL",
+        "logo_url": "https://api.twelvedata.com/logo/apple.com",
+        "figi_code": "BBG000B9Y5X2",
+        "figi_instrument": {
+          "figi_code": "BBG000B9Y5X2",
+          "figi_share_class": "BBG001S5N8V8"
+        }
+      },
+      "quote_universal_symbol": null,
+      "quote_currency": {
+        "code": "USD",
+        "name": "US Dollar",
+        "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+      },
+      "option_symbol": null,
+      "action": "SELL",
+      "total_quantity": "5.000000000000000000",
+      "open_quantity": "5.00",
+      "canceled_quantity": null,
+      "filled_quantity": "0.000000000000000000",
+      "execution_price": null,
+      "limit_price": null,
+      "stop_price": "175.0000000000",
+      "trailing_stop": null,
+      "order_type": "Stop",
+      "time_in_force": "Day",
+      "time_placed": "2026-10-29T07:10:13.024821Z",
+      "time_updated": null,
+      "time_executed": null,
+      "expiry_date": null,
+      "child_brokerage_order_ids": null
+    },
+    {
+      "brokerage_order_id": "sandbox-order-5",
+      "brokerage_group_order_id": null,
+      "order_role": null,
+      "status": "PARTIAL",
+      "universal_symbol": {
+        "id": "f2d10516-9aff-4338-b983-8db42a8bce91",
+        "symbol": "NVDA",
+        "description": "NVIDIA Corporation",
+        "currency": {
+          "code": "USD",
+          "name": "US Dollar",
+          "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+        },
+        "exchange": {
+          "id": "ff4b2ffc-5a0e-4471-9cf5-95c0c30cdedd",
+          "code": "NASDAQ",
+          "mic_code": "XNAS",
+          "name": "NASDAQ",
+          "suffix": null,
+          "timezone": "America/New_York",
+          "start_time": "09:30:00",
+          "close_time": "16:00:00"
+        },
+        "currencies": [],
+        "type": {
+          "id": "515c27d1-8471-4dec-a234-af12184c51d4",
+          "code": "cs",
+          "description": "Common Stock",
+          "is_supported": true
+        },
+        "raw_symbol": "NVDA",
+        "logo_url": null,
+        "figi_code": "BBG000BBK0R0",
+        "figi_instrument": {
+          "figi_code": "BBG000BBK0R0",
+          "figi_share_class": "BBG001S5TZJ6"
+        }
+      },
+      "quote_universal_symbol": null,
+      "quote_currency": {
+        "code": "USD",
+        "name": "US Dollar",
+        "id": "57f81c53-bdda-45a7-a51f-032afd1ae41b"
+      },
+      "option_symbol": null,
+      "action": "BUY",
+      "total_quantity": "20.000000000000000000",
+      "open_quantity": "10.00",
+      "canceled_quantity": null,
+      "filled_quantity": "10.000000000000000000",
+      "execution_price": "120.0000000000",
+      "limit_price": "121.0000000000",
+      "stop_price": null,
+      "trailing_stop": null,
+      "order_type": "Limit",
+      "time_in_force": "GTC",
+      "time_placed": "2026-11-05T07:10:11.537164Z",
+      "time_updated": null,
+      "time_executed": "2026-11-05T07:10:11.537164Z",
+      "expiry_date": null,
+      "child_brokerage_order_ids": null
+    }
+  ]
+}
