@@ -13,7 +13,7 @@ import { startMaxLossMonitor } from './maxLoss.js';
 import { INSTANCE_ID, startPoller } from './poller.js';
 import { reparseStaleRecaps } from './recaps/sweep.js';
 import { createQuoteSource } from './broker/quotes.js';
-import { createMcpRegistry } from './broker/registry.js';
+import { createMcpRegistry, restoreSessions } from './broker/registry.js';
 import { createRobinhoodAdapter } from './robinhood/adapter.js';
 import { buildServer } from './server.js';
 
@@ -59,24 +59,11 @@ async function main(): Promise<void> {
     instanceId: INSTANCE_ID,
   });
 
-  // Reconnect everyone who was connected before the restart, so their stored
-  // tokens are refreshed and their MCP session is warm before the first
-  // callout arrives rather than during it. Contained: a bad first query must
-  // not take the already-listening process down (see listen comment above).
+  // Warm every connected account's session before the first callout arrives.
+  // Contained: a bad first query must not take the already-listening process
+  // down (see listen comment above).
   try {
-    const accounts = await db.listConnectedAccounts();
-    log.info('restoring broker sessions', { accounts: accounts.length });
-    for (const account of accounts) {
-      void brokers
-        .for(account)
-        .session.ensureConnected()
-        .catch((err: unknown) =>
-          log.warn('could not restore broker session', {
-            accountId: account.id,
-            error: (err as Error).message,
-          })
-        );
-    }
+    await restoreSessions(db, brokers);
   } catch (err: unknown) {
     log.error('could not restore broker sessions', errorFields(err));
   }

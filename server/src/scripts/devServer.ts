@@ -207,6 +207,7 @@ const broker: UserBroker = {
 
 const brokers: McpRegistry = {
   for: () => broker,
+  supports: () => true,
   existing: () => broker,
   drop: () => {},
 };

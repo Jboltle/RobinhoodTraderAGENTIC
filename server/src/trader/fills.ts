@@ -22,7 +22,7 @@ import { restMissingStops } from './stops.js';
 import type { TraderEvents } from './events.js';
 import { normalizeOptionPremium } from './maxLoss.js';
 import { BrokerUnavailableError } from './broker/errors.js';
-import type { McpRegistry } from './broker/registry.js';
+import { supportedAccounts, type McpRegistry } from './broker/registry.js';
 import type { AccountRow, BrokerOrder } from './broker/types.js';
 
 const log = createLogger('trader:fills');
@@ -93,7 +93,7 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
   // a disconnected account's session would start an OAuth flow nobody asked for.
   // Equity orders have no history tool to read; they keep their submit-time state.
   const connected = new Map(
-    (await deps.db.listConnectedAccounts()).map((account) => [account.id, account])
+    (await supportedAccounts(deps.db, deps.brokers)).map((account) => [account.id, account])
   );
   const optionRows = rows.filter(
     (row) => connected.has(row.accountId) && row.decision.order?.assetType === 'option'
@@ -115,7 +115,7 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
     }
   }
   if (deps.executionMode === 'immediate') {
-    for (const account of await deps.db.listConnectedAccounts()) {
+    for (const account of await supportedAccounts(deps.db, deps.brokers)) {
       try {
         const broker = deps.brokers.for(account);
         await broker.session.ensureReady();

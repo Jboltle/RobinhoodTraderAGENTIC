@@ -105,6 +105,19 @@ export const fakeAccount = (id: string, userId: string = `owner-of-${id}`): Acco
   adapterData: {},
 });
 
+/** A SnapTrade paper account row of the given owner. */
+export const fakeSnapTradeAccount = (id: string, userId: string): AccountRow => ({
+  id,
+  userId,
+  adapter: 'snaptrade',
+  institution: 'alpaca-paper',
+  externalAccountId: `external-${id}`,
+  label: 'Alpaca Paper',
+  isPaper: true,
+  needsReconnect: false,
+  adapterData: { connectionId: 'connection-1', institutionSlug: 'ALPACA-PAPER', maskedAccountNumber: '1234' },
+});
+
 /** A stored broker connection, shaped like what the MCP SDK persists. */
 export const fakeTokens = (accessToken: string, refreshToken?: string): PersistedState => ({
   tokens: {

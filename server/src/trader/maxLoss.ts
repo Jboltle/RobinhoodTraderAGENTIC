@@ -19,7 +19,7 @@ import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
 import { instrumentKey } from './broker/instrument.js';
-import type { McpRegistry } from './broker/registry.js';
+import { supportedAccounts, type McpRegistry } from './broker/registry.js';
 import type {
   AccountRow,
   Broker,
@@ -116,7 +116,7 @@ export async function sweepMaxLoss(
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
 
-  const accounts = await deps.db.listConnectedAccounts();
+  const accounts = await supportedAccounts(deps.db, deps.brokers);
   await Promise.all(
     accounts.map((account) =>
       deps

@@ -17,7 +17,7 @@ import type { TraderEvents } from '../events.js';
 import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js';
 import { instrumentOf } from '../broker/instrument.js';
 import type { QuoteSource } from '../broker/quotes.js';
-import type { McpRegistry } from '../broker/registry.js';
+import { supportedAccounts, type McpRegistry } from '../broker/registry.js';
 import type { AccountRow, Broker } from '../broker/types.js';
 import {
   allocateFifo,
@@ -102,7 +102,7 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
       // flattened text; `embeds` stay raw for storage/display.
       const envelope = flattenEnvelope(rawEnvelope);
 
-      const accounts = await deps.db.listConnectedAccounts();
+      const accounts = await supportedAccounts(deps.db, deps.brokers);
       for (const account of accounts) {
         deps.events.emitStage(account.id, {
           messageId: envelope.messageId,
