@@ -40,6 +40,14 @@ export const FLATTEN_RETRY_MS = 10 * 60_000;
 /** Submit-time statuses that mean the broker did not accept the close. */
 const DEAD_ORDER_STATUSES = new Set(['rejected', 'canceled', 'cancelled', 'failed', 'expired']);
 
+/**
+ * A buy never fills above its limit, so a broker average of at least this many
+ * times the order's own limit is not a premium: it is the per-contract figure
+ * (159 for a 1.59 fill). The mark cannot tell once the option is worth about
+ * five times its entry, and Max Loss then sold a winner as a 95% loss.
+ */
+const OWN_LIMIT_PER_CONTRACT_FACTOR = 20;
+
 /** How far back we look for the buy that opened a position. Same depth as performance. */
 const ENTRY_HISTORY_LIMIT = 500;
 
@@ -517,6 +525,8 @@ export function resolveEquityEntry(submitted: readonly Decision[], position: Pos
  * fills first (average_price of filled buys from get_option_orders, newest
  * lots covering the open contracts), else the submitted limit premiums the
  * same way. Position rows carry no cost data, so fills are the best source.
+ * A fill of one of the user's own recorded limit buys is checked against that
+ * limit first; see OWN_LIMIT_PER_CONTRACT_FACTOR.
  * Shared with the dashboard (server.ts).
  */
 export function resolveOptionEntry(
@@ -538,13 +548,32 @@ export function resolveOptionEntry(
     )
     .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
     .map((o) => ({
-      price: normalizeOptionPremium(o.averagePrice!, mark),
+      price: fillPremium(o.averagePrice!, ownBuyLimit(submitted, o.orderId), mark),
       quantity: o.quantity > 0 ? o.quantity : 1,
     }));
   return (
     weightedAverageEntry(fillLots, position.quantity) ??
     findOptionEntry(submitted, position, position.quantity)
   );
+}
+
+/** The limit of the user's recorded limit buy with this broker order id, else null. */
+function ownBuyLimit(submitted: readonly Decision[], orderId: string | null): number | null {
+  if (orderId === null) return null;
+  const order = submitted.find((d) => d.order!.orderId === orderId)?.order;
+  if (!order || order.side !== 'buy' || order.orderType !== 'limit') return null;
+  return order.limitPrice !== null && order.limitPrice > 0 ? order.limitPrice : null;
+}
+
+/**
+ * A filled buy's premium per share. Only ever lower than normalizeOptionPremium
+ * alone would give, and a lower entry can only make Max Loss sell less.
+ */
+function fillPremium(average: number, ownLimit: number | null, mark: number | null): number {
+  if (ownLimit !== null && average >= OWN_LIMIT_PER_CONTRACT_FACTOR * ownLimit) {
+    return average / OPTION_MULTIPLIER;
+  }
+  return normalizeOptionPremium(average, mark);
 }
 
 /** Robinhood sometimes reports 159 when the premium is 1.59. */

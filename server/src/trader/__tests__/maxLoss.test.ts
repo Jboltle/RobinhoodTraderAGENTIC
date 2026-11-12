@@ -11,6 +11,7 @@ import {
   lossBreached,
   lossEnabled,
   normalizeOptionPremium,
+  resolveOptionEntry,
   sweepMaxLoss,
   weightedAverageEntry,
   type MaxLossDeps,
@@ -18,6 +19,7 @@ import {
 import type { McpRegistry, UserBroker } from '../rh/mcpRegistry.js';
 import { BrokerUnavailableError, type RobinhoodMcpClient } from '../rh/mcpClient.js';
 import type { RobinhoodTools } from '../rh/tools.js';
+import type { OptionOrder } from '../rh/types.js';
 import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
 
 const USER = 'user-1';
@@ -414,6 +416,171 @@ describe('sweepMaxLoss — a position whose lot carries a stored stop id', () =>
 
     expect(tools.placeOptionsOrder).not.toHaveBeenCalled();
     expect((await db.listDecisions(USER, 10)).some((d) => d.kind === 'max_loss_exit')).toBe(false);
+  });
+});
+
+describe("Max Loss entry — a per-contract fill of the system's own limit buy", () => {
+  const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+  const position = { symbol: 'QQQ', ...contract, quantity: 2, raw: {} };
+  /** Paid 1.59 on a 1.60 limit; Robinhood's order history reports the fill per contract. */
+  const LIMIT = 1.6;
+  const PER_CONTRACT_FILL = 159;
+
+  const fill = (orderId: string, averagePrice: number, overrides: Partial<OptionOrder> = {}): OptionOrder => ({
+    orderId,
+    symbol: 'QQQ',
+    ...contract,
+    side: 'buy',
+    state: 'filled',
+    averagePrice,
+    quantity: 2,
+    createdAt: '2026-09-08T14:00:00.000Z',
+    raw: {},
+    ...overrides,
+  });
+
+  /** What production (d6cf5d5) computes for one filled buy. */
+  const productionEntry = (averagePrice: number, mark: number | null): number =>
+    normalizeOptionPremium(averagePrice, mark);
+
+  async function sweepWith(opts: {
+    mark: number;
+    orders: OptionOrder[];
+    buy?: Decision | null;
+  }): Promise<{ sells: unknown[][]; reasons: string[] }> {
+    const { db, tools, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [position],
+      markFor: () => opts.mark,
+    });
+    if (opts.buy !== null) db.seedDecision(USER, opts.buy ?? submittedBuy('QQQ', LIMIT, contract));
+    asMock(tools.getOptionOrders).mockResolvedValue({ orders: opts.orders, raw: {} });
+
+    await sweepMaxLoss(deps, flattening);
+
+    const exits = (await db.listDecisions(USER, 10)).filter((d) => d.kind === 'max_loss_exit');
+    return { sells: asMock(tools.placeOptionsOrder).mock.calls, reasons: exits.map((d) => d.reason) };
+  }
+
+  it('does not sell a winner whose own limit buy is reported per contract', async () => {
+    // 159 / 8.00 is under 20, so the mark alone no longer gives the scale away.
+    const { sells } = await sweepWith({ mark: 8, orders: [fill('buy-1', PER_CONTRACT_FILL)] });
+
+    expect(sells).toHaveLength(0);
+  });
+
+  it('still sells a true loss from 1.59, with the same order as before', async () => {
+    const { sells, reasons } = await sweepWith({ mark: 0.7, orders: [fill('buy-1', PER_CONTRACT_FILL)] });
+
+    expect(sells).toEqual([
+      [expect.objectContaining({ symbol: 'QQQ', ...contract, contracts: 2, side: 'sell', orderType: 'market' })],
+    ]);
+    expect(reasons).toEqual(['Max loss: sold 2 QQQ 707C 2026-06-11 at mark $0.70 (entry $1.59)']);
+  });
+
+  it('still sells a collapse from 1.59: the corrected figure is not divided a second time', async () => {
+    // 1.59 / 0.05 is itself over 20; treated as a scale error again it would read 0.0159.
+    const { sells, reasons } = await sweepWith({ mark: 0.05, orders: [fill('buy-1', PER_CONTRACT_FILL)] });
+
+    expect(sells).toHaveLength(1);
+    expect(reasons).toEqual(['Max loss: sold 2 QQQ 707C 2026-06-11 at mark $0.05 (entry $1.59)']);
+  });
+
+  it('is identical to production when no recorded decision has that order id', async () => {
+    const { sells, reasons } = await sweepWith({ mark: 8, orders: [fill('bought-in-the-app', PER_CONTRACT_FILL)] });
+
+    expect(sells).toHaveLength(1);
+    expect(reasons[0]).toContain('(entry $159.00)');
+  });
+
+  it('is identical to production for a market buy, even one that carries a limit', async () => {
+    const buy = submittedBuy('QQQ', LIMIT, contract);
+    const { sells, reasons } = await sweepWith({
+      mark: 8,
+      orders: [fill('buy-1', PER_CONTRACT_FILL)],
+      buy: { ...buy, order: { ...buy.order!, orderType: 'market' } },
+    });
+
+    expect(sells).toHaveLength(1);
+    expect(reasons[0]).toContain('(entry $159.00)');
+  });
+
+  it.each([
+    ['a genuine per-share fill', 1.59],
+    ['a fill just under 20 times the limit', 31.99],
+    ['a limit that is not positive', PER_CONTRACT_FILL],
+  ])('is identical to production for %s', (label, averagePrice) => {
+    const buy = submittedBuy('QQQ', label === 'a limit that is not positive' ? 0 : LIMIT, contract);
+
+    for (const mark of [0.7, 7.9, 8, null]) {
+      expect(resolveOptionEntry([buy], position, [fill('buy-1', averagePrice)], mark)).toBe(
+        productionEntry(averagePrice, mark)
+      );
+    }
+  });
+
+  it('is identical to production when the recorded order with that id is a sell', () => {
+    const buy = submittedBuy('QQQ', LIMIT, contract);
+    const sell: Decision = { ...buy, action: 'sell', order: { ...buy.order!, side: 'sell' } };
+
+    expect(resolveOptionEntry([sell], position, [fill('buy-1', PER_CONTRACT_FILL)], 8)).toBe(159);
+  });
+
+  it('corrects at exactly 20 times the limit', () => {
+    const buy = submittedBuy('QQQ', LIMIT, contract);
+
+    expect(resolveOptionEntry([buy], position, [fill('buy-1', 32)], 8)).toBeCloseTo(0.32);
+  });
+
+  it("corrects only the system's own order when two orders opened the contract", () => {
+    const buy = submittedBuy('QQQ', LIMIT, contract);
+    const orders = [
+      fill('buy-1', PER_CONTRACT_FILL, { createdAt: '2026-09-08T14:05:00.000Z' }),
+      fill('bought-in-the-app', PER_CONTRACT_FILL, { createdAt: '2026-09-08T14:00:00.000Z' }),
+    ];
+
+    const entry = resolveOptionEntry([buy], { ...position, quantity: 4 }, orders, 8);
+
+    expect(entry).toBeCloseTo((1.59 * 2 + 159 * 2) / 4);
+  });
+
+  it('never matches a broker order that has no id', () => {
+    const buy = submittedBuy('QQQ', LIMIT, contract);
+    const unplaced: Decision = { ...buy, order: { ...buy.order!, orderId: null } };
+
+    expect(resolveOptionEntry([unplaced], position, [fill('x', PER_CONTRACT_FILL, { orderId: null })], 8)).toBe(159);
+  });
+
+  it('property: the entry is never above what production computes', () => {
+    // Deterministic pseudo-random numbers: the same cases on every run.
+    let seed = 20261112;
+    const random = (): number => {
+      seed = (seed * 1664525 + 1013904223) % 4294967296;
+      return seed / 4294967296;
+    };
+    const CASES = 5000;
+    let corrected = 0;
+    for (let i = 0; i < CASES; i += 1) {
+      const paid = 0.01 + random() * 40;
+      const limit = paid * (1 + random() * 0.2);
+      const averagePrice = random() < 0.5 ? paid : paid * 100;
+      const mark = random() < 0.1 ? null : 0.01 + random() * paid * 30;
+      const own = random() < 0.7;
+      const buy = submittedBuy('QQQ', Number(limit.toFixed(2)), contract);
+      const order = fill(own ? 'buy-1' : 'bought-in-the-app', averagePrice);
+
+      const entry = resolveOptionEntry([buy], position, [order], mark)!;
+      const production = productionEntry(averagePrice, mark);
+
+      expect(entry).toBeLessThanOrEqual(production);
+      if (!own) expect(entry).toBe(production);
+      if (entry !== production) {
+        corrected += 1;
+        expect(entry).toBeCloseTo(production / 100);
+      }
+    }
+    // The rule did fire: this is not a test of two identical functions.
+    expect(corrected).toBeGreaterThan(0);
   });
 });
 

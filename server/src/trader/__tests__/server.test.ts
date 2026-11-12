@@ -798,6 +798,59 @@ describe('GET /api/trades/performance', () => {
     expect(option.pctChange).toBeCloseTo(((1.94 - 0.92) / 0.92) * 100);
   });
 
+  // Paid 1.59 on a 1.60 limit, now worth 8.00: order history reports the fill
+  // per contract (159), and 159 / 8.00 is under the mark's own 20x test.
+  it("reads a per-contract fill of the system's own limit buy as the premium it was", async () => {
+    const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    harness.configureBroker(USER.id, {
+      optionPositions: [{ symbol: 'QQQ', ...option, quantity: 2, raw: {} }],
+      markPrice: 8,
+      toolsOverrides: {
+        getOptionOrders: vi.fn().mockResolvedValue({
+          orders: [
+            {
+              orderId: 'opt-001',
+              symbol: 'QQQ',
+              ...option,
+              side: 'buy',
+              state: 'filled',
+              averagePrice: 159,
+              quantity: 2,
+              createdAt: '2026-07-14T14:00:00.000Z',
+              raw: {},
+            },
+          ],
+          raw: {},
+        }),
+      },
+    });
+    harness.db.seedDecision(
+      USER.id,
+      decisionFixture('opt', {
+        ticker: 'QQQ',
+        order: {
+          symbol: 'QQQ',
+          side: 'buy',
+          assetType: 'option',
+          quantity: 2,
+          orderType: 'limit',
+          limitPrice: 1.6,
+          option,
+          orderId: 'opt-001',
+          status: 'filled',
+        },
+      })
+    );
+
+    const { positions } = (await get('/api/trades/performance')).json() as {
+      positions: Array<{ symbol: string; entryPrice: number; pctChange: number }>;
+    };
+
+    expect(positions).toHaveLength(1);
+    expect(positions[0]!.entryPrice).toBeCloseTo(1.59);
+    expect(positions[0]!.pctChange).toBeCloseTo(((8 - 1.59) / 1.59) * 100);
+  });
+
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
     harness.configureBroker(USER.id, {
       toolsOverrides: {
