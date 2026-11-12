@@ -37,6 +37,7 @@
     "fastify": "^5.8.5",
     "postgres": "^3.4.7",
     "regex": "^6.1.0",
+    "snaptrade-typescript-sdk": "^13.2.5",
     "zod": "^4.4.3"
   },
   "devDependencies": {
