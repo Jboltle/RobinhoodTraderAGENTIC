@@ -45,6 +45,11 @@ export default defineRailway((ctx) => {
       TRADE_EXECUTION_MODE: isProd ? preserve() : "read_only",
       // No Discord token on staging: a Listener cannot run there.
       ...(isProd ? { DISCORD_USER_TOKEN: preserve() } : {}),
+      // Connecting other brokers through SnapTrade (the owner's Personal key):
+      // on staging only for now. It places no order, there or anywhere.
+      ...(isProd
+        ? {}
+        : { SNAPTRADE_CLIENT_ID: preserve(), SNAPTRADE_CONSUMER_KEY: preserve(), SNAPTRADE_OWNER_EMAIL: preserve() }),
       DISCORD_ALLOWED_AUTHOR_IDS: preserve(),
       DISCORD_ALLOWED_CHANNEL_IDS: preserve(),
       DISCORD_RECAP_CHANNEL_IDS: preserve(),

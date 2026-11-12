@@ -42,6 +42,16 @@ One parse serves everyone, which is the cost saving that matters as accounts are
 - [`server/src/trader/db.ts`](server/src/trader/db.ts) is the only module that talks to the database. Settings, trades and broker tokens belong to an account, and every method that touches them takes `accountId` as its first argument so a caller cannot forget to scope a query. A route never takes an account from the request: the session resolves to the user's selected account (`requireAccount` in [`server/src/trader/auth.ts`](server/src/trader/auth.ts)), which is always one of their own.
 - RLS stays on with default-deny for every table, but nothing is exposed through a public data API: the browser only ever talks to the trader, which connects as the table owner.
 
+### Connecting other brokers (SnapTrade)
+
+The dashboard's Connect dialog offers **Robinhood** or **Other broker**. Other broker opens SnapTrade's Connection Portal (the `snaptrade-react` modal, loaded on demand), where the broker is picked and signed in to; the trader then syncs the accounts in. This is the connect half only: no order-placing SnapTrade adapter is registered yet, so a SnapTrade account is listed with its real connection state but is left out of the fan-out and the monitors, and its screens say it is not available on this deployment.
+
+- **Owner only.** The key is a SnapTrade *Personal* key, the owner's own SnapTrade login. Set `SNAPTRADE_CLIENT_ID`, `SNAPTRADE_CONSUMER_KEY` and `SNAPTRADE_OWNER_EMAIL`; while any is absent the option is off. Only the sign-in whose email equals `SNAPTRADE_OWNER_EMAIL` (case ignored) is offered it; everyone else goes straight to the Robinhood login and is refused on the routes.
+- **Routes.** `POST /api/snaptrade/link` returns a fresh portal link for any broker (`{ reconnect: <connection id> }` repairs one of the user's own connections). The link lives five minutes, so it is issued as the portal opens. `POST /api/snaptrade/sync` makes the user's SnapTrade accounts match what SnapTrade lists. Both must name the viewed account (`x-viewed-account`) like every other change, and both are allowed on a `read_only` deployment: neither places an order.
+- **Sync.** One `accounts` row per investment account under a `trade` connection. A new account copies the viewed account's settings and followed Callers but **starts in approval mode**, paper included. An account already here keeps its settings; one that was disconnected and is listed again comes back in approval mode. A disabled connection sets `needs_reconnect`. An account SnapTrade no longer lists is marked disconnected, never deleted. `read` connections and the SnapTrade Sandbox (a simulator every Personal key has) are skipped. A failed read of SnapTrade changes nothing.
+- **Connected.** A SnapTrade account stores no credentials: it is connected while it is not disconnected and does not need reconnecting. A Robinhood account is connected while it has stored credentials, as before.
+- SnapTrade's account list is cached daily, so a connection made a moment ago may list no account yet. The dialog says so and offers to sync again.
+
 ### Schema (`supabase/migrations/`)
 
 | Table | Scope | Holds |
@@ -350,6 +360,7 @@ What keeps staging apart from production:
 - **No Listener.** Staging starts the trader alone (`node dist/trader/index.js`) and has no `DISCORD_USER_TOKEN`: one gateway session per Discord user token.
 - **No orders.** `TRADE_EXECUTION_MODE=read_only` is pinned in the file. Every callout stops at waiting for approval, Approve is refused and nothing writes to a broker, Max Loss included. Production's value is held in Railway, not in the file, so it can be flipped there at once.
 - **No Robinhood login.** A `read_only` deployment refuses `POST /api/broker/connect` and `/api/broker/callback`. The agentic connection is one slot per account, so a login from staging would take production's. Staging has its own `RH_TOKENS_VAULT_KEY`.
+- **SnapTrade connect is allowed.** Staging holds the three `SNAPTRADE_*` variables (production does not yet), so the owner can connect another broker there. It places no order: the write guard refuses every order on every adapter.
 - **Own database.** `SUPABASE_DB_URL` is `${{Postgres.DATABASE_URL}}`, the Postgres in the same environment.
 - **Own trader behind the dashboard.** Staging's `API_URL` is `https://${{RobinhoodTradingServer.RAILWAY_PUBLIC_DOMAIN}}`, the trader in the same environment. Production's is a fixed address held in Railway.
 
