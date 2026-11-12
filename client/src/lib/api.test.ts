@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import {
+  approveTrade,
   authHeaders,
+  disconnectBroker,
   fetchAccounts,
   fetchSettings,
+  rejectTrade,
   selectAccount,
   setAccessTokenSource,
   setAccountChangedHandler,
 } from './api'
+import { saveSettings } from './settingsSync'
 
 const VIEWED_ACCOUNT_HEADER = 'x-viewed-account'
 
@@ -63,6 +67,49 @@ test('the account named for one session is not sent on another', async () => {
   token = 'someone-else-signed-in'
 
   expect(authHeaders()).toEqual({ authorization: 'Bearer someone-else-signed-in' })
+})
+
+test('a change names the account its control was rendered under, not the one last heard of', async () => {
+  // The list has just said paper is selected; the Robinhood account's
+  // controls are still on screen.
+  answers.push(Response.json({ selectedAccountId: 'account-paper', brokers: [] }))
+  await fetchAccounts()
+  expect(authHeaders()[VIEWED_ACCOUNT_HEADER]).toBe('account-paper')
+
+  answers.push(Response.json({ decision: {} }), Response.json({ decision: {} }))
+  await approveTrade('callout-1', 'account-robinhood')
+  await rejectTrade('callout-1', 'account-robinhood')
+  await disconnectBroker('account-robinhood')
+  answers.push(Response.json({ settings: {} }))
+  await saveSettings({}, 'account-robinhood')
+
+  const pathsSent = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)).pathname)
+  expect(pathsSent.slice(1)).toEqual([
+    '/api/trades/callout-1/approve',
+    '/api/trades/callout-1/reject',
+    '/api/broker/disconnect',
+    '/api/settings',
+  ])
+  expect(viewedAccountsSent().slice(1)).toEqual([
+    'account-robinhood',
+    'account-robinhood',
+    'account-robinhood',
+    'account-robinhood',
+  ])
+})
+
+test('a refusal for naming no account is handled like one for a stale account', async () => {
+  const onAccountChanged = vi.fn()
+  setAccountChangedHandler(onAccountChanged)
+
+  answers.push(
+    Response.json(
+      { error: 'This page is out of date. Reload it and try again.', code: 'account_not_named' },
+      { status: 409 },
+    ),
+  )
+  await expect(approveTrade('callout-1', 'account-robinhood')).rejects.toThrow('Reload it')
+  expect(onAccountChanged).toHaveBeenCalledTimes(1)
 })
 
 test('only a refusal for a stale account reports that the account changed', async () => {

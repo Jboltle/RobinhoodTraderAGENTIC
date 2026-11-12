@@ -41,6 +41,7 @@ export function ConnectDialog({
   onClose: () => void
 }) {
   const queryClient = useQueryClient()
+  const accounts = useAccounts({ refetchInterval: open ? STATUS_POLL_MS : false })
   // Mounted closed on every page via ConnectBanner, so it polls only while
   // open: that is when `connected` flipping after the paste closes the flow.
   const status = useQuery<BrokerStatus>({
@@ -48,8 +49,10 @@ export function ConnectDialog({
     queryFn: fetchBrokerStatus,
     refetchInterval: open ? STATUS_POLL_MS : false,
     retry: false,
+    // The account menu mounts this outside AccountGate: closed, it asks for
+    // no account's status before the list has said which account is viewed.
+    enabled: open || accounts.data !== undefined,
   })
-  const accounts = useAccounts({ refetchInterval: open ? STATUS_POLL_MS : false })
 
   const [redirectUrl, setRedirectUrl] = useState('')
   const [authUrl, setAuthUrl] = useState<string | null>(null)

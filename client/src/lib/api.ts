@@ -44,9 +44,17 @@ export function setUnauthorizedHandler(handler: () => void): void {
   onUnauthorized = handler
 }
 
-/** Mirrors VIEWED_ACCOUNT_HEADER and ACCOUNT_CHANGED_CODE in server/src/trader/auth.ts. */
+/**
+ * Mirrors VIEWED_ACCOUNT_HEADER, ACCOUNT_CHANGED_CODE and
+ * ACCOUNT_NOT_NAMED_CODE in server/src/trader/auth.ts.
+ */
 const VIEWED_ACCOUNT_HEADER = 'x-viewed-account'
-const ACCOUNT_CHANGED_CODE = 'account_changed'
+/**
+ * The `code` of a refusal that means this page no longer matches the server:
+ * the account it names is not the selected one, or it named none. Either way
+ * the answer is to read the account list again.
+ */
+const STALE_PAGE_CODES = new Set(['account_changed', 'account_not_named'])
 
 // The account this page is showing, as the server last named it, and the
 // session it was named for (a different sign-in starts without one).
@@ -60,7 +68,8 @@ function rememberViewedAccount(accountId: string): void {
 
 /**
  * Called when the server refuses a request because the selected account is no
- * longer the one this page is showing (it was switched in another tab).
+ * longer the one this page is showing (it was switched in another tab), or
+ * because the request named no account at all.
  */
 export function setAccountChangedHandler(handler: () => void): void {
   onAccountChanged = handler
@@ -79,6 +88,17 @@ export function authHeaders(): Record<string, string> {
     authorization: `Bearer ${token}`,
     ...(viewedAccount?.token === token && { [VIEWED_ACCOUNT_HEADER]: viewedAccount.accountId }),
   }
+}
+
+/**
+ * Headers for a request that changes something on one account. They name the
+ * account the control was rendered under, not the one this module last heard
+ * of: the two differ for the moment between the account list arriving and the
+ * previous account's rows leaving the screen, and an Approve clicked in that
+ * moment must be refused, not carried out on the other account.
+ */
+export function authHeadersFor(accountId: string): Record<string, string> {
+  return { ...authHeaders(), [VIEWED_ACCOUNT_HEADER]: accountId }
 }
 
 export interface OptionContract {
@@ -481,16 +501,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!res.ok) {
     if (res.status === 401) onUnauthorized()
     const body = (await res.json().catch(() => null)) as { error?: string; code?: string } | null
-    if (body?.code === ACCOUNT_CHANGED_CODE) onAccountChanged()
+    if (body?.code !== undefined && STALE_PAGE_CODES.has(body.code)) onAccountChanged()
     throw new Error(body?.error ?? `${init.method ?? 'GET'} ${path} failed: ${res.status}`)
   }
   return res.json() as Promise<T>
 }
 
-const postJson = <T>(path: string, body: unknown): Promise<T> =>
+/** `accountId`: the account the request acts on, when it acts on one (authHeadersFor). */
+const postJson = <T>(path: string, body: unknown, accountId?: string): Promise<T> =>
   request<T>(path, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(accountId !== undefined && authHeadersFor(accountId)),
+    },
     body: JSON.stringify(body),
   })
 
@@ -533,18 +557,23 @@ export const selectAccount = (accountId: string): Promise<string> =>
     return r.selectedAccountId
   })
 
-/** Submit a trade that was sized and parked in approval mode. */
-export const approveTrade = (messageId: string): Promise<Decision> =>
+/**
+ * Submit a trade that was sized and parked in approval mode. `accountId` is
+ * the account whose card the button was on.
+ */
+export const approveTrade = (messageId: string, accountId: string): Promise<Decision> =>
   postJson<{ decision: Decision }>(
     `/api/trades/${encodeURIComponent(messageId)}/approve`,
     {},
+    accountId,
   ).then((r) => r.decision)
 
 /** Turn down a parked trade. Nothing is sent to the broker. */
-export const rejectTrade = (messageId: string): Promise<Decision> =>
+export const rejectTrade = (messageId: string, accountId: string): Promise<Decision> =>
   postJson<{ decision: Decision }>(
     `/api/trades/${encodeURIComponent(messageId)}/reject`,
     {},
+    accountId,
   ).then((r) => r.decision)
 
 /**
@@ -557,8 +586,8 @@ export const connectBroker = (options: { force: boolean }): Promise<BrokerConnec
   postJson<BrokerConnectResult>('/api/broker/connect', options)
 
 /** Sever the stored Robinhood connection. Trading stops until reconnected. */
-export const disconnectBroker = (): Promise<void> =>
-  postJson<{ ok: true }>('/api/broker/disconnect', {}).then(() => undefined)
+export const disconnectBroker = (accountId: string): Promise<void> =>
+  postJson<{ ok: true }>('/api/broker/disconnect', {}, accountId).then(() => undefined)
 
 /** POST the dead-end 127.0.0.1 redirect URL the user pasted after approving. */
 export const submitBrokerRedirect = (redirectUrl: string): Promise<void> =>

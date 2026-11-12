@@ -275,6 +275,8 @@ test('still offers Settings and Sign out when the account list cannot be read', 
   await waitFor(() => expect(menu.textContent).toContain('Accounts unavailable (trader unreachable)'))
   expect(within(menu).queryAllByRole('menuitemradio')).toHaveLength(0)
   expect(within(menu).getAllByRole('menuitem')).toHaveLength(3)
+  // Its closed connect dialog asks for no account's status without a list.
+  expect(api.fetchBrokerStatus).not.toHaveBeenCalled()
 })
 
 test('an account that cannot be read is listed as unavailable and cannot be chosen', async () => {

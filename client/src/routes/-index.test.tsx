@@ -3,10 +3,18 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import type { BookResponse, Decision } from '../lib/api'
+import { AccountGate } from '../components/AccountGate'
+import type { AccountsResponse, BookResponse, Decision } from '../lib/api'
 import { Route } from './index'
 
+const listViewing = (selectedAccountId: string): AccountsResponse => ({
+  selectedAccountId,
+  brokers: [],
+})
+
 const api = vi.hoisted(() => ({
+  fetchAccounts: vi.fn<() => Promise<AccountsResponse>>(),
+  setAccountChangedHandler: vi.fn(),
   fetchBook: vi.fn<() => Promise<BookResponse>>(),
   fetchCallers: vi.fn(async () => []),
   fetchCallouts: vi.fn(async () => []),
@@ -16,6 +24,8 @@ const api = vi.hoisted(() => ({
   rejectTrade: vi.fn(),
 }))
 vi.mock('../lib/api', () => api)
+// The test plays the stream's part by writing the caches it fills.
+vi.mock('../lib/stream', () => ({ useTraderStream: vi.fn() }))
 
 const EMPTY_BOOK: BookResponse = {
   period: 'today',
@@ -37,7 +47,9 @@ async function renderDashboard() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const utils = render(
     <QueryClientProvider client={queryClient}>
-      <Dashboard />
+      <AccountGate>
+        <Dashboard />
+      </AccountGate>
     </QueryClientProvider>,
   )
   return { queryClient, ...utils }
@@ -69,6 +81,7 @@ function expectPlaceholders(container: HTMLElement): void {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  api.fetchAccounts.mockResolvedValue(listViewing('account-robinhood'))
 })
 
 afterEach(() => {
@@ -79,8 +92,12 @@ test('figures that have not loaded read as placeholders, on first load and after
   let answerBook = pendingBook()
   const { container, queryClient } = await renderDashboard()
 
-  // First load: nothing has answered yet.
-  expectPlaceholders(container)
+  // First load: the account list has answered and nothing else has yet. The
+  // book has been asked for by then, so the answer below has someone waiting.
+  await waitFor(() => {
+    expectPlaceholders(container)
+    expect(api.fetchBook).toHaveBeenCalledTimes(1)
+  })
 
   // The book answers and the stream delivers its first snapshot: an account
   // with nothing in it now reads as real zeros.
@@ -91,13 +108,17 @@ test('figures that have not loaded read as placeholders, on first load and after
   await waitFor(() => expect(container.textContent).toContain('Open 0'))
   for (const zero of REAL_ZEROS) expect(container.textContent, zero).toContain(zero)
 
-  // An account switch empties every cache (useResetOnAccountSwitch): back to
-  // placeholders until the new account's figures arrive.
+  // The account list names another account: AccountGate empties every cache
+  // (useResetOnAccountSwitch), so it is back to placeholders until the new
+  // account's figures arrive.
   answerBook = pendingBook()
   await act(async () => {
-    void queryClient.resetQueries()
+    queryClient.setQueryData<AccountsResponse>(['accounts'], listViewing('account-paper'))
   })
-  await waitFor(() => expectPlaceholders(container))
+  await waitFor(() => {
+    expectPlaceholders(container)
+    expect(api.fetchBook).toHaveBeenCalledTimes(2)
+  })
 
   await act(async () => {
     answerBook(EMPTY_BOOK)

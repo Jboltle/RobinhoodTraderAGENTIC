@@ -11,12 +11,12 @@ import { CalendarDays, ChartColumn, LayoutDashboard, Search, Settings } from 'lu
 
 import TanStackQueryDevtools from '../integrations/tanstack-query/devtools'
 
+import { AccountGate } from '../components/AccountGate'
 import { AccountBadge, AccountMenu } from '../components/AccountMenu'
 import { AuthScreen } from '../components/AuthScreen'
 import { ConnectBanner } from '../components/ConnectBanner'
-import { useAccounts, useResetOnAccountSwitch, useSelectedAccount } from '../lib/accounts'
+import { useSelectedAccount } from '../lib/accounts'
 import { useAuth } from '../lib/auth'
-import { useTraderStream } from '../lib/stream'
 
 import appCss from '../styles.css?url'
 
@@ -97,14 +97,6 @@ function RootDocument({ children }: { children: React.ReactNode }) {
  */
 function AuthGate({ children }: { children: React.ReactNode }) {
   const { session, isLoading } = useAuth()
-  const accounts = useAccounts({ enabled: session !== null })
-  const viewedAccountId = accounts.data?.selectedAccountId
-  useResetOnAccountSwitch(viewedAccountId)
-  // The stream is the only thing that opens a connection on its own, so it
-  // waits for a session rather than reconnecting in a loop against a 401. It
-  // also waits for the account list to answer (or fail), so it opens once, on
-  // the account being viewed, and a switch reopens it on the new one.
-  useTraderStream(session !== null && !accounts.isPending, viewedAccountId)
 
   if (isLoading) {
     return (
@@ -121,11 +113,16 @@ function AuthGate({ children }: { children: React.ReactNode }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <TopHeader />
         <main className="mx-auto w-full max-w-6xl flex-1 px-8 py-6">
-          {/* On every app open with a session, check the viewed account's
-              stored connection and prompt to connect when there is none —
-              whichever route they landed on. */}
-          <ConnectBanner />
-          {children}
+          {/* The stream is the only thing that opens a connection on its
+              own; it lives in AccountGate, so it waits for a session (this
+              branch) rather than reconnecting in a loop against a 401. */}
+          <AccountGate>
+            {/* On every app open with a session, check the viewed account's
+                stored connection and prompt to connect when there is none —
+                whichever route they landed on. */}
+            <ConnectBanner />
+            {children}
+          </AccountGate>
         </main>
       </div>
     </div>

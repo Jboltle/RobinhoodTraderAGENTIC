@@ -2,11 +2,13 @@
  * The user's brokerage accounts and the one the screens show.
  *
  * The server holds the selection (GET /api/accounts names it) and every
- * per-account route acts on it, so nothing here passes an account id along
- * with a request. What the client owes in return is to drop everything it
- * cached for the previous account the moment the selection moves.
+ * per-account route acts on it. What the client owes in return is to drop
+ * everything it cached for the previous account the moment the selection
+ * moves, and to say with each change it asks for which account the control
+ * was rendered under (useViewedAccountId), so the server can refuse one made
+ * from a screen that has fallen behind.
  */
-import { useEffect, useRef } from 'react'
+import { createContext, useContext, useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { UseQueryResult } from '@tanstack/react-query'
 
@@ -31,9 +33,27 @@ export function useAccounts(
   return useQuery({
     queryKey: ACCOUNTS_QUERY_KEY,
     queryFn: fetchAccounts,
+    // No silent retries: until the list loads nothing of an account is shown
+    // (AccountGate), and that screen says so at once and offers the retry. A
+    // list that fails to re-read later keeps the one already loaded.
     retry: false,
     ...options,
   })
+}
+
+/** The account the screens inside AccountGate are rendered for. */
+export const ViewedAccountContext = createContext<string | null>(null)
+
+/**
+ * The account this control is rendered under, to send with the change it asks
+ * for. Read here rather than from what api.ts last heard: that moves to the
+ * new account as soon as the list arrives, a moment before the previous
+ * account's rows leave the screen.
+ */
+export function useViewedAccountId(): string {
+  const accountId = useContext(ViewedAccountContext)
+  if (accountId === null) throw new Error('useViewedAccountId used outside AccountGate')
+  return accountId
 }
 
 /** Every account in the response as one flat list, in the server's order. */
@@ -93,25 +113,29 @@ export function institutionName(institution: string): string {
  * account; the ones the stream fills (decisions, performance, trade stage)
  * empty out until the reopened stream sends that account's snapshot.
  *
+ * Returns the account the caches now belong to. It trails `viewedAccountId`
+ * by one render on a switch, and AccountGate shows no account's screens for
+ * that render: they would be the new account's, over the previous one's data.
+ *
  * ponytail: this also refetches the shared queries (book, callers, recaps),
  * one extra request each per switch, rather than keeping a list of which
  * keys are per-account that a new query could be left off. Upgrade path: a
  * common key prefix for per-account queries.
  */
-export function useResetOnAccountSwitch(viewedAccountId: string | undefined): void {
+export function useResetOnAccountSwitch(viewedAccountId: string | undefined): string | undefined {
   const queryClient = useQueryClient()
-  const previous = useRef(viewedAccountId)
+  const [cachedForAccountId, setCachedForAccountId] = useState(viewedAccountId)
 
   useEffect(() => {
-    if (viewedAccountId === undefined) return
-    const switched = previous.current !== undefined && previous.current !== viewedAccountId
-    previous.current = viewedAccountId
-    if (!switched) return
-    // The account list itself is what just told us; it is already current.
-    void queryClient.resetQueries({
-      predicate: (query) => query.queryKey[0] !== ACCOUNTS_QUERY_KEY[0],
-    })
-  }, [queryClient, viewedAccountId])
+    if (viewedAccountId === undefined || viewedAccountId === cachedForAccountId) return
+    if (cachedForAccountId !== undefined) {
+      // The account list itself is what just told us; it is already current.
+      void queryClient.resetQueries({
+        predicate: (query) => query.queryKey[0] !== ACCOUNTS_QUERY_KEY[0],
+      })
+    }
+    setCachedForAccountId(viewedAccountId)
+  }, [queryClient, viewedAccountId, cachedForAccountId])
 
   // A switch made in another tab reaches this one as a refused request: read
   // the list again, and the effect above takes it from there.
@@ -121,4 +145,6 @@ export function useResetOnAccountSwitch(viewedAccountId: string | undefined): vo
     )
     return () => setAccountChangedHandler(() => {})
   }, [queryClient])
+
+  return cachedForAccountId
 }

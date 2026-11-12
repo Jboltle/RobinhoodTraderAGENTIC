@@ -17,6 +17,7 @@ import {
   useTable,
 } from '@tanstack/react-table'
 
+import { useViewedAccountId } from '../lib/accounts'
 import { approveTrade, rejectTrade } from '../lib/api'
 import type {
   Caller,
@@ -622,13 +623,14 @@ export const chipClass =
  */
 function ApprovalControls({ decision }: { decision: Decision }) {
   const queryClient = useQueryClient()
+  const accountId = useViewedAccountId()
   // The server pushes the resolved decision over SSE, so the mutation only
   // needs to refresh the callout feed's copy of the same outcome.
   const act = useMutation({
     mutationFn: (action: 'approve' | 'reject') =>
       action === 'approve'
-        ? approveTrade(decision.messageId)
-        : rejectTrade(decision.messageId),
+        ? approveTrade(decision.messageId, accountId)
+        : rejectTrade(decision.messageId, accountId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['callouts'] }),
   })
 

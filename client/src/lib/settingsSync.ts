@@ -3,15 +3,18 @@
  * PUT /api/settings, which upserts the caller's single settings row and is
  * picked up by the next callout. The form initializes from GET /api/settings
  * (fully resolved values), so every save writes a complete snapshot.
+ * `accountId` is the account the form was loaded for: the server refuses the
+ * save when that is no longer the selected one.
  */
-import { TRADER_URL, authHeaders, type TradeSettings, type TradeSettingsInput } from './api'
+import { TRADER_URL, authHeadersFor, type TradeSettings, type TradeSettingsInput } from './api'
 
 export async function saveSettings(
   settings: TradeSettingsInput,
+  accountId: string,
 ): Promise<TradeSettings> {
   const res = await fetch(`${TRADER_URL}/api/settings`, {
     method: 'PUT',
-    headers: { 'content-type': 'application/json', ...authHeaders() },
+    headers: { 'content-type': 'application/json', ...authHeadersFor(accountId) },
     body: JSON.stringify(settings),
   })
   if (!res.ok) {

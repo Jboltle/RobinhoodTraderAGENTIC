@@ -23,6 +23,7 @@ import {
   connectsThroughRobinhood,
   selectedAccount,
   useAccounts,
+  useViewedAccountId,
   type ListedAccount,
 } from '../lib/accounts'
 import { discordDefaultAvatarUrl, toggleCaller } from '../lib/following'
@@ -92,6 +93,7 @@ const UNNAMED_ACCOUNT = 'Account'
  */
 function BrokerSection({ account }: { account: ListedAccount | undefined }) {
   const queryClient = useQueryClient()
+  const accountId = useViewedAccountId()
   const label = account?.label ?? UNNAMED_ACCOUNT
   const isRobinhood = connectsThroughRobinhood(account)
   // Kept fresh by ConnectBanner's poll (mounted on every page); this query
@@ -104,7 +106,7 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
   const [dialogOpen, setDialogOpen] = useState(false)
 
   const disconnect = useMutation({
-    mutationFn: disconnectBroker,
+    mutationFn: () => disconnectBroker(accountId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['broker-status'] })
       void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
@@ -188,9 +190,10 @@ function SettingsForm({
 }) {
   const [form, setForm] = useState<TradeSettingsInput>(initial)
   const queryClient = useQueryClient()
+  const accountId = useViewedAccountId()
 
   const mutation = useMutation({
-    mutationFn: saveSettings,
+    mutationFn: (settings: TradeSettingsInput) => saveSettings(settings, accountId),
     onSuccess: () => {
       // The account menu shows the execution mode and whether anyone is followed.
       void queryClient.invalidateQueries({ queryKey: ACCOUNTS_QUERY_KEY })
