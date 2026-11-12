@@ -5,12 +5,16 @@
  * or route can reach a write on any broker from a read-only deployment.
  * `approval` is a policy about callout-driven trades and is decided by the
  * callers; it does not stop a write here (Max Loss still sells under it).
+ *
+ * The mode is the account's (executionModeFor), never the deployment's own:
+ * under `paper_only` that is `read_only` for every account that is not paper.
  */
-import { optionLabel, type TradeExecutionMode } from '../../shared/types.js';
+import { optionLabel } from '../../shared/types.js';
 import { BrokerWritesDisabledError } from './errors.js';
+import type { AccountExecutionMode } from './paperAccount.js';
 import type { Broker, OrderRequest } from './types.js';
 
-export function guardWrites(broker: Broker, mode: TradeExecutionMode): Broker {
+export function guardWrites(broker: Broker, mode: AccountExecutionMode): Broker {
   if (mode !== 'read_only') return broker;
   // Spelled out method by method rather than proxied: a method added to the
   // port fails to compile here until it is classed as a read or a write.

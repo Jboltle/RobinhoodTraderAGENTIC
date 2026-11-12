@@ -53,7 +53,7 @@ const decisionEngine = (raw: string | undefined): DecisionEngine => {
   return value as DecisionEngine;
 };
 
-/** Unset means the per-user settings decide; `approval` and `read_only` only ever tighten. */
+/** Unset means the per-user settings decide; `approval`, `read_only` and `paper_only` only ever tighten. */
 const tradeExecutionMode = (raw: string | undefined): TradeExecutionMode => {
   const value = raw?.trim() || 'immediate';
   if (!(TRADE_EXECUTION_MODES as readonly string[]).includes(value)) {

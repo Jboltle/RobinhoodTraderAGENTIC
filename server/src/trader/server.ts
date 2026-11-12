@@ -44,6 +44,7 @@ import {
   isoDateDaysAgo,
 } from './recaps/analytics.js';
 import { readTokenStatus } from './robinhood/mcpClient.js';
+import { executionModeFor } from './broker/paperAccount.js';
 import type { McpRegistry } from './broker/registry.js';
 import { createSpacedRead, METERED_DASHBOARD_READ_INTERVAL_MS } from './broker/requestBudget.js';
 import type { AccountRow, Broker, UserBroker } from './broker/types.js';
@@ -81,11 +82,12 @@ const BOOK_RECENT_LOOKBACK_MS = 9 * 24 * 60 * 60 * 1000;
 const AUTH_URL_TIMEOUT_MS = 15_000;
 const AUTH_URL_POLL_MS = 100;
 /**
- * A Robinhood account has one agent slot, so a login from a read_only
- * deployment (staging) would take it away from the deployment that trades.
+ * A Robinhood account has one agent slot, so a login from a deployment that
+ * never trades on Robinhood (staging) would take it away from the one that does.
  */
-const READ_ONLY_CONNECT_ERROR =
-  'Robinhood cannot be connected from this environment (TRADE_EXECUTION_MODE=read_only)';
+const NO_ROBINHOOD_LOGIN_MODES: ReadonlySet<TradeExecutionMode> = new Set(['read_only', 'paper_only']);
+const robinhoodLoginRefused = (mode: TradeExecutionMode): string =>
+  `Robinhood cannot be connected from this environment (TRADE_EXECUTION_MODE=${mode})`;
 const NO_ROBINHOOD_ACCOUNT_ERROR = 'this user has no Robinhood account to connect';
 /** One answer for "not the owner" and "no keys here": neither is told which. */
 const SNAPTRADE_UNAVAILABLE_ERROR = 'Connecting another broker is not available for this sign-in';
@@ -161,7 +163,7 @@ export interface ServerDeps {
   readonly db: TraderDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
-  /** The deployment's TRADE_EXECUTION_MODE: anything but immediate refuses Approve. */
+  /** The deployment's TRADE_EXECUTION_MODE: anything but immediate, for the account, refuses Approve. */
   readonly executionMode: TradeExecutionMode;
   /** Null on a deployment without the SnapTrade keys: connecting other brokers is off. */
   readonly snapTrade: SnapTradeAccess | null;
@@ -274,8 +276,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // on that account's row.
   fastify.post('/api/broker/connect', async (request, reply) => {
     const selected = requireAccount(request);
-    if (deps.executionMode === 'read_only') {
-      return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
+    if (NO_ROBINHOOD_LOGIN_MODES.has(deps.executionMode)) {
+      return reply.status(409).send({ error: robinhoodLoginRefused(deps.executionMode) });
     }
     const parsed = BrokerConnectBodySchema.safeParse(request.body ?? {});
     if (!parsed.success) {
@@ -314,8 +316,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   fastify.post('/api/broker/callback', async (request, reply) => {
     const selected = requireAccount(request);
-    if (deps.executionMode === 'read_only') {
-      return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
+    if (NO_ROBINHOOD_LOGIN_MODES.has(deps.executionMode)) {
+      return reply.status(409).send({ error: robinhoodLoginRefused(deps.executionMode) });
     }
     const parsed = BrokerCallbackBodySchema.safeParse(request.body);
     if (!parsed.success) {
@@ -467,7 +469,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     // The deployment's kill switch wins over the user's click: the row stays
     // pending so it can be approved once the deployment trades again.
-    if (deps.executionMode !== 'immediate') {
+    if (executionModeFor(deps.executionMode, account) !== 'immediate') {
       return reply.status(409).send({
         error: `this deployment is held by TRADE_EXECUTION_MODE=${deps.executionMode}; nothing can be approved here`,
       });

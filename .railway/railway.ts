@@ -6,7 +6,7 @@ import { defineRailway, github, postgres, preserve, project, service, volume } f
 export default defineRailway((ctx) => {
   // Railway's names are "production" and "Staging"; the match is exact. Anything
   // that is not production gets the staging shape, so an environment this file
-  // has never heard of comes up without a Listener and unable to trade.
+  // has never heard of comes up without a Listener and unable to trade real money.
   const isProd = ctx.isEnvironment("production");
   const branch = isProd ? "main" : "staging";
   // Staging services sleep when idle and wake on the next request; production
@@ -40,13 +40,14 @@ export default defineRailway((ctx) => {
       // The Postgres in the same environment, so staging cannot be pointed at
       // production's database by a typo.
       SUPABASE_DB_URL: Postgres.env.DATABASE_URL,
-      // Staging can never place an order. Production's kill switch stays a value
-      // held in Railway so it can be flipped there without a file change.
-      TRADE_EXECUTION_MODE: isProd ? preserve() : "read_only",
+      // Staging can never place a real-money order: only a paper account trades
+      // there (server/src/trader/broker/paperAccount.ts). Production's kill switch
+      // stays a value held in Railway so it can be flipped there without a file change.
+      TRADE_EXECUTION_MODE: isProd ? preserve() : "paper_only",
       // No Discord token on staging: a Listener cannot run there.
       ...(isProd ? { DISCORD_USER_TOKEN: preserve() } : {}),
       // Connecting other brokers through SnapTrade (the owner's Personal key):
-      // on staging only for now. It places no order, there or anywhere.
+      // on staging only for now, where only a paper account can trade through it.
       ...(isProd
         ? {}
         : { SNAPTRADE_CLIENT_ID: preserve(), SNAPTRADE_CONSUMER_KEY: preserve(), SNAPTRADE_OWNER_EMAIL: preserve() }),

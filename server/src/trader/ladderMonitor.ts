@@ -9,7 +9,7 @@ import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { contractsAtLevel } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
-import { supportedAccounts, type McpRegistry } from './broker/registry.js';
+import { unheldAccounts, type McpRegistry } from './broker/registry.js';
 import type { AccountRow } from './broker/types.js';
 import { BrokerUnavailableError } from './broker/errors.js';
 import { instrumentOf } from './broker/instrument.js';
@@ -35,9 +35,8 @@ export function startLadderMonitor(deps: LadderDeps): () => void {
 }
 
 export async function sweepLadders(deps: LadderDeps): Promise<number> {
-  if (deps.executionMode !== 'immediate') return 0;
   let placed = 0;
-  for (const account of await supportedAccounts(deps.db, deps.brokers)) {
+  for (const account of await unheldAccounts(deps.db, deps.brokers, deps.executionMode)) {
     try {
       placed += await sweepAccount(account, deps);
     } catch (err: unknown) {
