@@ -20,11 +20,16 @@ import { TrimLadder } from '../components/book/TrimLadder'
 import { ConnectDialog } from '../components/ConnectDialog'
 import {
   ACCOUNTS_QUERY_KEY,
+  CONNECTION_GONE_NOTICE,
+  CONNECT_A_BROKER_LABEL,
+  connectControl,
+  connectionGone,
   connectionToRepair,
   connectsThroughRobinhood,
   selectedAccount,
   useAccounts,
   useViewedAccountId,
+  viewedAccountConnected,
   type ListedAccount,
 } from '../lib/accounts'
 import { discordDefaultAvatarUrl, toggleCaller } from '../lib/following'
@@ -89,17 +94,22 @@ const UNNAMED_ACCOUNT = 'Account'
  * still calls healthy: saved authorization is retried first, and the
  * authorize-and-paste dialog only appears when Robinhood no longer accepts it.
  *
- * Connect and Reconnect are the Robinhood login, so they show only while the
+ * Connect and Reconnect are the Robinhood login, so they show while the
  * Robinhood account is the one being viewed. Another broker's account shows
  * Reconnect when its brokerage login broke: that opens SnapTrade's portal for
- * its connection.
+ * its connection. A sign-in that may connect other brokers gets "Connect a
+ * broker" (the chooser) from whichever account is not connected.
+ *
+ * Disconnect stays Robinhood's: it forgets stored credentials, and another
+ * broker's account has none here (its connection is ended at the broker).
  */
 function BrokerSection({ account }: { account: ListedAccount | undefined }) {
   const queryClient = useQueryClient()
   const accountId = useViewedAccountId()
   const label = account?.label ?? UNNAMED_ACCOUNT
   const isRobinhood = connectsThroughRobinhood(account)
-  const repairConnectionId = connectionToRepair(useAccounts().data)
+  const accounts = useAccounts()
+  const repairConnectionId = connectionToRepair(accounts.data)
   // Kept fresh by ConnectBanner's poll (mounted on every page); this query
   // just subscribes to the same cache entry.
   const status = useQuery<BrokerStatus>({
@@ -117,7 +127,9 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
     },
   })
 
-  const connected = status.data?.connected === true
+  const connection = viewedAccountConnected(accounts.data, status.data)
+  const connected = connection === true
+  const opensChooser = !connected && connectControl(accounts.data) === 'chooser'
 
   return (
     <FormSection title={`${label} connection`}>
@@ -126,11 +138,13 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
           className={`size-2 rounded-full ${connected ? 'bg-gain' : 'animate-pulse bg-warn'}`}
         />
         <span className="text-sm font-medium text-white">
-          {status.isPending
+          {connection === undefined && status.isPending
             ? 'Checking…'
             : connected
               ? 'Connected'
-              : 'Not connected'}
+              : connectionGone(account)
+                ? `Not connected. ${CONNECTION_GONE_NOTICE}`
+                : 'Not connected'}
         </span>
       </div>
 
@@ -141,13 +155,13 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
       </p>
 
       <div className="flex flex-wrap items-center gap-3">
-        {isRobinhood && (
+        {(isRobinhood || opensChooser) && (
           <button
             type="button"
             onClick={() => setDialogOpen(true)}
             className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-brand/80"
           >
-            {connected ? 'Reconnect' : 'Connect'}
+            {connected ? 'Reconnect' : opensChooser ? CONNECT_A_BROKER_LABEL : 'Connect'}
           </button>
         )}
         {repairConnectionId !== undefined && (
@@ -159,7 +173,7 @@ function BrokerSection({ account }: { account: ListedAccount | undefined }) {
             Reconnect
           </button>
         )}
-        {connected && (
+        {isRobinhood && connected && (
           <button
             type="button"
             disabled={disconnect.isPending}

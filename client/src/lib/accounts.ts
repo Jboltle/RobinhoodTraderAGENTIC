@@ -13,7 +13,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { UseQueryResult } from '@tanstack/react-query'
 
 import { fetchAccounts, setAccountChangedHandler } from './api'
-import type { AccountSummary, AccountsResponse, BrokerEntry } from './api'
+import type { AccountSummary, AccountsResponse, BrokerEntry, BrokerStatus } from './api'
 
 export const ACCOUNTS_QUERY_KEY = ['accounts'] as const
 
@@ -98,6 +98,48 @@ export function connectsThroughRobinhood(account: ListedAccount | undefined): bo
 export function connectionToRepair(response: AccountsResponse | undefined): string | undefined {
   const account = selectedAccount(response)
   return response?.canConnectSnapTrade && account?.needsReconnect ? account.connectionId : undefined
+}
+
+/**
+ * What the banner and the Settings card offer for the viewed account:
+ *   repair    open the portal for its broken SnapTrade connection
+ *   chooser   open the dialog on its first step, Robinhood or another broker
+ *   robinhood open the Robinhood login, the only thing this sign-in can connect
+ */
+export type ConnectControl = 'repair' | 'chooser' | 'robinhood'
+
+export function connectControl(response: AccountsResponse | undefined): ConnectControl | null {
+  if (connectionToRepair(response) !== undefined) return 'repair'
+  if (response?.canConnectSnapTrade) return 'chooser'
+  return connectsThroughRobinhood(selectedAccount(response)) ? 'robinhood' : null
+}
+
+/** On a button that opens the chooser: it must not name one broker. */
+export const CONNECT_A_BROKER_LABEL = 'Connect a broker'
+
+/**
+ * A SnapTrade account whose connection a sync no longer found at SnapTrade.
+ * There is nothing to repair; the way back is to connect the broker again.
+ */
+export function connectionGone(account: ListedAccount | undefined): boolean {
+  return account?.adapter === 'snaptrade' && !account.connected && !account.needsReconnect
+}
+
+export const CONNECTION_GONE_NOTICE = 'This connection no longer exists at the broker.'
+
+/**
+ * Whether the viewed account is connected; undefined while unknown. The
+ * account list answers for a SnapTrade account: it stores no credentials,
+ * which is all the status route looks at, and its state only moves on a sync,
+ * which reads the list again. Robinhood keeps the status poll, which notices
+ * a disconnect made elsewhere.
+ */
+export function viewedAccountConnected(
+  response: AccountsResponse | undefined,
+  status: BrokerStatus | undefined,
+): boolean | undefined {
+  const account = selectedAccount(response)
+  return account?.adapter === 'snaptrade' ? account.connected : status?.connected
 }
 
 /** What an account is doing with callouts right now, in the menu's words. */

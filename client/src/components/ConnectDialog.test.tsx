@@ -358,11 +358,12 @@ test('a repair opens the portal for that connection directly, and stays on its r
 
 function renderBanner() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const utils = render(
     <QueryClientProvider client={queryClient}>
       <ConnectBanner />
     </QueryClientProvider>,
   )
+  return { queryClient, ...utils }
 }
 
 test('the banner offers Reconnect for a SnapTrade account whose brokerage login broke', async () => {
@@ -397,4 +398,62 @@ test('the banner offers no Reconnect to a sign-in that may not use SnapTrade', a
 
   await waitFor(() => expect(utils.container.textContent).toContain(`${brokenPaper.label} not connected`))
   expect(utils.queryByRole('button', { name: /Reconnect/ })).toBeNull()
+})
+
+// ---- Where the banner starts a new connection -----------------------------------
+
+/** What a sync leaves of an account whose connection SnapTrade no longer has. */
+const gonePaper: SnapTradeAccountSummary = { ...paper, connected: false, needsReconnect: false }
+const GONE_NOTICE = `${gonePaper.label} not connected. This connection no longer exists at the broker.`
+
+test('the banner opens the choice for a sign-in that may connect other brokers, under a name that fits it', async () => {
+  const utils = renderBanner()
+
+  fireEvent.click(await utils.findByRole('button', { name: 'Connect a broker' }))
+
+  await utils.findByRole('group', { name: 'What to connect' })
+  expect(utils.queryByRole('button', { name: 'Connect Robinhood' })).toBeNull()
+  expect(api.connectBroker).not.toHaveBeenCalled()
+  expect(api.fetchSnapTradeLink).not.toHaveBeenCalled()
+})
+
+test('a connection that is gone at the broker is called that, with the choice and no repair', async () => {
+  api.fetchAccounts.mockResolvedValue(
+    accountList({ canConnectSnapTrade: true, paper: gonePaper, viewed: gonePaper.id }),
+  )
+  const utils = renderBanner()
+
+  fireEvent.click(await utils.findByRole('button', { name: 'Connect a broker' }))
+
+  await utils.findByRole('group', { name: 'What to connect' })
+  expect(utils.container.textContent).toContain(GONE_NOTICE)
+  expect(utils.queryByRole('button', { name: /Reconnect/ })).toBeNull()
+  // The choice, not the portal for a connection that cannot be repaired.
+  expect(api.fetchSnapTradeLink).not.toHaveBeenCalled()
+})
+
+test('a sign-in that may not use SnapTrade is told the same and offered nothing', async () => {
+  api.fetchAccounts.mockResolvedValue(
+    accountList({ canConnectSnapTrade: false, paper: gonePaper, viewed: gonePaper.id }),
+  )
+  const utils = renderBanner()
+
+  await waitFor(() => expect(utils.container.textContent).toContain(GONE_NOTICE))
+  expect(utils.queryByRole('button')).toBeNull()
+})
+
+test('the banner believes the account list about a SnapTrade account, not the status', async () => {
+  // The status route only knows stored credentials: it says "not connected" throughout.
+  api.fetchAccounts.mockResolvedValue(
+    accountList({ canConnectSnapTrade: true, paper: gonePaper, viewed: gonePaper.id }),
+  )
+  const utils = renderBanner()
+  await waitFor(() => expect(utils.container.textContent).toContain(GONE_NOTICE))
+
+  api.fetchAccounts.mockResolvedValue(
+    accountList({ canConnectSnapTrade: true, paper, viewed: paper.id }),
+  )
+  await utils.queryClient.invalidateQueries({ queryKey: ['accounts'] })
+
+  await waitFor(() => expect(utils.container.textContent).toBe(''))
 })

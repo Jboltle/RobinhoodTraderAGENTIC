@@ -5,14 +5,23 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import {
   accountState,
+  connectControl,
+  connectionGone,
   connectsThroughRobinhood,
   institutionName,
   listAccounts,
   selectedAccount,
   useAccounts,
   useResetOnAccountSwitch,
+  viewedAccountConnected,
 } from './accounts'
-import type { AccountSummary, AccountsResponse, SnapTradeAccountSummary } from './api'
+import type { ListedAccount } from './accounts'
+import type {
+  AccountSummary,
+  AccountsResponse,
+  BrokerStatus,
+  SnapTradeAccountSummary,
+} from './api'
 
 const { fetchAccounts, setAccountChangedHandler } = vi.hoisted(() => ({
   fetchAccounts: vi.fn<() => Promise<AccountsResponse>>(),
@@ -67,6 +76,55 @@ describe('reading the account list', () => {
     expect(connectsThroughRobinhood(selectedAccount(accounts(robinhood.id)))).toBe(true)
     expect(connectsThroughRobinhood(selectedAccount(accounts(paper.id)))).toBe(false)
     expect(connectsThroughRobinhood(undefined)).toBe(true)
+  })
+
+  test('what a not-connected notice offers depends on the sign-in and the viewed account', () => {
+    const owner = (selectedAccountId: string, paperState: Partial<AccountSummary> = {}): AccountsResponse => ({
+      ...accounts(selectedAccountId),
+      brokers: [
+        { adapter: 'robinhood', account: robinhood },
+        { adapter: 'snaptrade', accounts: { [paper.id]: { ...paper, ...paperState } } },
+      ],
+      canConnectSnapTrade: true,
+    })
+    const broken = { connected: false, needsReconnect: true }
+
+    // A sign-in that may connect other brokers: the choice from any account,
+    // except the portal for a viewed account whose brokerage login broke.
+    expect(connectControl(owner(robinhood.id))).toBe('chooser')
+    expect(connectControl(owner(paper.id, { connected: false }))).toBe('chooser')
+    expect(connectControl(owner(paper.id, broken))).toBe('repair')
+    expect(connectControl(owner(robinhood.id, broken))).toBe('chooser')
+    // Everyone else: the Robinhood login for Robinhood, nothing for another broker.
+    expect(connectControl(accounts(robinhood.id))).toBe('robinhood')
+    expect(connectControl(accounts(paper.id))).toBeNull()
+    expect(connectControl({ ...owner(paper.id, broken), canConnectSnapTrade: false })).toBeNull()
+    expect(connectControl(undefined)).toBe('robinhood')
+  })
+
+  test('a SnapTrade account that is neither connected nor repairable has lost its connection', () => {
+    const viewed = (state: Partial<AccountSummary>): ListedAccount => ({ ...paper, ...state, adapter: 'snaptrade' })
+    expect(connectionGone(viewed({ connected: false }))).toBe(true)
+    expect(connectionGone(viewed({ connected: true }))).toBe(false)
+    expect(connectionGone(viewed({ connected: false, needsReconnect: true }))).toBe(false)
+    expect(connectionGone({ ...robinhood, connected: false, adapter: 'robinhood' })).toBe(false)
+    expect(connectionGone(undefined)).toBe(false)
+  })
+
+  test('the account list says whether a SnapTrade account is connected; the status poll says it for Robinhood', () => {
+    const status = (connected: boolean): BrokerStatus => ({
+      connected,
+      authUrl: null,
+      tokenState: connected ? 'valid' : 'missing',
+      executionMode: 'immediate',
+    })
+    // `paper` is connected in the list, `robinhood` too.
+    expect(viewedAccountConnected(accounts(paper.id), status(false))).toBe(true)
+    expect(viewedAccountConnected(accounts(paper.id), undefined)).toBe(true)
+    expect(viewedAccountConnected(accounts(robinhood.id), status(false))).toBe(false)
+    expect(viewedAccountConnected(accounts(robinhood.id), undefined)).toBeUndefined()
+    // No list: the status is all there is.
+    expect(viewedAccountConnected(undefined, status(true))).toBe(true)
   })
 
   test('names what an account is doing, most pressing first', () => {
