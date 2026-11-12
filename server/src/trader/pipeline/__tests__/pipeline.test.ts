@@ -789,6 +789,83 @@ describe('fan-out — error paths', () => {
   });
 });
 
+describe('fan-out — which session checks the entry', () => {
+  interface CheckSession {
+    readonly session: RobinhoodMcpClient;
+    readonly broker: FakeBroker;
+  }
+
+  const readySession = (broker: FakeBroker): CheckSession => ({ session: makeMcp(), broker });
+
+  // Each test checks its own ticker: entry verdicts are kept per message and contract.
+  const entryOn = (ticker: string): Callout => ({ ...BTO_QQQ_PUT.expectedCallout, ticker });
+
+  /** Connected accounts in the order given, each on its own session and broker. */
+  function setupSessions(callout: Callout, sessions: Record<string, CheckSession>) {
+    const db = createFakeDb();
+    for (const userId of Object.keys(sessions)) {
+      db.seedBrokerTokens(userId, fakeTokens(`token-${userId}`));
+      db.seedSettings(userId, { ...TRADING_SETTINGS });
+    }
+    const brokers = makeFakeRegistry((userId) => sessions[userId]!);
+    const quotes = createQuoteSource({ db, brokers });
+    const pick = vi.spyOn(quotes, 'broker');
+    const deps: PipelineDeps = {
+      parser: makeParser(callout),
+      db,
+      events: new TraderEvents(),
+      brokers,
+      quotes,
+      executionMode: 'immediate',
+    };
+    return { db, deps, pick };
+  }
+
+  /** Every call a fake broker received, in the order it was made. */
+  const callsInOrder = (broker: FakeBroker): unknown[][] =>
+    Object.entries(broker)
+      .flatMap(([method, mock]) =>
+        mock.mock.calls.map((args, index) => ({
+          call: [method, ...args],
+          order: mock.mock.invocationCallOrder[index]!,
+        }))
+      )
+      .sort((a, b) => a.order - b.order)
+      .map(({ call }) => call);
+
+  it('a healthy first session is picked once and asked spot, contract, mark; no other session is touched', async () => {
+    const contract = {
+      kind: 'option',
+      symbol: 'MAAPL',
+      optionType: 'put',
+      strike: 710,
+      expiration: '2026-06-08',
+    };
+    const first = readySession(makeBroker({ equityMark: 710 }));
+    const second = readySession(makeBroker());
+    const { db, deps, pick } = setupSessions(entryOn('MAAPL'), {
+      [USER]: first,
+      [OTHER_USER]: second,
+    });
+    // The first account follows nobody, so every call on its broker is the check's.
+    db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: [] });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(pick).toHaveBeenCalledOnce();
+    expect(first.session.ensureReady).toHaveBeenCalledOnce();
+    expect(second.session.ensureReady).not.toHaveBeenCalled();
+    expect(callsInOrder(first.broker)).toEqual([
+      ['getMark', { kind: 'equity', symbol: 'MAAPL' }],
+      ['confirmInstrument', contract],
+      ['getMark', contract],
+    ]);
+    const [decision] = await db.listDecisions(OTHER_USER, 10);
+    expect(decision!.kind).toBe('submitted');
+    expect(placedOrders(second.broker, 'option')).toHaveLength(1);
+  });
+});
+
 describe('fan-out — several users', () => {
   beforeEach(() => vi.clearAllMocks());
 
