@@ -45,7 +45,7 @@ test('frames the portal link in a labelled iframe', async () => {
   expect(src.searchParams.get('token')).toBe('one-time')
 })
 
-test('reports success, failure and closing as SnapTrade posts them', () => {
+test('reports success and failure as SnapTrade posts them', () => {
   const { handlers } = renderPortal()
 
   fromPortal({ status: 'SUCCESS', authorizationId: 'authorization-1' })
@@ -55,8 +55,19 @@ test('reports success, failure and closing as SnapTrade posts them', () => {
   expect(handlers.onError).toHaveBeenCalledExactlyOnceWith('the broker refused the login')
 
   expect(handlers.onExit).not.toHaveBeenCalled()
+})
+
+// SnapTrade's own "x" posts CLOSE_MODAL: snaptrade-react answers it by calling
+// `close` and then `onExit`. An abandoned sign-in tab posts CLOSED: `onExit`
+// alone. Both props are this component's one way out.
+test('closing from inside SnapTrade lands in the same handler as the Close button', () => {
+  const { handlers } = renderPortal()
+
   fromPortal('CLOSE_MODAL')
-  expect(handlers.onExit).toHaveBeenCalled()
+  expect(handlers.onExit).toHaveBeenCalledTimes(2)
+
+  fromPortal('CLOSED')
+  expect(handlers.onExit).toHaveBeenCalledTimes(3)
 })
 
 test('ignores a message that does not come from SnapTrade', () => {
@@ -67,12 +78,50 @@ test('ignores a message that does not come from SnapTrade', () => {
   expect(handlers.onSuccess).not.toHaveBeenCalled()
 })
 
-test('can always be left: its own Close button, and Escape', () => {
-  const { handlers, getByRole } = renderPortal()
+const portalFrame = (): HTMLIFrameElement | null =>
+  document.querySelector<HTMLIFrameElement>('iframe[title="Connect your broker"]')
 
-  fireEvent.click(getByRole('button', { name: 'Close broker connection' }))
+test('its Close button is part of the modal, ahead of the portal page for the keyboard', async () => {
+  const { handlers, findByRole } = renderPortal()
+
+  const close = await findByRole('button', { name: 'Close broker connection' })
+  const frame = portalFrame()!
+  const panel = frame.closest('.ant-modal-content')!
+  // On the panel that holds the page, and before it: Tab reaches the button
+  // first, from the page, without going through SnapTrade's iframe.
+  expect(panel.contains(close)).toBe(true)
+  expect(close.compareDocumentPosition(frame) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  expect(close.tagName).toBe('BUTTON')
+  expect(close.textContent).toBe('Close')
+
+  fireEvent.click(close)
+  expect(handlers.onExit).toHaveBeenCalledTimes(1)
+})
+
+test('Escape closes it wherever in the page the keyboard is, the modal included', async () => {
+  const { handlers, findByRole } = renderPortal()
+  const close = await findByRole('button', { name: 'Close broker connection' })
+
+  fireEvent.keyDown(document.body, { key: 'Escape', keyCode: 27 })
   expect(handlers.onExit).toHaveBeenCalledTimes(1)
 
-  fireEvent.keyDown(document, { key: 'Escape' })
+  // antd's modal handles Escape itself and lets it go no further.
+  const modal = portalFrame()!.closest('.ant-modal-wrap')!
+  fireEvent.keyDown(modal, { key: 'Escape', keyCode: 27 })
   expect(handlers.onExit).toHaveBeenCalledTimes(2)
+
+  fireEvent.keyDown(close, { key: 'Escape', keyCode: 27 })
+  expect(handlers.onExit).toHaveBeenCalledTimes(3)
+
+  fireEvent.keyDown(document.body, { key: 'Enter', keyCode: 13 })
+  expect(handlers.onExit).toHaveBeenCalledTimes(3)
+})
+
+test('unmounted, it leaves nothing of its own behind', async () => {
+  const { findByRole, unmount } = renderPortal()
+  await findByRole('button', { name: 'Close broker connection' })
+
+  unmount()
+
+  expect(document.querySelector('button[aria-label="Close broker connection"]')).toBeNull()
 })
