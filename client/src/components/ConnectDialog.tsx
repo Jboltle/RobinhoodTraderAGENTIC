@@ -21,9 +21,16 @@ const CALLBACK_URL_RE = /^https?:\/\/\S*[?&]code=[^&\s]+/
 const ROBINHOOD_TITLE = 'Connect Robinhood'
 const CHOICE_TITLE = 'Connect an account'
 const OTHER_BROKER_TITLE = 'Connect another broker'
-const PORTAL_CLOSED_NOTICE = 'The broker connection was closed before it finished. Nothing was connected.'
+const PORTAL_CLOSED_NOTICE = 'You closed the broker connection. No account was added.'
 const PORTAL_FAILED_NOTICE = 'The broker connection did not finish:'
 const NO_ACCOUNT_LIST_NOTICE = 'Your accounts could not be read, so nothing was started. Try again.'
+
+/** Why the dialog is back at the choice. Closing the portal oneself is not a failure. */
+interface Notice {
+  message: string
+  isError: boolean
+}
+const failure = (message: string): Notice => ({ message, isError: true })
 
 /**
  * What the open dialog shows. `loading` waits for the account list, which
@@ -81,8 +88,7 @@ export function ConnectDialog({
   const accounts = useAccounts({ refetchInterval: open ? STATUS_POLL_MS : false })
 
   const [chosen, setChosen] = useState<Step | null>(null)
-  /** Why the dialog is back at the choice: the portal failed or was closed. */
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNotice] = useState<Notice | null>(null)
   const [portal, setPortal] = useState<OpenPortal | null>(null)
 
   // An account list that could not be read offers no choice: every user has a
@@ -146,10 +152,10 @@ export function ConnectDialog({
   // The account the screens show: a new account copies its settings.
   const viewedAccountId = accounts.data?.selectedAccountId
 
-  const backToChoice = (message: string): void => {
+  const backToChoice = (reason: Notice | null): void => {
     setPortal(null)
     setChosen('choose')
-    setNotice(message)
+    setNotice(reason)
   }
   // A link that arrives after the dialog was closed opens nothing, then or
   // at the next opening: it would be a stale one.
@@ -170,7 +176,7 @@ export function ConnectDialog({
       if (openRef.current) setPortal(opened)
     },
     onError: (error: Error) => {
-      if (openRef.current) backToChoice(error.message)
+      if (openRef.current) backToChoice(failure(error.message))
     },
   })
 
@@ -183,7 +189,7 @@ export function ConnectDialog({
   const startOther = useRef<() => void>(() => {})
   startOther.current = () => {
     sync.reset()
-    if (viewedAccountId === undefined) backToChoice(NO_ACCOUNT_LIST_NOTICE)
+    if (viewedAccountId === undefined) backToChoice(failure(NO_ACCOUNT_LIST_NOTICE))
     else openPortal.mutate(viewedAccountId)
   }
   useEffect(() => {
@@ -239,6 +245,19 @@ export function ConnectDialog({
   const clipboard = useClipboardCallback(awaitingPaste, (url) => {
     if (!submit.isPending) submit.mutate(url)
   })
+
+  // Back is offered only where there was a choice to come from. It forgets
+  // what this step had on screen. An authorization already started stays
+  // pending at the trader, exactly as when the dialog is closed, and choosing
+  // Robinhood again is handed that same link: the trader starts no second one.
+  const canGoBack = robinhoodOpen && firstStep === 'choose'
+  const backFromRobinhood = (): void => {
+    connect.reset()
+    submit.reset()
+    setAuthUrl(null)
+    setRedirectUrl('')
+    backToChoice(null)
+  }
 
   const title =
     step === 'other'
@@ -296,13 +315,17 @@ export function ConnectDialog({
             <button type="button" onClick={() => setChosen('other')} className={choiceClass}>
               <span className="text-sm font-medium text-white">Other broker</span>
               <span className="text-xs text-ink-400">
-                Pick your broker and sign in to it through SnapTrade. {NEW_ACCOUNT_NOTE}
+                Pick your broker in the list (search for it if it is not shown) and sign in
+                to it through SnapTrade. {NEW_ACCOUNT_NOTE}
               </span>
             </button>
           </div>
           {notice !== null && (
-            <p role="alert" className="mt-3 text-xs text-loss">
-              {notice}
+            <p
+              role={notice.isError ? 'alert' : 'status'}
+              className={`mt-3 text-xs ${notice.isError ? 'text-loss' : 'text-ink-400'}`}
+            >
+              {notice.message}
             </p>
           )}
         </>
@@ -428,6 +451,16 @@ export function ConnectDialog({
               )}
             </div>
           )}
+
+          {canGoBack && (
+            <button
+              type="button"
+              onClick={backFromRobinhood}
+              className="w-fit rounded-lg border border-ink-600 px-4 py-2 text-sm text-ink-400 transition-colors hover:text-white"
+            >
+              Back
+            </button>
+          )}
         </div>
       ))}
     </dialog>
@@ -439,8 +472,8 @@ export function ConnectDialog({
           setPortal(null)
           if (viewedAccountId !== undefined) sync.mutate(viewedAccountId)
         }}
-        onError={(detail) => backToChoice(`${PORTAL_FAILED_NOTICE} ${detail}`)}
-        onExit={() => backToChoice(PORTAL_CLOSED_NOTICE)}
+        onError={(detail) => backToChoice(failure(`${PORTAL_FAILED_NOTICE} ${detail}`))}
+        onExit={() => backToChoice({ message: PORTAL_CLOSED_NOTICE, isError: false })}
       />
     )}
     </>

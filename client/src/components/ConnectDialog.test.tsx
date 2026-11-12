@@ -178,6 +178,9 @@ test('a sign-in that may connect other brokers chooses first, and nothing starts
   const robinhoodChoice = await utils.findByRole('button', { name: /^Robinhood/ })
   const otherChoice = utils.getByRole('button', { name: /^Other broker/ })
   expect(utils.getByRole('group', { name: 'What to connect' }).contains(otherChoice)).toBe(true)
+  // What will happen, in plain words: the broker is picked from a list that may need a search.
+  expect(otherChoice.textContent).toContain('Pick your broker in the list (search for it if it is not shown)')
+  expect(otherChoice.textContent).toContain('A new account starts in approval mode')
   expect(utils.dialog().getAttribute('aria-label')).toBe('Connect an account')
   // Keyboard: focus lands on the first choice, and both are plain buttons.
   expect(document.activeElement).toBe(robinhoodChoice)
@@ -194,6 +197,9 @@ test('everyone else goes straight to the Robinhood login, with no choice shown',
   expect(utils.queryByRole('button', { name: /^Other broker/ })).toBeNull()
   expect(utils.dialog().getAttribute('aria-label')).toBe('Connect Robinhood')
   expect(api.fetchSnapTradeLink).not.toHaveBeenCalled()
+  // There was no choice to go back to.
+  await waitFor(() => expect(utils.container.querySelector(`a[href="${AUTH_URL}"]`)).not.toBeNull())
+  expect(utils.queryByRole('button', { name: 'Back' })).toBeNull()
 })
 
 test('an account list that cannot be read also goes straight to Robinhood', async () => {
@@ -230,6 +236,52 @@ test('on a deployment that refuses the Robinhood login, choosing it shows that r
   fireEvent.click(await utils.findByRole('button', { name: /^Robinhood/ }))
 
   await waitFor(() => expect(utils.container.textContent).toContain(READ_ONLY_REFUSAL))
+})
+
+test('Back from the Robinhood step returns to the choice, where the other broker can be chosen', async () => {
+  api.connectBroker.mockRejectedValue(new Error(READ_ONLY_REFUSAL))
+  const utils = renderDialog()
+  fireEvent.click(await utils.findByRole('button', { name: /^Robinhood/ }))
+  await waitFor(() => expect(utils.container.textContent).toContain(READ_ONLY_REFUSAL))
+
+  fireEvent.click(utils.getByRole('button', { name: 'Back' }))
+
+  const otherChoice = await utils.findByRole('button', { name: /^Other broker/ })
+  expect(utils.container.textContent).not.toContain(READ_ONLY_REFUSAL)
+  expect(utils.queryByRole('alert')).toBeNull()
+  expect(utils.queryByRole('status')).toBeNull()
+  expect(utils.dialog().getAttribute('aria-label')).toBe('Connect an account')
+  expect(utils.onClose).not.toHaveBeenCalled()
+  // Keyboard: focus is back on the first choice.
+  expect(document.activeElement).toBe(utils.getByRole('button', { name: /^Robinhood/ }))
+
+  fireEvent.click(otherChoice)
+  await utils.findByTestId('snaptrade-modal')
+})
+
+test('Back forgets what the Robinhood step showed; choosing Robinhood again asks the trader again', async () => {
+  const utils = renderDialog()
+  const authorizeLink = (): Element | null => utils.container.querySelector(`a[href="${AUTH_URL}"]`)
+  fireEvent.click(await utils.findByRole('button', { name: /^Robinhood/ }))
+  await waitFor(() => expect(authorizeLink()).not.toBeNull())
+  fireEvent.change(utils.container.querySelector('input')!, { target: { value: 'half-typed' } })
+
+  fireEvent.click(utils.getByRole('button', { name: 'Back' }))
+  await utils.findByRole('button', { name: /^Other broker/ })
+
+  // The trader still holds the authorization it started and hands out the same link.
+  let answer: (result: BrokerConnectResult) => void = () => {}
+  api.connectBroker.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)))
+  fireEvent.click(utils.getByRole('button', { name: /^Robinhood/ }))
+
+  await waitFor(() => expect(api.connectBroker).toHaveBeenCalledTimes(2))
+  // Nothing of the first visit is on screen while it answers.
+  expect(authorizeLink()).toBeNull()
+  expect(utils.container.textContent).toContain('Starting…')
+
+  answer({ connected: false, authUrl: AUTH_URL })
+  await waitFor(() => expect(authorizeLink()).not.toBeNull())
+  expect(utils.container.querySelector('input')!.value).toBe('')
 })
 
 // ---- Another broker --------------------------------------------------------------
@@ -291,15 +343,19 @@ test('a sync that fails says the broker is connected but its accounts were not a
   expect(utils.getByRole('button', { name: 'Sync again' })).not.toBeNull()
 })
 
+// A failure is an error, with its reason. Closing the portal oneself is not one.
 test.each([
-  ['portal: failed', 'the broker refused the login'],
-  ['portal: closed', 'Nothing was connected'],
-])('%s returns to the choice with the reason, and syncs nothing', async (button, reason) => {
+  ['portal: failed', 'alert', 'the broker refused the login'],
+  ['portal: closed', 'status', 'You closed the broker connection. No account was added.'],
+] as const)('%s returns to the choice with an %s, and syncs nothing', async (button, role, reason) => {
   const utils = renderDialog()
   await chooseOther(utils)
   await inPortal(utils, button)
 
-  expect((await utils.findByRole('alert')).textContent).toContain(reason)
+  const note = await utils.findByRole(role)
+  expect(note.textContent).toContain(reason)
+  expect(note.className.includes('text-loss')).toBe(role === 'alert')
+  expect(utils.queryAllByRole('alert')).toHaveLength(role === 'alert' ? 1 : 0)
   expect(utils.getByRole('button', { name: /^Other broker/ })).not.toBeNull()
   expect(utils.queryByTestId('snaptrade-modal')).toBeNull()
   expect(utils.dialog().open).toBe(true)
