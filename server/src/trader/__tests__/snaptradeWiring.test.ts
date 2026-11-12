@@ -7,15 +7,17 @@
  * The SnapTrade account here stores no credentials, as a real one does not.
  * No test builds the SDK client: nothing here can reach SnapTrade.
  */
+import type { InjectOptions, LightMyRequestResponse } from 'fastify';
 import type { AccountPosition, AllAccountPositionsResponse } from 'snaptrade-typescript-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
 import { type CalloutParser, type Decision, type TradeExecutionMode, type TradeSettings } from '../../shared/types.js';
 import { deployedAdapters } from '../adapters.js';
+import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { BrokerWritesDisabledError } from '../broker/errors.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry, supportedAccounts, type McpRegistry } from '../broker/registry.js';
-import type { BrokerSession } from '../broker/types.js';
+import type { AccountRow, BrokerSession } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
 import {
   BTO_QQQ_PUT,
@@ -24,6 +26,7 @@ import {
   type DiscordMessageFixture,
 } from '../pipeline/__tests__/fixtures/discordMessages.js';
 import { createMessageProcessor } from '../pipeline/index.js';
+import { buildServer } from '../server.js';
 import { createSnapTradeAdapter } from '../snaptrade/adapter.js';
 import { createSnapTrade } from '../snaptrade/client.js';
 import {
@@ -78,11 +81,13 @@ const held = (...results: AccountPosition[]): AllAccountPositionsResponse => ({
   data_freshness: { as_of: '2026-06-11T14:00:00Z' },
 });
 
+/** What a Robinhood login in progress offers; a SnapTrade account must never be handed it. */
+const ROBINHOOD_AUTH_URL = 'https://robinhood.example/authorize';
 const ROBINHOOD_SESSION: BrokerSession = {
   ensureReady: async () => undefined,
   ensureConnected: async () => undefined,
   isConnected: () => true,
-  getPendingAuthUrl: () => null,
+  getPendingAuthUrl: () => ROBINHOOD_AUTH_URL,
   isAuthPending: () => false,
   submitAuthCode: () => undefined,
 };
@@ -140,6 +145,20 @@ async function processCallout(world: World, fixture: DiscordMessageFixture, mode
     executionMode: mode,
   });
   await processor.process(envelopeFromFixture(fixture));
+}
+
+type Request = (options: InjectOptions) => Promise<LightMyRequestResponse>;
+
+/** The dashboard's routes over the world, signed in as the owner, who views `viewed`. */
+function serve(world: World, viewed: AccountRow = PAPER, mode: TradeExecutionMode = 'immediate'): Request {
+  const { db, events, brokers } = world;
+  db.addAccount(viewed, { select: true });
+  const app = buildServer({ db, events, brokers, executionMode: mode, snapTrade: null });
+  return (options) =>
+    app.inject({
+      ...options,
+      headers: { ...options.headers, authorization: `Bearer ${TOKEN}`, [VIEWED_ACCOUNT_HEADER]: viewed.id },
+    });
 }
 
 const decisionsOf = async (db: FakeDb, accountId: string): Promise<Decision[]> => db.listDecisions(accountId, 10);
@@ -243,5 +262,124 @@ describe('a read_only deployment with the SnapTrade adapter', () => {
     await expect(broker.cancelOrder(PLACED_ORDER_ID)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
 
     expect(sdk.calls).toEqual([]);
+  });
+});
+
+describe('the dashboard routes, viewing a SnapTrade account that stores no credentials', () => {
+  const PENDING_MESSAGE_ID = 'msg-pending';
+  const pendingEntry: Decision = {
+    at: '2026-06-09T14:27:00.000Z',
+    messageId: PENDING_MESSAGE_ID,
+    kind: 'pending_approval',
+    code: null,
+    reason: 'awaiting approval',
+    ticker: 'QQQ',
+    action: 'buy',
+    order: {
+      symbol: 'QQQ',
+      side: 'buy',
+      assetType: 'option',
+      quantity: 1,
+      orderType: 'limit',
+      limitPrice: 0.97,
+      option: BTO_QQQ_PUT.expectedCallout.option!,
+      orderId: null,
+      status: null,
+    },
+  };
+  const NOT_CONNECTED = { error: `${PAPER.label} is not connected` };
+  const approve = (request: Request): Promise<LightMyRequestResponse> =>
+    request({ method: 'POST', url: `/api/trades/${PENDING_MESSAGE_ID}/approve` });
+
+  it('status says connected, as the account list does, and offers no Robinhood login', async () => {
+    const world = makeWorld();
+    // A Robinhood login is in progress on the same user's other account.
+    world.brokers.for(ROBINHOOD);
+    const request = serve(world);
+
+    expect((await request({ method: 'GET', url: '/api/broker/status' })).json()).toMatchObject({
+      connected: true,
+      tokenState: 'valid',
+      authUrl: null,
+    });
+    expect((await request({ method: 'GET', url: '/api/accounts' })).json()).toMatchObject({
+      brokers: [{ adapter: 'robinhood' }, { adapter: 'snaptrade', accounts: { [PAPER.id]: { connected: true } } }],
+    });
+    expect(world.sdk.calls).toEqual([]);
+  });
+
+  it('the Robinhood account beside it is still offered its own login', async () => {
+    const world = makeWorld();
+    world.brokers.for(ROBINHOOD);
+
+    const status = await serve(world, ROBINHOOD)({ method: 'GET', url: '/api/broker/status' });
+
+    expect(status.json()).toMatchObject({ connected: true, authUrl: ROBINHOOD_AUTH_URL });
+  });
+
+  it('its warm session survives every read', async () => {
+    const world = makeWorld({ answers: { positions: held(), orders: { orders: [] } } });
+    const warm = world.brokers.for(PAPER);
+    const request = serve(world);
+
+    for (const url of ['/api/broker/status', '/api/portfolio', '/api/trades/performance', '/api/broker/status']) {
+      expect((await request({ method: 'GET', url })).statusCode).toBe(200);
+    }
+
+    expect(world.brokers.existing(PAPER.id)).toBe(warm);
+  });
+
+  it('portfolio and performance read its SnapTrade account', async () => {
+    const world = makeWorld({ answers: { positions: held(HELD_QQQ_CALL), orders: { orders: [] } } });
+    const request = serve(world);
+
+    const portfolio = await request({ method: 'GET', url: '/api/portfolio' });
+    const performance = await request({ method: 'GET', url: '/api/trades/performance' });
+
+    expect(portfolio.json()).toEqual({ portfolioValueUsd: null, buyingPowerUsd: 10_000, openPositions: 1 });
+    expect(performance.json()).toMatchObject({
+      positions: [{ assetType: 'option', symbol: 'QQQ', quantity: 2, strike: 707, currentPrice: null }],
+    });
+    for (const [, sent] of world.sdk.calls) expect(sent).toMatchObject({ accountId: PAPER_SNAPTRADE_ID });
+  });
+
+  it('Approve places the sized order at SnapTrade, for one request', async () => {
+    const world = makeWorld();
+    world.db.seedDecision(PAPER.id, pendingEntry);
+
+    const response = await approve(serve(world));
+
+    expect(response.statusCode).toBe(200);
+    expect(callNames(world.sdk)).toEqual([OPTION_ORDER]);
+    expect(world.sdk.calls[0]![1]).toMatchObject({ accountId: PAPER_SNAPTRADE_ID, limit_price: '0.97' });
+    expect(await decisionsOf(world.db, PAPER.id)).toMatchObject([
+      { kind: 'submitted', order: { orderId: PLACED_ORDER_ID } },
+    ]);
+  });
+
+  it.each([
+    ['its brokerage login is broken', (db: FakeDb) => db.addAccount({ ...PAPER, needsReconnect: true })],
+    ['it was disconnected', (db: FakeDb) => db.deleteBrokerTokens(PAPER.id)],
+  ])('when %s it is not connected: status, portfolio, performance and Approve all say so', async (_why, sever) => {
+    const world = makeWorld();
+    world.db.seedDecision(PAPER.id, pendingEntry);
+    const request = serve(world);
+    await sever(world.db);
+
+    expect((await request({ method: 'GET', url: '/api/broker/status' })).json()).toMatchObject({
+      connected: false,
+      tokenState: 'missing',
+      authUrl: null,
+    });
+    for (const url of ['/api/portfolio', '/api/trades/performance']) {
+      const response = await request({ method: 'GET', url });
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual(NOT_CONNECTED);
+    }
+    const approved = await approve(request);
+    expect(approved.statusCode).toBe(409);
+    expect(approved.json()).toEqual(NOT_CONNECTED);
+    expect((await decisionsOf(world.db, PAPER.id))[0]!.kind).toBe('pending_approval');
+    expect(world.sdk.calls).toEqual([]);
   });
 });

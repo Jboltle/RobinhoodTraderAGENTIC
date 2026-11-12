@@ -346,6 +346,9 @@ describe('the Robinhood login while another account is selected', () => {
   });
 
   it('status and the broker routes describe the selected account, by its own name', async () => {
+    // Not connected by its own adapter's rule, while the Robinhood account is.
+    harness.db.addAccount({ ...PAPER, needsReconnect: true });
+
     expect((await asOwner('GET', '/api/broker/status')).json()).toMatchObject({
       connected: false,
       tokenState: 'missing',

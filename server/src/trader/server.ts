@@ -243,6 +243,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // when the credentials are gone the warm session no longer represents a
     // connection, so it is evicted and status reports
     // disconnected instead of pretending off in-memory state.
+    // A SnapTrade account stores no credentials: its row is its connection
+    // (readConnection), and it never has a login URL to offer.
     const tokenState = await connections.state(account);
     return reply.send({
       // An account this deployment has no adapter for is not connected here,
@@ -942,9 +944,34 @@ async function loadFeed(deps: ServerDeps, accountId: string): Promise<CalloutFee
 // Broker connection guard
 // =============================================================================
 
+interface ConnectionOfRecord {
+  readonly state: TokenState;
+  /** The row to open the account's broker from. */
+  readonly account: AccountRow;
+}
+
 /**
- * The account's broker, gated on the connection of record (its stored
- * credentials). Every route that reads or trades the account goes through
+ * An account's connection of record, by its adapter's own rule.
+ *
+ * A Robinhood account is its stored tokens. A SnapTrade account stores none:
+ * it is connected exactly when the account list says so (not disconnected,
+ * its brokerage login not broken), which reads as `valid`, and its broker is
+ * opened from the row as it is now rather than one held since before a sync.
+ * ponytail: lists every connected account to test one, as the checks below
+ * do. Upgrade path: a per-account existence query.
+ */
+async function readConnection(deps: ServerDeps, account: AccountRow): Promise<ConnectionOfRecord> {
+  if (account.adapter === 'snaptrade') {
+    const listed = (await deps.db.listConnectedAccounts()).find((candidate) => candidate.id === account.id);
+    return listed === undefined ? { state: 'missing', account } : { state: 'valid', account: listed };
+  }
+  const stored = await deps.db.getBrokerTokens(account.id);
+  return { state: readTokenStatus(stored?.tokens).state, account };
+}
+
+/**
+ * The account's broker, gated on the connection of record (readConnection).
+ * Every route that reads or trades the account goes through
  * here, so none of them can serve from a warm in-memory session whose stored
  * connection no longer exists. Null means "not connected" — callers answer
  * 409, distinct from the 503 "broker down". An account whose adapter this
@@ -955,9 +982,9 @@ async function connectedBrokerTools(
   account: AccountRow
 ): Promise<Broker | null> {
   if (!deps.brokers.supports(account)) return null;
-  const stored = await deps.db.getBrokerTokens(account.id);
-  if (readTokenStatus(stored?.tokens).state !== 'missing') {
-    return deps.brokers.for(account).broker;
+  const connection = await readConnection(deps, account);
+  if (connection.state !== 'missing') {
+    return deps.brokers.for(connection.account).broker;
   }
   dropStaleBrokerSession(deps, account.id);
   return null;
@@ -984,7 +1011,7 @@ interface ConnectionRecord extends SessionSnapshot {
 }
 
 interface ConnectionCache {
-  /** The token state of the account's stored credentials. */
+  /** The state of the account's connection of record (readConnection). */
   state(account: AccountRow): Promise<TokenState>;
   /** connectedBrokerTools, from the cached read. */
   tools(account: AccountRow): Promise<Broker | null>;
@@ -1016,12 +1043,12 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
     return live.session !== record.session || live.connected !== record.connected;
   };
 
-  const read = (accountId: string): Promise<TokenState> => {
+  const read = (account: AccountRow): Promise<TokenState> => {
+    const accountId = account.id;
     const record: ConnectionRecord = {
       ...snapshot(accountId),
       checkedAt: Date.now(),
-      state: deps.db.getBrokerTokens(accountId).then((stored) => {
-        const { state } = readTokenStatus(stored?.tokens);
+      state: readConnection(deps, account).then(({ state }) => {
         if (state === 'missing') dropStaleBrokerSession(deps, accountId);
         return state;
       }),
@@ -1034,14 +1061,15 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
     return record.state;
   };
 
-  const state = async ({ id: accountId }: AccountRow): Promise<TokenState> => {
+  const state = async (account: AccountRow): Promise<TokenState> => {
+    const accountId = account.id;
     const record = records.get(accountId);
-    if (record === undefined || registryChanged(accountId, record)) return read(accountId);
+    if (record === undefined || registryChanged(accountId, record)) return read(account);
     if (Date.now() - record.checkedAt < CONNECTION_CHECK_INTERVAL_MS) return record.state;
     const [cached, connected] = await Promise.all([record.state, deps.db.listConnectedAccounts()]);
     record.checkedAt = Date.now();
     const stillConnected = connected.some((candidate) => candidate.id === accountId);
-    return stillConnected === (cached !== 'missing') ? cached : read(accountId);
+    return stillConnected === (cached !== 'missing') ? cached : read(account);
   };
 
   return {
