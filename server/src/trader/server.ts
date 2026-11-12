@@ -33,6 +33,7 @@ import {
 } from './book/ladder.js';
 import type { ApprovalOutcome, StoredCallout, TraderDb, UnusableAccount } from './db.js';
 import type { TraderEvents } from './events.js';
+import type { OpenOptionLot } from './lots.js';
 import { resolveEquityEntry, resolveOptionEntry } from './maxLoss.js';
 import { submitOrder } from './pipeline/execute.js';
 import { summarize } from './pipeline/summarize.js';
@@ -540,7 +541,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     try {
       const history = deps.db.listDecisions(account.id, PERFORMANCE_HISTORY_LIMIT);
-      return reply.send({ positions: await collectPerformance(tools, history) });
+      const lots = deps.db.listOpenOptionLots(account.id);
+      return reply.send({ positions: await collectPerformance(tools, history, lots) });
     } catch (err) {
       return reply
         .status(503)
@@ -598,12 +600,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       reply.raw.write(`event: performance\ndata: ${frame}\n\n`);
     };
 
-    // Egress: the connection row and the trade history only change on a
-    // (dis)connect or a logged decision, so both are read on connect and after
-    // each decision, and a tick re-fetches only live broker data. Undefined =
-    // read on the next tick.
+    // Egress: the connection row, the trade history and the open lots only
+    // change on a (dis)connect or a logged decision, so all three are read on
+    // connect and after each decision, and a tick re-fetches only live broker
+    // data. Undefined = read on the next tick.
     let connection: Broker | null | undefined;
     let history: Promise<Decision[]> | undefined;
+    let lots: Promise<OpenOptionLot[]> | undefined;
 
     // The registry is the in-memory disconnect signal: disconnect, Reconnect
     // and stale-session eviction drop or replace the session, and a finished
@@ -633,8 +636,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             history = undefined;
             throw err;
           });
+        lots ??= deps.db.listOpenOptionLots(accountId).catch((err: unknown) => {
+          lots = undefined;
+          throw err;
+        });
         sendPerformance({
-          positions: await collectPerformance(tools, history),
+          positions: await collectPerformance(tools, history, lots),
           error: null,
         });
       } catch (err) {
@@ -650,6 +657,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         pushDecisions();
         connection = undefined;
         history = undefined;
+        lots = undefined;
       },
       onStage: (event) => send('stage', event),
     });
@@ -966,7 +974,8 @@ interface PerformanceRow {
   readonly strike?: number;
   readonly expiration?: string;
   /**
-   * Entry basis matching the Robinhood app: the broker's average cost when
+   * Entry basis matching the Robinhood app: for an option the account's own
+   * open lots first; otherwise the broker's average cost when
    * the MCP reports it (equity position rows / filled option orders), else
    * the limit price of the user's most recent submitted buy. Null when
    * neither exists (e.g. a market fill on a position with no broker cost
@@ -980,9 +989,14 @@ interface PerformanceRow {
 
 async function collectPerformance(
   broker: Broker,
-  history: Promise<Decision[]>
+  history: Promise<Decision[]>,
+  lots: Promise<OpenOptionLot[]>
 ): Promise<PerformanceRow[]> {
-  const [positions, decisions] = await Promise.all([broker.getPositions(), history]);
+  const [positions, decisions, openLots] = await Promise.all([
+    broker.getPositions(),
+    history,
+    lots,
+  ]);
   // Already newest-first, so find() picks the most recent entry for a position.
   const submitted = decisions.filter((d) => d.kind === 'submitted' && d.order);
   // Real option fills for the entry basis; degrade to the trade log when the
@@ -1005,7 +1019,14 @@ async function collectPerformance(
           pctChange: pctChange(entryPrice, currentPrice),
         };
       }
-      const entryPrice = resolveOptionEntry(submitted, instrument, quantity, orders, currentPrice);
+      const entryPrice = resolveOptionEntry(
+        openLots,
+        submitted,
+        instrument,
+        quantity,
+        orders,
+        currentPrice
+      );
       return {
         assetType: 'option',
         symbol: instrument.symbol,

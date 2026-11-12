@@ -673,6 +673,418 @@ describe('sweepMaxLoss across two accounts of one user', () => {
   });
 });
 
+/**
+ * An option position is priced from the account's own open lots while they
+ * are its latest buy of the contract. Every test here seeds a ledger lot (a
+ * filled buy whose message names its Caller); the tests above seed none and
+ * describe the rebuild from broker history.
+ */
+describe('sweepMaxLoss entry price from the account ledger', () => {
+  const CONTRACT = { optionType: 'call', strike: 772, expiration: '2026-10-21' } as const;
+  const SPY_CALL = { kind: 'option', symbol: 'SPY', ...CONTRACT } as const;
+  const PAID = 1.59;
+  const LIMIT = 1.6;
+  /** More than 5x the fill: where the rebuild reads a fill reported as 159 as the entry. */
+  const WINNING_MARK = 8;
+  const MAX_LOSS_PCT = 50;
+  const EARLIER = '2026-09-08T13:00:00.000Z';
+  const LATER = '2026-09-08T14:00:00.000Z';
+  /** A filled buy in the broker's order history. `orderId` defaults to the one submittedBuy stores. */
+  const brokerBuy = (
+    fillPrice: number,
+    opts: { orderId?: string; quantity?: number; createdAt?: string } = {}
+  ): BrokerOrder => ({
+    orderId: opts.orderId ?? 'buy-1',
+    instrument: SPY_CALL,
+    side: 'buy',
+    quantity: opts.quantity ?? 2,
+    status: 'filled',
+    fillPrice,
+    createdAt: opts.createdAt ?? LATER,
+  });
+  /** Robinhood's order history reports the 1.59 fill per contract. */
+  const REPORTED_AS_159 = brokerBuy(159);
+  const holding = (quantity: number): OptionRow[] => [{ symbol: 'SPY', ...CONTRACT, quantity }];
+  const exitsOf = async (db: FakeDb, accountId: string): Promise<Decision[]> =>
+    (await db.listDecisions(accountId, 10)).filter((d) => d.kind === 'max_loss_exit');
+  /** A limit buy of the contract, placed as `orderId` at `at`. */
+  const buyAt = (orderId: string, at: string, limitPrice: number, quantity = 2): Decision =>
+    submittedBuy('SPY', limitPrice, CONTRACT, { messageId: orderId, at, quantity });
+
+  it('does not sell a winner whose lot filled at 1.59 while order history reports 159', async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => WINNING_MARK,
+      orders: [REPORTED_AS_159],
+    });
+    seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: PAID });
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+    expect(await exitsOf(db, USER)).toHaveLength(0);
+  });
+
+  it('sells that lot once the mark is 50% below its 1.59 fill, with the order it always sent', async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => 0.79,
+      orders: [REPORTED_AS_159],
+    });
+    seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: PAID });
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(placedOrders(broker, 'option')).toEqual([
+      { instrument: SPY_CALL, side: 'sell', quantity: 2, type: 'market' },
+    ]);
+    const [exit] = await exitsOf(db, USER);
+    expect(exit!.reason).toBe('Max loss: sold 2 SPY 772C 2026-10-21 at mark $0.79 (entry $1.59)');
+  });
+
+  it("two accounts of one user holding the same contract each use their own lot's price", async () => {
+    const OWNER = 'user-owner';
+    const CHEAP = fakeAccount('account-cheap', OWNER);
+    const DEAR = fakeAccount('account-dear', OWNER);
+    const DEAR_PAID = 20;
+    const db = createFakeDb();
+    const lotPrices = [
+      [CHEAP, PAID],
+      [DEAR, DEAR_PAID],
+    ] as const;
+    const brokers = new Map(
+      lotPrices.map(([account, paid]) => {
+        db.addAccount(account);
+        db.seedBrokerTokens(account.id, fakeTokens('tok'));
+        db.seedSettings(account.id, TradeSettingsSchema.parse({ maxLossPct: MAX_LOSS_PCT }));
+        seedLot(db, account.id, submittedBuy('SPY', paid, CONTRACT), { averageFillPrice: paid });
+        const broker = makeFakeBroker({
+          positions: optionPositions(holding(2)),
+          optionMark: WINNING_MARK,
+          // Both order histories report per contract, as Robinhood does.
+          orders: [brokerBuy(paid * OPTION_MULTIPLIER)],
+        });
+        return [account.id, broker] as const;
+      })
+    );
+    const session = {
+      isConnected: vi.fn().mockReturnValue(true),
+      ensureReady: vi.fn().mockResolvedValue(undefined),
+    } as unknown as RobinhoodMcpClient;
+
+    await sweepMaxLoss(
+      {
+        db,
+        brokers: makeFakeRegistry((accountId) => ({ session, broker: brokers.get(accountId)! })),
+        events: new TraderEvents(),
+        enqueue: (_accountId, run) => run(),
+        now: () => RTH,
+      },
+      new Map()
+    );
+
+    // 8.00 is +403% on the 1.59 lot and -60% on the 20.00 lot.
+    expect(placedOrders(brokers.get(CHEAP.id)!, 'option')).toHaveLength(0);
+    expect(placedOrders(brokers.get(DEAR.id)!, 'option')).toEqual([
+      { instrument: SPY_CALL, side: 'sell', quantity: 2, type: 'market' },
+    ]);
+    expect((await exitsOf(db, DEAR.id))[0]!.reason).toContain('(entry $20.00)');
+    expect(await exitsOf(db, CHEAP.id)).toHaveLength(0);
+  });
+
+  describe('position and lots disagree on quantity', () => {
+    it('contracts bought outside the system before the lot take the lot price, and the position is sold whole', async () => {
+      let mark = WINNING_MARK;
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(5),
+        markFor: () => mark,
+        orders: [
+          brokerBuy(159, { orderId: 'app-buy', quantity: 3, createdAt: EARLIER }),
+          REPORTED_AS_159,
+        ],
+      });
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: PAID });
+
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+      mark = 0.79;
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toEqual([
+        { instrument: SPY_CALL, side: 'sell', quantity: 5, type: 'market' },
+      ]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.59)');
+    });
+
+    it('contracts bought outside the system after the lot: priced from broker history, as without a lot', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(5),
+        markFor: () => 1.2,
+        orders: [
+          brokerBuy(400, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(100, { orderId: 'app-buy', quantity: 3, createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+
+      // (3 x 1.00 + 2 x 4.00) / 5 = 2.20, so 1.20 is -45%. At the lot's 4.00 it would read -70%.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('fewer contracts held than the lots hold: the newest lots are the ones still open', async () => {
+      let mark = 1.2;
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => mark,
+        orders: [
+          brokerBuy(400, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(100, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      // The early lot's contracts were sold in the broker's app.
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, 1), { orderId: 'buy-late' });
+
+      // +20% on the 1.00 lot. Averaged with the 4.00 lot it would read -52% and sell.
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+      mark = 0.5;
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.00)');
+    });
+  });
+
+  // A Max Loss exit leaves its lot open in the ledger, and a new buy is no
+  // lot until its fill is read back.
+  it('a re-entry whose fill is not read back yet is not priced at the lot it replaced', async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => 1.5,
+      orders: [
+        brokerBuy(400, { orderId: 'buy-early', createdAt: EARLIER }),
+        brokerBuy(150, { orderId: 'buy-late', createdAt: LATER }),
+      ],
+    });
+    seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+    db.seedDecision(USER, {
+      ...buyAt('buy-late', LATER, 1.5),
+      order: { ...buyAt('buy-late', LATER, 1.5).order!, orderId: 'buy-late', status: 'unconfirmed' },
+    });
+
+    // Flat on the 1.50 re-entry; -62% on the 4.00 lot that is no longer held.
+    await sweepMaxLoss(deps, flattening);
+
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+  });
+
+  it('with no order history from the broker the position is priced as without a lot', async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => 0.79,
+    });
+    seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: PAID });
+
+    await sweepMaxLoss(deps, flattening);
+
+    // The submitted limit, which is what production reads here; no fill to misread.
+    expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+    expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.60)');
+  });
+
+  it("a lot whose fill was never read back is priced at its order's limit", async () => {
+    let mark = WINNING_MARK;
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => mark,
+      orders: [REPORTED_AS_159],
+    });
+    seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT));
+
+    await sweepMaxLoss(deps, flattening);
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+    mark = 0.8;
+    await sweepMaxLoss(deps, flattening);
+    expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+    expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.60)');
+  });
+
+  describe('a lot with no price to trust', () => {
+    const MARKET_BUY = { orderType: 'market', limitPrice: null } as const;
+
+    it('no price at all: the position is priced from broker history, exactly as without a lot', async () => {
+      let mark = 1.5;
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => mark,
+        orders: [REPORTED_AS_159],
+      });
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), MARKET_BUY);
+
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+      mark = 0.75;
+      await sweepMaxLoss(deps, flattening);
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+      expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.59)');
+    });
+
+    // A market buy has no limit to scale its fill against, so the read-back
+    // keeps anything up to 20 as reported: a 0.15 premium reported per
+    // contract is stored as 15.
+    it('a market buy whose stored fill is at the wrong scale does not sell a fresh position', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => 0.15,
+        orders: [brokerBuy(15)],
+      });
+      seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { ...MARKET_BUY, averageFillPrice: 15 });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('a market re-entry is not priced at the older lot it replaced', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(2),
+        markFor: () => 1.2,
+        orders: [
+          brokerBuy(400, { orderId: 'buy-early', createdAt: EARLIER }),
+          // The re-entry filled at 1.00, reported per contract.
+          brokerBuy(100, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      // Closed by an earlier Max Loss exit, which leaves its lot open in the ledger.
+      seedLot(db, USER, buyAt('buy-early', EARLIER, 4), { orderId: 'buy-early' });
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), {
+        ...MARKET_BUY,
+        orderId: 'buy-late',
+        averageFillPrice: 1,
+      });
+
+      // +20% on the 1.00 re-entry; -70% on the 4.00 lot that is no longer held.
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+
+    it('beside a priced lot: the priced lot prices the position', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: MAX_LOSS_PCT,
+        optionPositions: holding(4),
+        markFor: () => WINNING_MARK,
+        orders: [
+          brokerBuy(159, { orderId: 'buy-early', createdAt: EARLIER }),
+          brokerBuy(159, { orderId: 'buy-late', createdAt: LATER }),
+        ],
+      });
+      seedLot(db, USER, buyAt('buy-early', EARLIER, LIMIT), {
+        orderId: 'buy-early',
+        averageFillPrice: PAID,
+      });
+      seedLot(db, USER, buyAt('buy-late', LATER, LIMIT), { ...MARKET_BUY, orderId: 'buy-late' });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+    });
+  });
+
+  it('several lots at different prices are weighted by the contracts each still holds', async () => {
+    let mark = 0.78;
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(4),
+      markFor: () => mark,
+      orders: [
+        brokerBuy(200, { orderId: 'buy-early', createdAt: EARLIER }),
+        brokerBuy(100, { orderId: 'buy-late', quantity: 4, createdAt: LATER }),
+      ],
+    });
+    // Two bought at 2.00; then four at 1.00, two of which an own-target level sold.
+    seedLot(db, USER, buyAt('buy-early', EARLIER, 2.1), { orderId: 'buy-early', averageFillPrice: 2 });
+    seedLot(db, USER, buyAt('buy-late', LATER, 1.1, 4), { orderId: 'buy-late', averageFillPrice: 1 });
+    const trim = buyAt('trim-late', '2026-09-08T14:10:00.000Z', 1.5);
+    db.seedDecision(USER, {
+      ...trim,
+      action: 'sell',
+      order: { ...trim.order!, side: 'sell', orderId: 'trim-late', lots: [{ lotId: 'buy-late', quantity: 2 }] },
+    });
+
+    // (2 x 2.00 + 2 x 1.00) / 4 = 1.50, so 0.78 is -48%: held.
+    await sweepMaxLoss(deps, flattening);
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+
+    // 0.74 is -50.7% of 1.50. Weighted by what was bought (2 and 4) the basis
+    // would be 1.33 and this would read -44.5%.
+    mark = 0.74;
+    await sweepMaxLoss(deps, flattening);
+    expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 4, type: 'market' }]);
+    expect((await exitsOf(db, USER))[0]!.reason).toContain('(entry $1.50)');
+  });
+
+  it("another contract's lot does not price this one", async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => 1.5,
+      orders: [REPORTED_AS_159],
+    });
+    seedLot(db, USER, submittedBuy('SPY', 20, { ...CONTRACT, strike: 780 }));
+
+    // -5.7% on the 1.59 this contract cost; -92.5% on the other contract's 20.00.
+    await sweepMaxLoss(deps, flattening);
+
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+  });
+
+  it('a sweep that cannot read the ledger sells no option, and still protects stock', async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: MAX_LOSS_PCT,
+      optionPositions: holding(2),
+      markFor: () => WINNING_MARK,
+      orders: [REPORTED_AS_159],
+      equityPositions: [{ symbol: 'PLTR', quantity: 10, averageEntryPrice: 2 }],
+      quoteFor: () => 0.9,
+    });
+    seedLot(db, USER, submittedBuy('SPY', LIMIT, CONTRACT), { averageFillPrice: PAID });
+    vi.spyOn(db, 'listOpenOptionLots').mockRejectedValueOnce(new Error('db down'));
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(placedOrders(broker, 'option')).toHaveLength(0);
+    expect(placedOrders(broker, 'equity')).toMatchObject([{ side: 'sell', quantity: 10, type: 'market' }]);
+  });
+});
+
+/** A filled buy the ledger counts as a lot: its message row names the Caller. */
+function seedLot(
+  db: FakeDb,
+  accountId: string,
+  buy: Decision,
+  order: Partial<SubmittedOrder> = {}
+): void {
+  db.seedMessage({ messageId: buy.messageId, sentAt: buy.at });
+  db.seedDecision(accountId, { ...buy, order: { ...buy.order!, ...order } });
+}
+
 interface OptionRow {
   readonly symbol: string;
   readonly optionType: 'call' | 'put';

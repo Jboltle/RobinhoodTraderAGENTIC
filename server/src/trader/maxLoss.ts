@@ -15,6 +15,7 @@ import {
 } from '../shared/types.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
+import { sameOption, type OpenOptionLot } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
@@ -159,19 +160,27 @@ async function scanAccount(
   const submitted = await entryHistory(accountId, deps, entries, held);
   const orders = await broker.getOrders().catch(() => null);
 
-  const openLots = await deps.db.listOpenOptionLots(accountId).catch(() => []);
+  const openLots = await deps.db.listOpenOptionLots(accountId).catch(() => null);
+  if (openLots === null) {
+    log.warn('max-loss: ledger unreadable, option positions wait a sweep', { accountId });
+  }
   const openKeys = new Set<string>();
 
   for (const position of positions) {
     const { instrument } = position;
     const key = instrumentKey(instrument);
     if (position.quantity > 0) openKeys.add(`${accountId}:${key}`);
+    // An unreadable ledger is not an empty one. Pricing an option from broker
+    // history because the lots could not be read would sell the winner the
+    // lot's own fill rules out, so options wait for the next sweep.
+    if (instrument.kind === 'option' && openLots === null) continue;
+    const lots = openLots ?? [];
     // A resting broker stop is this position's Max Loss. Selling here too would
     // double-close it. ponytail: the dollar cap does not fire while that stop
     // rests. Upgrade path: cancel the stop and software-flatten only the usd breach.
     const stopped =
       instrument.kind === 'option' &&
-      openLots.some(
+      lots.some(
         (lot) =>
           lot.stopOrderId !== null &&
           lot.symbol === instrument.symbol.toUpperCase() &&
@@ -203,7 +212,7 @@ async function scanAccount(
           : null,
       entry:
         instrument.kind === 'option'
-          ? resolveOptionEntry(submitted, instrument, position.quantity, orders, mark)
+          ? resolveOptionEntry(lots, submitted, instrument, position.quantity, orders, mark)
           : resolveEquityEntry(submitted, position),
       mark,
       multiplier: instrument.kind === 'option' ? OPTION_MULTIPLIER : EQUITY_MULTIPLIER,
@@ -479,24 +488,35 @@ export function resolveEquityEntry(
 }
 
 /**
- * Entry basis for an option position, matching the Robinhood app: actual
- * fills first (average_price of filled buys from get_option_orders, newest
- * lots covering the open contracts), else the submitted limit premiums the
- * same way. Position rows carry no cost data, so fills are the best source.
- * Shared with the dashboard (server.ts).
+ * Entry basis for an option position: the account's own open lots while they
+ * are the account's latest buy of the contract, else the rebuild from broker
+ * order history. `lots` are that account's open lots. Shared with the
+ * dashboard (server.ts), so the sweep and the percent shown always agree.
  */
 export function resolveOptionEntry(
+  lots: readonly OpenOptionLot[],
   submitted: readonly Decision[],
   contract: OptionInstrument,
   openQuantity: number,
   orders: readonly BrokerOrder[] | null,
   mark: number | null
 ): number | null {
-  const fillLots = (orders ?? [])
+  const bought = boughtNewestFirst(orders, contract);
+  return (
+    ledgerOptionEntry(lots, contract, openQuantity, bought[0]?.orderId ?? null) ??
+    rebuildOptionEntry(submitted, contract, openQuantity, bought, mark)
+  );
+}
+
+/** The broker's buys of one contract that bought something, newest first. */
+function boughtNewestFirst(
+  orders: readonly BrokerOrder[] | null,
+  contract: OptionInstrument
+): BrokerOrder[] {
+  return (orders ?? [])
     .filter(
       (o) =>
         o.side === 'buy' &&
-        (o.status === null || o.status === 'filled') &&
         o.instrument.kind === 'option' &&
         o.instrument.symbol === contract.symbol &&
         o.instrument.optionType === contract.optionType &&
@@ -504,7 +524,83 @@ export function resolveOptionEntry(
         o.instrument.expiration === contract.expiration &&
         o.fillPrice !== null
     )
-    .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+    .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''));
+}
+
+/**
+ * Entry basis from the ledger: the newest open lots of this contract covering
+ * the open contracts, each weighted by what it still holds. A lot's price was
+ * scaled once against its own order's limit (fills.ts), which does not move;
+ * the rebuild rescales against today's mark and reads a 1.59 fill reported as
+ * 159 as the entry once the mark passes 5x it. Null when the lots cannot be
+ * trusted to price the position; the caller then rebuilds.
+ *
+ * The lots price the contract only while the broker's latest buy of it
+ * (`latestBuyOrderId`) is one of them. A lot outlives its contracts when a
+ * Max Loss exit, a fired broker stop or a sale in the broker's app closes
+ * them, and a new buy is no lot until its fill is read back; without this
+ * check a re-entry would be priced at the lot it replaced and sold at once.
+ * No buy in the broker's history also means the rebuild, which then reads
+ * only the submitted limits and has no fill to misread.
+ *
+ * ponytail: newest lots cover the position (sells close the oldest first,
+ * allocateFifo), and contracts the lots do not cover, bought outside the
+ * system before the newest lot, take the lots' price. The basis is off by
+ * the real price gap between those buys, never by the 100x scale. Upgrade
+ * path: close a lot when its contracts leave the account, and replay the
+ * broker's buys and sells for the rest.
+ *
+ * ponytail: a market buy's lot is not priced. Its fill was scaled with no
+ * limit to compare against (fills.ts), so the stored price can be 100x off
+ * either way; a 0.15 premium stored as 15 would sell the position at once.
+ * It still covers its contracts, so an older lot is never priced in its
+ * place. Ceiling: a position held only through market buys keeps the
+ * rebuild's misread. Upgrade path: scale a market fill against the mark read
+ * when it fills, and store that.
+ */
+function ledgerOptionEntry(
+  lots: readonly OpenOptionLot[],
+  contract: OptionInstrument,
+  openQuantity: number,
+  latestBuyOrderId: string | null
+): number | null {
+  const ofContract = lots.filter((lot) => sameOption(lot, contract.symbol, contract));
+  if (
+    latestBuyOrderId === null ||
+    !ofContract.some((lot) => lot.buyOrder.orderId === latestBuyOrderId)
+  ) {
+    return null;
+  }
+  let uncovered = openQuantity;
+  let cost = 0;
+  let priced = 0;
+  for (const lot of ofContract.reverse()) {
+    if (uncovered <= 0) break;
+    const held = Math.min(lot.openQty, uncovered);
+    uncovered -= held;
+    if (lot.buyOrder.limitPrice === null || !(lot.entryPrice > 0)) continue;
+    cost += lot.entryPrice * held;
+    priced += held;
+  }
+  return priced > 0 ? cost / priced : null;
+}
+
+/**
+ * Entry basis rebuilt from broker order history, for a contract the ledger
+ * does not price (bought before the ledger, or outside the system): actual
+ * fills first (average_price of filled buys from get_option_orders, newest
+ * lots covering the open contracts), else the submitted limit premiums the
+ * same way. Position rows carry no cost data, so fills are the best source.
+ */
+function rebuildOptionEntry(
+  submitted: readonly Decision[],
+  contract: OptionInstrument,
+  openQuantity: number,
+  bought: readonly BrokerOrder[],
+  mark: number | null
+): number | null {
+  const fillLots = bought
+    .filter((o) => o.status === null || o.status === 'filled')
     .map((o) => ({
       price: normalizeOptionPremium(o.fillPrice!, mark),
       quantity: o.quantity > 0 ? o.quantity : 1,

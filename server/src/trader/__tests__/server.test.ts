@@ -706,6 +706,55 @@ describe('GET /api/trades/performance', () => {
     expect(option.pctChange).toBeCloseTo(((1.94 - 0.92) / 0.92) * 100);
   });
 
+  // The misread Max Loss had: above 5x the fill, a fill the order history
+  // reports as 159 was taken as the entry, and a +403% position showed -95%.
+  it("prices an option from the account's own ledger lot, not from order history", async () => {
+    const contract = { optionType: 'call', strike: 772, expiration: '2026-10-21' } as const;
+    harness.configureBroker(ACCOUNT_ID, {
+      positions: [optionPosition('SPY', 'call', 772, '2026-10-21', 2)],
+      optionMark: 8,
+      orders: [
+        {
+          orderId: 'opt-001',
+          instrument: { kind: 'option', symbol: 'SPY', ...contract },
+          side: 'buy',
+          status: 'filled',
+          fillPrice: 159,
+          quantity: 2,
+          createdAt: '2026-07-14T14:00:00.000Z',
+        },
+      ],
+    });
+    // A filled buy whose message names its Caller is a ledger lot.
+    harness.db.seedMessage({ messageId: 'lot', sentAt: '2026-07-14T14:00:00.000Z' });
+    harness.db.seedDecision(
+      ACCOUNT_ID,
+      decisionFixture('lot', {
+        ticker: 'SPY',
+        order: {
+          symbol: 'SPY',
+          side: 'buy',
+          assetType: 'option',
+          quantity: 2,
+          orderType: 'limit',
+          limitPrice: 1.6,
+          option: contract,
+          orderId: 'opt-001',
+          status: 'filled',
+          averageFillPrice: 1.59,
+        },
+      })
+    );
+
+    const { positions } = (await get('/api/trades/performance')).json() as {
+      positions: Array<{ symbol: string; entryPrice: number; pctChange: number }>;
+    };
+
+    const option = positions.find((p) => p.symbol === 'SPY')!;
+    expect(option.entryPrice).toBe(1.59);
+    expect(option.pctChange).toBeCloseTo(((8 - 1.59) / 1.59) * 100);
+  });
+
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
     harness.configureBroker(ACCOUNT_ID, {
       overrides: {
@@ -1211,6 +1260,29 @@ describe('GET /api/stream', () => {
         await stream.readUntil('"currentPrice":154');
         expect(reads('getBrokerTokens')).toBe(2);
         expect(reads('listDecisions')).toBe(4);
+      } finally {
+        await stream.close();
+      }
+    }, 10_000);
+
+    it('a tick does not re-read the ledger lots; a logged decision does', async () => {
+      harness.db.seedBrokerTokens(ACCOUNT_ID, fakeTokens('access-token'));
+      let price = 150;
+      harness.configureBroker(ACCOUNT_ID, {
+        positions: [equityPosition('AAPL', 10)],
+        equityMark: () => price++,
+      });
+      const stream = await openStream();
+      try {
+        await stream.readUntil('"currentPrice":150');
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"currentPrice":151');
+        expect(reads('listOpenOptionLots')).toBe(1);
+
+        harness.events.emitDecision(ACCOUNT_ID, decisionFixture('live', { reason: 'live-push' }));
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        await stream.readUntil('"currentPrice":152');
+        expect(reads('listOpenOptionLots')).toBe(2);
       } finally {
         await stream.close();
       }
