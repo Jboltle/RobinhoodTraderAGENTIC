@@ -120,6 +120,11 @@ export interface FakeDb extends TraderDb {
   addUser(user: AuthUser, accessToken: string, accountId?: string): void;
   /** Add a further account to its user; `select` makes it the one their routes act on. */
   addAccount(account: AccountRow, options?: { readonly select?: boolean }): void;
+  /**
+   * Write users.selected_account_id as a bad row would hold it: an id the
+   * user does not own, or null where the selected account was deleted.
+   */
+  corruptSelection(userId: string, accountId: string | null): void;
   /** The account row for an id, created as a direct Robinhood account when unknown. */
   account(accountId: string): AccountRow;
   seedSettings(accountId: string, settings: TradeSettings): void;
@@ -198,6 +203,10 @@ export function createFakeDb(): FakeDb {
       if (options.select || !selectedAccounts.has(account.userId)) {
         selectedAccounts.set(account.userId, account.id);
       }
+    },
+    corruptSelection(userId, accountId) {
+      if (accountId === null) selectedAccounts.delete(userId);
+      else selectedAccounts.set(userId, accountId);
     },
     account: ensureAccount,
     seedSettings(accountId, value) {
@@ -576,6 +585,25 @@ export function createFakeDb(): FakeDb {
     },
     async getSelectedAccount(userId) {
       return selectedAccountOf(userId);
+    },
+    async listAccounts(userId) {
+      return [...accounts.values()]
+        .filter((account) => account.userId === userId)
+        .map((account) => {
+          const resolved = settings.get(account.id) ?? TradeSettingsSchema.parse({});
+          return {
+            account,
+            connected: brokerTokens.has(account.id),
+            executionMode: resolved.executionMode,
+            followedCallerIds: resolved.followedCallerIds,
+          };
+        });
+    },
+    async selectAccount(userId, accountId) {
+      // Mirrors the real UPDATE: matched among this user's own accounts only.
+      if (accounts.get(accountId)?.userId !== userId) return false;
+      selectedAccounts.set(userId, accountId);
+      return true;
     },
     async createSession(userId, token, expiresAt) {
       const user = [...usersByEmail.values()].find((candidate) => candidate.id === userId);

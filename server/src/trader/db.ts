@@ -46,6 +46,7 @@ import {
   defaultSettings,
   type Callout,
   type Decision,
+  type ExecutionMode,
   type OptionContract,
   type ResolvedTradeSettings,
   type SubmittedOrder,
@@ -202,6 +203,16 @@ export interface AuthSession {
   readonly account: AccountRow | null;
 }
 
+/** One of a user's accounts, with what the account menu shows about it. */
+export interface AccountListing {
+  readonly account: AccountRow;
+  /** Has a connection of record: the test listConnectedAccounts fans out by. */
+  readonly connected: boolean;
+  readonly executionMode: ExecutionMode;
+  /** Null = follows every Caller. */
+  readonly followedCallerIds: readonly string[] | null;
+}
+
 /** A placed order whose broker state is not yet terminal, with the account that placed it. */
 export interface OpenOrderRow {
   readonly accountId: string;
@@ -343,6 +354,14 @@ export interface TraderDb {
   userForSignIn(email: string): Promise<AuthUser | null>;
   /** AuthSession.account for a user known by id rather than by token (the CLI scripts). */
   getSelectedAccount(userId: string): Promise<AccountRow | null>;
+  /** Every account the user owns, oldest first. Never another user's. */
+  listAccounts(userId: string): Promise<AccountListing[]>;
+  /**
+   * Make one of the user's own accounts the one their dashboard and Settings
+   * show. False, with nothing written, when `accountId` is not an account of
+   * theirs. Which accounts trade is unaffected: that is listConnectedAccounts.
+   */
+  selectAccount(userId: string, accountId: string): Promise<boolean>;
   /** Start a session for `token` (only its hash is stored), ending at `expiresAt`. */
   createSession(userId: string, token: string, expiresAt: Date): Promise<void>;
   /** End the session for `token`, if it exists. */
@@ -979,6 +998,54 @@ class DrizzleTraderDb implements TraderDb {
       .orderBy(...SELECTED_ACCOUNT_FIRST)
       .limit(1);
     return row ? toAccount(row) : null;
+  }
+
+  async listAccounts(userId: string): Promise<AccountListing[]> {
+    const rows = await this.db
+      .select({ ...accountColumns, connected: sql<boolean>`${accounts.credentials} is not null` })
+      .from(accounts)
+      .where(eq(accounts.userId, userId))
+      .orderBy(asc(accounts.createdAt), asc(accounts.id));
+    // One unreadable row must not hide the user's other accounts.
+    return rows.flatMap((row) => {
+      try {
+        return [
+          {
+            account: toAccount(row),
+            connected: row.connected,
+            executionMode: row.executionMode,
+            followedCallerIds: row.followedCallerIds,
+          },
+        ];
+      } catch (err: unknown) {
+        log.error('skipping an account whose row cannot be read', {
+          accountId: row.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return [];
+      }
+    });
+  }
+
+  async selectAccount(userId: string, accountId: string): Promise<boolean> {
+    // Ownership is part of the statement that writes the selection: the id is
+    // only ever matched among this user's own accounts, so no row is updated
+    // for someone else's account or for one that does not exist. Compared as
+    // text so an id that is not a uuid matches nothing instead of failing the
+    // cast.
+    const updated = await this.db
+      .update(users)
+      .set({ selectedAccountId: sql`${accounts.id}` })
+      .from(accounts)
+      .where(
+        and(
+          eq(users.id, userId),
+          eq(accounts.userId, users.id),
+          sql`${accounts.id}::text = ${accountId}`
+        )
+      )
+      .returning({ id: users.id });
+    return updated.length > 0;
   }
 
   async createSession(userId: string, token: string, expiresAt: Date): Promise<void> {

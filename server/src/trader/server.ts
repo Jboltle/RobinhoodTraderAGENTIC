@@ -18,6 +18,7 @@ import {
   TradeSettingsSchema,
   type AssetType,
   type Decision,
+  type ExecutionMode,
   type OptionType,
   type TradeExecutionMode,
 } from '../shared/types.js';
@@ -81,12 +82,49 @@ const AUTH_URL_POLL_MS = 100;
  */
 const READ_ONLY_CONNECT_ERROR =
   'Robinhood cannot be connected from this environment (TRADE_EXECUTION_MODE=read_only)';
+const NO_ROBINHOOD_ACCOUNT_ERROR = 'this user has no Robinhood account to connect';
 
 /** Full redirect URL the user copied from the dead-end 127.0.0.1 tab. */
 const BrokerCallbackBodySchema = z.object({ redirectUrl: z.string() });
 
 /** `force` tears down the current session first — the settings Reconnect. */
 const BrokerConnectBodySchema = z.object({ force: z.boolean().optional() });
+
+const SelectAccountBodySchema = z.object({ accountId: z.string().min(1) });
+
+/** One account in GET /api/accounts: what the account menu shows about it. */
+export interface AccountSummary {
+  readonly id: string;
+  readonly label: string;
+  readonly institution: string;
+  readonly isPaper: boolean;
+  readonly connected: boolean;
+  readonly needsReconnect: boolean;
+  readonly executionMode: ExecutionMode;
+  /** An account that follows every Caller counts the whole roster. */
+  readonly followedCallerCount: number;
+}
+
+export interface SnapTradeAccountSummary extends AccountSummary {
+  readonly externalAccountId: string;
+  readonly connectionId: string;
+}
+
+/** A later adapter adds one variant. */
+export type BrokerEntry =
+  | { readonly adapter: 'robinhood'; readonly account: AccountSummary }
+  | {
+      readonly adapter: 'snaptrade';
+      /** Keyed by our own account id. */
+      readonly accounts: Record<string, SnapTradeAccountSummary>;
+    };
+
+export interface AccountsResponse {
+  /** The account every per-account route acts on for this user right now. */
+  readonly selectedAccountId: string;
+  /** One entry per adapter the user has an account through. */
+  readonly brokers: BrokerEntry[];
+}
 
 export interface ServerDeps {
   readonly db: TraderDb;
@@ -132,6 +170,29 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.send({ ok: true });
   });
 
+  // ---- Accounts ---------------------------------------------------------------
+
+  // The user's own accounts and which of them the dashboard and Settings show.
+  fastify.get('/api/accounts', async (request, reply) => {
+    const selected = requireAccount(request);
+    return reply.send(await listAccounts(deps, selected));
+  });
+
+  // Switches what the screens and Settings show and edit. Which accounts trade
+  // is every connected account, whatever is selected here.
+  fastify.post('/api/accounts/select', async (request, reply) => {
+    const user = requireUser(request);
+    const parsed = SelectAccountBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'body must be { accountId: string }' });
+    }
+    // Someone else's account answers exactly as one that does not exist.
+    if (!(await deps.db.selectAccount(user.id, parsed.data.accountId))) {
+      return reply.status(404).send({ error: 'no such account' });
+    }
+    return reply.send({ selectedAccountId: parsed.data.accountId });
+  });
+
   // ---- Robinhood connection (per account) -------------------------------------
 
   fastify.get('/api/broker/status', async (request, reply) => {
@@ -157,14 +218,23 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // post-consent redirect dead-ends on the user's own 127.0.0.1. The dashboard
   // opens the URL returned here, the user approves, then pastes the dead-end
   // redirect URL into POST /api/broker/callback.
+  //
+  // connect and callback are the Robinhood OAuth flow, so they act on the
+  // user's direct Robinhood account whichever account is selected: a login
+  // started while another account is being viewed must never land its tokens
+  // on that account's row.
   fastify.post('/api/broker/connect', async (request, reply) => {
-    const account = requireAccount(request);
+    const selected = requireAccount(request);
     if (deps.executionMode === 'read_only') {
       return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
     }
     const parsed = BrokerConnectBodySchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.status(400).send({ error: 'body must be { force?: boolean }' });
+    }
+    const account = await directRobinhoodAccount(deps, selected);
+    if (account === null) {
+      return reply.status(409).send({ error: NO_ROBINHOOD_ACCOUNT_ERROR });
     }
     // Reconnect (settings page): drop the current session — connected but
     // wedged, or holding an abandoned OAuth flow — and run the flow again.
@@ -194,7 +264,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   fastify.post('/api/broker/callback', async (request, reply) => {
-    const account = requireAccount(request);
+    const selected = requireAccount(request);
     if (deps.executionMode === 'read_only') {
       return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
     }
@@ -212,7 +282,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!code) {
       return reply.status(400).send({ error: 'redirectUrl has no code parameter' });
     }
-    const broker = deps.brokers.existing(account.id);
+    const account = await directRobinhoodAccount(deps, selected);
+    const broker = account === null ? undefined : deps.brokers.existing(account.id);
     if (!broker || !broker.session.isAuthPending()) {
       return reply.status(409).send({ error: 'no OAuth authorization is pending' });
     }
@@ -288,7 +359,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // run against a stale one. The row stays pending — reconnect, then approve.
     const broker = await connectedBrokerTools(deps, account);
     if (broker === null) {
-      return reply.status(409).send({ error: 'Robinhood is not connected' });
+      return reply.status(409).send({ error: notConnectedError(account) });
     }
 
     const approvedAt = new Date().toISOString();
@@ -430,7 +501,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const account = requireAccount(request);
     const broker = await connections.tools(account);
     if (broker === null) {
-      return reply.status(409).send({ error: 'Robinhood is not connected' });
+      return reply.status(409).send({ error: notConnectedError(account) });
     }
     try {
       const [account, positions] = await Promise.all([broker.getAccount(), broker.getPositions()]);
@@ -450,7 +521,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const account = requireAccount(request);
     const tools = await connectedBrokerTools(deps, account);
     if (tools === null) {
-      return reply.status(409).send({ error: 'Robinhood is not connected' });
+      return reply.status(409).send({ error: notConnectedError(account) });
     }
     try {
       const history = deps.db.listDecisions(account.id, PERFORMANCE_HISTORY_LIMIT);
@@ -537,7 +608,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         if (tools === null) {
           // No connection of record (disconnected, or the row was removed):
           // an error frame, never data from a session that outlived its row.
-          sendPerformance({ positions: null, error: 'Robinhood is not connected' });
+          sendPerformance({ positions: null, error: notConnectedError(account) });
           return;
         }
         // A failed read is not kept: the next tick tries again.
@@ -608,6 +679,65 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   return fastify;
 }
+
+// =============================================================================
+// Accounts
+// =============================================================================
+
+/**
+ * The accounts of the selected account's owner, grouped by adapter. The
+ * database keeps one row per account; this shape is built on read.
+ */
+async function listAccounts(deps: ServerDeps, selected: AccountRow): Promise<AccountsResponse> {
+  const listings = await deps.db.listAccounts(selected.userId);
+  const followsEveryone = listings.some((listing) => listing.followedCallerIds === null);
+  const rosterSize = followsEveryone ? (await deps.db.listCallers()).length : 0;
+
+  const brokers: BrokerEntry[] = [];
+  const snapTradeAccounts: Record<string, SnapTradeAccountSummary> = {};
+  for (const { account, connected, executionMode, followedCallerIds } of listings) {
+    const summary: AccountSummary = {
+      id: account.id,
+      label: account.label,
+      institution: account.institution,
+      isPaper: account.isPaper,
+      connected,
+      needsReconnect: account.needsReconnect,
+      executionMode,
+      followedCallerCount: followedCallerIds?.length ?? rosterSize,
+    };
+    switch (account.adapter) {
+      case 'robinhood':
+        brokers.push({ adapter: 'robinhood', account: summary });
+        break;
+      case 'snaptrade':
+        snapTradeAccounts[account.id] = {
+          ...summary,
+          // Every SnapTrade row is written with one; '' only on a hand-made row.
+          externalAccountId: account.externalAccountId ?? '',
+          connectionId: account.adapterData.connectionId,
+        };
+        break;
+    }
+  }
+  if (Object.keys(snapTradeAccounts).length > 0) {
+    brokers.push({ adapter: 'snaptrade', accounts: snapTradeAccounts });
+  }
+  return { selectedAccountId: selected.id, brokers };
+}
+
+/** The direct Robinhood account of the selected account's owner; every user is created with one. */
+async function directRobinhoodAccount(
+  deps: ServerDeps,
+  selected: AccountRow
+): Promise<AccountRow | null> {
+  if (selected.adapter === 'robinhood') return selected;
+  const listings = await deps.db.listAccounts(selected.userId);
+  return listings.find(({ account }) => account.adapter === 'robinhood')?.account ?? null;
+}
+
+/** What a route answers when the account it was asked about has no connection of record. */
+const notConnectedError = (account: AccountRow): string => `${account.label} is not connected`;
 
 // =============================================================================
 // Approval
