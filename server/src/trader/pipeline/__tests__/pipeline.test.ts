@@ -864,6 +864,26 @@ describe('fan-out — which session checks the entry', () => {
     expect(decision!.kind).toBe('submitted');
     expect(placedOrders(second.broker, 'option')).toHaveLength(1);
   });
+
+  // The default spot (150) is far from the 710 strike: a check that ran would
+  // hold these entries for approval, so a submitted one went unchecked.
+  it('skips the check, and still fans the message out, when a session fails with something other than BrokerUnavailableError', async () => {
+    const broken: CheckSession = {
+      session: {
+        isConnected: vi.fn().mockReturnValue(false),
+        ensureReady: vi.fn().mockRejectedValue(new Error('adapter session exploded')),
+      } as unknown as RobinhoodMcpClient,
+      broker: makeBroker(),
+    };
+    const { db, deps } = setupSessions(entryOn('MMSFT'), { [USER]: broken });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(markReads(broken.broker, 'equity')).toHaveLength(0);
+    const [decision] = await db.listDecisions(USER, 10);
+    expect(decision!.kind).toBe('submitted');
+    expect(placedOrders(broken.broker, 'option')).toHaveLength(1);
+  });
 });
 
 describe('fan-out — several users', () => {

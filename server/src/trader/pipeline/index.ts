@@ -726,14 +726,15 @@ async function entryMismatchReason(
   const cached = entryVerdicts.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  // Read live, not from the quote source's cache: this price decides whether
-  // the entry is placed or held for approval.
-  const broker = await deps.quotes.broker();
-  if (broker === null) return null;
   const contract = instrumentOf({ symbol: ticker, assetType: 'option', option });
 
   let reason: string | null = null;
   try {
+    // Read live, not from the quote source's cache: this price decides whether
+    // the entry is placed or held for approval. Picked inside the try: a
+    // session that fails in a way of its own skips the check, not the message.
+    const broker = await deps.quotes.broker();
+    if (broker === null) return null;
     let spot: number | null = null;
     try {
       const price = await broker.getMark({ kind: 'equity', symbol: ticker });
