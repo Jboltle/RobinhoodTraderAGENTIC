@@ -15,6 +15,7 @@ import {
   type MaxLossDeps,
 } from '../maxLoss.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
+import type { BrokerOrder } from '../broker/types.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import {
@@ -224,6 +225,78 @@ describe('sweepMaxLoss', () => {
     const rows = await db.listDecisions(USER, 10);
     expect(rows.some((d) => d.kind === 'max_loss_exit' && d.ticker === 'QQQ')).toBe(true);
     expect(enqueue).toHaveBeenCalled();
+  });
+
+  it('skips a position whose lot has a resting stop, so it is not closed twice', async () => {
+    const { db, broker, flattening, deps } = setupMonitor({
+      maxLossPct: 50,
+      optionPositions: [
+        { symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11', quantity: 2 },
+        { symbol: 'NVDA', optionType: 'call', strike: 180, expiration: '2026-06-20', quantity: 3 },
+      ],
+      // Both are down 50% or more; only QQQ's lot has a stop resting at the broker.
+      markFor: (symbol) => (symbol === 'QQQ' ? 0.75 : 2),
+    });
+    const stopped = submittedBuy('QQQ', 1.5, { optionType: 'call', strike: 707, expiration: '2026-06-11' });
+    db.seedMessage({ messageId: stopped.messageId, sentAt: stopped.at });
+    db.seedDecision(USER, { ...stopped, order: { ...stopped.order!, stopOrderId: 'stop-1' } });
+    db.seedDecision(USER, submittedBuy('NVDA', 5, { optionType: 'call', strike: 180, expiration: '2026-06-20' }));
+
+    await sweepMaxLoss(deps, flattening);
+
+    expect(placedOrders(broker, 'option')).toMatchObject([
+      { instrument: { symbol: 'NVDA' }, side: 'sell', quantity: 3 },
+    ]);
+    const exits = (await db.listDecisions(USER, 10)).filter((d) => d.kind === 'max_loss_exit');
+    expect(exits.map((d) => d.ticker)).toEqual(['NVDA']);
+  });
+
+  describe('entry price from broker fills', () => {
+    const SPY_CALL = { kind: 'option', symbol: 'SPY', optionType: 'call', strike: 772, expiration: '2026-10-21' } as const;
+    const buyOrder = (order: Pick<BrokerOrder, 'orderId' | 'status' | 'fillPrice' | 'createdAt'>): BrokerOrder => ({
+      instrument: SPY_CALL,
+      side: 'buy',
+      quantity: 2,
+      ...order,
+    });
+    // Robinhood reports this fill per contract: the premium paid was 1.59.
+    const FILLED = buyOrder({ orderId: 'ord-1', status: 'filled', fillPrice: 159, createdAt: '2026-09-08T14:00:00Z' });
+    // Newer, never filled, and priced where it would look like a 90% loss if counted.
+    const UNFILLED = [
+      buyOrder({ orderId: 'ord-2', status: 'cancelled', fillPrice: 15, createdAt: '2026-09-08T14:10:00Z' }),
+      buyOrder({ orderId: 'ord-3', status: 'queued', fillPrice: 15, createdAt: '2026-09-08T14:20:00Z' }),
+    ];
+    const held = [{ symbol: 'SPY', optionType: 'call' as const, strike: 772, expiration: '2026-10-21', quantity: 2 }];
+
+    it('reads a fill reported as 159 as 1.59, ignores unfilled buys, and does not sell inside the limit', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: 50,
+        optionPositions: held,
+        markFor: () => 1.5,
+        orders: [...UNFILLED, FILLED],
+      });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect(broker.getOrders).toHaveBeenCalledOnce();
+      expect(placedOrders(broker, 'option')).toHaveLength(0);
+      expect((await db.listDecisions(USER, 10)).some((d) => d.kind === 'max_loss_exit')).toBe(false);
+    });
+
+    it('sells on that 1.59 entry once the mark is 50% below it', async () => {
+      const { db, broker, flattening, deps } = setupMonitor({
+        maxLossPct: 50,
+        optionPositions: held,
+        markFor: () => 0.75,
+        orders: [...UNFILLED, FILLED],
+      });
+
+      await sweepMaxLoss(deps, flattening);
+
+      expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+      const [exit] = (await db.listDecisions(USER, 10)).filter((d) => d.kind === 'max_loss_exit');
+      expect(exit!.reason).toContain('(entry $1.59)');
+    });
   });
 
   it('does not sell when entry is unknown', async () => {
@@ -610,6 +683,8 @@ function setupMonitor(opts: {
   optionPositions?: OptionRow[];
   markFor?: (symbol: string) => number;
   quoteFor?: (symbol: string) => number;
+  /** The broker's order history; the fake offers none unless given. */
+  orders?: readonly BrokerOrder[];
   ensureReady?: () => Promise<void>;
   executionMode?: TradeExecutionMode;
 }) {
@@ -632,6 +707,7 @@ function setupMonitor(opts: {
     ],
     equityMark: (symbol) => opts.quoteFor?.(symbol) ?? 150,
     optionMark: (contract) => opts.markFor?.(contract.symbol) ?? 0.97,
+    orders: opts.orders ?? null,
   });
 
   const mcp = {
