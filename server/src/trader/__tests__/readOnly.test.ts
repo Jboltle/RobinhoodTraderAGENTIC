@@ -12,9 +12,9 @@ import {
   type OptionContract,
   type TradeExecutionMode,
 } from '../../shared/types.js';
-import { BrokerWritesDisabledError } from '../broker/errors.js';
+import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
 import { createMcpRegistry } from '../broker/registry.js';
-import type { Broker, Instrument, OrderRequest } from '../broker/types.js';
+import type { AccountRow, Broker, BrokerAdapter, Instrument, OrderRequest } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
 import { sweepLadders } from '../ladderMonitor.js';
 import { submitOrder } from '../pipeline/execute.js';
@@ -140,6 +140,75 @@ describe('read_only refusal', () => {
     expect(fake.confirmInstrument).toHaveBeenCalledWith(QQQ_CALL);
     expect(fake.getPositions).toHaveBeenCalledWith('option');
     expect(fake.getOrders).toHaveBeenCalledOnce();
+  });
+});
+
+describe('a registry over several adapters', () => {
+  const ROBINHOOD_ACCOUNT = fakeAccount('account-robinhood', USER);
+  const PAPER_ACCOUNT: AccountRow = {
+    id: 'account-paper',
+    userId: USER,
+    adapter: 'snaptrade',
+    institution: 'alpaca-paper',
+    externalAccountId: 'snaptrade-account-1',
+    label: 'Alpaca Paper',
+    isPaper: true,
+    needsReconnect: false,
+    adapterData: { connectionId: 'connection-1', institutionSlug: 'ALPACA-PAPER', maskedAccountNumber: '1234' },
+  };
+
+  function setup(mode: TradeExecutionMode): {
+    brokers: ReturnType<typeof createMcpRegistry>;
+    behind: Record<BrokerAdapter['id'], FakeBroker>;
+    opened: AccountRow[];
+  } {
+    const behind = { robinhood: makeFakeBroker(), snaptrade: makeFakeBroker() };
+    const opened: AccountRow[] = [];
+    const adapter = (id: BrokerAdapter['id']): BrokerAdapter => ({
+      id,
+      quotesOptions: id === 'robinhood',
+      open(account) {
+        opened.push(account);
+        return { session: SESSION, broker: behind[id] };
+      },
+    });
+    return { brokers: createMcpRegistry([adapter('robinhood'), adapter('snaptrade')], mode), behind, opened };
+  }
+
+  it('opens each account with the adapter its row names, once, handing it the row', () => {
+    const { brokers, behind, opened } = setup('immediate');
+
+    expect(brokers.for(ROBINHOOD_ACCOUNT)).toMatchObject({ broker: behind.robinhood, quotesOptions: true });
+    expect(brokers.for(PAPER_ACCOUNT)).toMatchObject({ broker: behind.snaptrade, quotesOptions: false });
+    expect(brokers.for(PAPER_ACCOUNT)).toBe(brokers.existing(PAPER_ACCOUNT.id));
+    expect(opened).toEqual([ROBINHOOD_ACCOUNT, PAPER_ACCOUNT]);
+  });
+
+  it('read_only refuses every write on every adapter\'s broker', async () => {
+    const { brokers, behind } = setup('read_only');
+
+    for (const account of [ROBINHOOD_ACCOUNT, PAPER_ACCOUNT]) {
+      const { broker } = brokers.for(account);
+      for (const order of WRITES) {
+        await expect(broker.placeOrder(order)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+      }
+      await expect(broker.cancelOrder(RESTING_STOP_ID)).rejects.toBeInstanceOf(BrokerWritesDisabledError);
+    }
+
+    for (const fake of Object.values(behind)) {
+      expect(fake.placeOrder).not.toHaveBeenCalled();
+      expect(fake.cancelOrder).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an account whose adapter this deployment does not have is unavailable, not opened by another', () => {
+    const robinhoodOnly = createMcpRegistry(
+      [{ id: 'robinhood', quotesOptions: true, open: () => ({ session: SESSION, broker: makeFakeBroker() }) }],
+      'immediate'
+    );
+
+    expect(() => robinhoodOnly.for(PAPER_ACCOUNT)).toThrow(BrokerUnavailableError);
+    expect(robinhoodOnly.existing(PAPER_ACCOUNT.id)).toBeUndefined();
   });
 });
 

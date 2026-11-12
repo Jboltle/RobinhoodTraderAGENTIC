@@ -10,12 +10,31 @@
  *   2. No query the request made was scoped to A's user id. This is the one
  *      that catches a route reading the right rows for the wrong reason.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Decision } from '../../shared/types.js';
+import type { Callout, CalloutParser, Decision, TradeSettings } from '../../shared/types.js';
+import { createQuoteSource } from '../broker/quotes.js';
+import { createMcpRegistry } from '../broker/registry.js';
+import type { AccountRow, BrokerAdapter } from '../broker/types.js';
 import type { StoredCallout } from '../db.js';
-import { fakeTokens } from './fakeDb.js';
-import { equityPosition, makeHarness, type Harness } from './harness.js';
+import { TraderEvents } from '../events.js';
+import {
+  BTO_QQQ_PUT,
+  TRIM_QQQ_DOUBLE,
+  envelopeFromFixture,
+} from '../pipeline/__tests__/fixtures/discordMessages.js';
+import { createMessageProcessor, type MessageProcessor } from '../pipeline/index.js';
+import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
+import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
+import {
+  equityPosition,
+  makeFakeBroker,
+  makeHarness,
+  optionPosition,
+  placedOrders,
+  type FakeBroker,
+  type Harness,
+} from './harness.js';
 
 const USER_A = { id: 'user-a', email: 'a@example.com' };
 const USER_B = { id: 'user-b', email: 'b@example.com' };
@@ -298,3 +317,376 @@ describe('user B cannot see user A', () => {
   }, 10_000);
 });
 
+
+// =============================================================================
+// Accounts of one user are as separate as two users
+//
+// The ids below are deliberately not the owner's user id: every read and write
+// has to go by account, and one that went by user would find nothing.
+// =============================================================================
+
+const OWNER = { id: 'user-owner', email: 'owner@example.com' };
+const TOKEN_OWNER = 'token-for-owner';
+const ROBINHOOD = fakeAccount('account-robinhood', OWNER.id);
+const PAPER: AccountRow = {
+  id: 'account-paper',
+  userId: OWNER.id,
+  adapter: 'snaptrade',
+  institution: 'alpaca-paper',
+  externalAccountId: 'snaptrade-account-1',
+  label: 'Alpaca Paper',
+  isPaper: true,
+  needsReconnect: false,
+  adapterData: { connectionId: 'connection-1', institutionSlug: 'ALPACA-PAPER', maskedAccountNumber: '1234' },
+};
+
+/** Auto-executing and following everyone, with the calendar guards relaxed. */
+const TRADING: TradeSettings = {
+  executionMode: 'immediate',
+  followedCallerIds: null,
+  regularHoursOnly: false,
+  cooldownSeconds: 0,
+  optionsFullPct: 10,
+  maxSingleContractPct: 10,
+};
+
+const CONTRACT = { optionType: 'call', strike: 707, expiration: '2026-06-11' } as const;
+const ENTRY_PREMIUM = 1;
+// Both fake accounts have $10,000 buying power and a contract costs $100, so
+// each account's own "small" percentage is its own contract count.
+const ROBINHOOD_SMALL_PCT = 4;
+const ROBINHOOD_CONTRACTS = 4;
+const PAPER_SMALL_PCT = 2;
+const PAPER_CONTRACTS = 2;
+
+const ENTRY_FIXTURE = {
+  ...BTO_QQQ_PUT,
+  id: 'entry-qqq-707c',
+  content: 'BTO $QQQ 707c 06/11 1.00',
+  timestamp: '2026-06-11T13:30:00.000Z',
+};
+const ENTRY_ENVELOPE = envelopeFromFixture(ENTRY_FIXTURE);
+const ENTRY_CALLOUT: Callout = {
+  ...BTO_QQQ_PUT.expectedCallout,
+  limitPrice: ENTRY_PREMIUM,
+  option: CONTRACT,
+};
+// "TRIM TRIM": sell all but one of what this Caller's entry left the account holding.
+const TRIM_ENVELOPE = envelopeFromFixture(TRIM_QQQ_DOUBLE);
+const TRIM_CALLOUT = TRIM_QQQ_DOUBLE.expectedCallout;
+
+describe('two accounts of one user', () => {
+  const READY_SESSION = {
+    isConnected: vi.fn().mockReturnValue(true),
+    ensureReady: vi.fn().mockResolvedValue(undefined),
+  } as unknown as RobinhoodMcpClient;
+
+  let db: FakeDb;
+  let events: TraderEvents;
+  let fakes: Map<string, FakeBroker>;
+  let opened: Array<{ adapter: string; accountId: string }>;
+  let processor: MessageProcessor;
+
+  /** Each account already holds what its own entry bought; only a sell reads positions. */
+  const brokerHolding = (contracts: number): FakeBroker =>
+    makeFakeBroker({
+      equityMark: 710,
+      optionMark: null,
+      positions: [optionPosition('QQQ', CONTRACT.optionType, CONTRACT.strike, CONTRACT.expiration, contracts)],
+    });
+
+  beforeEach(() => {
+    db = createFakeDb();
+    events = new TraderEvents();
+    db.addUser(OWNER, TOKEN_OWNER, ROBINHOOD.id);
+    db.addAccount(PAPER);
+    db.seedBrokerTokens(ROBINHOOD.id, fakeTokens('robinhood-token'));
+    db.seedBrokerTokens(PAPER.id, fakeTokens('paper-token'));
+    db.seedSettings(ROBINHOOD.id, { ...TRADING, optionsSmallPct: ROBINHOOD_SMALL_PCT });
+    db.seedSettings(PAPER.id, { ...TRADING, optionsSmallPct: PAPER_SMALL_PCT });
+    // The entry's author is what a later trim is matched against.
+    db.seedMessage({ messageId: ENTRY_ENVELOPE.messageId, sentAt: ENTRY_ENVELOPE.timestamp, authorId: ENTRY_ENVELOPE.authorId });
+
+    fakes = new Map([
+      [ROBINHOOD.id, brokerHolding(ROBINHOOD_CONTRACTS)],
+      [PAPER.id, brokerHolding(PAPER_CONTRACTS)],
+    ]);
+    opened = [];
+    const adapter = (id: BrokerAdapter['id'], quotesOptions: boolean): BrokerAdapter => ({
+      id,
+      quotesOptions,
+      open(account) {
+        opened.push({ adapter: id, accountId: account.id });
+        return { session: READY_SESSION, broker: fakes.get(account.id)! };
+      },
+    });
+    const brokers = createMcpRegistry([adapter('robinhood', true), adapter('snaptrade', false)], 'immediate');
+
+    const parser: CalloutParser = {
+      parse: vi.fn(async (envelope) =>
+        envelope.messageId === ENTRY_ENVELOPE.messageId ? ENTRY_CALLOUT : TRIM_CALLOUT
+      ),
+    };
+    processor = createMessageProcessor({
+      parser,
+      db,
+      events,
+      brokers,
+      quotes: createQuoteSource({ db, brokers }),
+      executionMode: 'immediate',
+    });
+  });
+
+  const decisionFor = async (accountId: string, messageId: string): Promise<Decision | undefined> =>
+    (await db.decisionsByMessageId(accountId, [messageId])).get(messageId);
+
+  /** What the fill monitor writes once the broker reports the buy filled. */
+  const fillEntry = async (accountId: string): Promise<void> => {
+    const { order } = (await decisionFor(accountId, ENTRY_ENVELOPE.messageId))!;
+    await db.updateOrder(accountId, ENTRY_ENVELOPE.messageId, {
+      ...order!,
+      status: 'filled',
+      filledQuantity: order!.quantity,
+      averageFillPrice: ENTRY_PREMIUM,
+    });
+  };
+
+  it('both take the same callout, each sized by its own settings on its own broker', async () => {
+    await processor.process(ENTRY_ENVELOPE);
+
+    const onRobinhood = await decisionFor(ROBINHOOD.id, ENTRY_ENVELOPE.messageId);
+    const onPaper = await decisionFor(PAPER.id, ENTRY_ENVELOPE.messageId);
+    expect(onRobinhood).toMatchObject({ kind: 'submitted', order: { side: 'buy', quantity: ROBINHOOD_CONTRACTS } });
+    expect(onPaper).toMatchObject({ kind: 'submitted', order: { side: 'buy', quantity: PAPER_CONTRACTS } });
+
+    expect(placedOrders(fakes.get(ROBINHOOD.id)!, 'option')).toMatchObject([
+      { side: 'buy', quantity: ROBINHOOD_CONTRACTS, limitPrice: ENTRY_PREMIUM },
+    ]);
+    expect(placedOrders(fakes.get(PAPER.id)!, 'option')).toMatchObject([
+      { side: 'buy', quantity: PAPER_CONTRACTS, limitPrice: ENTRY_PREMIUM },
+    ]);
+    // Each account was opened once, by the adapter its row names.
+    expect(opened).toEqual(
+      expect.arrayContaining([
+        { adapter: 'robinhood', accountId: ROBINHOOD.id },
+        { adapter: 'snaptrade', accountId: PAPER.id },
+      ])
+    );
+    expect(opened).toHaveLength(2);
+    // Nothing was read or written under the owner's user id.
+    expect(db.calls.map((call) => call.scopeId)).not.toContain(OWNER.id);
+  });
+
+  it('a trim sells only that account\'s own lot', async () => {
+    await processor.process(ENTRY_ENVELOPE);
+    await fillEntry(ROBINHOOD.id);
+    await fillEntry(PAPER.id);
+    expect((await db.listOpenOptionLots(ROBINHOOD.id)).map((lot) => lot.openQty)).toEqual([ROBINHOOD_CONTRACTS]);
+    expect((await db.listOpenOptionLots(PAPER.id)).map((lot) => lot.openQty)).toEqual([PAPER_CONTRACTS]);
+
+    await processor.process(TRIM_ENVELOPE);
+
+    const robinhoodSell = await decisionFor(ROBINHOOD.id, TRIM_ENVELOPE.messageId);
+    const paperSell = await decisionFor(PAPER.id, TRIM_ENVELOPE.messageId);
+    expect(robinhoodSell).toMatchObject({
+      kind: 'submitted',
+      order: { side: 'sell', quantity: ROBINHOOD_CONTRACTS - 1, lots: [{ quantity: ROBINHOOD_CONTRACTS - 1 }] },
+    });
+    expect(paperSell).toMatchObject({
+      kind: 'submitted',
+      order: { side: 'sell', quantity: PAPER_CONTRACTS - 1, lots: [{ quantity: PAPER_CONTRACTS - 1 }] },
+    });
+
+    const sells = (accountId: string): number[] =>
+      placedOrders(fakes.get(accountId)!, 'option')
+        .filter((order) => order.side === 'sell')
+        .map((order) => order.quantity);
+    expect(sells(ROBINHOOD.id)).toEqual([ROBINHOOD_CONTRACTS - 1]);
+    expect(sells(PAPER.id)).toEqual([PAPER_CONTRACTS - 1]);
+    // One runner left on each, counted from that account's own ledger.
+    expect((await db.listOpenOptionLots(ROBINHOOD.id)).map((lot) => lot.openQty)).toEqual([1]);
+    expect((await db.listOpenOptionLots(PAPER.id)).map((lot) => lot.openQty)).toEqual([1]);
+  });
+
+  it('an account that never took the entry sells nothing on the exit', async () => {
+    // Paper stops following before the entry, so only Robinhood buys.
+    db.seedSettings(PAPER.id, { ...TRADING, followedCallerIds: [] });
+    await processor.process(ENTRY_ENVELOPE);
+    await fillEntry(ROBINHOOD.id);
+    expect(await decisionFor(PAPER.id, ENTRY_ENVELOPE.messageId)).toBeUndefined();
+
+    // It follows again by the time of the trim, and holds the same contract
+    // at its broker from elsewhere: the Caller's exit still has no lot of
+    // theirs to sell there.
+    db.seedSettings(PAPER.id, { ...TRADING });
+    db.seedMessage({ messageId: 'paper-own-buy', sentAt: ENTRY_ENVELOPE.timestamp, authorId: 'another-caller' });
+    db.seedDecision(PAPER.id, {
+      at: ENTRY_ENVELOPE.timestamp,
+      messageId: 'paper-own-buy',
+      kind: 'submitted',
+      code: null,
+      reason: 'filled',
+      ticker: 'QQQ',
+      action: 'buy',
+      order: {
+        symbol: 'QQQ',
+        side: 'buy',
+        assetType: 'option',
+        quantity: PAPER_CONTRACTS,
+        orderType: 'limit',
+        limitPrice: ENTRY_PREMIUM,
+        option: CONTRACT,
+        orderId: 'paper-own-buy',
+        status: 'filled',
+        filledQuantity: PAPER_CONTRACTS,
+        averageFillPrice: ENTRY_PREMIUM,
+      },
+    });
+
+    await processor.process(TRIM_ENVELOPE);
+
+    expect(await decisionFor(ROBINHOOD.id, TRIM_ENVELOPE.messageId)).toMatchObject({
+      kind: 'submitted',
+      order: { side: 'sell', quantity: ROBINHOOD_CONTRACTS - 1 },
+    });
+    expect(await decisionFor(PAPER.id, TRIM_ENVELOPE.messageId)).toMatchObject({ kind: 'risk_rejected' });
+    expect(placedOrders(fakes.get(PAPER.id)!, 'option')).toHaveLength(0);
+    expect((await db.listOpenOptionLots(PAPER.id)).map((lot) => lot.openQty)).toEqual([PAPER_CONTRACTS]);
+  });
+
+  it('the daily trade cap counts each account on its own', async () => {
+    db.seedSettings(ROBINHOOD.id, { ...TRADING, maxTradesPerDay: 1 });
+    db.seedSettings(PAPER.id, { ...TRADING, maxTradesPerDay: 1 });
+    db.seedDecision(ROBINHOOD.id, {
+      at: new Date().toISOString(),
+      messageId: 'earlier-today',
+      kind: 'submitted',
+      code: null,
+      reason: 'earlier trade',
+      ticker: 'SPY',
+      action: 'buy',
+      order: null,
+    });
+
+    await processor.process(ENTRY_ENVELOPE);
+
+    expect(await decisionFor(ROBINHOOD.id, ENTRY_ENVELOPE.messageId)).toMatchObject({
+      kind: 'risk_rejected',
+      code: 'daily_cap_reached',
+    });
+    expect(await decisionFor(PAPER.id, ENTRY_ENVELOPE.messageId)).toMatchObject({ kind: 'submitted' });
+  });
+
+  it('live events reach only the account they belong to', async () => {
+    const heard: string[] = [];
+    events.subscribe(ROBINHOOD.id, { onDecision: () => heard.push('robinhood') });
+    events.subscribe(PAPER.id, { onDecision: () => heard.push('paper') });
+    events.subscribe(OWNER.id, { onDecision: () => heard.push('owner user id') });
+    db.seedSettings(PAPER.id, { ...TRADING, followedCallerIds: [] });
+
+    await processor.process(ENTRY_ENVELOPE);
+
+    expect(heard).toEqual(['robinhood']);
+  });
+});
+
+describe('routes act on the selected account, never on the user id', () => {
+  const ROBINHOOD_TRADE: Decision = { ...A_TRADE, messageId: 'msg-shared' };
+  const PAPER_TRADE: Decision = {
+    ...A_TRADE,
+    reason: 'Bought 3 TSLA on the paper account, order paper-secret-order.',
+    ticker: 'TSLA',
+    order: { ...A_TRADE.order!, symbol: 'TSLA', quantity: 3, orderId: 'paper-secret-order' },
+  };
+  const PAPER_FINGERPRINTS = ['paper-secret-order', 'TSLA'];
+
+  let harness: Harness;
+
+  beforeEach(() => {
+    harness = makeHarness();
+    harness.db.addUser(OWNER, TOKEN_OWNER, ROBINHOOD.id);
+    harness.db.addAccount(PAPER);
+    harness.db.seedBrokerTokens(ROBINHOOD.id, fakeTokens('robinhood-token'));
+    harness.db.seedSettings(ROBINHOOD.id, { maxTradesPerDay: 4 });
+    harness.db.seedSettings(PAPER.id, { maxTradesPerDay: 7 });
+    harness.db.seedDecision(ROBINHOOD.id, ROBINHOOD_TRADE);
+    harness.db.seedDecision(ROBINHOOD.id, A_PENDING);
+    harness.db.seedDecision(PAPER.id, PAPER_TRADE);
+    harness.db.seedCallout(SHARED_CALLOUT);
+    harness.configureBroker(ROBINHOOD.id, { connected: true, positions: [equityPosition('NVDA', 7)] });
+  });
+
+  for (const request of B_REQUESTS) {
+    it(`${request.name} is scoped to the selected account`, async () => {
+      harness.db.calls.length = 0;
+
+      const response = await harness.as(TOKEN_OWNER, {
+        method: request.method,
+        url: request.url,
+        ...(request.payload
+          ? {
+              headers: { 'content-type': 'application/json' },
+              payload: JSON.stringify(request.payload),
+            }
+          : {}),
+      });
+
+      expect(response.statusCode).toBeLessThan(500);
+      for (const fingerprint of PAPER_FINGERPRINTS) {
+        expect(response.body).not.toContain(fingerprint);
+      }
+      for (const call of harness.db.calls) {
+        expect(call.scopeId).toBe(ROBINHOOD.id);
+      }
+    });
+  }
+
+  it('reads the selected account\'s settings and trades, and the other one\'s once that is selected', async () => {
+    const settings = async (): Promise<number> =>
+      (
+        (await harness.as(TOKEN_OWNER, { method: 'GET', url: '/api/settings' })).json() as {
+          settings: { maxTradesPerDay: number };
+        }
+      ).settings.maxTradesPerDay;
+    const orderIds = async (): Promise<Array<string | null | undefined>> =>
+      (
+        (await harness.as(TOKEN_OWNER, { method: 'GET', url: '/api/decisions' })).json() as {
+          decisions: Decision[];
+        }
+      ).decisions.map((decision) => decision.order?.orderId);
+
+    expect(await settings()).toBe(4);
+    expect(await orderIds()).toEqual([null, 'a-secret-order']);
+
+    harness.db.addAccount(PAPER, { select: true });
+
+    expect(await settings()).toBe(7);
+    expect(await orderIds()).toEqual(['paper-secret-order']);
+  });
+
+  it('a settings save lands on the selected account only', async () => {
+    await harness.as(TOKEN_OWNER, {
+      method: 'PUT',
+      url: '/api/settings',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ maxTradesPerDay: 2 }),
+    });
+
+    expect((await harness.db.getSettings(ROBINHOOD.id)).maxTradesPerDay).toBe(2);
+    expect((await harness.db.getSettings(PAPER.id)).maxTradesPerDay).toBe(7);
+  });
+
+  it('approving submits on the selected account\'s broker', async () => {
+    const response = await harness.as(TOKEN_OWNER, {
+      method: 'POST',
+      url: '/api/trades/msg-pending/approve',
+      headers: { 'content-type': 'application/json' },
+      payload: '{}',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(placedOrders(harness.fakeBroker(ROBINHOOD.id), 'equity')).toHaveLength(1);
+    expect((await harness.db.decisionsByMessageId(ROBINHOOD.id, ['msg-pending'])).get('msg-pending')?.kind).toBe('submitted');
+    expect((await harness.db.decisionsByMessageId(PAPER.id, ['msg-pending'])).size).toBe(0);
+  });
+});

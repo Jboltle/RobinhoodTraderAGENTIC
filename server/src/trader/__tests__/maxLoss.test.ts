@@ -16,7 +16,7 @@ import {
 } from '../maxLoss.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
-import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
+import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import {
   equityPosition,
   makeFakeBroker,
@@ -503,6 +503,61 @@ describe('sweepMaxLoss entry history', () => {
     await sweepMaxLoss(deps, flattening, entries);
     expect(listDecisions).toHaveBeenCalledTimes(2);
     expect(placedOrders(broker, 'option')).toHaveLength(1);
+  });
+});
+
+describe('sweepMaxLoss across two accounts of one user', () => {
+  const OWNER = 'user-owner';
+  const PROTECTED = fakeAccount('account-protected', OWNER);
+  const UNPROTECTED = fakeAccount('account-unprotected', OWNER);
+  const CALL = { optionType: 'call', strike: 707, expiration: '2026-06-11' } as const;
+
+  it('sells only on the account whose own setting is breached, and records it there', async () => {
+    const db = createFakeDb();
+    db.addAccount(PROTECTED);
+    db.addAccount(UNPROTECTED);
+    const brokers = new Map(
+      [PROTECTED, UNPROTECTED].map((account) => {
+        db.seedBrokerTokens(account.id, fakeTokens('tok'));
+        db.seedDecision(account.id, submittedBuy('QQQ', 1.5, CALL));
+        const broker = makeFakeBroker({
+          positions: [optionPosition('QQQ', CALL.optionType, CALL.strike, CALL.expiration, 2)],
+          optionMark: 0.75,
+        });
+        return [account.id, broker] as const;
+      })
+    );
+    db.seedSettings(PROTECTED.id, TradeSettingsSchema.parse({ maxLossPct: 50 }));
+    db.seedSettings(UNPROTECTED.id, TradeSettingsSchema.parse({ maxLossPct: null }));
+    const session = {
+      isConnected: vi.fn().mockReturnValue(true),
+      ensureReady: vi.fn().mockResolvedValue(undefined),
+    } as unknown as RobinhoodMcpClient;
+    const enqueue = vi.fn(<T,>(_accountId: string, run: () => Promise<T>) => run());
+
+    await sweepMaxLoss(
+      {
+        db,
+        brokers: makeFakeRegistry((accountId) => ({ session, broker: brokers.get(accountId)! })),
+        events: new TraderEvents(),
+        enqueue: enqueue as MaxLossDeps['enqueue'],
+        now: () => RTH,
+      },
+      new Map()
+    );
+
+    expect(placedOrders(brokers.get(PROTECTED.id)!, 'option')).toMatchObject([{ side: 'sell', quantity: 2, type: 'market' }]);
+    expect(placedOrders(brokers.get(UNPROTECTED.id)!, 'option')).toHaveLength(0);
+
+    const exits = (await db.listDecisions(PROTECTED.id, 10)).filter((d) => d.kind === 'max_loss_exit');
+    expect(exits).toHaveLength(1);
+    // The exit's synthetic message id names the owner, exactly as it did
+    // before accounts existed; the row itself belongs to the account.
+    expect(exits[0]!.messageId).toBe(`max-loss:${OWNER}:opt:QQQ:call:707:2026-06-11:${RTH.getTime()}`);
+    expect((await db.listDecisions(UNPROTECTED.id, 10)).some((d) => d.kind === 'max_loss_exit')).toBe(false);
+    expect(await db.listDecisions(OWNER, 10)).toEqual([]);
+    // Each scan runs on its own account's queue, the one its callouts use.
+    expect(enqueue.mock.calls.map(([accountId]) => accountId)).toEqual([PROTECTED.id, UNPROTECTED.id]);
   });
 });
 

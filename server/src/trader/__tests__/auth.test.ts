@@ -112,6 +112,21 @@ describe('POST /api/auth/login', () => {
     expect(await harness.db.findUserByEmail('invited@example.com')).toEqual(account);
   });
 
+  it('gives an invited email its own account at first sign-in, with the default settings', async () => {
+    harness.db.allowEmail('invited@example.com');
+    const { token } = (await signIn({ email: 'invited@example.com' })).json() as { token: string };
+    const invited = (await harness.db.findUserByEmail('invited@example.com'))!;
+
+    const account = await harness.db.getSelectedAccount(invited.id);
+    expect(account).toMatchObject({ userId: invited.id, adapter: 'robinhood', institution: 'robinhood' });
+
+    const settings = await harness.as(token, { method: 'GET', url: '/api/settings' });
+    expect(settings.statusCode).toBe(200);
+    expect(settings.json()).toMatchObject({ settings: { executionMode: 'approval', followedCallerIds: [] } });
+    const status = await harness.as(token, { method: 'GET', url: '/api/broker/status' });
+    expect(status.json()).toMatchObject({ connected: false });
+  });
+
   it('refuses an email that is neither an account nor invited, and creates nothing', async () => {
     const response = await signIn({ email: 'stranger@example.com' });
     expect(response.statusCode).toBe(403);
