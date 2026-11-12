@@ -726,32 +726,41 @@ async function entryMismatchReason(
   const cached = entryVerdicts.get(cacheKey);
   if (cached !== undefined) return cached;
 
+  // Read live, not from the quote source's cache: this price decides whether
+  // the entry is placed or held for approval. Both picks sit outside any try:
+  // the quote source passes over a session that fails, so a pick that rejects
+  // is the account listing failing. That fails the message, not the check:
+  // nothing is written for it yet, and the poller retries it on its next tick.
+  const first = await deps.quotes.broker();
+  if (first === null) return null;
+
   let reason: string | null;
   try {
-    // Read live, not from the quote source's cache: this price decides whether
-    // the entry is placed or held for approval. Picked inside the try: a
-    // session that fails in a way of its own skips the check, not the message.
-    const first = await deps.quotes.broker();
-    if (first === null) return null;
-    try {
-      reason = await entryMismatchOn(first, ticker, option, callout.limitPrice);
-    } catch (err) {
-      if (!(err instanceof BrokerUnavailableError)) throw err;
-      // That session was ready and then failed a call: its login was revoked
-      // under it. Another account's may be healthy, so pick again without it.
-      // Once only: the pick can wait a ready timeout, and exits queue behind
-      // this check.
-      const second = await deps.quotes.broker(first);
-      if (second === null) return null;
-      reason = await entryMismatchOn(second, ticker, option, callout.limitPrice);
-    }
+    reason = await entryMismatchOn(first, ticker, option, callout.limitPrice);
   } catch (err: unknown) {
-    if (err instanceof BrokerUnavailableError) return null;
-    log.warn('entry check skipped', { messageId, error: errMsg(err) });
-    return null;
+    if (!(err instanceof BrokerUnavailableError)) return entryUnchecked(messageId, err);
+    // That session was ready and then failed a call: its login was revoked
+    // under it. Another account's may be healthy, so pick again without it.
+    // Once only: the pick can wait a ready timeout, and exits queue behind
+    // this check.
+    const second = await deps.quotes.broker(first);
+    if (second === null) return null;
+    try {
+      reason = await entryMismatchOn(second, ticker, option, callout.limitPrice);
+    } catch (retryErr: unknown) {
+      return entryUnchecked(messageId, retryErr);
+    }
   }
   entryVerdicts.set(cacheKey, reason);
   return reason;
+}
+
+/** A session could not answer the check, so the entry goes unchecked. A dead session is routine; anything else is logged. */
+function entryUnchecked(messageId: string, err: unknown): null {
+  if (!(err instanceof BrokerUnavailableError)) {
+    log.warn('entry check skipped', { messageId, error: errMsg(err) });
+  }
+  return null;
 }
 
 /** One pass of the entry check through one session's broker; rejects when that session cannot answer. */

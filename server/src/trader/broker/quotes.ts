@@ -6,12 +6,15 @@
  *
  * This is the swap point for a market-data feed later.
  */
+import { createLogger, errorFields } from '../../shared/logger.js';
 import type { TraderDb } from '../db.js';
 import { BrokerUnavailableError } from './errors.js';
 import { instrumentKey } from './instrument.js';
 import { READY_TIMEOUT_MS } from '../robinhood/mcpClient.js';
 import type { McpRegistry } from './registry.js';
 import type { Broker, Instrument } from './types.js';
+
+const log = createLogger('trader:quotes');
 
 /** How long getMark keeps serving a price before asking the broker again. */
 export const MARK_CACHE_MS = 15_000;
@@ -26,7 +29,9 @@ export interface QuoteSource {
    * The first connected account's ready session whose broker quotes options,
    * the last one that worked first. Null when there is none. A session that
    * needs consent is skipped, not started: reaching for a disconnected
-   * account's broker would begin an OAuth flow nobody asked for.
+   * account's broker would begin an OAuth flow nobody asked for. A session
+   * that fails any other way is passed over too; the pick rejects only when
+   * the account listing itself does.
    *
    * Reads through it are live; whatever decides an order reads here.
    *
@@ -78,8 +83,13 @@ export function createQuoteSource(
         await candidate.session.ensureReady(Math.max(0, deadline - Date.now()));
         state.preferredAccountId = account.id;
         return candidate.broker;
-      } catch (err) {
-        if (!(err instanceof BrokerUnavailableError)) throw err;
+      } catch (err: unknown) {
+        // Whatever a session fails with is that session's own: it is passed
+        // over, and the next account's may be healthy. Only the account
+        // listing above fails the pick itself.
+        if (!(err instanceof BrokerUnavailableError)) {
+          log.warn('quote session passed over', { accountId: account.id, ...errorFields(err) });
+        }
       }
     }
     state.preferredAccountId = null;

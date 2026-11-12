@@ -135,6 +135,36 @@ describe('quote source: which session is asked', () => {
     expect(dead.session.ensureReady).toHaveBeenCalledOnce();
   });
 
+  it('passes over a session that fails in a way of its own, opening or readying, and asks the next', async () => {
+    const exploding: Session = {
+      session: {
+        ensureReady: vi.fn().mockRejectedValue(new Error('adapter session exploded')),
+      } as unknown as RobinhoodMcpClient,
+      broker: makeFakeBroker(),
+    };
+    const live = readySession();
+    const db = createFakeDb();
+    for (const accountId of ['u1', 'u2', 'u3']) db.seedBrokerTokens(accountId, fakeTokens(accountId));
+    const brokers = makeFakeRegistry((accountId) => {
+      if (accountId === 'u1') throw new Error('adapter could not open the session');
+      return accountId === 'u2' ? exploding : live;
+    });
+
+    expect(await createQuoteSource({ db, brokers }).broker()).toBe(live.broker);
+    expect(exploding.session.ensureReady).toHaveBeenCalledOnce();
+  });
+
+  it('rejects when the account listing fails: that is the database, not a session', async () => {
+    const db = {
+      listConnectedAccounts: vi.fn().mockRejectedValue(new Error('Connection terminated unexpectedly')),
+    };
+    const brokers = makeFakeRegistry(() => readySession());
+
+    await expect(createQuoteSource({ db, brokers }).broker()).rejects.toThrow(
+      'Connection terminated unexpectedly'
+    );
+  });
+
   it('leaves out the session behind a broker the caller watched fail', async () => {
     const failed = readySession();
     const next = readySession();

@@ -32,6 +32,7 @@ import {
 } from '../../broker/errors.js';
 import { createQuoteSource } from '../../broker/quotes.js';
 import { guardWrites } from '../../broker/writeGuard.js';
+import { drainOnce } from '../../poller.js';
 import type { RobinhoodMcpClient } from '../../robinhood/mcpClient.js';
 import { JevCalloutDecider } from '../decide.js';
 import { contractsForPortion, submitOrder } from '../execute.js';
@@ -996,6 +997,171 @@ describe('fan-out — which session checks the entry', () => {
     expect(markReads(third.broker, 'equity')).toHaveLength(0);
     const [decision] = await db.listDecisions('user-3', 10);
     expect(decision!.kind).toBe('submitted');
+  });
+
+  // A dead session is the only failure worth a second pick. Whatever else a
+  // read fails with is answered on that one session, as before the retry
+  // existed: the first account's broker sees these calls and no other does.
+  it.each([
+    {
+      failure: 'the spot read fails in transit',
+      ticker: 'MMETA',
+      failing: {
+        equityMark: () => {
+          throw new Error('fetch failed');
+        },
+      },
+      asked: ['getMark', 'confirmInstrument', 'getMark'],
+      outcome: { kind: 'submitted' },
+    },
+    {
+      failure: 'the contract lookup fails in transit',
+      ticker: 'MNFLX',
+      failing: {
+        overrides: { confirmInstrument: vi.fn().mockRejectedValue(new Error('MCP transport closed')) },
+      },
+      asked: ['getMark', 'confirmInstrument'],
+      outcome: { kind: 'submitted' },
+    },
+    {
+      failure: 'the contract is not on the chain',
+      ticker: 'MORCL',
+      failing: {
+        overrides: {
+          confirmInstrument: vi
+            .fn()
+            .mockRejectedValue(new SymbolNotFoundError('no option instrument matched MORCL')),
+        },
+      },
+      asked: ['getMark', 'confirmInstrument'],
+      outcome: { kind: 'pending_approval', code: 'price_mismatch' },
+    },
+    {
+      // The strike was already read against spot (150), and that verdict stands.
+      failure: 'the mark read fails in transit',
+      ticker: 'MADBE',
+      failing: {
+        optionMark: () => {
+          throw new Error('fetch failed');
+        },
+      },
+      asked: ['getMark', 'confirmInstrument', 'getMark'],
+      outcome: { kind: 'pending_approval' },
+    },
+  ] satisfies ReadonlyArray<{
+    failure: string;
+    ticker: string;
+    failing: FakeBrokerOptions;
+    asked: string[];
+    outcome: Partial<Decision>;
+  }>)('does not pick another session when $failure', async ({ ticker, failing, asked, outcome }) => {
+    const first = readySession(makeBroker(failing));
+    const second = readySession(makeBroker());
+    const { db, deps, pick } = setupSessions(entryOn(ticker), {
+      [USER]: first,
+      [OTHER_USER]: second,
+    });
+    // The first account follows nobody, so every call on its broker is the check's.
+    db.seedSettings(USER, { ...TRADING_SETTINGS, followedCallerIds: [] });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(BTO_QQQ_PUT));
+
+    expect(pick).toHaveBeenCalledOnce();
+    expect(second.session.ensureReady).not.toHaveBeenCalled();
+    expect(markReads(second.broker, 'equity')).toHaveLength(0);
+    expect(callsInOrder(first.broker).map(([method]) => method)).toEqual(asked);
+    const [decision] = await db.listDecisions(OTHER_USER, 10);
+    expect(decision).toMatchObject(outcome);
+  });
+
+  describe('when the quote source cannot list the accounts', () => {
+    const LISTING_FAILED = 'Connection terminated unexpectedly';
+    const envelope = envelopeFromFixture(BTO_QQQ_PUT);
+
+    /**
+     * The message as a row the poller drains, checked through a quote source
+     * whose account listing fails on its `failingCall`th call and never again.
+     */
+    function setupDrain(callout: Callout, sessions: Record<string, CheckSession>, failingCall: number) {
+      const { db, deps } = setupSessions(callout, sessions);
+      let listings = 0;
+      const quotes = createQuoteSource({
+        db: {
+          listConnectedAccounts: async () => {
+            listings += 1;
+            if (listings === failingCall) throw new Error(LISTING_FAILED);
+            return db.listConnectedAccounts();
+          },
+        },
+        brokers: deps.brokers,
+      });
+      const processor = createMessageProcessor({ ...deps, quotes });
+      db.seedMessage({
+        messageId: envelope.messageId,
+        sentAt: envelope.timestamp,
+        channelId: envelope.channelId,
+        authorId: envelope.authorId,
+        authorName: envelope.authorName,
+        content: envelope.content,
+      });
+      const drain = (): Promise<number> =>
+        drainOnce({ db, processor, recapChannelIds: [], now: () => new Date(envelope.timestamp) });
+      return { db, drain };
+    }
+
+    /** The failed attempt left the row as it found it, so the retry cannot double anything. */
+    async function expectNothingWritten(db: FakeDb, sessions: Record<string, CheckSession>): Promise<void> {
+      expect(db.getMessage(envelope.messageId)).toMatchObject({
+        disposition: null,
+        parse: null,
+        processedAt: null,
+      });
+      expect(db.getTracked(envelope.messageId)).toBeNull();
+      for (const [userId, { broker }] of Object.entries(sessions)) {
+        expect(await db.listDecisions(userId, 10)).toEqual([]);
+        expect(placedOrders(broker, 'option')).toHaveLength(0);
+      }
+    }
+
+    /** The next drain checked the same message and held it: one row per account, no order. */
+    async function expectHeldOnRetry(
+      db: FakeDb,
+      sessions: Record<string, CheckSession>,
+      mismatch: RegExp
+    ): Promise<void> {
+      expect(db.getMessage(envelope.messageId)?.processedAt).not.toBeNull();
+      for (const [userId, { broker }] of Object.entries(sessions)) {
+        const decisions = await db.listDecisions(userId, 10);
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]!.kind).toBe('pending_approval');
+        expect(decisions[0]!.reason).toMatch(mismatch);
+        expect(placedOrders(broker, 'option')).toHaveLength(0);
+      }
+    }
+
+    it('fails the message when the first pick cannot list them, and holds the mismatching entry on the next drain', async () => {
+      const sessions = { [USER]: readySession(makeBroker()) };
+      const { db, drain } = setupDrain(entryOn('MCRM'), sessions, 1);
+
+      await expect(drain()).rejects.toThrow(LISTING_FAILED);
+      await expectNothingWritten(db, sessions);
+
+      expect(await drain()).toBe(1);
+      await expectHeldOnRetry(db, sessions, /caller 710 strike, MCRM at 150\.00/);
+      expect(await drain()).toBe(0);
+    });
+
+    it('fails the message when the retry pick cannot list them, and holds the mismatching entry on the next drain', async () => {
+      const sessions = { [USER]: sessionDyingMidCheck(), [OTHER_USER]: readySession(makeBroker()) };
+      const { db, drain } = setupDrain(entryOn('MINTC'), sessions, 2);
+
+      await expect(drain()).rejects.toThrow(LISTING_FAILED);
+      await expectNothingWritten(db, sessions);
+
+      expect(await drain()).toBe(1);
+      await expectHeldOnRetry(db, sessions, /caller 710 strike, MINTC at 150\.00/);
+      expect(await drain()).toBe(0);
+    });
   });
 });
 
