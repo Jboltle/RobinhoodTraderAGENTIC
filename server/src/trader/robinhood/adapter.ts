@@ -7,7 +7,7 @@ export function createRobinhoodAdapter(db: BrokerTokenStore): BrokerAdapter {
   return {
     open(userId) {
       const mcp = new RobinhoodMcpClient({ userId, db });
-      return { mcp, tools: new RobinhoodTools(mcp) };
+      return { session: mcp, broker: new RobinhoodTools(mcp) };
     },
   };
 }

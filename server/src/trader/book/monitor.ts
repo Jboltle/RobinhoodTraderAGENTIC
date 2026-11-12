@@ -127,9 +127,9 @@ async function quoteSession(
   for (const userId of ordered) {
     const broker = deps.brokers.for(userId);
     try {
-      await broker.mcp.ensureReady();
+      await broker.session.ensureReady();
       state.preferredUserId = userId;
-      return broker.tools;
+      return broker.broker;
     } catch (err) {
       if (!(err instanceof BrokerUnavailableError)) throw err;
     }

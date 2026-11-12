@@ -31,7 +31,7 @@ function makeBroker(options: StubOptions = {}): UserBroker {
       .fn()
       .mockResolvedValue(options.markPrice === null ? null : { markPrice: options.markPrice ?? 0.8 }),
   } as unknown as RobinhoodTools;
-  return { mcp, tools };
+  return { session: mcp, broker: tools };
 }
 
 function makeDeps(
@@ -74,7 +74,7 @@ describe('sweepBook', () => {
     const result = await sweepBook(deps);
 
     expect(result).toEqual({ open: 2, marked: 2, settled: 0 });
-    expect(broker.tools.getOptionsMarkPrice).toHaveBeenCalledTimes(2);
+    expect(broker.broker.getOptionsMarkPrice).toHaveBeenCalledTimes(2);
     expect(db.getTracked('m-1')!.lastMark).toBe(0.8);
     expect(db.getTracked('m-1')!.highestPct).toBeCloseTo(60);
     expect(db.getTracked('m-1')!.fills).toHaveLength(2);
@@ -92,8 +92,8 @@ describe('sweepBook', () => {
 
     await sweepBook(makeDeps(db, { u1: dead, u2: live }, RTH), state);
 
-    expect(dead.tools.getOptionsMarkPrice).not.toHaveBeenCalled();
-    expect(live.tools.getOptionsMarkPrice).toHaveBeenCalledTimes(1);
+    expect(dead.broker.getOptionsMarkPrice).not.toHaveBeenCalled();
+    expect(live.broker.getOptionsMarkPrice).toHaveBeenCalledTimes(1);
     expect(state.preferredUserId).toBe('u2');
   });
 
@@ -126,7 +126,7 @@ describe('sweepBook', () => {
       closedAt: '2026-10-17T20:00:00.000Z',
     });
     expect(db.getTracked('live')!.closedAt).toBeNull();
-    expect(broker.mcp.ensureReady).not.toHaveBeenCalled();
+    expect(broker.session.ensureReady).not.toHaveBeenCalled();
   });
 
   it('does nothing with an empty book', async () => {
@@ -135,6 +135,6 @@ describe('sweepBook', () => {
     const broker = makeBroker();
 
     expect(await sweepBook(makeDeps(db, { u1: broker }, RTH))).toEqual({ open: 0, marked: 0, settled: 0 });
-    expect(broker.mcp.ensureReady).not.toHaveBeenCalled();
+    expect(broker.session.ensureReady).not.toHaveBeenCalled();
   });
 });

@@ -146,13 +146,13 @@ async function scanUser(
   // Reconnect from stored tokens so a dropped session does not silently turn
   // Max Loss off; a session that needs OAuth consent is skipped this sweep.
   try {
-    await broker.mcp.ensureReady();
+    await broker.session.ensureReady();
   } catch (err) {
     if (err instanceof BrokerUnavailableError) return null;
     throw err;
   }
 
-  const tools = broker.tools;
+  const tools = broker.broker;
   const [equity, options] = await Promise.all([tools.getPositions(), tools.getOptionPositions()]);
   const held = new Set([
     ...equity.positions.filter((p) => p.quantity > 0).map((p) => positionKey('equity', p.symbol)),

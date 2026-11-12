@@ -116,11 +116,11 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
     for (const userId of await deps.db.listBrokerUserIds()) {
       try {
         const broker = deps.brokers.for(userId);
-        await broker.mcp.ensureReady();
+        await broker.session.ensureReady();
         await restMissingStops({
           userId,
           db: deps.db,
-          tools: broker.tools,
+          tools: broker.broker,
           executionMode: deps.executionMode,
         });
       } catch (err: unknown) {
@@ -145,13 +145,13 @@ async function syncUser(
   // A session that needs consent is skipped this sweep; the rows stay open
   // and are picked up once the user reconnects.
   try {
-    await broker.mcp.ensureReady();
+    await broker.session.ensureReady();
   } catch (err) {
     if (err instanceof BrokerUnavailableError) return 0;
     throw err;
   }
 
-  const history = await broker.tools.getOptionOrders();
+  const history = await broker.broker.getOptionOrders();
   if (history === null) return 0;
   const byId = new Map<string, OptionOrder>();
   for (const order of history.orders) {

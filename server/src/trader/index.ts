@@ -66,7 +66,7 @@ async function main(): Promise<void> {
     for (const userId of userIds) {
       void brokers
         .for(userId)
-        .mcp.ensureConnected()
+        .session.ensureConnected()
         .catch((err: unknown) =>
           log.warn('could not restore Robinhood session', { userId, error: (err as Error).message })
         );

@@ -148,7 +148,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const tokenState = await connections.state(userId);
     return reply.send({
       connected: tokenState === 'valid' || tokenState === 'refreshable',
-      authUrl: deps.brokers.existing(userId)?.mcp.getPendingAuthUrl() ?? null,
+      authUrl: deps.brokers.existing(userId)?.session.getPendingAuthUrl() ?? null,
       tokenState,
       executionMode: (await deps.db.getSettings(userId)).executionMode,
     });
@@ -174,14 +174,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (parsed.data.force === true) deps.brokers.drop(userId);
     connections.invalidate(userId);
     const broker = deps.brokers.for(userId);
-    if (broker.mcp.isConnected()) {
+    if (broker.session.isConnected()) {
       return reply.send({ connected: true, authUrl: null });
     }
 
     // ensureConnected only resolves once the whole OAuth dance finishes, which
     // needs the paste this endpoint's caller hasn't made yet — so kick it off
     // and wait only for the authorization URL it produces on the way.
-    void broker.mcp.ensureConnected().catch((err: unknown) =>
+    void broker.session.ensureConnected().catch((err: unknown) =>
       log.warn('Robinhood connect failed', { userId, error: (err as Error).message })
     );
 
@@ -214,10 +214,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.status(400).send({ error: 'redirectUrl has no code parameter' });
     }
     const broker = deps.brokers.existing(userId);
-    if (!broker || !broker.mcp.isAuthPending()) {
+    if (!broker || !broker.session.isAuthPending()) {
       return reply.status(409).send({ error: 'no OAuth authorization is pending' });
     }
-    broker.mcp.submitAuthCode(code, url.searchParams.get('state'));
+    broker.session.submitAuthCode(code, url.searchParams.get('state'));
     // Token exchange happens asynchronously inside the pending connect();
     // the client polls /api/broker/status until `connected` flips.
     return reply.send({ ok: true });
@@ -529,7 +529,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // OAuth adds a connected one. Any of those re-checks the row.
     const sessionChanged = (cached: RobinhoodTools | null): boolean => {
       const live = deps.brokers.existing(userId);
-      return cached === null ? live?.mcp.isConnected() === true : live?.tools !== cached;
+      return cached === null ? live?.session.isConnected() === true : live?.broker !== cached;
     };
 
     const pushPerformance = async (): Promise<void> => {
@@ -693,7 +693,7 @@ async function connectedBrokerTools(
 ): Promise<RobinhoodTools | null> {
   const stored = await deps.db.getBrokerTokens(userId);
   if (readTokenStatus(stored?.tokens).state !== 'missing') {
-    return deps.brokers.for(userId).tools;
+    return deps.brokers.for(userId).broker;
   }
   dropStaleBrokerSession(deps, userId);
   return null;
@@ -705,7 +705,7 @@ async function connectedBrokerTools(
  * not connected yet and are left alone so the flow they hold can finish.
  */
 function dropStaleBrokerSession(deps: ServerDeps, userId: string): void {
-  if (deps.brokers.existing(userId)?.mcp.isConnected()) deps.brokers.drop(userId);
+  if (deps.brokers.existing(userId)?.session.isConnected()) deps.brokers.drop(userId);
 }
 
 /** What the registry held for a user when their row was last read. */
@@ -744,7 +744,7 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
 
   const snapshot = (userId: string): SessionSnapshot => {
     const session = deps.brokers.existing(userId);
-    return { session, connected: session?.mcp.isConnected() === true };
+    return { session, connected: session?.session.isConnected() === true };
   };
 
   const registryChanged = (userId: string, record: ConnectionRecord): boolean => {
@@ -782,7 +782,7 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
   return {
     state,
     tools: async (userId) =>
-      (await state(userId)) === 'missing' ? null : deps.brokers.for(userId).tools,
+      (await state(userId)) === 'missing' ? null : deps.brokers.for(userId).broker,
     invalidate: (userId) => void records.delete(userId),
   };
 }
@@ -790,10 +790,10 @@ function createConnectionCache(deps: ServerDeps): ConnectionCache {
 async function waitForAuthUrl(broker: UserBroker): Promise<string | null> {
   const deadline = Date.now() + AUTH_URL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const authUrl = broker.mcp.getPendingAuthUrl();
+    const authUrl = broker.session.getPendingAuthUrl();
     if (authUrl) return authUrl;
     // Already-valid stored tokens finish the connect with no consent step.
-    if (broker.mcp.isConnected()) return null;
+    if (broker.session.isConnected()) return null;
     await new Promise((resolve) => setTimeout(resolve, AUTH_URL_POLL_MS));
   }
   return null;

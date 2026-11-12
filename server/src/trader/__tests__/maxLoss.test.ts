@@ -570,8 +570,8 @@ function setupMonitor(opts: {
     ensureReady: opts.ensureReady ?? vi.fn().mockResolvedValue(undefined),
   } as unknown as RobinhoodMcpClient;
   const brokers: McpRegistry = {
-    for: (): UserBroker => ({ mcp, tools }),
-    existing: () => ({ mcp, tools }),
+    for: (): UserBroker => ({ session: mcp, broker: tools }),
+    existing: () => ({ session: mcp, broker: tools }),
     drop: () => undefined,
   };
   const enqueue = vi.fn(<T,>(_userId: string, run: () => Promise<T>) => run());

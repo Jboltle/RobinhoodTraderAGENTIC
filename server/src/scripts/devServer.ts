@@ -175,7 +175,7 @@ db.seedDecision(USER.id, {
 });
 
 const broker: UserBroker = {
-  mcp: {
+  session: {
     isConnected: () => true,
     getPendingAuthUrl: () => null,
     isAuthPending: () => false,
@@ -185,7 +185,7 @@ const broker: UserBroker = {
     getTokenStatus: async () => ({ state: 'valid', hasRefreshToken: true }),
     getToolNames: () => [],
   } as unknown as RobinhoodMcpClient,
-  tools: {
+  broker: {
     getBuyingPower: async () => ({
       amountUsd: BUYING_POWER_USD,
       accountNumber: 'dev-account',

@@ -132,5 +132,5 @@ function makeBrokerStub(userId: string, options: BrokerStubOptions): UserBroker 
     ...options.toolsOverrides,
   } as unknown as RobinhoodTools;
 
-  return { mcp, tools };
+  return { session: mcp, broker: tools };
 }

@@ -85,7 +85,7 @@ function makeRegistry(toolsByUser: Map<string, RobinhoodTools>): McpRegistry {
   const forUser = (userId: string): UserBroker => {
     let broker = brokers.get(userId);
     if (!broker) {
-      broker = { mcp: makeMcp(), tools: toolsByUser.get(userId) ?? makeTools() };
+      broker = { session: makeMcp(), broker: toolsByUser.get(userId) ?? makeTools() };
       brokers.set(userId, broker);
     }
     return broker;

@@ -64,8 +64,8 @@ function setup(opts: { orders?: OptionOrder[] | null; ensureReady?: () => Promis
     ensureReady: opts.ensureReady ?? vi.fn().mockResolvedValue(undefined),
   } as unknown as RobinhoodMcpClient;
   const brokers: McpRegistry = {
-    for: (): UserBroker => ({ mcp, tools }),
-    existing: () => ({ mcp, tools }),
+    for: (): UserBroker => ({ session: mcp, broker: tools }),
+    existing: () => ({ session: mcp, broker: tools }),
     drop: () => undefined,
   };
   const events = new TraderEvents();
@@ -165,7 +165,7 @@ describe('sweepFills', () => {
 
     expect(result).toEqual({ open: 1, updated: 0 });
     expect(tools.getOptionOrders).not.toHaveBeenCalled();
-    expect(deps.brokers.for('disconnected-user').mcp.ensureReady).not.toHaveBeenCalled();
+    expect(deps.brokers.for('disconnected-user').session.ensureReady).not.toHaveBeenCalled();
   });
 
   it('skips a user whose session needs OAuth consent without failing the sweep', async () => {

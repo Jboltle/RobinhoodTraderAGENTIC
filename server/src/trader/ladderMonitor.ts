@@ -53,12 +53,12 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
   const settings = await deps.db.getSettings(userId);
   if (settings.exitMode !== 'ladder') return 0;
   const broker = deps.brokers.for(userId);
-  await broker.mcp.ensureReady();
+  await broker.session.ensureReady();
   const lots = await deps.db.listOpenOptionLots(userId);
   let placed = 0;
   for (const lot of lots) {
     if (lot.entryPrice <= 0) continue;
-    const mark = await broker.tools
+    const mark = await broker.broker
       .getOptionsMarkPrice(lot.symbol, lot.option.optionType, lot.option.strike, lot.option.expiration)
       .then((quote) => quote?.markPrice ?? null)
       .catch(() => null);
@@ -84,8 +84,8 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
         status: null,
         lots: [{ lotId: lot.lotId, quantity, gainPct: level.gainPct }],
       };
-      await cancelStops(deps.db, userId, broker.tools, lot.symbol, lot.option);
-      const result = await submitOrder(order, broker.tools, deps.executionMode);
+      await cancelStops(deps.db, userId, broker.broker, lot.symbol, lot.option);
+      const result = await submitOrder(order, broker.broker, deps.executionMode);
       const decision: Decision = {
         at: new Date().toISOString(),
         messageId,

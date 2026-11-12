@@ -109,7 +109,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect(decision.kind).toBe('submitted');
     expect(decision.order).toMatchObject({ orderId: 'eq-001', status: 'queued', quantity: 4 });
 
-    const tools = harness.brokerFor(USER.id).tools;
+    const tools = harness.brokerFor(USER.id).broker;
     expect(tools.placeOrder).toHaveBeenCalledWith(
       expect.objectContaining({ symbol: 'AAPL', side: 'buy', quantity: 4 })
     );
@@ -130,7 +130,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
       expect(response.statusCode).toBe(409);
       expect((response.json() as { error: string }).error).toContain(executionMode);
-      expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+      expect(harness.brokerFor(USER.id).broker.placeOrder).not.toHaveBeenCalled();
       expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
     }
   );
@@ -142,7 +142,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
     expect(response.statusCode).toBe(200);
     expect((response.json() as { decision: Decision }).decision.kind).toBe('rejected');
-    expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+    expect(harness.brokerFor(USER.id).broker.placeOrder).not.toHaveBeenCalled();
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('rejected');
   });
 
@@ -155,7 +155,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
     const second = await send('POST', `/api/trades/${messageId}/approve`, {});
 
     expect(second.statusCode).toBe(404);
-    expect(harness.brokerFor(USER.id).tools.placeOrder).toHaveBeenCalledOnce();
+    expect(harness.brokerFor(USER.id).broker.placeOrder).toHaveBeenCalledOnce();
   });
 
   it('404s for a callout with no pending row', async () => {
@@ -192,7 +192,7 @@ describe('/api/trades/:messageId/approve|reject', () => {
 
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ error: 'Robinhood is not connected' });
-    expect(harness.brokerFor(USER.id).tools.placeOrder).not.toHaveBeenCalled();
+    expect(harness.brokerFor(USER.id).broker.placeOrder).not.toHaveBeenCalled();
     expect((await harness.db.listDecisions(USER.id, 10))[0]!.kind).toBe('pending_approval');
   });
 });
@@ -833,7 +833,7 @@ describe('/api/broker', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(broker.mcp.submitAuthCode).toHaveBeenCalledWith('the-code', 'the-state');
+    expect(broker.session.submitAuthCode).toHaveBeenCalledWith('the-code', 'the-state');
   });
 
   it('callback 400s on an unparseable URL and on a URL without a code', async () => {
@@ -877,14 +877,14 @@ describe('/api/broker', () => {
     expect((connect.json() as { error: string }).error).toContain(
       'cannot be connected from this environment'
     );
-    expect(broker.mcp.ensureConnected).not.toHaveBeenCalled();
+    expect(broker.session.ensureConnected).not.toHaveBeenCalled();
     expect(harness.brokers.existing(USER.id)).toBe(broker);
 
     const callback = await send('POST', '/api/broker/callback', {
       redirectUrl: 'http://127.0.0.1:8788/oauth/callback?code=x&state=y',
     });
     expect(callback.statusCode).toBe(409);
-    expect(broker.mcp.submitAuthCode).not.toHaveBeenCalled();
+    expect(broker.session.submitAuthCode).not.toHaveBeenCalled();
   });
 
   it('disconnect drops the stored tokens and the live session', async () => {
@@ -953,8 +953,8 @@ describe('/api/broker', () => {
       expect(reads('getBrokerTokens')).toBe(1);
 
       harness.db.seedBrokerTokens(USER.id, fakeTokens('access-token'));
-      vi.mocked(broker.mcp.isAuthPending).mockReturnValue(false);
-      vi.mocked(broker.mcp.isConnected).mockReturnValue(true);
+      vi.mocked(broker.session.isAuthPending).mockReturnValue(false);
+      vi.mocked(broker.session.isConnected).mockReturnValue(true);
       expect((await get('/api/broker/status')).json()).toMatchObject({
         connected: true,
         tokenState: 'valid',
@@ -1172,7 +1172,7 @@ describe('GET /api/stream', () => {
         connected: true,
         equityPositions: [{ symbol: 'AAPL', quantity: 10, raw: {} }],
       });
-      const tools = harness.brokerFor(USER.id).tools;
+      const tools = harness.brokerFor(USER.id).broker;
       const stream = await openStream();
       try {
         await stream.readUntil('"symbol":"AAPL"');

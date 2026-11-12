@@ -485,7 +485,7 @@ export async function runForUser(
 
   const symbol = callout.ticker!.toUpperCase();
   const side = callout.action!;
-  const tools = deps.brokers.for(userId).tools;
+  const tools = deps.brokers.for(userId).broker;
 
   if (callout.reviewReason?.includes('no such contract')) {
     return finalize(userId, deps, {
@@ -721,7 +721,7 @@ async function entryMismatchReason(
 
   let tools: RobinhoodTools | null = null;
   for (const userId of await deps.db.listBrokerUserIds()) {
-    const candidate = deps.brokers.for(userId).tools;
+    const candidate = deps.brokers.for(userId).broker;
     if (typeof candidate.confirmOption === 'function') {
       tools = candidate;
       break;

@@ -212,8 +212,8 @@ describe('user B cannot see user A', () => {
     });
 
     expect(response.statusCode).toBe(404);
-    expect(harness.brokerFor(USER_B.id).tools.placeOrder).not.toHaveBeenCalled();
-    expect(harness.brokerFor(USER_A.id).tools.placeOrder).not.toHaveBeenCalled();
+    expect(harness.brokerFor(USER_B.id).broker.placeOrder).not.toHaveBeenCalled();
+    expect(harness.brokerFor(USER_A.id).broker.placeOrder).not.toHaveBeenCalled();
 
     const asA = await harness.as(TOKEN_A, { method: 'GET', url: '/api/decisions' });
     const pending = (asA.json() as { decisions: Decision[] }).decisions.find(
