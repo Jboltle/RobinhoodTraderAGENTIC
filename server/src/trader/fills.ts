@@ -207,7 +207,7 @@ export function applyBrokerState(order: SubmittedOrder, live: BrokerOrder, now: 
       : (order.filledQuantity ?? null);
   const averageFillPrice =
     (filled || partial) && live.fillPrice !== null
-      ? normalizeOptionPremium(live.fillPrice, order.limitPrice)
+      ? (live.fillPricePerShare ? live.fillPrice : normalizeOptionPremium(live.fillPrice, order.limitPrice))
       : (order.averageFillPrice ?? null);
   const filledAt = filled ? (order.filledAt ?? now.toISOString()) : (order.filledAt ?? null);
 

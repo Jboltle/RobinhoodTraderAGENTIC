@@ -382,8 +382,10 @@ function brokerOrder(order: AccountOrderRecord): BrokerOrder | null {
     instrument,
     side,
     status: portStatus(order.status),
-    // Per share on an option order too, by the SDK's own account of the field.
+    // Per share on an option order too, by the SDK's own account of the field,
+    // and said so: the callers' Robinhood scale fix must leave it alone.
     fillPrice: positiveNumber(order.execution_price),
+    fillPricePerShare: true,
     // The filled count, as on a Robinhood row: what the fill sweep reads on a partial fill.
     quantity: finiteNumber(order.filled_quantity) ?? 0,
     createdAt: order.time_placed ?? null,

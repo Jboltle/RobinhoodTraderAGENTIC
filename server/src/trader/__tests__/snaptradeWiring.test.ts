@@ -17,8 +17,10 @@ import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry, supportedAccounts, type McpRegistry } from '../broker/registry.js';
-import type { AccountRow, BrokerSession } from '../broker/types.js';
+import type { AccountRow, BrokerSession, OptionInstrument } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
+import { sweepFills } from '../fills.js';
+import { resolveOptionEntry } from '../maxLoss.js';
 import {
   BTO_QQQ_PUT,
   TRIM_QQQ_FIRST,
@@ -40,9 +42,12 @@ import {
   type FakeSnapTradeAnswers,
   type FakeSnapTradeClient,
 } from '../snaptrade/__tests__/fakeClient.js';
-import { optionOrderPlaced, optionPosition } from '../snaptrade/__tests__/fixtures/unverified.js';
+import { optionOrder, optionOrderPlaced, optionPosition } from '../snaptrade/__tests__/fixtures/unverified.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, placedOrders, type FakeBroker } from './harness.js';
+
+/** Tuesday 2026-09-08 10:30 ET: inside regular US hours, when the monitors sweep. */
+const NOW = new Date('2026-09-08T14:30:00.000Z');
 
 const OWNER = { id: 'user-owner', email: 'owner@example.com' };
 const TOKEN = 'token-for-owner';
@@ -164,6 +169,40 @@ function serve(world: World, viewed: AccountRow = PAPER, snapTrade: SnapTradeAcc
       ...options,
       headers: { ...options.headers, authorization: `Bearer ${TOKEN}`, [VIEWED_ACCOUNT_HEADER]: viewed.id },
     });
+}
+
+/** The contract the SnapTrade order fixture (optionOrder) is for. */
+const SPY_CALL: OptionInstrument = {
+  kind: 'option',
+  symbol: 'SPY',
+  optionType: 'call',
+  strike: 772,
+  expiration: '2026-10-21',
+};
+const SPY_CALL_CONTRACTS = 3;
+
+/** An option buy the account placed that the broker has not been seen to fill yet. */
+function workingBuy(orderType: 'market' | 'limit', limitPrice: number | null, messageId = 'msg-working'): Decision {
+  return {
+    at: NOW.toISOString(),
+    messageId,
+    kind: 'submitted',
+    code: null,
+    reason: 'bought',
+    ticker: SPY_CALL.symbol,
+    action: 'buy',
+    order: {
+      symbol: SPY_CALL.symbol,
+      side: 'buy',
+      assetType: 'option',
+      quantity: SPY_CALL_CONTRACTS,
+      orderType,
+      limitPrice,
+      option: { optionType: SPY_CALL.optionType, strike: SPY_CALL.strike, expiration: SPY_CALL.expiration },
+      orderId: PLACED_ORDER_ID,
+      status: 'accepted',
+    },
+  };
 }
 
 const decisionsOf = async (db: FakeDb, accountId: string): Promise<Decision[]> => db.listDecisions(accountId, 10);
@@ -470,5 +509,61 @@ describe('a sync that changes a SnapTrade account row', () => {
     await syncing(world, { connections: [CONNECTION], accounts: [LISTED] })();
 
     expect(world.brokers.existing(ROBINHOOD.id)).toBe(robinhood);
+  });
+});
+
+describe('prices that come from SnapTrade are per share already', () => {
+  /** A market fill at a 25.00 premium: above the 20 the Robinhood scale fix divides by 100. */
+  const FILLED_AT_25 = { orders: [optionOrder({ execution_price: '25.00', order_type: 'Market', limit_price: null })] };
+
+  it('a market option order filled at 25.00 is recorded as 25.00', async () => {
+    const world = makeWorld({ answers: { orders: FILLED_AT_25 } });
+    world.db.seedDecision(PAPER.id, workingBuy('market', null));
+
+    await sweepFills({ db: world.db, brokers: world.brokers, events: world.events, now: () => NOW });
+
+    expect((await decisionsOf(world.db, PAPER.id))[0]!.order).toMatchObject({
+      status: 'filled',
+      filledQuantity: SPY_CALL_CONTRACTS,
+      averageFillPrice: 25,
+    });
+  });
+
+  it('the same fill reported by Robinhood is still read as 0.25', async () => {
+    const db = createFakeDb();
+    db.addUser(OWNER, TOKEN, ROBINHOOD.id);
+    db.seedBrokerTokens(ROBINHOOD.id, fakeTokens('robinhood-token'));
+    db.seedDecision(ROBINHOOD.id, workingBuy('market', null));
+    const reported = makeFakeBroker({
+      orders: [
+        {
+          orderId: PLACED_ORDER_ID,
+          instrument: SPY_CALL,
+          side: 'buy',
+          status: 'filled',
+          fillPrice: 25,
+          quantity: SPY_CALL_CONTRACTS,
+          createdAt: NOW.toISOString(),
+        },
+      ],
+    });
+    const brokers = createMcpRegistry(
+      [{ id: 'robinhood', quotesOptions: true, open: () => ({ session: ROBINHOOD_SESSION, broker: reported }) }],
+      'immediate'
+    );
+
+    await sweepFills({ db, brokers, events: new TraderEvents(), now: () => NOW });
+
+    expect((await decisionsOf(db, ROBINHOOD.id))[0]!.order).toMatchObject({ status: 'filled', averageFillPrice: 0.25 });
+  });
+
+  it('an entry rebuilt from its orders is the 25.00 paid, where an unmarked order would read 0.25', async () => {
+    const world = makeWorld({ answers: { orders: FILLED_AT_25 } });
+
+    const orders = await world.brokers.for(PAPER).broker.getOrders();
+    const unmarked = (orders ?? []).map(({ fillPricePerShare: _perShare, ...order }) => order);
+
+    expect(resolveOptionEntry([], [], SPY_CALL, SPY_CALL_CONTRACTS, orders, null)).toBe(25);
+    expect(resolveOptionEntry([], [], SPY_CALL, SPY_CALL_CONTRACTS, unmarked, null)).toBe(0.25);
   });
 });

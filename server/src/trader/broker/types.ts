@@ -36,9 +36,16 @@ export interface BrokerOrder {
   /**
    * Average fill price exactly as the broker reports it. Robinhood reports an
    * option fill per contract on some endpoints (159.0) and per share on others
-   * (1.59); callers that need a cost basis scale it with normalizeOptionPremium.
+   * (1.59); callers that need a cost basis scale it with normalizeOptionPremium,
+   * unless `fillPricePerShare` says there is nothing to scale.
    */
   readonly fillPrice: number | null;
+  /**
+   * Set by an adapter whose fill price is always per share (SnapTrade). Such a
+   * price is stored as it stands: the scale fix would take a 25.00 premium for
+   * 0.25 reported per contract.
+   */
+  readonly fillPricePerShare?: boolean;
   readonly quantity: number;
   /** ISO timestamp; the ordering key for "most recently opened". */
   readonly createdAt: string | null;

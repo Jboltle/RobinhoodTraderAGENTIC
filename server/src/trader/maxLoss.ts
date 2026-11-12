@@ -691,7 +691,7 @@ function rebuildOptionEntry(
   const fillLots = bought
     .filter((o) => o.status === null || o.status === 'filled')
     .map((o) => ({
-      price: normalizeOptionPremium(o.fillPrice!, mark),
+      price: o.fillPricePerShare ? o.fillPrice! : normalizeOptionPremium(o.fillPrice!, mark),
       quantity: o.quantity > 0 ? o.quantity : 1,
     }));
   return (
