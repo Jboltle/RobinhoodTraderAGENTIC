@@ -5,7 +5,7 @@
  *
  * On first run this triggers the OAuth flow: the script prints an
  * authorization URL, spins up a local listener at the configured redirect,
- * persists the encrypted tokens to that user's `broker_connections` row, then
+ * persists the encrypted tokens to that user's direct Robinhood account, then
  * lists the tools the server advertises and verifies our canonical TOOL_NAMES
  * line up with what the server actually exposes.
  */
@@ -31,9 +31,16 @@ async function main(): Promise<void> {
     throw new Error(`no such user: ${identifier}`);
   }
 
-  log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl, userId });
+  // Every user has exactly one direct Robinhood account, and until a second
+  // adapter exists it is the one they have selected.
+  const account = await db.getSelectedAccount(userId);
+  if (account?.adapter !== 'robinhood') {
+    throw new Error(`user ${userId} has no direct Robinhood account selected`);
+  }
 
-  const mcp = new RobinhoodMcpClient({ userId, db });
+  log.info('connecting to Robinhood MCP', { url: config.robinhoodMcpUrl, accountId: account.id });
+
+  const mcp = new RobinhoodMcpClient({ accountId: account.id, db });
   await mcp.ensureConnected();
 
   const advertised = mcp.getToolNames();

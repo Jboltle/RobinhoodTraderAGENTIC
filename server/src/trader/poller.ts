@@ -16,14 +16,14 @@
  * A crash between the two leaves disposition set with processed_at null; the
  * guard below then finishes the mark WITHOUT re-running the fan-out, because
  * re-running it is the one path to a double trade. The cost is the same as
- * today's crash mode: some users may lack a decision row for that message.
+ * today's crash mode: some accounts may lack a decision row for that message.
  *
  * Multiple instances: every row is claimed (claimMessage, an atomic
  * conditional UPDATE) before anything else happens to it, so when two trader
  * processes poll the same database — a local run next to the deployed one, or
  * containers overlapping during a redeploy — exactly one fans each message
- * out. Without it both did, and every user got two outcomes (and potentially
- * two orders) per callout. A claim held past CLAIM_STALE_MS by an instance
+ * out. Without it both did, and every account got two outcomes (and
+ * potentially two orders) per callout. A claim held past CLAIM_STALE_MS by an instance
  * that never finished is treated as abandoned; by then the message is past
  * the staleness window, so the re-claimer records it as missed, never trades.
  *
@@ -114,7 +114,7 @@ async function handleRow(deps: PollerDeps, row: PendingMessage): Promise<void> {
 
   // Ownership first: a row another live instance claimed is theirs to fan
   // out and mark. Skipping it — not marking it — is what keeps one message to
-  // one outcome per user when two traders share a database.
+  // one outcome per account when two traders share a database.
   const staleBefore = new Date(now.getTime() - CLAIM_STALE_MS);
   if (!(await deps.db.claimMessage(row.messageId, instanceId, staleBefore))) {
     await warnRivalInstance(deps, row.messageId, now);
@@ -144,7 +144,7 @@ async function handleRow(deps: PollerDeps, row: PendingMessage): Promise<void> {
 
   // Retracted before we got to it: archive-only. The deleted alert stays a
   // signal in the feed, but nothing deleted is ever traded or parsed, and a
-  // per-user "missed" fan-out for a message that no longer exists is noise.
+  // per-account "missed" fan-out for a message that no longer exists is noise.
   if (row.deletedAt !== null) {
     await deps.db.setMessageDisposition(row.messageId, 'missed', null);
     await deps.db.markMessageProcessed(row.messageId);

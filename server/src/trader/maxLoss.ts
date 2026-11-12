@@ -1,6 +1,6 @@
 /**
  * Max Loss: a process-lifetime monitor that market-sells one open position
- * when that position's unrealized loss hits the user's % or $ threshold.
+ * when that position's unrealized loss hits the account's % or $ threshold.
  *
  * Entry-time risk is unchanged. This loop is independent of the dashboard —
  * SSE performance polling only runs while a client is connected.
@@ -21,6 +21,7 @@ import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/erro
 import { instrumentKey } from './broker/instrument.js';
 import type { McpRegistry } from './broker/registry.js';
 import type {
+  AccountRow,
   Broker,
   BrokerOrder,
   BrokerPosition,
@@ -46,7 +47,7 @@ const DEAD_ORDER_STATUSES = new Set(['rejected', 'canceled', 'cancelled', 'faile
 /** How far back we look for the buy that opened a position. Same depth as performance. */
 const ENTRY_HISTORY_LIMIT = 500;
 
-/** One user's entry history, kept across sweeps; see entryHistory for when it is re-read. */
+/** One account's entry history, kept across sweeps; see entryHistory for when it is re-read. */
 interface EntryHistory {
   /** Submitted orders from the last trades read; null = read on the next sweep. */
   submitted: Promise<readonly Decision[]> | null;
@@ -82,7 +83,7 @@ export interface MaxLossDeps {
   readonly db: TraderDb;
   readonly brokers: McpRegistry;
   readonly events: TraderEvents;
-  readonly enqueue: <T>(userId: string, run: () => Promise<T>) => Promise<T>;
+  readonly enqueue: <T>(accountId: string, run: () => Promise<T>) => Promise<T>;
   readonly now?: () => Date;
 }
 
@@ -115,14 +116,14 @@ export async function sweepMaxLoss(
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
 
-  const userIds = await deps.db.listBrokerUserIds();
+  const accounts = await deps.db.listConnectedAccounts();
   await Promise.all(
-    userIds.map((userId) =>
+    accounts.map((account) =>
       deps
-        .enqueue(userId, () => scanUser(userId, deps, flattening, now, entries))
+        .enqueue(account.id, () => scanAccount(account, deps, flattening, now, entries))
         .catch((err: unknown) =>
-          log.warn('max-loss user scan failed', {
-            userId,
+          log.warn('max-loss account scan failed', {
+            accountId: account.id,
             error: err instanceof Error ? err.message : String(err),
           })
         )
@@ -130,17 +131,18 @@ export async function sweepMaxLoss(
   );
 }
 
-async function scanUser(
-  userId: string,
+async function scanAccount(
+  account: AccountRow,
   deps: MaxLossDeps,
   flattening: Map<string, number>,
   now: Date,
   entries: Map<string, EntryHistory>
 ): Promise<null> {
-  const settings = await deps.db.getSettings(userId);
+  const accountId = account.id;
+  const settings = await deps.db.getSettings(accountId);
   if (!lossEnabled(settings.maxLossPct, settings.maxLossUsd)) return null;
 
-  const { session, broker } = deps.brokers.for(userId);
+  const { session, broker } = deps.brokers.for(account);
   // Reconnect from stored tokens so a dropped session does not silently turn
   // Max Loss off; a session that needs OAuth consent is skipped this sweep.
   try {
@@ -154,16 +156,16 @@ async function scanUser(
   const held = new Set(
     positions.filter((p) => p.quantity > 0).map((p) => instrumentKey(p.instrument))
   );
-  const submitted = await entryHistory(userId, deps, entries, held);
+  const submitted = await entryHistory(accountId, deps, entries, held);
   const orders = await broker.getOrders().catch(() => null);
 
-  const openLots = await deps.db.listOpenOptionLots(userId).catch(() => []);
+  const openLots = await deps.db.listOpenOptionLots(accountId).catch(() => []);
   const openKeys = new Set<string>();
 
   for (const position of positions) {
     const { instrument } = position;
     const key = instrumentKey(instrument);
-    if (position.quantity > 0) openKeys.add(`${userId}:${key}`);
+    if (position.quantity > 0) openKeys.add(`${accountId}:${key}`);
     // A resting broker stop is this position's Max Loss. Selling here too would
     // double-close it. ponytail: the dollar cap does not fire while that stop
     // rests. Upgrade path: cancel the stop and software-flatten only the usd breach.
@@ -180,7 +182,8 @@ async function scanUser(
     if (stopped) continue;
     const mark = await broker.getMark(instrument).catch(() => null);
     await considerPosition({
-      userId,
+      accountId,
+      ownerUserId: account.userId,
       deps,
       flattening,
       now,
@@ -212,7 +215,7 @@ async function scanUser(
   // in-flight guard silently disables Max Loss for every re-entry until the
   // process restarts.
   for (const inflight of flattening.keys()) {
-    if (inflight.startsWith(`${userId}:`) && !openKeys.has(inflight)) {
+    if (inflight.startsWith(`${accountId}:`) && !openKeys.has(inflight)) {
       flattening.delete(inflight);
     }
   }
@@ -221,26 +224,26 @@ async function scanUser(
 }
 
 /**
- * The user's submitted orders, re-read from the trades table only when the
+ * The account's submitted orders, re-read from the trades table only when the
  * cached copy may be stale: the first sweep, the sweep after any decision is
- * logged for the user (a buy opens a position, an add re-averages one), and a
+ * logged for the account (a buy opens a position, an add re-averages one), and a
  * sweep holding a position the previous one did not, so a new position never
  * waits on that event alone.
- * ponytail: one history and one decision subscription per user, never
+ * ponytail: one history and one decision subscription per account, never
  * dropped; fine at invite-only scale. Events reach only this process, so an
  * add logged by another instance goes unseen until a local decision. Upgrade
  * path: invalidate from a Postgres NOTIFY on trades writes.
  */
 function entryHistory(
-  userId: string,
+  accountId: string,
   deps: MaxLossDeps,
   entries: Map<string, EntryHistory>,
   held: ReadonlySet<string>
 ): Promise<readonly Decision[]> {
-  const history: EntryHistory = entries.get(userId) ?? { submitted: null, held };
-  if (!entries.has(userId)) {
-    entries.set(userId, history);
-    deps.events.subscribe(userId, {
+  const history: EntryHistory = entries.get(accountId) ?? { submitted: null, held };
+  if (!entries.has(accountId)) {
+    entries.set(accountId, history);
+    deps.events.subscribe(accountId, {
       onDecision: () => {
         history.submitted = null;
       },
@@ -253,7 +256,7 @@ function entryHistory(
   }
   // Cached while still in flight, so a decision logged mid-read voids it too.
   const read = deps.db
-    .listDecisions(userId, ENTRY_HISTORY_LIMIT)
+    .listDecisions(accountId, ENTRY_HISTORY_LIMIT)
     .then((decisions) => decisions.filter((d) => d.kind === 'submitted' && d.order));
   history.submitted = read;
   // A failed read is not kept: the next sweep tries again.
@@ -264,7 +267,9 @@ function entryHistory(
 }
 
 interface ConsiderArgs {
-  readonly userId: string;
+  readonly accountId: string;
+  /** The account's owner: named in the exit's synthetic message id, as it always was. */
+  readonly ownerUserId: string;
   readonly deps: MaxLossDeps;
   readonly flattening: Map<string, number>;
   readonly now: Date;
@@ -281,8 +286,8 @@ interface ConsiderArgs {
 }
 
 async function considerPosition(args: ConsiderArgs): Promise<void> {
-  const { userId, flattening, key, quantity } = args;
-  const inflight = `${userId}:${key}`;
+  const { accountId, flattening, key, quantity } = args;
+  const inflight = `${accountId}:${key}`;
 
   if (quantity <= 0) return;
   // A fresh in-flight close means the broker is still working the order; a
@@ -294,7 +299,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
   }
   if (args.entry === null || args.mark === null) {
     if (args.entry === null) {
-      log.info('max-loss skipped: no entry', { userId, key });
+      log.info('max-loss skipped: no entry', { accountId, key });
     }
     return;
   }
@@ -337,7 +342,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
     };
     const decision: Decision = {
       at: args.now.toISOString(),
-      messageId: `max-loss:${userId}:${key}:${args.now.getTime()}`,
+      messageId: `max-loss:${args.ownerUserId}:${key}:${args.now.getTime()}`,
       kind: 'max_loss_exit',
       code: null,
       reason: maxLossReason(order, args.entry, args.mark),
@@ -345,9 +350,9 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
       action: 'sell',
       order,
     };
-    await args.deps.db.recordDecision(userId, decision);
-    args.deps.events.emitDecision(userId, decision);
-    log.info('max-loss flattened', { userId, key, orderId: placed.orderId });
+    await args.deps.db.recordDecision(accountId, decision);
+    args.deps.events.emitDecision(accountId, decision);
+    log.info('max-loss flattened', { accountId, key, orderId: placed.orderId });
   } catch (err) {
     if (err instanceof BrokerWritesDisabledError) {
       // Max Loss is protection the user opted into, so `approval` does not
@@ -355,7 +360,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
       // sell. The in-flight key stays set so the same breach is logged once
       // per FLATTEN_RETRY_MS, not once per 15 s sweep.
       log.info('max-loss breach observed; read-only deployment, not flattening', {
-        userId,
+        accountId,
         key,
         entry: args.entry,
         mark: args.mark,
@@ -364,7 +369,7 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
     }
     flattening.delete(inflight);
     log.warn('max-loss flatten failed', {
-      userId,
+      accountId,
       key,
       error: err instanceof Error ? err.message : String(err),
     });
@@ -412,7 +417,7 @@ export function weightedAverageEntry(
 }
 
 /**
- * Entry basis from the user's submitted buy limits for the position — the
+ * Entry basis from the account's submitted buy limits for the position — the
  * fallback when the broker reports no cost data. `submitted` must be
  * newest-first so the covering walk starts from the latest lot.
  */

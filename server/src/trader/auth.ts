@@ -4,8 +4,8 @@
  * Sign-in is the email alone: an account's email, or an invited one
  * (allowed_emails), starts a session; nothing is emailed and there is no
  * password. The browser keeps the returned bearer token and sends it on every
- * request; the token is resolved to a user, and that user is the only scope
- * the route may read or write (see db.ts).
+ * request; the token is resolved to a user, and that user's selected account is
+ * the only scope the route may read or write (see db.ts).
  *
  * ponytail: the email is the whole credential, by choice, so anyone who knows
  * a user's email can act as that user, trades included. The invite list is
@@ -17,6 +17,7 @@ import { z } from 'zod';
 
 import { createLogger } from '../shared/logger.js';
 import { newSessionToken } from './credentials.js';
+import type { AccountRow } from './broker/types.js';
 import type { AuthUser, TraderDb } from './db.js';
 
 const log = createLogger('trader:auth');
@@ -30,6 +31,8 @@ declare module 'fastify' {
   interface FastifyRequest {
     /** Set by the auth hook on every route it guards. */
     authUser?: AuthUser;
+    /** The user's selected account, set with authUser; null for a user with none. */
+    authAccount?: AccountRow | null;
   }
 }
 
@@ -48,6 +51,17 @@ export function requireUser(request: FastifyRequest): AuthUser {
   return request.authUser;
 }
 
+/**
+ * The acting user's selected account: what every per-account route reads and
+ * writes. Resolved from the session by the auth hook, never from anything the
+ * client sends, so a route cannot be pointed at another user's account.
+ */
+export function requireAccount(request: FastifyRequest): AccountRow {
+  const user = requireUser(request);
+  if (!request.authAccount) throw new Error(`user ${user.id} has no account`);
+  return request.authAccount;
+}
+
 export function registerAuth(fastify: FastifyInstance, db: TraderDb): void {
   fastify.addHook('preHandler', async (request, reply) => {
     if (PUBLIC_ROUTES.has(request.routeOptions.url ?? request.url)) return;
@@ -59,15 +73,16 @@ export function registerAuth(fastify: FastifyInstance, db: TraderDb): void {
       return reply.status(401).send({ error: 'missing bearer token' });
     }
 
-    const user = await db.verifyAccessToken(token).catch((err: unknown) => {
+    const session = await db.verifyAccessToken(token).catch((err: unknown) => {
       log.warn('token verification failed', { error: (err as Error).message });
       return null;
     });
-    if (!user) {
+    if (!session) {
       return reply.status(401).send({ error: 'invalid or expired token' });
     }
 
-    request.authUser = user;
+    request.authUser = session.user;
+    request.authAccount = session.account;
   });
 
   fastify.post('/api/auth/login', async (request, reply) => {

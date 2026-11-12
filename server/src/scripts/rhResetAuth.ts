@@ -4,8 +4,9 @@
  *   npm run auth:reset <email or user id>
  *
  * Use this when Robinhood shows the agent as connected but the app can no
- * longer trade with the tokens it holds. Removing the row means the user's
- * next visit to the dashboard starts a fresh OAuth flow.
+ * longer trade with the tokens it holds. Clearing them means the user's next
+ * visit to the dashboard starts a fresh OAuth flow; the account, its settings
+ * and its trades stay.
  */
 import { createLogger } from '../shared/logger.js';
 import { createTraderDb } from '../trader/db.js';
@@ -30,12 +31,21 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Every user has exactly one direct Robinhood account, and until a second
+  // adapter exists it is the one they have selected.
+  const account = await db.getSelectedAccount(userId);
+  if (account?.adapter !== 'robinhood') {
+    log.error('user has no direct Robinhood account selected', { userId });
+    process.exitCode = 1;
+    return;
+  }
+
   try {
-    await db.deleteBrokerTokens(userId);
-    log.info('removed stored Robinhood OAuth state', { userId });
+    await db.deleteBrokerTokens(account.id);
+    log.info('removed stored Robinhood OAuth state', { accountId: account.id });
   } catch (err) {
     log.error('failed to remove stored Robinhood OAuth state', {
-      userId,
+      accountId: account.id,
       error: (err as Error).message,
     });
     process.exitCode = 1;

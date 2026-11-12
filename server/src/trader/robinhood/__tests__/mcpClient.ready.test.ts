@@ -21,7 +21,7 @@ function makeClient(connect: (self: Internals) => Promise<void>): {
   internals: Internals;
   connectSpy: ReturnType<typeof vi.fn>;
 } {
-  const mcp = new RobinhoodMcpClient({ userId: 'user-1', db: {} as BrokerTokenStore });
+  const mcp = new RobinhoodMcpClient({ accountId: 'account-1', db: {} as BrokerTokenStore });
   const internals = mcp as unknown as Internals;
   const connectSpy = vi.fn(() => connect(internals));
   internals.connect = connectSpy;

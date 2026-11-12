@@ -22,7 +22,7 @@ import { RobinhoodBroker } from '../robinhood/broker.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { RobinhoodTools, TOOL_NAMES } from '../robinhood/tools.js';
 import { cancelStops, restMissingStops } from '../stops.js';
-import { createFakeDb, fakeTokens, type FakeDb } from './fakeDb.js';
+import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from './harness.js';
 
 const USER = 'user-1';
@@ -82,9 +82,9 @@ const ADAPTERS = [
 
 const registryOver = (adapter: AdapterUnderTest, mode: TradeExecutionMode): Broker =>
   createMcpRegistry(
-    { quotesOptions: true, open: () => ({ session: SESSION, broker: adapter.broker }) },
+    [{ id: 'robinhood', quotesOptions: true, open: () => ({ session: SESSION, broker: adapter.broker }) }],
     mode
-  ).for(USER).broker;
+  ).for(fakeAccount(USER)).broker;
 
 describe.each(ADAPTERS)('read_only deployment over %s', (_name, makeAdapter) => {
   it('refuses every order and every cancel before the adapter is reached', async () => {
@@ -162,7 +162,7 @@ describe('read_only deployment: the write paths cannot write', () => {
     // A mark far above every own-target rung, so the ladder wants to sell.
     const fake = makeFakeBroker({ optionMark: ENTRY_PRICE * 10 });
     const brokers = makeFakeRegistry(() => ({ session: SESSION, broker: fake }), 'read_only');
-    return { db, fake, broker: brokers.for(USER).broker, brokers };
+    return { db, fake, broker: brokers.for(fakeAccount(USER)).broker, brokers };
   }
 
   const expectNoWrite = (fake: FakeBroker): void => {
@@ -195,7 +195,7 @@ describe('read_only deployment: the write paths cannot write', () => {
   it('restMissingStops: no stop is rested and none is recorded', async () => {
     const { db, fake, broker } = setup();
 
-    await restMissingStops({ userId: USER, db, broker, executionMode: 'immediate' });
+    await restMissingStops({ accountId: USER, db, broker, executionMode: 'immediate' });
 
     expectNoWrite(fake);
     const [lot] = await db.listOpenOptionLots(USER);

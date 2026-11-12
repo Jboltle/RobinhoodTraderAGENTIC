@@ -93,8 +93,8 @@ export const NO_TRADES_YET: DerivedRiskState = {
 
 /** Source of the two count queries behind DerivedRiskState. */
 export interface RiskHistory {
-  countSubmittedSince(userId: string, since: Date): Promise<number>;
-  lastSubmittedAt(userId: string, ticker: string): Promise<Date | null>;
+  countSubmittedSince(accountId: string, since: Date): Promise<number>;
+  lastSubmittedAt(accountId: string, ticker: string): Promise<Date | null>;
 }
 
 /** Local midnight — the daily cap resets with the trading day, not with UTC. */
@@ -106,13 +106,13 @@ export function startOfDay(now: Date = new Date()): Date {
 
 export async function deriveRiskState(
   history: RiskHistory,
-  userId: string,
+  accountId: string,
   ticker: string | null,
   now: Date = new Date()
 ): Promise<DerivedRiskState> {
   const [submittedToday, lastSubmittedForTicker] = await Promise.all([
-    history.countSubmittedSince(userId, startOfDay(now)),
-    ticker ? history.lastSubmittedAt(userId, ticker) : Promise.resolve(null),
+    history.countSubmittedSince(accountId, startOfDay(now)),
+    ticker ? history.lastSubmittedAt(accountId, ticker) : Promise.resolve(null),
   ]);
   return { submittedToday, lastSubmittedForTicker };
 }

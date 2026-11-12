@@ -1,12 +1,12 @@
 /**
- * Trader HTTP server: the per-user REST API (feed, position performance,
+ * Trader HTTP server: the per-account REST API (feed, position performance,
  * trade settings, Robinhood connection). Message ingestion does not pass
  * through HTTP any more — the poller reads the `messages` table directly.
  *
  * Every /api route runs behind the session-token hook in auth.ts and reads or
- * writes only the acting user's rows. Kept separate from index.ts (which
- * auto-runs main() on import) so routes can be tested with fastify.inject and
- * mocked deps.
+ * writes only the acting user's selected account (requireAccount). Kept
+ * separate from index.ts (which auto-runs main() on import) so routes can be
+ * tested with fastify.inject and mocked deps.
  */
 import fastifyCors from '@fastify/cors';
 import fastifyEtag from '@fastify/etag';
@@ -21,7 +21,7 @@ import {
   type OptionType,
   type TradeExecutionMode,
 } from '../shared/types.js';
-import { registerAuth, requireUser } from './auth.js';
+import { registerAuth, requireAccount, requireUser } from './auth.js';
 import { cancelStops } from './stops.js';
 import {
   BOOK_PERIODS,
@@ -43,7 +43,7 @@ import {
 } from './recaps/analytics.js';
 import { readTokenStatus } from './robinhood/mcpClient.js';
 import type { McpRegistry } from './broker/registry.js';
-import type { Broker, UserBroker } from './broker/types.js';
+import type { AccountRow, Broker, UserBroker } from './broker/types.js';
 import type { TokenState } from './robinhood/types.js';
 
 const log = createLogger('trader:server');
@@ -62,8 +62,8 @@ const SSE_PERFORMANCE_INTERVAL_MS = 10_000;
 const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
 /**
  * How often a cached connection (an open stream, the status/portfolio polls)
- * confirms its user's broker_connections row still exists: the backstop for a
- * row removed outside this process (auth:reset).
+ * confirms its account still has stored credentials: the backstop for ones
+ * removed outside this process (auth:reset).
  */
 const CONNECTION_CHECK_INTERVAL_MS = 60_000;
 /**
@@ -132,24 +132,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.send({ ok: true });
   });
 
-  // ---- Robinhood connection (per user) ----------------------------------------
+  // ---- Robinhood connection (per account) -------------------------------------
 
   fastify.get('/api/broker/status', async (request, reply) => {
-    const { id: userId } = requireUser(request);
-    // The connection of record is the user's broker_connections row, not the
+    const account = requireAccount(request);
+    // The connection of record is the account's stored credentials, not the
     // in-memory session: stored tokens survive restarts and are what the
-    // pipeline fans out over. A user with tokens but no warm session is still
-    // connected — the next broker call (RobinhoodTools → mcp.ensureReady)
+    // pipeline fans out over. An account with tokens but no warm session is
+    // still connected — the next broker call (RobinhoodTools → mcp.ensureReady)
     // recreates the session from those tokens. The reverse is a stale session:
-    // when the row is gone the warm session no longer represents a
+    // when the credentials are gone the warm session no longer represents a
     // connection, so it is evicted and status reports
     // disconnected instead of pretending off in-memory state.
-    const tokenState = await connections.state(userId);
+    const tokenState = await connections.state(account);
     return reply.send({
       connected: tokenState === 'valid' || tokenState === 'refreshable',
-      authUrl: deps.brokers.existing(userId)?.session.getPendingAuthUrl() ?? null,
+      authUrl: deps.brokers.existing(account.id)?.session.getPendingAuthUrl() ?? null,
       tokenState,
-      executionMode: (await deps.db.getSettings(userId)).executionMode,
+      executionMode: (await deps.db.getSettings(account.id)).executionMode,
     });
   });
 
@@ -158,7 +158,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // opens the URL returned here, the user approves, then pastes the dead-end
   // redirect URL into POST /api/broker/callback.
   fastify.post('/api/broker/connect', async (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
     if (deps.executionMode === 'read_only') {
       return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
     }
@@ -170,9 +170,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // wedged, or holding an abandoned OAuth flow — and run the flow again.
     // Stored tokens are kept: when they still refresh this reconnects with no
     // consent step, else the browser OAuth fallback issues a fresh auth URL.
-    if (parsed.data.force === true) deps.brokers.drop(userId);
-    connections.invalidate(userId);
-    const broker = deps.brokers.for(userId);
+    if (parsed.data.force === true) deps.brokers.drop(account.id);
+    connections.invalidate(account.id);
+    const broker = deps.brokers.for(account);
     if (broker.session.isConnected()) {
       return reply.send({ connected: true, authUrl: null });
     }
@@ -181,7 +181,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // needs the paste this endpoint's caller hasn't made yet — so kick it off
     // and wait only for the authorization URL it produces on the way.
     void broker.session.ensureConnected().catch((err: unknown) =>
-      log.warn('Robinhood connect failed', { userId, error: (err as Error).message })
+      log.warn('Robinhood connect failed', { accountId: account.id, error: (err as Error).message })
     );
 
     const authUrl = await waitForAuthUrl(broker);
@@ -194,7 +194,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   fastify.post('/api/broker/callback', async (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
     if (deps.executionMode === 'read_only') {
       return reply.status(409).send({ error: READ_ONLY_CONNECT_ERROR });
     }
@@ -212,7 +212,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!code) {
       return reply.status(400).send({ error: 'redirectUrl has no code parameter' });
     }
-    const broker = deps.brokers.existing(userId);
+    const broker = deps.brokers.existing(account.id);
     if (!broker || !broker.session.isAuthPending()) {
       return reply.status(409).send({ error: 'no OAuth authorization is pending' });
     }
@@ -223,37 +223,37 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   fastify.post('/api/broker/disconnect', async (request, reply) => {
-    const { id: userId } = requireUser(request);
-    await deps.db.deleteBrokerTokens(userId);
-    deps.brokers.drop(userId);
-    connections.invalidate(userId);
+    const account = requireAccount(request);
+    await deps.db.deleteBrokerTokens(account.id);
+    deps.brokers.drop(account.id);
+    connections.invalidate(account.id);
     return reply.send({ ok: true });
   });
 
   // ---- Feed --------------------------------------------------------------------
 
-  // This user's trade outcomes, newest-first.
+  // The selected account's trade outcomes, newest-first.
   fastify.get('/api/decisions', async (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
     const limitRaw = (request.query as { limit?: string }).limit;
     const limit = limitRaw === undefined ? DEFAULT_DECISIONS_LIMIT : Number(limitRaw);
     if (!Number.isInteger(limit) || limit < 1) {
       return reply.status(400).send({ error: 'limit must be a positive integer' });
     }
-    return reply.send({ decisions: await deps.db.listDecisions(userId, limit) });
+    return reply.send({ decisions: await deps.db.listDecisions(account.id, limit) });
   });
 
-  // Every callout the pipeline has seen, each carrying THIS user's outcome.
+  // Every callout the pipeline has seen, each carrying THIS account's outcome.
   // The callouts themselves are shared; the decision attached to them is not.
   // Egress: the etag is the feed's version, computed in one cheap query, so a
   // poll that changed nothing answers 304 without reading a single row
   // (@fastify/etag keeps an etag the route set and does the 304 itself).
   fastify.get('/api/callouts', async (request, reply) => {
-    const { id: userId } = requireUser(request);
-    const etag = `"${await deps.db.feedVersion(userId, DEFAULT_CALLOUTS_LIMIT)}"`;
+    const account = requireAccount(request);
+    const etag = `"${await deps.db.feedVersion(account.id, DEFAULT_CALLOUTS_LIMIT)}"`;
     reply.header('etag', etag);
     if (request.headers['if-none-match'] === etag) return reply.code(304).send();
-    return reply.send({ callouts: await loadFeed(deps, userId) });
+    return reply.send({ callouts: await loadFeed(deps, account.id) });
   });
 
   // ---- Approval ------------------------------------------------------------
@@ -266,10 +266,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // reach past the closing bell.
 
   fastify.post('/api/trades/:messageId/approve', async (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
     const { messageId } = request.params as { messageId: string };
 
-    const pending = await findPendingApproval(deps, userId, messageId);
+    const pending = await findPendingApproval(deps, account.id, messageId);
     if (pending === null) {
       return reply.status(404).send({ error: 'no trade awaiting approval for that callout' });
     }
@@ -284,9 +284,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       });
     }
 
-    // Approving spends money over the user's broker session, so it must not
+    // Approving spends money over the account's broker session, so it must not
     // run against a stale one. The row stays pending — reconnect, then approve.
-    const broker = await connectedBrokerTools(deps, userId);
+    const broker = await connectedBrokerTools(deps, account);
     if (broker === null) {
       return reply.status(409).send({ error: 'Robinhood is not connected' });
     }
@@ -295,7 +295,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     let outcome: ApprovalOutcome;
     try {
       if (pending.order.assetType === 'option' && pending.order.side === 'sell') {
-        await cancelStops(deps.db, userId, broker, pending.order.symbol, pending.order.option);
+        await cancelStops(deps.db, account.id, broker, pending.order.symbol, pending.order.option);
       }
       const placed = await submitOrder(pending.order, broker);
       const order = {
@@ -320,20 +320,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       };
     }
 
-    return reply.send(await applyApproval(deps, userId, messageId, pending, outcome));
+    return reply.send(await applyApproval(deps, account.id, messageId, pending, outcome));
   });
 
   fastify.post('/api/trades/:messageId/reject', async (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
     const { messageId } = request.params as { messageId: string };
 
-    const pending = await findPendingApproval(deps, userId, messageId);
+    const pending = await findPendingApproval(deps, account.id, messageId);
     if (pending === null) {
       return reply.status(404).send({ error: 'no trade awaiting approval for that callout' });
     }
 
     return reply.send(
-      await applyApproval(deps, userId, messageId, pending, {
+      await applyApproval(deps, account.id, messageId, pending, {
         kind: 'rejected',
         code: null,
         reason: 'Rejected — no order submitted.',
@@ -407,19 +407,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // ---- Settings -----------------------------------------------------------------
 
   fastify.get('/api/settings', async (request, reply) => {
-    const { id: userId } = requireUser(request);
-    return reply.send({ settings: await deps.db.getSettings(userId) });
+    const account = requireAccount(request);
+    return reply.send({ settings: await deps.db.getSettings(account.id) });
   });
 
   fastify.put('/api/settings', async (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
     // strict(): a typo'd key ("maxTradesperDay") must 400, not be silently
     // stripped and leave the user thinking they raised a limit they didn't.
     const parsed = TradeSettingsSchema.strict().safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: 'invalid settings', detail: parsed.error.message });
     }
-    return reply.send({ settings: await deps.db.saveSettings(userId, parsed.data) });
+    return reply.send({ settings: await deps.db.saveSettings(account.id, parsed.data) });
   });
 
   // ---- Portfolio ------------------------------------------------------------------
@@ -427,8 +427,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // Account snapshot for the dashboard header: total portfolio value plus a
   // count of open (quantity > 0) equity + option positions.
   fastify.get('/api/portfolio', async (request, reply) => {
-    const { id: userId } = requireUser(request);
-    const broker = await connections.tools(userId);
+    const account = requireAccount(request);
+    const broker = await connections.tools(account);
     if (broker === null) {
       return reply.status(409).send({ error: 'Robinhood is not connected' });
     }
@@ -447,13 +447,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   fastify.get('/api/trades/performance', async (request, reply) => {
-    const { id: userId } = requireUser(request);
-    const tools = await connectedBrokerTools(deps, userId);
+    const account = requireAccount(request);
+    const tools = await connectedBrokerTools(deps, account);
     if (tools === null) {
       return reply.status(409).send({ error: 'Robinhood is not connected' });
     }
     try {
-      const history = deps.db.listDecisions(userId, PERFORMANCE_HISTORY_LIMIT);
+      const history = deps.db.listDecisions(account.id, PERFORMANCE_HISTORY_LIMIT);
       return reply.send({ positions: await collectPerformance(tools, history) });
     } catch (err) {
       return reply
@@ -473,8 +473,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   //
   // Read with fetch, not EventSource, so it carries the same Authorization
   // header as every other route (see client/src/lib/stream.ts).
+  //
+  // The stream follows the account that was selected when it opened.
   fastify.get('/api/stream', (request, reply) => {
-    const { id: userId } = requireUser(request);
+    const account = requireAccount(request);
+    const accountId = account.id;
 
     // Raw SSE writing bypasses Fastify's send path, so @fastify/cors headers
     // are lost — reflect the origin manually.
@@ -492,7 +495,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     const pushDecisions = (): void => {
       void deps.db
-        .listDecisions(userId, DEFAULT_DECISIONS_LIMIT)
+        .listDecisions(accountId, DEFAULT_DECISIONS_LIMIT)
         .then((decisions) => send('decisions', decisions))
         .catch((err: unknown) =>
           log.warn('could not push decisions frame', { error: (err as Error).message })
@@ -520,7 +523,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // and stale-session eviction drop or replace the session, and a finished
     // OAuth adds a connected one. Any of those re-checks the row.
     const sessionChanged = (cached: Broker | null): boolean => {
-      const live = deps.brokers.existing(userId);
+      const live = deps.brokers.existing(accountId);
       return cached === null ? live?.session.isConnected() === true : live?.broker !== cached;
     };
 
@@ -528,7 +531,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       try {
         let tools = connection;
         if (tools === undefined || sessionChanged(tools)) {
-          tools = await connectedBrokerTools(deps, userId);
+          tools = await connectedBrokerTools(deps, account);
           connection = tools;
         }
         if (tools === null) {
@@ -539,7 +542,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         }
         // A failed read is not kept: the next tick tries again.
         history ??= deps.db
-          .listDecisions(userId, PERFORMANCE_HISTORY_LIMIT)
+          .listDecisions(accountId, PERFORMANCE_HISTORY_LIMIT)
           .catch((err: unknown) => {
             history = undefined;
             throw err;
@@ -556,7 +559,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     pushDecisions();
     void pushPerformance();
-    const unsubscribe = deps.events.subscribe(userId, {
+    const unsubscribe = deps.events.subscribe(accountId, {
       onDecision: () => {
         pushDecisions();
         connection = undefined;
@@ -570,7 +573,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     // ponytail: per-connection timers — N clients means N× Robinhood quote
     // traffic. Fine at invite-only scale; upgrade path is one shared broadcast
-    // loop per user gated on client count. Zero clients = zero timers either way.
+    // loop per account gated on client count. Zero clients = zero timers either way.
     const performanceTimer = setInterval(() => void pushPerformance(), SSE_PERFORMANCE_INTERVAL_MS);
     const heartbeatTimer = setInterval(
       () => reply.raw.write(': heartbeat\n\n'),
@@ -579,14 +582,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // A row removed out of process (auth:reset) leaves the registry alone, so
     // an id-only existence check, which never fetches the token blob, backs
     // the in-memory signal up at a slower cadence.
-    // ponytail: lists every connected user's id to test one; fine at
-    // invite-only scale. Upgrade path: a per-user existence query.
+    // ponytail: lists every connected account to test one; fine at
+    // invite-only scale. Upgrade path: a per-account existence query.
     const connectionTimer = setInterval(() => {
       if (!connection) return;
       void deps.db
-        .listBrokerUserIds()
-        .then((userIds) => {
-          if (!userIds.includes(userId)) connection = undefined;
+        .listConnectedAccounts()
+        .then((connected) => {
+          if (!connected.some((candidate) => candidate.id === accountId)) connection = undefined;
         })
         .catch((err: unknown) =>
           log.warn('could not check broker connection', { error: (err as Error).message })
@@ -610,13 +613,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 // Approval
 // =============================================================================
 
-/** This user's decision for a callout, but only if it is awaiting approval. */
+/** This account's decision for a callout, but only if it is awaiting approval. */
 async function findPendingApproval(
   deps: ServerDeps,
-  userId: string,
+  accountId: string,
   messageId: string
 ): Promise<Decision | null> {
-  const decisions = await deps.db.decisionsByMessageId(userId, [messageId]);
+  const decisions = await deps.db.decisionsByMessageId(accountId, [messageId]);
   const decision = decisions.get(messageId);
   return decision?.kind === 'pending_approval' ? decision : null;
 }
@@ -630,12 +633,12 @@ async function findPendingApproval(
  */
 async function applyApproval(
   deps: ServerDeps,
-  userId: string,
+  accountId: string,
   messageId: string,
   pending: Decision,
   outcome: ApprovalOutcome
 ): Promise<{ decision: Decision }> {
-  const applied = await deps.db.resolvePendingApproval(userId, messageId, outcome);
+  const applied = await deps.db.resolvePendingApproval(accountId, messageId, outcome);
   const decision: Decision = {
     ...pending,
     kind: outcome.kind,
@@ -643,7 +646,7 @@ async function applyApproval(
     reason: outcome.reason,
     order: outcome.order,
   };
-  if (applied) deps.events.emitDecision(userId, decision);
+  if (applied) deps.events.emitDecision(accountId, decision);
   return { decision };
 }
 
@@ -651,15 +654,15 @@ async function applyApproval(
 // Feed
 // =============================================================================
 
-/** A shared callout plus the acting user's outcome for it (null = not acted on). */
+/** A shared callout plus the selected account's outcome for it (null = not acted on). */
 export interface CalloutFeedItem extends StoredCallout {
   readonly decision: Decision | null;
 }
 
-async function loadFeed(deps: ServerDeps, userId: string): Promise<CalloutFeedItem[]> {
+async function loadFeed(deps: ServerDeps, accountId: string): Promise<CalloutFeedItem[]> {
   const callouts = await deps.db.listCallouts(DEFAULT_CALLOUTS_LIMIT);
   const decisions = await deps.db.decisionsByMessageId(
-    userId,
+    accountId,
     callouts.map((c) => c.messageId)
   );
   return callouts.map((callout) => ({
@@ -673,34 +676,34 @@ async function loadFeed(deps: ServerDeps, userId: string): Promise<CalloutFeedIt
 // =============================================================================
 
 /**
- * The user's broker tools, gated on the connection of record (their
- * broker_connections row). Every route that reads or trades the user's
- * Robinhood account goes through here, so none of them can serve from a warm
- * in-memory session whose stored connection no longer exists. Null means
- * "not connected" — callers answer 409, distinct from the 503 "broker down".
+ * The account's broker, gated on the connection of record (its stored
+ * credentials). Every route that reads or trades the account goes through
+ * here, so none of them can serve from a warm in-memory session whose stored
+ * connection no longer exists. Null means "not connected" — callers answer
+ * 409, distinct from the 503 "broker down".
  */
 async function connectedBrokerTools(
   deps: ServerDeps,
-  userId: string
+  account: AccountRow
 ): Promise<Broker | null> {
-  const stored = await deps.db.getBrokerTokens(userId);
+  const stored = await deps.db.getBrokerTokens(account.id);
   if (readTokenStatus(stored?.tokens).state !== 'missing') {
-    return deps.brokers.for(userId).broker;
+    return deps.brokers.for(account).broker;
   }
-  dropStaleBrokerSession(deps, userId);
+  dropStaleBrokerSession(deps, account.id);
   return null;
 }
 
 /**
- * Evict a warm session that outlived its broker_connections row (removed by
- * an operator reset or a disconnect made elsewhere). Sessions mid-OAuth are
+ * Evict a warm session that outlived its stored credentials (removed by an
+ * operator reset or a disconnect made elsewhere). Sessions mid-OAuth are
  * not connected yet and are left alone so the flow they hold can finish.
  */
-function dropStaleBrokerSession(deps: ServerDeps, userId: string): void {
-  if (deps.brokers.existing(userId)?.session.isConnected()) deps.brokers.drop(userId);
+function dropStaleBrokerSession(deps: ServerDeps, accountId: string): void {
+  if (deps.brokers.existing(accountId)?.session.isConnected()) deps.brokers.drop(accountId);
 }
 
-/** What the registry held for a user when their row was last read. */
+/** What the registry held for an account when its credentials were last read. */
 interface SessionSnapshot {
   readonly session: UserBroker | undefined;
   readonly connected: boolean;
@@ -712,70 +715,71 @@ interface ConnectionRecord extends SessionSnapshot {
 }
 
 interface ConnectionCache {
-  /** The token state of the user's broker_connections row. */
-  state(userId: string): Promise<TokenState>;
-  /** connectedBrokerTools, from the cached row. */
-  tools(userId: string): Promise<Broker | null>;
-  invalidate(userId: string): void;
+  /** The token state of the account's stored credentials. */
+  state(account: AccountRow): Promise<TokenState>;
+  /** connectedBrokerTools, from the cached read. */
+  tools(account: AccountRow): Promise<Broker | null>;
+  invalidate(accountId: string): void;
 }
 
 /**
  * The connection of record for the dashboard's polled routes, shared by every
- * tab a user has open, without reading and decrypting the token row per poll.
+ * tab a user has open, without reading and decrypting the credentials per poll.
  *
  * Every in-process (dis)connect shows in the registry — disconnect, Reconnect
  * and stale-session eviction drop or replace the session, and a finished
- * OAuth flips it to connected — so any change there re-reads the row. A row
- * removed out of process (auth:reset) leaves the registry alone; an id-only
- * existence check every CONNECTION_CHECK_INTERVAL_MS catches it.
- * ponytail: the check lists every connected user's id to test one; fine at
- * invite-only scale. Upgrade path: a per-user existence query.
+ * OAuth flips it to connected — so any change there re-reads the credentials.
+ * Ones removed out of process (auth:reset) leave the registry alone; an
+ * id-only existence check every CONNECTION_CHECK_INTERVAL_MS catches it.
+ * ponytail: the check lists every connected account to test one; fine at
+ * invite-only scale. Upgrade path: a per-account existence query.
  */
 function createConnectionCache(deps: ServerDeps): ConnectionCache {
   const records = new Map<string, ConnectionRecord>();
 
-  const snapshot = (userId: string): SessionSnapshot => {
-    const session = deps.brokers.existing(userId);
+  const snapshot = (accountId: string): SessionSnapshot => {
+    const session = deps.brokers.existing(accountId);
     return { session, connected: session?.session.isConnected() === true };
   };
 
-  const registryChanged = (userId: string, record: ConnectionRecord): boolean => {
-    const live = snapshot(userId);
+  const registryChanged = (accountId: string, record: ConnectionRecord): boolean => {
+    const live = snapshot(accountId);
     return live.session !== record.session || live.connected !== record.connected;
   };
 
-  const read = (userId: string): Promise<TokenState> => {
+  const read = (accountId: string): Promise<TokenState> => {
     const record: ConnectionRecord = {
-      ...snapshot(userId),
+      ...snapshot(accountId),
       checkedAt: Date.now(),
-      state: deps.db.getBrokerTokens(userId).then((stored) => {
+      state: deps.db.getBrokerTokens(accountId).then((stored) => {
         const { state } = readTokenStatus(stored?.tokens);
-        if (state === 'missing') dropStaleBrokerSession(deps, userId);
+        if (state === 'missing') dropStaleBrokerSession(deps, accountId);
         return state;
       }),
     };
-    records.set(userId, record);
+    records.set(accountId, record);
     // A failed read is not kept: the next request tries again.
     record.state.catch(() => {
-      if (records.get(userId) === record) records.delete(userId);
+      if (records.get(accountId) === record) records.delete(accountId);
     });
     return record.state;
   };
 
-  const state = async (userId: string): Promise<TokenState> => {
-    const record = records.get(userId);
-    if (record === undefined || registryChanged(userId, record)) return read(userId);
+  const state = async ({ id: accountId }: AccountRow): Promise<TokenState> => {
+    const record = records.get(accountId);
+    if (record === undefined || registryChanged(accountId, record)) return read(accountId);
     if (Date.now() - record.checkedAt < CONNECTION_CHECK_INTERVAL_MS) return record.state;
-    const [cached, userIds] = await Promise.all([record.state, deps.db.listBrokerUserIds()]);
+    const [cached, connected] = await Promise.all([record.state, deps.db.listConnectedAccounts()]);
     record.checkedAt = Date.now();
-    return userIds.includes(userId) === (cached !== 'missing') ? cached : read(userId);
+    const stillConnected = connected.some((candidate) => candidate.id === accountId);
+    return stillConnected === (cached !== 'missing') ? cached : read(accountId);
   };
 
   return {
     state,
-    tools: async (userId) =>
-      (await state(userId)) === 'missing' ? null : deps.brokers.for(userId).broker,
-    invalidate: (userId) => void records.delete(userId),
+    tools: async (account) =>
+      (await state(account)) === 'missing' ? null : deps.brokers.for(account).broker,
+    invalidate: (accountId) => void records.delete(accountId),
   };
 }
 

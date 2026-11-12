@@ -45,7 +45,10 @@ const LIVE_ORDER = {
 const CONNECT_TIMEOUT_MS = 120_000;
 
 async function connectTools(): Promise<{ mcp: RobinhoodMcpClient; tools: RobinhoodTools }> {
-  const mcp = new RobinhoodMcpClient({ userId: LIVE_USER_ID, db: createTraderDb() });
+  const db = createTraderDb();
+  const account = await db.getSelectedAccount(LIVE_USER_ID);
+  if (account?.adapter !== 'robinhood') throw new Error(`user ${LIVE_USER_ID} has no Robinhood account selected`);
+  const mcp = new RobinhoodMcpClient({ accountId: account.id, db });
   await mcp.ensureConnected();
   log.info('connected to Robinhood MCP', { tools: mcp.getToolNames() });
   return { mcp, tools: new RobinhoodTools(mcp) };

@@ -1,11 +1,15 @@
 /**
  * In-memory TraderDb for route and pipeline tests.
  *
- * It stores rows the way Postgres does — keyed by user — and filters every
- * read by the `userId` it was handed, so a route that passes the wrong user
- * (or a hardcoded one) sees the wrong data and the test fails. It also records
- * every per-user call, which is what isolation.test.ts asserts against: no
- * endpoint may query a user id other than the caller's.
+ * It stores rows the way Postgres does — keyed by account — and filters every
+ * read by the `accountId` it was handed, so a route that passes the wrong
+ * account (or a hardcoded one) sees the wrong data and the test fails. It also
+ * records every scoped call, which is what isolation.test.ts asserts against:
+ * no endpoint may query an id other than the caller's.
+ *
+ * A user's first account takes the user's own id unless the test names another
+ * (addUser's third argument), so a single-account fixture needs one identifier.
+ * Tests about the user/account distinction give the two different ids.
  */
 import { createHash } from 'node:crypto';
 
@@ -38,6 +42,7 @@ import type {
 import type { PersistedState } from '../robinhood/types.js';
 import { optionLabel } from '../../shared/types.js';
 import type { TrackedPosition } from '../book/ladder.js';
+import type { AccountRow } from '../broker/types.js';
 
 /** An in-memory `messages` row: capture columns + the trader's verdict marks. */
 export interface FakeMessageRow {
@@ -79,8 +84,22 @@ const DISPOSITION_FROM_FEED_STATUS: Record<CalloutFeedStatus, MessageDisposition
 
 export interface ScopedCall {
   readonly method: string;
-  readonly userId: string;
+  /** The account id the call was scoped to. */
+  readonly scopeId: string;
 }
+
+/** A direct Robinhood account row, owned by the user of the same id unless told otherwise. */
+export const fakeAccount = (id: string, userId: string = id): AccountRow => ({
+  id,
+  userId,
+  adapter: 'robinhood',
+  institution: 'robinhood',
+  externalAccountId: null,
+  label: 'Robinhood',
+  isPaper: false,
+  needsReconnect: false,
+  adapterData: {},
+});
 
 /** A stored broker connection, shaped like what the MCP SDK persists. */
 export const fakeTokens = (accessToken: string, refreshToken?: string): PersistedState => ({
@@ -92,13 +111,20 @@ export const fakeTokens = (accessToken: string, refreshToken?: string): Persiste
 });
 
 export interface FakeDb extends TraderDb {
-  /** Every per-user query this db has served, in order. */
+  /** Every scoped query this db has served, in order. */
   readonly calls: ScopedCall[];
-  /** Register a user with a never-expiring session for `accessToken`. */
-  addUser(user: AuthUser, accessToken: string): void;
-  seedSettings(userId: string, settings: TradeSettings): void;
-  seedDecision(userId: string, decision: Decision): void;
-  seedBrokerTokens(userId: string, state: PersistedState): void;
+  /**
+   * Register a user with a never-expiring session for `accessToken`, and their
+   * direct Robinhood account (selected), whose id is the user's unless given.
+   */
+  addUser(user: AuthUser, accessToken: string, accountId?: string): void;
+  /** Add a further account to its user; `select` makes it the one their routes act on. */
+  addAccount(account: AccountRow, options?: { readonly select?: boolean }): void;
+  /** The account row for an id, created as a direct Robinhood account when unknown. */
+  account(accountId: string): AccountRow;
+  seedSettings(accountId: string, settings: TradeSettings): void;
+  seedDecision(accountId: string, decision: Decision): void;
+  seedBrokerTokens(accountId: string, state: PersistedState): void;
   /** Seed an already-judged message row from its feed shape. */
   seedCallout(callout: StoredCallout): void;
   /** Seed a raw messages row (unprocessed unless marks are given). */
@@ -113,8 +139,12 @@ export interface FakeDb extends TraderDb {
 
 export function createFakeDb(): FakeDb {
   const calls: ScopedCall[] = [];
+  /** Account id -> row, in creation order. */
+  const accounts = new Map<string, AccountRow>();
+  /** User id -> the account their routes act on. */
+  const selectedAccounts = new Map<string, string>();
   const settings = new Map<string, ResolvedTradeSettings>();
-  const trades: Array<{ userId: string; decision: Decision }> = [];
+  const trades: Array<{ accountId: string; decision: Decision }> = [];
   const brokerTokens = new Map<string, PersistedState>();
   const messages = new Map<string, FakeMessageRow>();
   const callers = new Map<string, Caller>();
@@ -126,12 +156,28 @@ export function createFakeDb(): FakeDb {
   /** Bearer token -> session; a null expiry never ends (addUser's tokens). */
   const sessions = new Map<string, { user: AuthUser; expiresAt: Date | null }>();
 
-  const record = <T>(method: string, userId: string, value: T): T => {
-    calls.push({ method, userId });
+  const record = <T>(method: string, scopeId: string, value: T): T => {
+    calls.push({ method, scopeId });
     return value;
   };
-  const decisionsFor = (userId: string): Decision[] =>
-    trades.filter((row) => row.userId === userId).map((row) => row.decision);
+  const decisionsFor = (accountId: string): Decision[] =>
+    trades.filter((row) => row.accountId === accountId).map((row) => row.decision);
+  // The selected account, or the user's oldest when that selection is not theirs.
+  const selectedAccountOf = (userId: string): AccountRow | null => {
+    const selected = accounts.get(selectedAccounts.get(userId) ?? '');
+    if (selected?.userId === userId) return selected;
+    return [...accounts.values()].find((account) => account.userId === userId) ?? null;
+  };
+  // Seeding or opening an account nobody registered creates it, as the
+  // pipeline and monitor tests do: they never sign a user in.
+  const ensureAccount = (accountId: string): AccountRow => {
+    const existing = accounts.get(accountId);
+    if (existing) return existing;
+    const created = fakeAccount(accountId);
+    accounts.set(accountId, created);
+    if (!selectedAccounts.has(created.userId)) selectedAccounts.set(created.userId, accountId);
+    return created;
+  };
   const feedRows = (limit: number): FakeMessageRow[] =>
     [...messages.values()]
       .filter((row) => row.disposition !== null && row.disposition !== 'recap')
@@ -141,18 +187,30 @@ export function createFakeDb(): FakeDb {
   return {
     calls,
 
-    addUser(user, accessToken) {
+    addUser(user, accessToken, accountId = user.id) {
       sessions.set(accessToken, { user, expiresAt: null });
       if (user.email) usersByEmail.set(user.email.toLowerCase(), user);
+      accounts.set(accountId, fakeAccount(accountId, user.id));
+      selectedAccounts.set(user.id, accountId);
     },
-    seedSettings(userId, value) {
-      settings.set(userId, TradeSettingsSchema.parse(value));
+    addAccount(account, options = {}) {
+      accounts.set(account.id, account);
+      if (options.select || !selectedAccounts.has(account.userId)) {
+        selectedAccounts.set(account.userId, account.id);
+      }
     },
-    seedDecision(userId, decision) {
-      trades.push({ userId, decision });
+    account: ensureAccount,
+    seedSettings(accountId, value) {
+      ensureAccount(accountId);
+      settings.set(accountId, TradeSettingsSchema.parse(value));
     },
-    seedBrokerTokens(userId, state) {
-      brokerTokens.set(userId, state);
+    seedDecision(accountId, decision) {
+      ensureAccount(accountId);
+      trades.push({ accountId, decision });
+    },
+    seedBrokerTokens(accountId, state) {
+      ensureAccount(accountId);
+      brokerTokens.set(accountId, state);
     },
     seedCallout(callout) {
       messages.set(callout.messageId, {
@@ -197,23 +255,23 @@ export function createFakeDb(): FakeDb {
       return tracked.get(messageId) ?? null;
     },
 
-    // ---- Per-user ------------------------------------------------------------
+    // ---- Per-account ---------------------------------------------------------
 
-    async getSettings(userId) {
-      return record('getSettings', userId, settings.get(userId) ?? TradeSettingsSchema.parse({}));
+    async getSettings(accountId) {
+      return record('getSettings', accountId, settings.get(accountId) ?? TradeSettingsSchema.parse({}));
     },
-    async saveSettings(userId, value) {
+    async saveSettings(accountId, value) {
       const parsed = TradeSettingsSchema.parse(value);
-      settings.set(userId, parsed);
-      return record('saveSettings', userId, parsed);
+      settings.set(accountId, parsed);
+      return record('saveSettings', accountId, parsed);
     },
-    async listDecisions(userId, limit) {
-      const newestFirst = [...decisionsFor(userId)].sort((a, b) => b.at.localeCompare(a.at));
-      return record('listDecisions', userId, newestFirst.slice(0, limit));
+    async listDecisions(accountId, limit) {
+      const newestFirst = [...decisionsFor(accountId)].sort((a, b) => b.at.localeCompare(a.at));
+      return record('listDecisions', accountId, newestFirst.slice(0, limit));
     },
-    async listOpenOptionLots(userId) {
+    async listOpenOptionLots(accountId) {
       const rows = trades
-        .filter((row) => row.userId === userId)
+        .filter((row) => row.accountId === accountId)
         .map((row) => ({
           id: row.decision.messageId,
           messageId: row.decision.messageId,
@@ -222,20 +280,20 @@ export function createFakeDb(): FakeDb {
           at: row.decision.at,
           order: row.decision.order,
         }));
-      return record('listOpenOptionLots', userId, openOptionLots(rows));
+      return record('listOpenOptionLots', accountId, openOptionLots(rows));
     },
-    async recordDecision(userId, decision) {
-      // Mirrors trades_user_message_uidx + ON CONFLICT DO NOTHING.
-      if (trades.some((r) => r.userId === userId && r.decision.messageId === decision.messageId)) {
+    async recordDecision(accountId, decision) {
+      // Mirrors trades_account_message_uidx + ON CONFLICT DO NOTHING.
+      if (trades.some((r) => r.accountId === accountId && r.decision.messageId === decision.messageId)) {
         return;
       }
-      trades.push({ userId, decision });
-      record('recordDecision', userId, undefined);
+      trades.push({ accountId, decision });
+      record('recordDecision', accountId, undefined);
     },
-    async resolvePendingApproval(userId, messageId, outcome) {
+    async resolvePendingApproval(accountId, messageId, outcome) {
       const row = trades.find(
         (r) =>
-          r.userId === userId &&
+          r.accountId === accountId &&
           r.decision.messageId === messageId &&
           r.decision.kind === 'pending_approval'
       );
@@ -248,58 +306,58 @@ export function createFakeDb(): FakeDb {
           order: outcome.order,
         };
       }
-      return record('resolvePendingApproval', userId, row !== undefined);
+      return record('resolvePendingApproval', accountId, row !== undefined);
     },
-    async updateOrder(userId, messageId, order) {
-      const row = trades.find((r) => r.userId === userId && r.decision.messageId === messageId);
+    async updateOrder(accountId, messageId, order) {
+      const row = trades.find((r) => r.accountId === accountId && r.decision.messageId === messageId);
       if (row) row.decision = { ...row.decision, order };
-      record('updateOrder', userId, undefined);
+      record('updateOrder', accountId, undefined);
     },
-    async decisionsByMessageId(userId, messageIds) {
+    async decisionsByMessageId(accountId, messageIds) {
       const wanted = new Set(messageIds);
       const found = new Map<string, Decision>();
-      for (const decision of decisionsFor(userId)) {
+      for (const decision of decisionsFor(accountId)) {
         if (wanted.has(decision.messageId)) found.set(decision.messageId, decision);
       }
-      return record('decisionsByMessageId', userId, found);
+      return record('decisionsByMessageId', accountId, found);
     },
-    async feedVersion(userId, limit) {
+    async feedVersion(accountId, limit) {
       const rows = feedRows(limit);
       const ids = new Set(rows.map((row) => row.messageId));
-      const decisions = decisionsFor(userId).filter((d) => ids.has(d.messageId));
+      const decisions = decisionsFor(accountId).filter((d) => ids.has(d.messageId));
       const version = createHash('md5')
-        .update(JSON.stringify([userId, rows, decisions]))
+        .update(JSON.stringify([accountId, rows, decisions]))
         .digest('hex');
-      return record('feedVersion', userId, version);
+      return record('feedVersion', accountId, version);
     },
-    async countSubmittedSince(userId, since) {
-      const count = decisionsFor(userId).filter(
+    async countSubmittedSince(accountId, since) {
+      const count = decisionsFor(accountId).filter(
         (d) => d.kind === 'submitted' && Date.parse(d.at) >= since.getTime()
       ).length;
-      return record('countSubmittedSince', userId, count);
+      return record('countSubmittedSince', accountId, count);
     },
-    async lastSubmittedAt(userId, ticker) {
-      const times = decisionsFor(userId)
+    async lastSubmittedAt(accountId, ticker) {
+      const times = decisionsFor(accountId)
         .filter((d) => d.kind === 'submitted' && d.ticker === ticker.toUpperCase())
         .map((d) => Date.parse(d.at));
-      return record('lastSubmittedAt', userId, times.length ? new Date(Math.max(...times)) : null);
+      return record('lastSubmittedAt', accountId, times.length ? new Date(Math.max(...times)) : null);
     },
-    async getBrokerTokens(userId) {
-      return record('getBrokerTokens', userId, brokerTokens.get(userId) ?? null);
+    async getBrokerTokens(accountId) {
+      return record('getBrokerTokens', accountId, brokerTokens.get(accountId) ?? null);
     },
-    async saveBrokerTokens(userId, state) {
-      brokerTokens.set(userId, state);
-      record('saveBrokerTokens', userId, undefined);
+    async saveBrokerTokens(accountId, state) {
+      brokerTokens.set(accountId, state);
+      record('saveBrokerTokens', accountId, undefined);
     },
-    async deleteBrokerTokens(userId) {
-      brokerTokens.delete(userId);
-      record('deleteBrokerTokens', userId, undefined);
+    async deleteBrokerTokens(accountId) {
+      brokerTokens.delete(accountId);
+      record('deleteBrokerTokens', accountId, undefined);
     },
 
     // ---- Shared --------------------------------------------------------------
 
-    async listBrokerUserIds() {
-      return [...brokerTokens.keys()];
+    async listConnectedAccounts() {
+      return [...brokerTokens.keys()].map(ensureAccount);
     },
     async listOpenOrders(since) {
       return trades
@@ -311,7 +369,7 @@ export function createFakeDb(): FakeDb {
             !isTerminalOrderState(decision.order.status)
         )
         .sort((a, b) => a.decision.at.localeCompare(b.decision.at))
-        .map(({ userId, decision }) => ({ userId, decision }));
+        .map(({ accountId, decision }) => ({ accountId, decision }));
     },
     async listUnprocessedMessages(limit) {
       return [...messages.values()]
@@ -513,7 +571,11 @@ export function createFakeDb(): FakeDb {
       if (!allowedEmails.has(normalized)) return null;
       const created: AuthUser = { id: `user-${usersByEmail.size + 1}`, email: normalized };
       usersByEmail.set(normalized, created);
+      ensureAccount(created.id);
       return created;
+    },
+    async getSelectedAccount(userId) {
+      return selectedAccountOf(userId);
     },
     async createSession(userId, token, expiresAt) {
       const user = [...usersByEmail.values()].find((candidate) => candidate.id === userId);
@@ -529,7 +591,8 @@ export function createFakeDb(): FakeDb {
     async verifyAccessToken(token) {
       const session = sessions.get(token);
       if (!session) return null;
-      return session.expiresAt === null || session.expiresAt > new Date() ? session.user : null;
+      if (session.expiresAt !== null && session.expiresAt <= new Date()) return null;
+      return { user: session.user, account: selectedAccountOf(session.user.id) };
     },
   };
 }

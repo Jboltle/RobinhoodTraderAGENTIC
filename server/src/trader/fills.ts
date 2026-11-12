@@ -5,7 +5,7 @@
  *
  * Robinhood answers `unconfirmed` the moment it accepts an order, and nothing
  * else in the system looked again — so "submitted" only ever meant "sent".
- * This loop polls the user's option order history (the same call Max Loss
+ * This loop polls the account's option order history (the same call Max Loss
  * uses for cost basis), matches by order id, and writes the change back. The
  * dashboard learns about it through the normal decision event, so the chip
  * flips from working to filled without a new frame type.
@@ -23,7 +23,7 @@ import type { TraderEvents } from './events.js';
 import { normalizeOptionPremium } from './maxLoss.js';
 import { BrokerUnavailableError } from './broker/errors.js';
 import type { McpRegistry } from './broker/registry.js';
-import type { BrokerOrder } from './broker/types.js';
+import type { AccountRow, BrokerOrder } from './broker/types.js';
 
 const log = createLogger('trader:fills');
 
@@ -89,44 +89,46 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
   );
   if (rows.length === 0) return { open: 0, updated: 0 };
 
-  // Only users with a connection of record, as Max Loss does: reaching for a
-  // disconnected user's session would start an OAuth flow nobody asked for.
+  // Only accounts with a connection of record, as Max Loss does: reaching for
+  // a disconnected account's session would start an OAuth flow nobody asked for.
   // Equity orders have no history tool to read; they keep their submit-time state.
-  const connected = new Set(await deps.db.listBrokerUserIds());
+  const connected = new Map(
+    (await deps.db.listConnectedAccounts()).map((account) => [account.id, account])
+  );
   const optionRows = rows.filter(
-    (row) => connected.has(row.userId) && row.decision.order?.assetType === 'option'
+    (row) => connected.has(row.accountId) && row.decision.order?.assetType === 'option'
   );
 
-  const byUser = new Map<string, OpenOrderRow[]>();
+  const byAccount = new Map<string, OpenOrderRow[]>();
   for (const row of optionRows) {
-    const list = byUser.get(row.userId) ?? [];
+    const list = byAccount.get(row.accountId) ?? [];
     list.push(row);
-    byUser.set(row.userId, list);
+    byAccount.set(row.accountId, list);
   }
 
   let updated = 0;
-  for (const [userId, userRows] of byUser) {
+  for (const [accountId, accountRows] of byAccount) {
     try {
-      updated += await syncUser(userId, userRows, deps, now);
+      updated += await syncAccount(connected.get(accountId)!, accountRows, deps, now);
     } catch (err: unknown) {
-      log.warn('fill sync failed for user', { userId, error: err instanceof Error ? err.message : String(err) });
+      log.warn('fill sync failed for account', { accountId, error: err instanceof Error ? err.message : String(err) });
     }
   }
   if (deps.executionMode === 'immediate') {
-    for (const userId of await deps.db.listBrokerUserIds()) {
+    for (const account of await deps.db.listConnectedAccounts()) {
       try {
-        const broker = deps.brokers.for(userId);
+        const broker = deps.brokers.for(account);
         await broker.session.ensureReady();
         await restMissingStops({
-          userId,
+          accountId: account.id,
           db: deps.db,
           broker: broker.broker,
           executionMode: deps.executionMode,
         });
       } catch (err: unknown) {
         if (err instanceof BrokerUnavailableError) continue;
-        log.warn('stop rest failed for user', {
-          userId,
+        log.warn('stop rest failed for account', {
+          accountId: account.id,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -135,13 +137,14 @@ export async function sweepFills(deps: FillMonitorDeps, since?: Date): Promise<S
   return { open: rows.length, updated };
 }
 
-async function syncUser(
-  userId: string,
+async function syncAccount(
+  account: AccountRow,
   rows: readonly OpenOrderRow[],
   deps: FillMonitorDeps,
   now: Date
 ): Promise<number> {
-  const broker = deps.brokers.for(userId);
+  const accountId = account.id;
+  const broker = deps.brokers.for(account);
   // A session that needs consent is skipped this sweep; the rows stay open
   // and are picked up once the user reconnects.
   try {
@@ -167,12 +170,12 @@ async function syncUser(
     const next = applyBrokerState(order, live, now);
     if (next === order) continue;
 
-    await deps.db.updateOrder(userId, decision.messageId, next);
+    await deps.db.updateOrder(accountId, decision.messageId, next);
     const updatedDecision: Decision = { ...decision, order: next };
-    deps.events.emitDecision(userId, updatedDecision);
+    deps.events.emitDecision(accountId, updatedDecision);
     updated += 1;
     log.info('order state updated', {
-      userId,
+      accountId,
       messageId: decision.messageId,
       orderId: order.orderId,
       from: order.status,

@@ -11,7 +11,7 @@ type Internals = {
 describe('RobinhoodMcpClient paste waiter', () => {
   it('accepts a pasted code once the auth URL waiter is armed', async () => {
     const mcp = new RobinhoodMcpClient({
-      userId: 'user-1',
+      accountId: 'account-1',
       db: {} as BrokerTokenStore,
     });
     expect(mcp.isAuthPending()).toBe(false);

@@ -16,8 +16,8 @@ export type { SupabaseOAuthProviderOptions } from './types.js';
 const log = createLogger('trader:rh:oauth');
 
 /**
- * OAuthClientProvider that keeps one user's DCR client info, PKCE verifier and
- * tokens in `broker_connections`, encrypted at rest. Postgres rather than a
+ * OAuthClientProvider that keeps one account's DCR client info, PKCE verifier
+ * and tokens in `accounts.credentials`, encrypted at rest. Postgres rather than a
  * local file because the deployed filesystem is ephemeral: tokens written to
  * disk vanish on every spin-down, which is what forced re-auth every 30 minutes.
  */
@@ -72,7 +72,7 @@ export class SupabaseOAuthProvider implements OAuthClientProvider {
     const state = await this.load();
     state.tokens = tokens;
     await this.persist();
-    log.info('saved Robinhood OAuth tokens', { userId: this.opts.userId });
+    log.info('saved Robinhood OAuth tokens', { accountId: this.opts.accountId });
   }
 
   async redirectToAuthorization(url: URL): Promise<void> {
@@ -101,17 +101,17 @@ export class SupabaseOAuthProvider implements OAuthClientProvider {
     if (scope === 'all' || scope === 'tokens') state.tokens = undefined;
     if (scope === 'all' || scope === 'verifier') state.codeVerifier = undefined;
     await this.persist();
-    log.warn('invalidated credentials', { scope, userId: this.opts.userId });
+    log.warn('invalidated credentials', { scope, accountId: this.opts.accountId });
   }
 
   private async load(): Promise<PersistedState> {
     if (this.cachedState) return this.cachedState;
     this.loadPromise ??= this.opts.db
-      .getBrokerTokens(this.opts.userId)
+      .getBrokerTokens(this.opts.accountId)
       .then((state) => state ?? {})
       .catch((err: unknown) => {
         log.warn('could not read broker connection, starting fresh', {
-          userId: this.opts.userId,
+          accountId: this.opts.accountId,
           error: (err as Error).message,
         });
         return {} as PersistedState;
@@ -122,6 +122,6 @@ export class SupabaseOAuthProvider implements OAuthClientProvider {
 
   private async persist(): Promise<void> {
     if (!this.cachedState) return;
-    await this.opts.db.saveBrokerTokens(this.opts.userId, this.cachedState);
+    await this.opts.db.saveBrokerTokens(this.opts.accountId, this.cachedState);
   }
 }

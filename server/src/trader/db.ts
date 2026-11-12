@@ -5,7 +5,8 @@
  * (SUPABASE_DB_URL), sign-in included: accounts, invites and sessions are rows
  * here like everything else.
  *
- * Every method that touches per-user data takes `userId` as its first
+ * Settings, trades and broker credentials belong to an account (a user holds
+ * one or more). Every method that touches them takes `accountId` as its first
  * argument, so a caller cannot forget to scope a query. The shared-data and
  * auth methods are grouped separately below and are the only ones without it.
  *
@@ -14,12 +15,16 @@
  *
  * Schema is owned by supabase/migrations/ and mirrored for the type system in
  * ./db/schema.ts — reconcile all three when it changes. Notable shape:
- *   users               the account: id, email and trade settings as typed
- *                       columns (defaults mirror TradeSettingsSchema)
+ *   users               who can sign in: id, email and the account the
+ *                       dashboard shows (selected_account_id)
+ *   accounts            one row per brokerage account, fk -> users: how it is
+ *                       reached (adapter, adapter_data), its credentials as
+ *                       ciphertext, and its trade settings as typed columns
+ *                       (defaults mirror TradeSettingsSchema). One direct
+ *                       Robinhood account per user, created at first sign-in
  *   sessions            signed-in browsers by token hash, fk -> users
- *   trades              per-user decision audit log, fk -> users
- *   broker_connections  user_id pk (exactly one Robinhood connection per user),
- *                       fk -> users, ciphertext only
+ *   trades              per-account decision audit log, fk -> accounts and
+ *                       users; one row per account per message
  *   messages            raw Discord archive written by the Listener
  *                       (server/listener) + the trader's verdict columns
  *                       (disposition/parse/processed_at); the poller's work
@@ -28,11 +33,13 @@
  *   allowed_emails      invite list: an email here gets its users row at first
  *                       sign-in
  */
-import { and, asc, count, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
+import { z } from 'zod';
 
 import { config } from '../shared/config.js';
+import { createLogger } from '../shared/logger.js';
 import {
   TERMINAL_ORDER_STATES,
   TradeSettingsSchema,
@@ -51,10 +58,11 @@ import {
   truncateSafe,
 } from '../shared/embedText.js';
 import type { TrackedPosition } from './book/ladder.js';
+import type { AccountRow } from './broker/types.js';
 import { hashSessionToken } from './credentials.js';
 import {
+  accounts,
   allowedEmails,
-  brokerConnections,
   callers,
   messages,
   recapInsights,
@@ -68,6 +76,8 @@ import { openOptionLots, type OpenOptionLot } from './lots.js';
 import { decryptTokens, encryptTokens } from './robinhood/tokenCrypto.js';
 import type { RecapParse, RecapParseStatus } from './recaps/parser.js';
 import type { PersistedState } from './robinhood/types.js';
+
+const log = createLogger('trader:db');
 
 /**
  * The trader's verdict on a captured Message. Null on the row means the poller
@@ -182,22 +192,32 @@ export interface AuthUser {
   readonly email: string | null;
 }
 
-/** A placed order whose broker state is not yet terminal, with its owner. */
+/** A live session: its user and the account that user's dashboard and Settings show. */
+export interface AuthSession {
+  readonly user: AuthUser;
+  /**
+   * The account the user selected, or their oldest when that selection is
+   * gone. Never another user's. Null only for a user with no account at all.
+   */
+  readonly account: AccountRow | null;
+}
+
+/** A placed order whose broker state is not yet terminal, with the account that placed it. */
 export interface OpenOrderRow {
-  readonly userId: string;
+  readonly accountId: string;
   readonly decision: Decision;
 }
 
 export interface TraderDb {
-  // ---- Per-user: userId always first ----------------------------------------
+  // ---- Per-account: accountId always first -----------------------------------
 
-  getSettings(userId: string): Promise<ResolvedTradeSettings>;
-  saveSettings(userId: string, settings: TradeSettings): Promise<ResolvedTradeSettings>;
+  getSettings(accountId: string): Promise<ResolvedTradeSettings>;
+  saveSettings(accountId: string, settings: TradeSettings): Promise<ResolvedTradeSettings>;
 
-  listDecisions(userId: string, limit: number): Promise<Decision[]>;
-  /** Filled option buys this user still holds, minus the sells that name them. */
-  listOpenOptionLots(userId: string): Promise<OpenOptionLot[]>;
-  recordDecision(userId: string, decision: Decision): Promise<void>;
+  listDecisions(accountId: string, limit: number): Promise<Decision[]>;
+  /** Filled option buys this account still holds, minus the sells that name them. */
+  listOpenOptionLots(accountId: string): Promise<OpenOptionLot[]>;
+  recordDecision(accountId: string, decision: Decision): Promise<void>;
   /**
    * Move a pending-approval row to its post-approval state, in place.
    *
@@ -206,42 +226,43 @@ export interface TraderDb {
    * what stops a double-click from submitting the same order twice.
    */
   resolvePendingApproval(
-    userId: string,
+    accountId: string,
     messageId: string,
     outcome: ApprovalOutcome
   ): Promise<boolean>;
   /** Decisions for the given callouts, keyed by message id. */
-  decisionsByMessageId(userId: string, messageIds: readonly string[]): Promise<Map<string, Decision>>;
+  decisionsByMessageId(accountId: string, messageIds: readonly string[]): Promise<Map<string, Decision>>;
   /**
    * Replace the stored order on one decision row: the fill monitor's write.
    * Keyed like recordDecision's uniqueness, so it reaches synthetic rows
    * (max_loss_exit) as well as callout-driven ones.
    */
-  updateOrder(userId: string, messageId: string, order: SubmittedOrder): Promise<void>;
+  updateOrder(accountId: string, messageId: string, order: SubmittedOrder): Promise<void>;
   /**
-   * A hash of everything this user's feed page (listCallouts(limit) joined
-   * with their decisions) is built from: equal versions mean an identical
+   * A hash of everything this account's feed page (listCallouts(limit) joined
+   * with its decisions) is built from: equal versions mean an identical
    * page. Computed in the database, so only the hash crosses the wire.
    */
-  feedVersion(userId: string, limit: number): Promise<string>;
+  feedVersion(accountId: string, limit: number): Promise<string>;
 
   /** Submitted orders since `since` — the daily cap counter. */
-  countSubmittedSince(userId: string, since: Date): Promise<number>;
-  /** When this user last submitted an order for `ticker`; null if never. */
-  lastSubmittedAt(userId: string, ticker: string): Promise<Date | null>;
+  countSubmittedSince(accountId: string, since: Date): Promise<number>;
+  /** When this account last submitted an order for `ticker`; null if never. */
+  lastSubmittedAt(accountId: string, ticker: string): Promise<Date | null>;
 
-  getBrokerTokens(userId: string): Promise<PersistedState | null>;
-  saveBrokerTokens(userId: string, state: PersistedState): Promise<void>;
-  deleteBrokerTokens(userId: string): Promise<void>;
+  getBrokerTokens(accountId: string): Promise<PersistedState | null>;
+  saveBrokerTokens(accountId: string, state: PersistedState): Promise<void>;
+  /** Disconnect: the stored credentials go, the account, its settings and its trades stay. */
+  deleteBrokerTokens(accountId: string): Promise<void>;
 
-  // ---- Shared data: not user-scoped -----------------------------------------
+  // ---- Shared data: not account-scoped ---------------------------------------
 
-  /** Users with a broker connection — the pipeline's fan-out set. */
-  listBrokerUserIds(): Promise<string[]>;
+  /** Accounts with a connection of record — the pipeline's fan-out set. */
+  listConnectedAccounts(): Promise<AccountRow[]>;
   /**
-   * Every user's placed orders since `since` whose broker state is not yet
-   * terminal: the fill monitor's work list. Cross-user by design (one sweep
-   * serves everyone); each row carries its owner.
+   * Every account's placed orders since `since` whose broker state is not yet
+   * terminal: the fill monitor's work list. Cross-account by design (one sweep
+   * serves everyone); each row carries the account that placed it.
    */
   listOpenOrders(since: Date): Promise<OpenOrderRow[]>;
 
@@ -315,17 +336,23 @@ export interface TraderDb {
   // ---- Auth ------------------------------------------------------------------
 
   /**
-   * The account a sign-in names: the user with this email, created on the
-   * spot when the email is on the invite list. Null when it is neither.
+   * The user a sign-in names: the one with this email, created on the spot,
+   * with their Robinhood account, when the email is on the invite list. Null
+   * when it is neither.
    */
   userForSignIn(email: string): Promise<AuthUser | null>;
+  /** AuthSession.account for a user known by id rather than by token (the CLI scripts). */
+  getSelectedAccount(userId: string): Promise<AccountRow | null>;
   /** Start a session for `token` (only its hash is stored), ending at `expiresAt`. */
   createSession(userId: string, token: string, expiresAt: Date): Promise<void>;
   /** End the session for `token`, if it exists. */
   deleteSession(token: string): Promise<void>;
   findUserByEmail(email: string): Promise<AuthUser | null>;
-  /** Resolve a bearer token to its user; null when unknown or expired. */
-  verifyAccessToken(token: string): Promise<AuthUser | null>;
+  /**
+   * Resolve a bearer token to its user and their selected account, in one
+   * query; null when unknown or expired.
+   */
+  verifyAccessToken(token: string): Promise<AuthSession | null>;
 }
 
 /** Notified by the Listener's insert (server/listener/src/listener/db.py). */
@@ -348,7 +375,7 @@ export function createTraderDb(): TraderDb {
   const client = postgres(config.supabaseDbUrl, {
     prepare: false,
     ssl: plaintext ? false : 'require',
-    // Pooler startups can omit public; unqualified "broker_connections" then
+    // Pooler startups can omit public; unqualified "accounts" then
     // fails as relation-not-exist and Drizzle reports only the SQL.
     connection: { options: '-c search_path=public' },
   });
@@ -365,20 +392,25 @@ class DrizzleTraderDb implements TraderDb {
     private readonly client: postgres.Sql
   ) {}
 
-  async getSettings(userId: string): Promise<ResolvedTradeSettings> {
-    const [row] = await this.db.select().from(users).where(eq(users.id, userId)).limit(1);
-    // The auth sync trigger gives every user a row; a manually deleted one
-    // falls back to the schema defaults rather than an error.
+  async getSettings(accountId: string): Promise<ResolvedTradeSettings> {
+    const [row] = await this.db
+      .select(accountColumns)
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
+      .limit(1);
+    // An account row always exists for a signed-in user; one that was removed
+    // by hand falls back to the schema defaults (approval, following no one)
+    // rather than an error.
     return row ? toSettings(row) : defaultSettings();
   }
 
-  async saveSettings(userId: string, settings: TradeSettings): Promise<ResolvedTradeSettings> {
+  async saveSettings(accountId: string, settings: TradeSettings): Promise<ResolvedTradeSettings> {
     const payload = TradeSettingsSchema.parse(settings);
-    await this.db.update(users).set(payload).where(eq(users.id, userId));
+    await this.db.update(accounts).set(payload).where(eq(accounts.id, accountId));
     return payload;
   }
 
-  async listOpenOptionLots(userId: string): Promise<ReturnType<typeof openOptionLots>> {
+  async listOpenOptionLots(accountId: string): Promise<ReturnType<typeof openOptionLots>> {
     const rows = await this.db
       .select({
         id: trades.id,
@@ -390,7 +422,7 @@ class DrizzleTraderDb implements TraderDb {
       })
       .from(trades)
       .leftJoin(messages, eq(messages.id, trades.messageId))
-      .where(eq(trades.userId, userId));
+      .where(eq(trades.accountId, accountId));
     return openOptionLots(
       rows.map((row) => ({
         id: row.id,
@@ -403,21 +435,23 @@ class DrizzleTraderDb implements TraderDb {
     );
   }
 
-  async listDecisions(userId: string, limit: number): Promise<Decision[]> {
+  async listDecisions(accountId: string, limit: number): Promise<Decision[]> {
     const rows = await this.db
       .select()
       .from(trades)
-      .where(eq(trades.userId, userId))
+      .where(eq(trades.accountId, accountId))
       .orderBy(desc(trades.timestamp))
       .limit(limit);
     return rows.map(toDecision);
   }
 
-  async recordDecision(userId: string, decision: Decision): Promise<void> {
-    // Backstop for the poller claim: one decision per user per message
-    // (trades_user_message_uidx) — a second write for the same pair is dropped.
+  async recordDecision(accountId: string, decision: Decision): Promise<void> {
+    // Backstop for the poller claim: one decision per account per message
+    // (trades_account_message_uidx) — a second write for the same pair is
+    // dropped. user_id is the account's owner, read in the same statement.
     await this.db.insert(trades).values({
-      userId,
+      userId: sql`(select ${accounts.userId} from ${accounts} where ${accounts.id} = ${accountId})`,
+      accountId,
       messageId: decision.messageId,
       kind: decision.kind,
       code: decision.code,
@@ -426,11 +460,11 @@ class DrizzleTraderDb implements TraderDb {
       action: decision.action,
       orderPayload: decision.order,
       timestamp: new Date(decision.at),
-    }).onConflictDoNothing({ target: [trades.userId, trades.messageId] });
+    }).onConflictDoNothing({ target: [trades.accountId, trades.messageId] });
   }
 
   async resolvePendingApproval(
-    userId: string,
+    accountId: string,
     messageId: string,
     outcome: ApprovalOutcome
   ): Promise<boolean> {
@@ -445,7 +479,7 @@ class DrizzleTraderDb implements TraderDb {
       })
       .where(
         and(
-          eq(trades.userId, userId),
+          eq(trades.accountId, accountId),
           eq(trades.messageId, messageId),
           eq(trades.kind, 'pending_approval')
         )
@@ -454,11 +488,11 @@ class DrizzleTraderDb implements TraderDb {
     return updated.length > 0;
   }
 
-  async updateOrder(userId: string, messageId: string, order: SubmittedOrder): Promise<void> {
+  async updateOrder(accountId: string, messageId: string, order: SubmittedOrder): Promise<void> {
     await this.db
       .update(trades)
       .set({ orderPayload: order })
-      .where(and(eq(trades.userId, userId), eq(trades.messageId, messageId)));
+      .where(and(eq(trades.accountId, accountId), eq(trades.messageId, messageId)));
   }
 
   async listOpenOrders(since: Date): Promise<OpenOrderRow[]> {
@@ -477,28 +511,28 @@ class DrizzleTraderDb implements TraderDb {
         )
       )
       .orderBy(asc(trades.timestamp));
-    return rows.map((row) => ({ userId: row.userId, decision: toDecision(row) }));
+    return rows.map((row) => ({ accountId: row.accountId, decision: toDecision(row) }));
   }
 
   async decisionsByMessageId(
-    userId: string,
+    accountId: string,
     messageIds: readonly string[]
   ): Promise<Map<string, Decision>> {
     if (messageIds.length === 0) return new Map();
     const rows = await this.db
       .select()
       .from(trades)
-      .where(and(eq(trades.userId, userId), inArray(trades.messageId, [...messageIds])))
+      .where(and(eq(trades.accountId, accountId), inArray(trades.messageId, [...messageIds])))
       .orderBy(asc(trades.timestamp));
     // Ascending order means the last write for a message id wins, which is the
     // newest outcome — a retried message shows its final state.
     return new Map(rows.map((row) => [row.messageId, toDecision(row)]));
   }
 
-  async feedVersion(userId: string, limit: number): Promise<string> {
+  async feedVersion(accountId: string, limit: number): Promise<string> {
     // Same rows, filter and order as listCallouts, hashing every column the
     // feed shows (content and embeds change on Discord embed unfurls without
-    // edited_at moving), plus the user's trades rows for those messages.
+    // edited_at moving), plus the account's trades rows for those messages.
     const [row] = await this.db.execute<{ version: string }>(sql`
       with feed as (
         select id, channel_id, channel_name, author_id, author_name, content, embeds,
@@ -509,33 +543,33 @@ class DrizzleTraderDb implements TraderDb {
          limit ${limit}
       )
       select md5(concat_ws('#',
-        ${userId}::text,
+        ${accountId}::text,
         (select string_agg(md5(feed::text), ',' order by sent_at desc, id) from feed),
         (select string_agg(md5(t::text), ',' order by t.timestamp, t.id)
            from trades t
-          where t.user_id = ${userId} and t.message_id in (select id from feed))
+          where t.account_id = ${accountId} and t.message_id in (select id from feed))
       )) as version
     `);
     return row!.version;
   }
 
-  async countSubmittedSince(userId: string, since: Date): Promise<number> {
+  async countSubmittedSince(accountId: string, since: Date): Promise<number> {
     const [row] = await this.db
       .select({ value: count() })
       .from(trades)
       .where(
-        and(eq(trades.userId, userId), eq(trades.kind, 'submitted'), gte(trades.timestamp, since))
+        and(eq(trades.accountId, accountId), eq(trades.kind, 'submitted'), gte(trades.timestamp, since))
       );
     return row?.value ?? 0;
   }
 
-  async lastSubmittedAt(userId: string, ticker: string): Promise<Date | null> {
+  async lastSubmittedAt(accountId: string, ticker: string): Promise<Date | null> {
     const [row] = await this.db
       .select({ timestamp: trades.timestamp })
       .from(trades)
       .where(
         and(
-          eq(trades.userId, userId),
+          eq(trades.accountId, accountId),
           eq(trades.kind, 'submitted'),
           eq(trades.ticker, ticker.toUpperCase())
         )
@@ -545,36 +579,57 @@ class DrizzleTraderDb implements TraderDb {
     return row?.timestamp ?? null;
   }
 
-  async getBrokerTokens(userId: string): Promise<PersistedState | null> {
+  async getBrokerTokens(accountId: string): Promise<PersistedState | null> {
     const [row] = await this.db
-      .select({ encryptedTokens: brokerConnections.encryptedTokens })
-      .from(brokerConnections)
-      .where(eq(brokerConnections.userId, userId))
+      .select({ credentials: accounts.credentials })
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
       .limit(1);
-    if (!row) return null;
-    const blob = Buffer.from(row.encryptedTokens, 'base64');
+    if (!row?.credentials) return null;
+    const blob = Buffer.from(row.credentials, 'base64');
     return JSON.parse(decryptTokens(blob, config.rhTokensVaultKey)) as PersistedState;
   }
 
-  async saveBrokerTokens(userId: string, state: PersistedState): Promise<void> {
+  async saveBrokerTokens(accountId: string, state: PersistedState): Promise<void> {
     const blob = encryptTokens(JSON.stringify(state), config.rhTokensVaultKey);
-    const encryptedTokens = blob.toString('base64');
+    const saved = await this.db
+      .update(accounts)
+      .set({ credentials: blob.toString('base64'), disconnectedAt: null })
+      .where(eq(accounts.id, accountId))
+      .returning({ id: accounts.id });
+    // A refreshed token that reaches no row is lost, and Robinhood has already
+    // retired the one before it: fail loudly instead.
+    if (saved.length === 0) throw new Error(`no account ${accountId} to store broker credentials on`);
+  }
+
+  async deleteBrokerTokens(accountId: string): Promise<void> {
     await this.db
-      .insert(brokerConnections)
-      .values({ userId, encryptedTokens })
-      .onConflictDoUpdate({
-        target: brokerConnections.userId,
-        set: { encryptedTokens, updatedAt: new Date() },
-      });
+      .update(accounts)
+      .set({ credentials: null, disconnectedAt: new Date() })
+      .where(eq(accounts.id, accountId));
   }
 
-  async deleteBrokerTokens(userId: string): Promise<void> {
-    await this.db.delete(brokerConnections).where(eq(brokerConnections.userId, userId));
-  }
-
-  async listBrokerUserIds(): Promise<string[]> {
-    const rows = await this.db.select({ userId: brokerConnections.userId }).from(brokerConnections);
-    return rows.map((row) => row.userId);
+  async listConnectedAccounts(): Promise<AccountRow[]> {
+    // ponytail: connected means stored credentials, which every adapter that
+    // exists keeps. Upgrade path: an adapter that keeps none (SnapTrade) adds
+    // its own clause here (disconnected_at is null and not needs_reconnect).
+    const rows = await this.db
+      .select(accountColumns)
+      .from(accounts)
+      .where(isNotNull(accounts.credentials))
+      .orderBy(asc(accounts.createdAt), asc(accounts.id));
+    // One unreadable row must not stop every other account from trading.
+    return rows.flatMap((row) => {
+      try {
+        return [toAccount(row)];
+      } catch (err: unknown) {
+        log.error('skipping an account whose row cannot be read', {
+          accountId: row.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return [];
+      }
+    });
   }
 
   async listUnprocessedMessages(limit: number): Promise<PendingMessage[]> {
@@ -888,13 +943,42 @@ class DrizzleTraderDb implements TraderDb {
       .limit(1);
     if (!invite) return null;
 
-    // Two first sign-ins racing: the loser inserts nothing and reads the winner's row.
-    const [created] = await this.db
-      .insert(users)
-      .values({ email: normalized })
-      .onConflictDoNothing({ target: users.email })
-      .returning({ id: users.id, email: users.email });
+    // One transaction, so a user never exists without the account every
+    // per-account route resolves. Two first sign-ins racing: the loser inserts
+    // nothing and reads the winner's row.
+    const created = await this.db.transaction(async (tx) => {
+      const [user] = await tx
+        .insert(users)
+        .values({ email: normalized })
+        .onConflictDoNothing({ target: users.email })
+        .returning({ id: users.id, email: users.email });
+      if (!user) return null;
+      // Both writes tolerate the row already being there: until the accounts
+      // contract migration, a database trigger creates it on the users insert.
+      await tx
+        .insert(accounts)
+        .values({ userId: user.id, ...DIRECT_ROBINHOOD_ACCOUNT })
+        .onConflictDoNothing();
+      await tx
+        .update(users)
+        .set({
+          selectedAccountId: sql`(select ${accounts.id} from ${accounts} where ${accounts.userId} = ${user.id} and ${accounts.adapter} = ${DIRECT_ROBINHOOD_ACCOUNT.adapter})`,
+        })
+        .where(and(eq(users.id, user.id), isNull(users.selectedAccountId)));
+      return user;
+    });
     return created ?? this.findUserByEmail(normalized);
+  }
+
+  async getSelectedAccount(userId: string): Promise<AccountRow | null> {
+    const [row] = await this.db
+      .select(accountColumns)
+      .from(accounts)
+      .innerJoin(users, eq(users.id, accounts.userId))
+      .where(eq(accounts.userId, userId))
+      .orderBy(...SELECTED_ACCOUNT_FIRST)
+      .limit(1);
+    return row ? toAccount(row) : null;
   }
 
   async createSession(userId: string, token: string, expiresAt: Date): Promise<void> {
@@ -918,14 +1002,22 @@ class DrizzleTraderDb implements TraderDb {
     return row ?? null;
   }
 
-  async verifyAccessToken(token: string): Promise<AuthUser | null> {
+  async verifyAccessToken(token: string): Promise<AuthSession | null> {
+    // Joined to the user's own accounts only, so a selection can never resolve
+    // to someone else's account.
     const [row] = await this.db
-      .select({ id: users.id, email: users.email })
+      .select({ id: users.id, email: users.email, account: accountColumns })
       .from(sessions)
       .innerJoin(users, eq(users.id, sessions.userId))
+      .leftJoin(accounts, eq(accounts.userId, users.id))
       .where(and(eq(sessions.tokenHash, hashSessionToken(token)), gt(sessions.expiresAt, new Date())))
+      .orderBy(...SELECTED_ACCOUNT_FIRST)
       .limit(1);
-    return row ?? null;
+    if (!row) return null;
+    return {
+      user: { id: row.id, email: row.email },
+      account: row.account ? toAccount(row.account) : null,
+    };
   }
 }
 
@@ -934,7 +1026,58 @@ class DrizzleTraderDb implements TraderDb {
 // Date -> ISO string conversion and trimming table rows to their public shapes.
 // =============================================================================
 
-function toSettings(row: typeof users.$inferSelect): ResolvedTradeSettings {
+/** The direct Robinhood account every user gets at first sign-in. */
+const DIRECT_ROBINHOOD_ACCOUNT = {
+  adapter: 'robinhood',
+  institution: 'robinhood',
+  label: 'Robinhood',
+} as const;
+
+/**
+ * Every accounts column except the credentials: what a settings read and an
+ * account read select, so the ciphertext only crosses the wire for
+ * getBrokerTokens.
+ */
+const { credentials: _credentials, ...accountColumns } = getTableColumns(accounts);
+type AccountRecord = Omit<typeof accounts.$inferSelect, 'credentials'>;
+
+/** Orders a user's accounts (joined to users) so the selected one is first, then the oldest. */
+const SELECTED_ACCOUNT_FIRST = [
+  sql`(${accounts.id} = ${users.selectedAccountId}) desc nulls last`,
+  asc(accounts.createdAt),
+  asc(accounts.id),
+];
+
+const SnapTradeAdapterDataSchema = z.object({
+  connectionId: z.string(),
+  institutionSlug: z.string(),
+  maskedAccountNumber: z.string().nullable(),
+});
+
+/** Throws when adapter_data does not have the shape its adapter needs. */
+function toAccount(row: AccountRecord): AccountRow {
+  const identity = {
+    id: row.id,
+    userId: row.userId,
+    institution: row.institution,
+    externalAccountId: row.externalAccountId,
+    label: row.label,
+    isPaper: row.isPaper,
+    needsReconnect: row.needsReconnect,
+  };
+  switch (row.adapter) {
+    case 'robinhood':
+      return { ...identity, adapter: 'robinhood', adapterData: {} };
+    case 'snaptrade':
+      return {
+        ...identity,
+        adapter: 'snaptrade',
+        adapterData: SnapTradeAdapterDataSchema.parse(row.adapterData),
+      };
+  }
+}
+
+function toSettings(row: AccountRecord): ResolvedTradeSettings {
   return {
     executionMode: row.executionMode,
     equitySmallPct: row.equitySmallPct,

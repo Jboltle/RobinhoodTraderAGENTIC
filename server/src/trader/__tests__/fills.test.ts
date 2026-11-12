@@ -6,7 +6,7 @@ import { applyBrokerState, sweepFills, type FillMonitorDeps } from '../fills.js'
 import { BrokerUnavailableError } from '../broker/errors.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import type { BrokerOrder } from '../broker/types.js';
-import { createFakeDb, fakeTokens } from './fakeDb.js';
+import { createFakeDb, fakeAccount, fakeTokens } from './fakeDb.js';
 import { makeFakeBroker, makeFakeRegistry } from './harness.js';
 
 const USER = 'user-1';
@@ -155,7 +155,7 @@ describe('sweepFills', () => {
 
     expect(result).toEqual({ open: 1, updated: 0 });
     expect(broker.getOrders).not.toHaveBeenCalled();
-    expect(deps.brokers.for('disconnected-user').session.ensureReady).not.toHaveBeenCalled();
+    expect(deps.brokers.for(fakeAccount('disconnected-user')).session.ensureReady).not.toHaveBeenCalled();
   });
 
   it('skips a user whose session needs OAuth consent without failing the sweep', async () => {

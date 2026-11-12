@@ -6,9 +6,10 @@ import type { BrokerTokenStore } from './types.js';
 
 export function createRobinhoodAdapter(db: BrokerTokenStore): BrokerAdapter {
   return {
+    id: 'robinhood',
     quotesOptions: true,
-    open(userId) {
-      const mcp = new RobinhoodMcpClient({ userId, db });
+    open(account) {
+      const mcp = new RobinhoodMcpClient({ accountId: account.id, db });
       return { session: mcp, broker: new RobinhoodBroker(new RobinhoodTools(mcp)) };
     },
   };

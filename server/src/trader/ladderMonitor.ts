@@ -1,5 +1,5 @@
 /**
- * Own-target exits. For each open lot of a user on the ladder, sell a level's
+ * Own-target exits. For each open lot of an account on the ladder, sell a level's
  * contracts once the mark reaches it. The Caller's trims are not involved;
  * their full close still goes through the pipeline.
  */
@@ -10,6 +10,7 @@ import type { TraderEvents } from './events.js';
 import { contractsAtLevel } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
 import type { McpRegistry } from './broker/registry.js';
+import type { AccountRow } from './broker/types.js';
 import { BrokerUnavailableError } from './broker/errors.js';
 import { instrumentOf } from './broker/instrument.js';
 import { cancelStops } from './stops.js';
@@ -36,13 +37,13 @@ export function startLadderMonitor(deps: LadderDeps): () => void {
 export async function sweepLadders(deps: LadderDeps): Promise<number> {
   if (deps.executionMode !== 'immediate') return 0;
   let placed = 0;
-  for (const userId of await deps.db.listBrokerUserIds()) {
+  for (const account of await deps.db.listConnectedAccounts()) {
     try {
-      placed += await sweepUser(userId, deps);
+      placed += await sweepAccount(account, deps);
     } catch (err: unknown) {
       if (err instanceof BrokerUnavailableError) continue;
-      log.warn('ladder sweep skipped user', {
-        userId,
+      log.warn('ladder sweep skipped account', {
+        accountId: account.id,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -50,12 +51,13 @@ export async function sweepLadders(deps: LadderDeps): Promise<number> {
   return placed;
 }
 
-async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
-  const settings = await deps.db.getSettings(userId);
+async function sweepAccount(account: AccountRow, deps: LadderDeps): Promise<number> {
+  const accountId = account.id;
+  const settings = await deps.db.getSettings(accountId);
   if (settings.exitMode !== 'ladder') return 0;
-  const broker = deps.brokers.for(userId);
+  const broker = deps.brokers.for(account);
   await broker.session.ensureReady();
-  const lots = await deps.db.listOpenOptionLots(userId);
+  const lots = await deps.db.listOpenOptionLots(accountId);
   let placed = 0;
   for (const lot of lots) {
     if (lot.entryPrice <= 0) continue;
@@ -84,7 +86,7 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
         status: null,
         lots: [{ lotId: lot.lotId, quantity, gainPct: level.gainPct }],
       };
-      await cancelStops(deps.db, userId, broker.broker, lot.symbol, lot.option);
+      await cancelStops(deps.db, accountId, broker.broker, lot.symbol, lot.option);
       const result = await submitOrder(order, broker.broker);
       const decision: Decision = {
         at: new Date().toISOString(),
@@ -96,8 +98,8 @@ async function sweepUser(userId: string, deps: LadderDeps): Promise<number> {
         action: 'sell',
         order: { ...order, orderId: result.orderId, status: result.status ?? 'submitted' },
       };
-      await deps.db.recordDecision(userId, decision);
-      deps.events.emitDecision(userId, decision);
+      await deps.db.recordDecision(accountId, decision);
+      deps.events.emitDecision(accountId, decision);
       placed += 1;
       break;
     }

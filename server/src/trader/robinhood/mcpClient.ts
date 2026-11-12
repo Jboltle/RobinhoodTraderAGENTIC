@@ -61,15 +61,15 @@ interface AuthCodeSubmission {
 }
 
 export interface RobinhoodMcpClientOptions {
-  /** Whose Robinhood account this client trades. One client per user. */
-  readonly userId: string;
+  /** Which account this client trades (accounts.id). One client per account. */
+  readonly accountId: string;
   readonly db: BrokerTokenStore;
 }
 
 /**
- * One user's connection to the Robinhood MCP server. Pending-auth state lives
- * on the instance, so several users can sit in the OAuth flow at once — see
- * McpRegistry, which owns one instance per user.
+ * One account's connection to the Robinhood MCP server. Pending-auth state
+ * lives on the instance, so several accounts can sit in the OAuth flow at once
+ * — see McpRegistry, which owns one instance per account.
  */
 export class RobinhoodMcpClient {
   constructor(private readonly options: RobinhoodMcpClientOptions) {}
@@ -154,9 +154,9 @@ export class RobinhoodMcpClient {
     }
   }
 
-  /** Stored-token state for this user, for /api/broker/status and logging. */
+  /** Stored-token state for this account, for /api/broker/status and logging. */
   async getTokenStatus(): Promise<TokenStatus> {
-    const state = await this.options.db.getBrokerTokens(this.options.userId);
+    const state = await this.options.db.getBrokerTokens(this.options.accountId);
     return readTokenStatus(state?.tokens);
   }
 
@@ -167,13 +167,13 @@ export class RobinhoodMcpClient {
     // we fall back to browser OAuth below only when that fails.
     const status = await this.getTokenStatus();
     log.info('Robinhood token status', {
-      userId: this.options.userId,
+      accountId: this.options.accountId,
       state: status.state,
       hasRefreshToken: status.hasRefreshToken,
     });
 
     const provider = new SupabaseOAuthProvider({
-      userId: this.options.userId,
+      accountId: this.options.accountId,
       db: this.options.db,
       clientName: config.robinhoodOAuthClientName,
       redirectUri: config.robinhoodOAuthRedirectUri,
@@ -185,7 +185,7 @@ export class RobinhoodMcpClient {
         if (url.pathname === '/oauth') url.pathname = '/mcp/trading';
         this.pendingAuthUrl = url.toString();
         this.armManualAuth();
-        log.info('OAuth authorization required', { userId: this.options.userId });
+        log.info('OAuth authorization required', { accountId: this.options.accountId });
         process.stdout.write('\n========================================\n');
         process.stdout.write('Robinhood authorization required.\n');
         process.stdout.write('Open this URL in your browser to authorize:\n\n');

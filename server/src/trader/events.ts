@@ -26,8 +26,8 @@ export interface BookEvent {
 /**
  * In-process fan-out from the pipeline to connected dashboards.
  *
- * Subscription is per user by construction — there is no way to listen to
- * every user's events, so an SSE connection cannot leak another account's
+ * Subscription is per account by construction — there is no way to listen to
+ * every account's events, so an SSE connection cannot leak another account's
  * trades. The one exception is the book event: the tracked-callout book is
  * shared data (Caller entries, not anyone's trades), so it is process-wide.
  * ponytail: a plain EventEmitter, so this only reaches dashboards
@@ -42,28 +42,28 @@ export class TraderEvents {
     this.emitter.setMaxListeners(0);
   }
 
-  emitStage(userId: string, event: Omit<StageEvent, 'at'>): void {
-    this.emitter.emit(`stage:${userId}`, { ...event, at: new Date().toISOString() });
+  emitStage(accountId: string, event: Omit<StageEvent, 'at'>): void {
+    this.emitter.emit(`stage:${accountId}`, { ...event, at: new Date().toISOString() });
   }
 
-  emitDecision(userId: string, decision: Decision): void {
-    this.emitter.emit(`decision:${userId}`, decision);
+  emitDecision(accountId: string, decision: Decision): void {
+    this.emitter.emit(`decision:${accountId}`, decision);
   }
 
   emitBook(): void {
     this.emitter.emit('book', { at: new Date().toISOString() } satisfies BookEvent);
   }
 
-  /** Subscribe to book changes (shared, not per user). Returns the unsubscribe function. */
+  /** Subscribe to book changes (shared, not per account). Returns the unsubscribe function. */
   subscribeBook(onBook: (event: BookEvent) => void): () => void {
     this.emitter.on('book', onBook);
     return () => this.emitter.off('book', onBook);
   }
 
-  /** Subscribe to one user's events. Returns the unsubscribe function. */
-  subscribe(userId: string, handlers: UserEventHandlers): () => void {
-    const stageKey = `stage:${userId}`;
-    const decisionKey = `decision:${userId}`;
+  /** Subscribe to one account's events. Returns the unsubscribe function. */
+  subscribe(accountId: string, handlers: UserEventHandlers): () => void {
+    const stageKey = `stage:${accountId}`;
+    const decisionKey = `decision:${accountId}`;
     const { onStage, onDecision } = handlers;
     if (onStage) this.emitter.on(stageKey, onStage);
     if (onDecision) this.emitter.on(decisionKey, onDecision);

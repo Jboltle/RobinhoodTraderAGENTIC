@@ -90,13 +90,13 @@ describe('sweepBook', () => {
     await seedOpen(db, 'm-1');
     const dead = makeBroker({ unavailable: true });
     const live = makeBroker({ markPrice: 0.55 });
-    const state = { preferredUserId: null };
+    const state = { preferredAccountId: null };
 
     await sweepBook(makeDeps(db, { u1: dead, u2: live }, RTH, state));
 
     expect(dead.broker.getMark).not.toHaveBeenCalled();
     expect(live.broker.getMark).toHaveBeenCalledTimes(1);
-    expect(state.preferredUserId).toBe('u2');
+    expect(state.preferredAccountId).toBe('u2');
   });
 
   it('leaves a position untouched when no quote comes back', async () => {

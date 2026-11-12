@@ -640,7 +640,7 @@ describe("the trader's write paths over RobinhoodBroker", () => {
     const db = dbWithLot();
 
     await restMissingStops({
-      userId: USER,
+      accountId: USER,
       db,
       broker: new RobinhoodBroker(tools),
       executionMode: 'immediate',

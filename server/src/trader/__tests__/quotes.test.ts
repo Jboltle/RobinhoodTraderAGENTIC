@@ -111,11 +111,11 @@ describe('quote source: which session is asked', () => {
   it('skips a session that needs consent and remembers the one that answered', async () => {
     const dead = sessionNeedingConsent();
     const live = readySession();
-    const state: QuoteSessionState = { preferredUserId: null };
+    const state: QuoteSessionState = { preferredAccountId: null };
     const { quotes } = setup({ u1: dead, u2: live }, state);
 
     expect(await quotes.broker()).toBe(live.broker);
-    expect(state.preferredUserId).toBe('u2');
+    expect(state.preferredAccountId).toBe('u2');
 
     // The remembered session is tried first: the dead one is not asked again.
     expect(await quotes.broker()).toBe(live.broker);
@@ -126,7 +126,10 @@ describe('quote source: which session is asked', () => {
     const db = createFakeDb();
     db.seedBrokerTokens('u1', fakeTokens('u1'));
     const cannotQuote = readySession();
-    const brokers = createMcpRegistry({ quotesOptions: false, open: () => cannotQuote }, 'immediate');
+    const brokers = createMcpRegistry(
+      [{ id: 'robinhood', quotesOptions: false, open: () => cannotQuote }],
+      'immediate'
+    );
 
     expect(await createQuoteSource({ db, brokers }).broker()).toBeNull();
     expect(cannotQuote.session.ensureReady).not.toHaveBeenCalled();

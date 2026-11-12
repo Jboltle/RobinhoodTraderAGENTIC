@@ -24,7 +24,7 @@ async function main(): Promise<void> {
 
   const db = createTraderDb();
   const events = new TraderEvents();
-  const brokers = createMcpRegistry(createRobinhoodAdapter(db), config.tradeExecutionMode);
+  const brokers = createMcpRegistry([createRobinhoodAdapter(db)], config.tradeExecutionMode);
   const quotes = createQuoteSource({ db, brokers });
 
   // DECISION_ENGINE=parser rolls the trade path back to the LLM parser.
@@ -64,14 +64,17 @@ async function main(): Promise<void> {
   // callout arrives rather than during it. Contained: a bad first query must
   // not take the already-listening process down (see listen comment above).
   try {
-    const userIds = await db.listBrokerUserIds();
-    log.info('restoring broker sessions', { users: userIds.length });
-    for (const userId of userIds) {
+    const accounts = await db.listConnectedAccounts();
+    log.info('restoring broker sessions', { accounts: accounts.length });
+    for (const account of accounts) {
       void brokers
-        .for(userId)
+        .for(account)
         .session.ensureConnected()
         .catch((err: unknown) =>
-          log.warn('could not restore Robinhood session', { userId, error: (err as Error).message })
+          log.warn('could not restore broker session', {
+            accountId: account.id,
+            error: (err as Error).message,
+          })
         );
     }
   } catch (err: unknown) {
@@ -103,7 +106,7 @@ async function main(): Promise<void> {
     db,
     brokers,
     events,
-    enqueue: (userId, run) => processor.enqueue(userId, run),
+    enqueue: (accountId, run) => processor.enqueue(accountId, run),
   });
 }
 

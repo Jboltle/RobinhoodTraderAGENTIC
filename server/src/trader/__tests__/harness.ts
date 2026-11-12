@@ -2,9 +2,9 @@
  * Shared wiring for the HTTP tests: a real Fastify app built by buildServer,
  * behind the real auth hook, over an in-memory db and stubbed broker sessions.
  *
- * Broker stubs are keyed by user id like the real registry, so a route that
- * reaches for the wrong user's Robinhood session gets that user's numbers and
- * the test notices.
+ * Broker stubs are keyed by account id like the real registry, so a route that
+ * reaches for the wrong account's Robinhood session gets that account's
+ * numbers and the test notices.
  */
 import { vi, type Mock } from 'vitest';
 import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
@@ -112,11 +112,15 @@ export const placedOrders = (broker: FakeBroker, kind: Instrument['kind']): Orde
 export const markReads = (broker: FakeBroker, kind: Instrument['kind']): Instrument[] =>
   broker.getMark.mock.calls.map(([instrument]) => instrument).filter((asked) => asked.kind === kind);
 
-/** The production registry over fake sessions and brokers. */
+/** The production registry over fake sessions and brokers, opened by account id. */
 export const makeFakeRegistry = (
-  open: BrokerAdapter['open'],
+  open: (accountId: string) => ReturnType<BrokerAdapter['open']>,
   executionMode: TradeExecutionMode = 'immediate'
-): McpRegistry => createMcpRegistry({ quotesOptions: true, open }, executionMode);
+): McpRegistry =>
+  createMcpRegistry(
+    [{ id: 'robinhood', quotesOptions: true, open: (account) => open(account.id) }],
+    executionMode
+  );
 
 // =============================================================================
 // HTTP harness
@@ -135,11 +139,11 @@ export interface Harness {
   readonly brokers: McpRegistry;
   /** Inject a request carrying this user's bearer token. */
   as(accessToken: string, options: InjectOptions): Promise<LightMyRequestResponse>;
-  /** The stub session for a user, creating it if the test hasn't configured one. */
-  brokerFor(userId: string): UserBroker;
-  /** That user's fake broker, for asserting what the app asked of it. */
-  fakeBroker(userId: string): FakeBroker;
-  configureBroker(userId: string, options: BrokerStubOptions): void;
+  /** The stub session for an account, creating it if the test hasn't configured one. */
+  brokerFor(accountId: string): UserBroker;
+  /** That account's fake broker, for asserting what the app asked of it. */
+  fakeBroker(accountId: string): FakeBroker;
+  configureBroker(accountId: string, options: BrokerStubOptions): void;
 }
 
 export interface HarnessOptions {
@@ -154,10 +158,10 @@ export function makeHarness(options: HarnessOptions = {}): Harness {
   const fakes = new Map<string, FakeBroker>();
   const executionMode = options.executionMode ?? 'immediate';
 
-  const brokers = makeFakeRegistry((userId) => {
-    const options = configured.get(userId) ?? {};
+  const brokers = makeFakeRegistry((accountId) => {
+    const options = configured.get(accountId) ?? {};
     const broker = makeFakeBroker(options);
-    fakes.set(userId, broker);
+    fakes.set(accountId, broker);
     return { session: makeSessionStub(options), broker };
   }, executionMode);
 
@@ -173,16 +177,16 @@ export function makeHarness(options: HarnessOptions = {}): Harness {
         ...options,
         headers: { ...options.headers, authorization: `Bearer ${accessToken}` },
       }),
-    brokerFor: (userId) => brokers.for(userId),
-    fakeBroker(userId) {
-      brokers.for(userId);
-      return fakes.get(userId)!;
+    brokerFor: (accountId) => brokers.for(db.account(accountId)),
+    fakeBroker(accountId) {
+      brokers.for(db.account(accountId));
+      return fakes.get(accountId)!;
     },
-    // Replaces the user's session at once, as a (re)connect does.
-    configureBroker(userId, options) {
-      configured.set(userId, options);
-      brokers.drop(userId);
-      brokers.for(userId);
+    // Replaces the account's session at once, as a (re)connect does.
+    configureBroker(accountId, options) {
+      configured.set(accountId, options);
+      brokers.drop(accountId);
+      brokers.for(db.account(accountId));
     },
   };
 }

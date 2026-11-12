@@ -6,8 +6,8 @@
  *   npm run fills:backfill            # last 90 days
  *   npm run fills:backfill 180        # last N days
  *
- * Read-only against the broker, safe under every TRADE_EXECUTION_MODE. Users
- * whose Robinhood session needs consent are skipped and reported.
+ * Read-only against the broker, safe under every TRADE_EXECUTION_MODE. Accounts
+ * whose broker session needs consent are skipped and reported.
  */
 import { assertConfigValid } from '../shared/config.js';
 import { createLogger, errorFields } from '../shared/logger.js';
@@ -30,12 +30,12 @@ async function main(): Promise<void> {
   const before = await db.listOpenOrders(since);
   log.info('backfill start', { since: since.toISOString(), openOrders: before.length });
 
-  const result = await sweepFills({ db, brokers: createMcpRegistry(createRobinhoodAdapter(db), 'read_only'), events: new TraderEvents() }, since);
+  const result = await sweepFills({ db, brokers: createMcpRegistry([createRobinhoodAdapter(db)], 'read_only'), events: new TraderEvents() }, since);
   const after = await db.listOpenOrders(since);
   log.info('backfill done', { ...result, stillOpen: after.length });
   for (const row of after) {
     log.info('still open', {
-      userId: row.userId,
+      accountId: row.accountId,
       messageId: row.decision.messageId,
       orderId: row.decision.order?.orderId,
       status: row.decision.order?.status,

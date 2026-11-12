@@ -140,12 +140,12 @@ export interface PlaceOptionsOrderArgs extends OptionContract {
 
 /** The subset of the data layer the OAuth provider needs. */
 export interface BrokerTokenStore {
-  getBrokerTokens(userId: string): Promise<PersistedState | null>;
-  saveBrokerTokens(userId: string, state: PersistedState): Promise<void>;
+  getBrokerTokens(accountId: string): Promise<PersistedState | null>;
+  saveBrokerTokens(accountId: string, state: PersistedState): Promise<void>;
 }
 
 export interface SupabaseOAuthProviderOptions {
-  readonly userId: string;
+  readonly accountId: string;
   readonly db: BrokerTokenStore;
   readonly clientName: string;
   readonly redirectUri: string;

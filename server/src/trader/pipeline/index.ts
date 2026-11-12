@@ -18,6 +18,7 @@ import { BrokerUnavailableError, SymbolNotFoundError } from '../broker/errors.js
 import { instrumentOf } from '../broker/instrument.js';
 import type { QuoteSource } from '../broker/quotes.js';
 import type { McpRegistry } from '../broker/registry.js';
+import type { AccountRow } from '../broker/types.js';
 import {
   allocateFifo,
   entryMismatch,
@@ -56,7 +57,7 @@ export interface PipelineDeps {
 export interface ProcessOptions {
   /**
    * Seen too late to trade (the poller's staleness gate). The message is
-   * recorded as missed and shown in every user's feed, but no order is ever
+   * recorded as missed and shown in every account's feed, but no order is ever
    * placed and the LLM is never called.
    */
   readonly missed?: boolean;
@@ -64,34 +65,36 @@ export interface ProcessOptions {
 
 export interface MessageProcessor {
   process(envelope: DiscordEnvelope, options?: ProcessOptions): Promise<void>;
-  /** Serialize work on one user's Robinhood session (callouts and Max Loss). */
-  enqueue<T>(userId: string, run: () => Promise<T>): Promise<T>;
+  /** Serialize work on one account's broker session (callouts and Max Loss). */
+  enqueue<T>(accountId: string, run: () => Promise<T>): Promise<T>;
 }
 
 /**
- * Turns one Discord message into one outcome per connected user.
+ * Turns one Discord message into one outcome per connected account.
  *
  * The LLM parse happens once and is cached on the shared `callouts` row, so
- * adding users costs no extra tokens. Users then run CONCURRENTLY: they hold
- * separate Robinhood sessions, so the old single-session serialization buys
- * nothing, and one user's slow broker call must not delay everyone else's fill
- * on a time-sensitive callout. Each user's own messages stay serialized
- * through a per-user chain, preserving the "never two orders in flight on one
- * session" guarantee, and a failure is isolated to the user it happened to.
+ * adding accounts costs no extra tokens. Accounts then run CONCURRENTLY: they
+ * hold separate broker sessions, so the old single-session serialization buys
+ * nothing, and one account's slow broker call must not delay everyone else's
+ * fill on a time-sensitive callout. Each account's own messages stay
+ * serialized through a per-account chain, preserving the "never two orders in
+ * flight on one session" guarantee, and a failure is isolated to the account
+ * it happened to. Two accounts of one user are two accounts like any others:
+ * each takes the callout under its own settings and against its own lots.
  */
 export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
-  // ponytail: unbounded map of settled promises, one entry per user seen this
-  // process lifetime. Upgrade path is dropping the entry once its chain idles.
+  // ponytail: unbounded map of settled promises, one entry per account seen
+  // this process lifetime. Upgrade path is dropping the entry once its chain idles.
   const chains = new Map<string, Promise<unknown>>();
 
-  const queueForUser = <T>(userId: string, run: () => Promise<T>): Promise<T> => {
-    const chain = (chains.get(userId) ?? Promise.resolve()).then(run, run);
-    chains.set(userId, chain);
+  const queueForAccount = <T>(accountId: string, run: () => Promise<T>): Promise<T> => {
+    const chain = (chains.get(accountId) ?? Promise.resolve()).then(run, run);
+    chains.set(accountId, chain);
     return chain as Promise<T>;
   };
 
   return {
-    enqueue: queueForUser,
+    enqueue: queueForAccount,
     async process(rawEnvelope: DiscordEnvelope, options: ProcessOptions = {}): Promise<void> {
       // The one flatten site on the trade path: producers send raw content +
       // embeds (envelope contract in shared/types.ts). Everything downstream
@@ -99,9 +102,9 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
       // flattened text; `embeds` stay raw for storage/display.
       const envelope = flattenEnvelope(rawEnvelope);
 
-      const userIds = await deps.db.listBrokerUserIds();
-      for (const userId of userIds) {
-        deps.events.emitStage(userId, {
+      const accounts = await deps.db.listConnectedAccounts();
+      for (const account of accounts) {
+        deps.events.emitStage(account.id, {
           messageId: envelope.messageId,
           ticker: null,
           stage: 'received',
@@ -127,8 +130,8 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
       // recorded on the shared callouts row, so there is nothing to fan out
       // and no reason to write the same "not a callout" to N trade rows.
       if (parsed.status === 'not_callout') {
-        for (const userId of userIds) {
-          deps.events.emitStage(userId, {
+        for (const account of accounts) {
+          deps.events.emitStage(account.id, {
             messageId: envelope.messageId,
             ticker: null,
             stage: 'done',
@@ -138,15 +141,15 @@ export function createMessageProcessor(deps: PipelineDeps): MessageProcessor {
       }
 
       const settled = await Promise.allSettled(
-        userIds.map((userId) =>
-          queueForUser(userId, () => runForUser(userId, envelope, parsed, deps))
+        accounts.map((account) =>
+          queueForAccount(account.id, () => runForAccount(account, envelope, parsed, deps))
         )
       );
 
       for (const [index, result] of settled.entries()) {
         if (result.status === 'rejected') {
-          log.error('user pipeline crashed', {
-            userId: userIds[index],
+          log.error('account pipeline crashed', {
+            accountId: accounts[index]?.id,
             messageId: envelope.messageId,
             error: errMsg(result.reason),
           });
@@ -208,7 +211,7 @@ async function resolveCallout(
 
   // A buy still without a contract is not a trade. A sell that names a ticker
   // and matches nothing is the same. A ticker-less sell, and a sell whose
-  // caller has several live entries, go to each user: their lots decide.
+  // caller has several live entries, go to each account: its lots decide.
   const unnamedSell = callout.action === 'sell' && callout.ticker === null;
   const ambiguous = Boolean(callout.reviewReason) && callout.option === null;
   if (callout.engine === 'jev' && callout.option === null && !unnamedSell && !ambiguous) {
@@ -231,7 +234,7 @@ async function resolveCallout(
 
   await setDisposition(deps, envelope.messageId, 'callout', callout);
   // The shared book records the Caller's entry or exit once per message,
-  // before the per-user fan-out: tracking never depends on anyone trading.
+  // before the per-account fan-out: tracking never depends on anyone trading.
   // A buy whose contract failed the mismatch check is not tracked.
   if (!mismatch) await trackCallout(deps, envelope, callout);
   return { status: 'callout', callout, parseError: null };
@@ -246,7 +249,7 @@ const CALLER_ENTRY_LOOKBACK = 20;
  * Caller's card the exit replies to, then the Caller's one live entry in the
  * ticker; several live entries pick the newest and wait for approval. With
  * none, option stays null: the Jev path skips the message, and the parser path
- * rejects it per user as missing_contract — a visible miss, never a guess.
+ * rejects it per account as missing_contract — a visible miss, never a guess.
  */
 async function resolveCallerContract(
   callout: Callout,
@@ -351,24 +354,25 @@ async function setDisposition(
 }
 
 // =============================================================================
-// Per-user execution
+// Per-account execution
 // =============================================================================
 
 /**
- * One user's run against an already-parsed callout:
- *  0. Following gate → a Caller this user does not follow produces nothing
- *     for them: no trade, no per-user record (silent skip, returns null)
+ * One account's run against an already-parsed callout:
+ *  0. Following gate → a Caller this account does not follow produces nothing
+ *     for it: no trade, no per-account record (silent skip, returns null)
  *  1. Risk check → deterministic guards + portfolio-percentage sizing, against
- *     this user's settings and their trade history
+ *     this account's settings and its trade history
  *  2. Fetch buying power (always — needed for capital validation even when qty is explicit)
- *  3. Submit → place the equity or options order via this user's Robinhood MCP
+ *  3. Submit → place the equity or options order through this account's broker
  */
-export async function runForUser(
-  userId: string,
+export async function runForAccount(
+  account: AccountRow,
   envelope: DiscordEnvelope,
   parsed: ParsedCallout,
   deps: PipelineDeps
 ): Promise<Decision | null> {
+  const accountId = account.id;
   const at = new Date().toISOString();
   const base = { at, messageId: envelope.messageId, order: null };
   let callout = parsed.callout;
@@ -376,12 +380,12 @@ export async function runForUser(
   // ponytail: a settings DB failure here also drops missed/parser_error records
   // (they write to the same DB, so a fallback rarely helps); upgrade path is to
   // catch it and fall back to record-only default paths — never trade on defaults.
-  const settings = await loadSettings(userId, deps);
+  const settings = await loadSettings(accountId, deps);
 
   // ---- 0. Following gate ---------------------------------------------------
   // null = follow everyone (default); otherwise the list is exhaustive.
   if (settings.followedCallerIds !== null && !settings.followedCallerIds.includes(envelope.authorId)) {
-    deps.events.emitStage(userId, {
+    deps.events.emitStage(accountId, {
       messageId: envelope.messageId,
       ticker: null,
       stage: 'done',
@@ -390,7 +394,7 @@ export async function runForUser(
   }
 
   if (parsed.status === 'missed') {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       kind: 'missed',
       code: null,
@@ -401,7 +405,7 @@ export async function runForUser(
   }
 
   if (!callout) {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       kind: 'parser_error',
       code: 'parse_failed',
@@ -415,7 +419,7 @@ export async function runForUser(
   // pick none. Exactly one: that lot is the trade. None: there is nothing of
   // theirs to sell.
   if (callout.action === 'sell' && callout.option === null && callout.reviewReason) {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       kind: 'pending_approval',
       code: 'ambiguous_exit',
@@ -425,14 +429,14 @@ export async function runForUser(
     });
   }
   if (callout.action === 'sell' && callout.option === null && callout.ticker === null) {
-    const lots = (await deps.db.listOpenOptionLots(userId)).filter((lot) => lot.authorId === envelope.authorId);
+    const lots = (await deps.db.listOpenOptionLots(accountId)).filter((lot) => lot.authorId === envelope.authorId);
     const contracts = distinctContracts(lots);
     const only = contracts[0];
     if (contracts.length === 1 && only) {
       callout = withContract(callout, only.symbol, only.option, `${envelope.authorName}'s open lot`);
     } else if (contracts.length > 1) {
       const listed = contracts.map((lot) => `${lot.symbol} ${optionLabel(lot.option)}`).join(', ');
-      return finalize(userId, deps, {
+      return finalize(accountId, deps, {
         ...base,
         kind: 'pending_approval',
         code: 'ambiguous_exit',
@@ -441,7 +445,7 @@ export async function runForUser(
         action: 'sell',
       });
     } else {
-      return finalize(userId, deps, {
+      return finalize(accountId, deps, {
         ...base,
         kind: 'risk_rejected',
         code: 'missing_contract',
@@ -458,7 +462,7 @@ export async function runForUser(
   // equity trade — the "limit price" is almost certainly an option premium
   // (e.g. buying AAPL stock at $7.70 from "aapl calls 3.38 to 7.70").
   if (callout.assetType === 'equity' && OPTION_CONTEXT.test(envelope.content)) {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       ...identity,
       kind: 'risk_rejected',
@@ -469,15 +473,15 @@ export async function runForUser(
   }
 
   // ---- 1. Risk check ------------------------------------------------------
-  deps.events.emitStage(userId, {
+  deps.events.emitStage(accountId, {
     messageId: envelope.messageId,
     ticker: callout.ticker,
     stage: 'risk_check',
   });
-  const state = await deriveRiskState(deps.db, userId, callout.ticker);
+  const state = await deriveRiskState(deps.db, accountId, callout.ticker);
   const risk = checkRisk(callout, settings, state);
   if (!risk.allow) {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       ...identity,
       kind: 'risk_rejected',
@@ -488,10 +492,10 @@ export async function runForUser(
 
   const symbol = callout.ticker!.toUpperCase();
   const side = callout.action!;
-  const { broker } = deps.brokers.for(userId);
+  const { broker } = deps.brokers.for(account);
 
   if (callout.reviewReason?.includes('no such contract')) {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       ...identity,
       kind: 'pending_approval',
@@ -508,7 +512,7 @@ export async function runForUser(
     try {
       const price = await broker.getMark({ kind: 'equity', symbol });
       if (price === null || !(price > 0)) {
-        return finalize(userId, deps, {
+        return finalize(accountId, deps, {
           ...base,
           ...identity,
           kind: 'risk_rejected',
@@ -518,7 +522,7 @@ export async function runForUser(
       }
     } catch (err) {
       const notFound = err instanceof SymbolNotFoundError;
-      return finalize(userId, deps, {
+      return finalize(accountId, deps, {
         ...base,
         ...identity,
         kind: notFound ? 'risk_rejected' : 'execution_failed',
@@ -531,7 +535,7 @@ export async function runForUser(
   }
 
   if (side === 'sell' && callout.assetType === 'option' && settings.exitMode === 'ladder' && !isFullClose(callout.exitPortion, callout.tickerOnlyExit)) {
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       ...identity,
       kind: 'risk_rejected',
@@ -540,7 +544,7 @@ export async function runForUser(
     });
   }
 
-  deps.events.emitStage(userId, {
+  deps.events.emitStage(accountId, {
     messageId: envelope.messageId,
     ticker: symbol,
     stage: 'executing',
@@ -556,7 +560,7 @@ export async function runForUser(
       const account = await broker.getAccount();
       buyingPower = account.buyingPowerUsd;
     } catch (err) {
-      return finalize(userId, deps, {
+      return finalize(accountId, deps, {
         ...base,
         ...identity,
         kind: 'execution_failed',
@@ -566,7 +570,7 @@ export async function runForUser(
     }
 
     if (buyingPower <= 0) {
-      return finalize(userId, deps, {
+      return finalize(accountId, deps, {
         ...base,
         ...identity,
         kind: 'risk_rejected',
@@ -583,7 +587,7 @@ export async function runForUser(
   try {
     const sellLots =
       risk.assetType === 'option' && side === 'sell' && callout.option
-        ? await lotsForExit(deps, userId, envelope.authorId, symbol, callout.option)
+        ? await lotsForExit(deps, accountId, envelope.authorId, symbol, callout.option)
         : null;
     if (sellLots?.kind === 'blocked') {
       throw new CapitalConstraintError(
@@ -629,7 +633,7 @@ export async function runForUser(
       const receipt = summarizePendingApproval(sized);
       const held = heldByDeployment ? `Held by TRADE_EXECUTION_MODE=${deps.executionMode}` : null;
       const prefix = [callout.reviewReason, held].filter(Boolean).join('; ');
-      return finalize(userId, deps, {
+      return finalize(accountId, deps, {
         ...base,
         ...identity,
         kind: 'pending_approval',
@@ -640,7 +644,7 @@ export async function runForUser(
     }
 
     if (sized.assetType === 'option' && sized.side === 'sell') {
-      await cancelStops(deps.db, userId, broker, symbol, sized.option);
+      await cancelStops(deps.db, accountId, broker, symbol, sized.option);
     }
     const placed = await submitOrder(sized, broker);
     const order: SubmittedOrder = {
@@ -649,7 +653,7 @@ export async function runForUser(
       status: placed.status ?? 'submitted',
     };
 
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       at,
       messageId: envelope.messageId,
       ...identity,
@@ -661,7 +665,7 @@ export async function runForUser(
   } catch (err) {
     const capital = err instanceof CapitalConstraintError;
     const inconsistent = err instanceof ParseInconsistencyError;
-    return finalize(userId, deps, {
+    return finalize(accountId, deps, {
       ...base,
       ...identity,
       kind: capital || inconsistent ? 'risk_rejected' : 'execution_failed',
@@ -696,12 +700,12 @@ function distinctContracts(lots: readonly OpenOptionLot[]): OpenOptionLot[] {
 
 async function lotsForExit(
   deps: PipelineDeps,
-  userId: string,
+  accountId: string,
   authorId: string,
   symbol: string,
   option: NonNullable<Callout['option']>
 ): Promise<{ kind: 'fallback' } | { kind: 'blocked' } | { kind: 'sized'; held: number; lots: OpenOptionLot[] }> {
-  const open = await deps.db.listOpenOptionLots(userId);
+  const open = await deps.db.listOpenOptionLots(accountId);
   const same = open.filter((lot) => sameOption(lot, symbol, option));
   if (same.length === 0) return { kind: 'fallback' };
   const mine = same.filter((lot) => lot.authorId === authorId);
@@ -767,26 +771,26 @@ async function entryMismatchReason(
   return reason;
 }
 
-async function loadSettings(userId: string, deps: PipelineDeps): Promise<ResolvedTradeSettings> {
-  return deps.db.getSettings(userId);
+async function loadSettings(accountId: string, deps: PipelineDeps): Promise<ResolvedTradeSettings> {
+  return deps.db.getSettings(accountId);
 }
 
-async function finalize(userId: string, deps: PipelineDeps, decision: Decision): Promise<Decision> {
-  deps.events.emitStage(userId, {
+async function finalize(accountId: string, deps: PipelineDeps, decision: Decision): Promise<Decision> {
+  deps.events.emitStage(accountId, {
     messageId: decision.messageId,
     ticker: decision.ticker,
     stage: 'done',
   });
-  await deps.db.recordDecision(userId, decision).catch((err: unknown) =>
+  await deps.db.recordDecision(accountId, decision).catch((err: unknown) =>
     log.error('could not persist decision', {
-      userId,
+      accountId,
       messageId: decision.messageId,
       error: errMsg(err),
     })
   );
-  deps.events.emitDecision(userId, decision);
+  deps.events.emitDecision(accountId, decision);
   log.info('pipeline complete', {
-    userId,
+    accountId,
     messageId: decision.messageId,
     kind: decision.kind,
     reason: decision.reason,

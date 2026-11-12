@@ -152,9 +152,9 @@ describe('user B cannot see user A', () => {
       for (const fingerprint of A_FINGERPRINTS) {
         expect(body).not.toContain(fingerprint);
       }
-      expect(harness.db.calls.map((c) => c.userId)).not.toContain(USER_A.id);
+      expect(harness.db.calls.map((c) => c.scopeId)).not.toContain(USER_A.id);
       for (const call of harness.db.calls) {
-        expect(call.userId).toBe(USER_B.id);
+        expect(call.scopeId).toBe(USER_B.id);
       }
     });
   }

@@ -87,8 +87,42 @@ export interface Broker {
   cancelOrder(orderId: string): Promise<void>;
 }
 
+/** How an account is reached: the adapter that opens it. */
+export type BrokerId = 'robinhood' | 'snaptrade';
+
+/** What reaching a SnapTrade account needs beyond the shared columns. */
+export interface SnapTradeAdapterData {
+  /** The brokerage connection the account came from (`connection_id`). */
+  readonly connectionId: string;
+  /** The connection's `brokerage.slug`. */
+  readonly institutionSlug: string;
+  /** Last four digits only; SnapTrade gives no full number. */
+  readonly maskedAccountNumber: string | null;
+}
+
+interface AccountIdentity {
+  readonly id: string;
+  readonly userId: string;
+  /** Which broker holds it: 'robinhood', 'alpaca-paper', … */
+  readonly institution: string;
+  /** The broker's own account id; null on a direct Robinhood account. */
+  readonly externalAccountId: string | null;
+  readonly label: string;
+  readonly isPaper: boolean;
+  readonly needsReconnect: boolean;
+}
+
+/**
+ * One connected brokerage account: an `accounts` row without its settings or
+ * credentials. `adapterData` is whatever that adapter needs to reach it.
+ */
+export type AccountRow =
+  | (AccountIdentity & { readonly adapter: 'robinhood'; readonly adapterData: Record<string, never> })
+  | (AccountIdentity & { readonly adapter: 'snaptrade'; readonly adapterData: SnapTradeAdapterData });
+
 // ponytail: the session is still the Robinhood MCP client class. Upgrade path:
 // a BrokerSession interface once a second adapter has a session of its own.
+/** One account's session and the Broker over it. */
 export interface UserBroker {
   readonly session: RobinhoodMcpClient;
   readonly broker: Broker;
@@ -96,9 +130,10 @@ export interface UserBroker {
   readonly quotesOptions: boolean;
 }
 
-/** Opens one user's broker session; the registry holds the result per user. */
+/** Opens one account's broker session; the registry holds the result per account. */
 export interface BrokerAdapter {
+  readonly id: BrokerId;
   /** Whether this broker can price option contracts; the shared quote source asks only these. */
   readonly quotesOptions: boolean;
-  open(userId: string): Omit<UserBroker, 'quotesOptions'>;
+  open(account: AccountRow): Omit<UserBroker, 'quotesOptions'>;
 }

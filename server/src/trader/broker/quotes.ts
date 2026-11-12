@@ -15,17 +15,17 @@ import type { Broker, Instrument } from './types.js';
 /** How long getMark keeps serving a price before asking the broker again. */
 export const MARK_CACHE_MS = 15_000;
 
-/** Which user's session served quotes last; tried first next time. */
+/** Which account's session served quotes last; tried first next time. */
 export interface QuoteSessionState {
-  preferredUserId: string | null;
+  preferredAccountId: string | null;
 }
 
 export interface QuoteSource {
   /**
-   * The first connected user's ready session whose broker quotes options, the
-   * last one that worked first. Null when there is none. A session that needs
-   * consent is skipped, not started: reaching for a disconnected user's broker
-   * would begin an OAuth flow nobody asked for.
+   * The first connected account's ready session whose broker quotes options,
+   * the last one that worked first. Null when there is none. A session that
+   * needs consent is skipped, not started: reaching for a disconnected
+   * account's broker would begin an OAuth flow nobody asked for.
    *
    * Reads through it are live; whatever decides an order reads here.
    */
@@ -38,7 +38,7 @@ export interface QuoteSource {
 }
 
 export interface QuoteSourceDeps {
-  readonly db: Pick<TraderDb, 'listBrokerUserIds'>;
+  readonly db: Pick<TraderDb, 'listConnectedAccounts'>;
   readonly brokers: McpRegistry;
   readonly now?: () => Date;
 }
@@ -50,7 +50,7 @@ interface CachedMark {
 
 export function createQuoteSource(
   deps: QuoteSourceDeps,
-  state: QuoteSessionState = { preferredUserId: null }
+  state: QuoteSessionState = { preferredAccountId: null }
 ): QuoteSource {
   // ponytail: never pruned — one small entry per instrument priced this
   // process lifetime, and two readers missing at once both ask the broker.
@@ -58,23 +58,23 @@ export function createQuoteSource(
   const marks = new Map<string, CachedMark>();
 
   async function broker(): Promise<Broker | null> {
-    const userIds = await deps.db.listBrokerUserIds();
-    const ordered =
-      state.preferredUserId !== null && userIds.includes(state.preferredUserId)
-        ? [state.preferredUserId, ...userIds.filter((id) => id !== state.preferredUserId)]
-        : userIds;
-    for (const userId of ordered) {
-      const candidate = deps.brokers.for(userId);
-      if (!candidate.quotesOptions) continue;
+    const accounts = await deps.db.listConnectedAccounts();
+    const preferred = accounts.find((account) => account.id === state.preferredAccountId);
+    const ordered = preferred
+      ? [preferred, ...accounts.filter((account) => account !== preferred)]
+      : accounts;
+    for (const account of ordered) {
       try {
+        const candidate = deps.brokers.for(account);
+        if (!candidate.quotesOptions) continue;
         await candidate.session.ensureReady();
-        state.preferredUserId = userId;
+        state.preferredAccountId = account.id;
         return candidate.broker;
       } catch (err) {
         if (!(err instanceof BrokerUnavailableError)) throw err;
       }
     }
-    state.preferredUserId = null;
+    state.preferredAccountId = null;
     return null;
   }
 

@@ -15,13 +15,13 @@ const log = createLogger('trader:stops');
 /** Cancel resting stops on this contract. Clears the id even if the cancel 404s. */
 export async function cancelStops(
   db: TraderDb,
-  userId: string,
+  accountId: string,
   broker: Broker,
   symbol: string,
   option: OptionContract | null
 ): Promise<void> {
   if (!option) return;
-  const lots = await db.listOpenOptionLots(userId);
+  const lots = await db.listOpenOptionLots(accountId);
   for (const lot of lots) {
     if (!lot.stopOrderId) continue;
     if (lot.symbol !== symbol.toUpperCase()) continue;
@@ -36,13 +36,13 @@ export async function cancelStops(
       await broker.cancelOrder(lot.stopOrderId);
     } catch (err: unknown) {
       log.warn('stop cancel failed', {
-        userId,
+        accountId,
         orderId: lot.stopOrderId,
         error: err instanceof Error ? err.message : String(err),
       });
       throw err;
     }
-    await db.updateOrder(userId, lot.messageId, { ...lot.buyOrder, stopOrderId: null });
+    await db.updateOrder(accountId, lot.messageId, { ...lot.buyOrder, stopOrderId: null });
   }
 }
 
@@ -54,16 +54,16 @@ export async function cancelStops(
  * without a stop for one poll. Upgrade path: re-rest in the same turn as the sell.
  */
 export async function restMissingStops(args: {
-  readonly userId: string;
+  readonly accountId: string;
   readonly db: TraderDb;
   readonly broker: Broker;
   readonly executionMode: TradeExecutionMode;
 }): Promise<void> {
   if (args.executionMode !== 'immediate') return;
-  const settings = await args.db.getSettings(args.userId);
+  const settings = await args.db.getSettings(args.accountId);
   if (settings.maxLossPct == null || settings.maxLossPct <= 0) return;
 
-  const lots = await args.db.listOpenOptionLots(args.userId);
+  const lots = await args.db.listOpenOptionLots(args.accountId);
   for (const lot of lots) {
     if (lot.stopOrderId || lot.entryPrice <= 0 || lot.openQty < 1) continue;
     try {
@@ -76,16 +76,16 @@ export async function restMissingStops(args: {
         timeInForce: 'gtc',
       });
       if (!placed.orderId) continue;
-      await args.db.updateOrder(args.userId, lot.messageId, { ...lot.buyOrder, stopOrderId: placed.orderId });
+      await args.db.updateOrder(args.accountId, lot.messageId, { ...lot.buyOrder, stopOrderId: placed.orderId });
       log.info('rested max-loss stop', {
-        userId: args.userId,
+        accountId: args.accountId,
         symbol: lot.symbol,
         contracts: lot.openQty,
         orderId: placed.orderId,
       });
     } catch (err: unknown) {
       log.warn('max-loss stop was not accepted', {
-        userId: args.userId,
+        accountId: args.accountId,
         symbol: lot.symbol,
         error: err instanceof Error ? err.message : String(err),
       });

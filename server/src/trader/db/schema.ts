@@ -26,22 +26,52 @@ import {
 
 import type { Callout, Decision, ExecutionMode, OptionType, ResolvedTradeSettings } from '../../shared/types.js';
 import type { ClosedBy, LadderLevel, TrackedFill, TrackedResult } from '../book/ladder.js';
+import type { BrokerId } from '../broker/types.js';
 import type { MessageDisposition } from '../db.js';
 import type { RecapParse, RecapParseStatus } from '../recaps/parser.js';
 
 const isoTimestamp = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
 const numericAsNumber = (name: string) => numeric(name, { mode: 'number' });
 
-// ---- Per-user -----------------------------------------------------------------
+// ---- Per-user and per-account ---------------------------------------------------
 
 /**
- * The account + resolved trade settings, one row per user. Created at an
- * invited email's first sign-in; the app writes only the settings columns
- * after that. Defaults mirror TradeSettingsSchema (shared/types.ts).
+ * Identity, one row per person who can sign in. Created at an invited email's
+ * first sign-in. The trade settings live on the user's accounts.
  */
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
   email: text('email').notNull(),
+  /** The account the dashboard and Settings show; fk -> accounts in the migration. */
+  selectedAccountId: uuid('selected_account_id'),
+  updatedAt: isoTimestamp('updated_at').notNull().defaultNow(),
+});
+
+/**
+ * One real brokerage account with its resolved trade settings. Every user has
+ * a direct Robinhood row from their first sign-in; a SnapTrade connection adds
+ * one row per account it holds. Setting defaults mirror TradeSettingsSchema
+ * (shared/types.ts).
+ */
+export const accounts = pgTable('accounts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  /** How we reach the account. */
+  adapter: text('adapter').$type<BrokerId>().notNull(),
+  /** Which broker holds it: 'robinhood', 'alpaca-paper', ... */
+  institution: text('institution').notNull(),
+  /** The broker's own account id; null on a direct Robinhood account. */
+  externalAccountId: text('external_account_id'),
+  label: text('label').notNull(),
+  isPaper: boolean('is_paper').notNull().default(false),
+  needsReconnect: boolean('needs_reconnect').notNull().default(false),
+  disconnectedAt: isoTimestamp('disconnected_at'),
+  /** Ciphertext only (AES-256-GCM under RH_TOKENS_VAULT_KEY); null when not connected. */
+  credentials: text('credentials'),
+  /** Shape depends on `adapter`; validated on read (toAccount in db.ts). */
+  adapterData: jsonb('adapter_data').$type<Record<string, unknown>>().notNull().default({}),
   executionMode: text('execution_mode').$type<ExecutionMode>().notNull().default('approval'),
   equitySmallPct: numericAsNumber('equity_small_pct').notNull().default(1.25),
   equityMediumPct: numericAsNumber('equity_medium_pct').notNull().default(2.5),
@@ -69,15 +99,19 @@ export const users = pgTable('users', {
     { gainPct: 75, portionPct: 25 },
     { gainPct: 100, portionPct: 25 },
   ]),
+  createdAt: isoTimestamp('created_at').notNull().defaultNow(),
   updatedAt: isoTimestamp('updated_at').notNull().defaultNow(),
 });
 
-/** Per-user decision audit log; one row per callout per user. */
+/** Per-account decision audit log; one row per callout per account. */
 export const trades = pgTable('trades', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id')
     .notNull()
     .references(() => users.id, { onDelete: 'cascade' }),
+  accountId: uuid('account_id')
+    .notNull()
+    .references(() => accounts.id),
   messageId: text('message_id').notNull(),
   kind: text('kind').$type<Decision['kind']>().notNull(),
   code: text('code').$type<Decision['code']>(),
@@ -87,18 +121,6 @@ export const trades = pgTable('trades', {
   orderPayload: jsonb('order_payload').$type<Decision['order']>(),
   approvedAt: isoTimestamp('approved_at'),
   timestamp: isoTimestamp('timestamp').notNull().defaultNow(),
-});
-
-/**
- * One Robinhood connection per user — user_id as pk is what enforces that
- * product rule. Ciphertext only (AES-256-GCM under RH_TOKENS_VAULT_KEY).
- */
-export const brokerConnections = pgTable('broker_connections', {
-  userId: uuid('user_id')
-    .primaryKey()
-    .references(() => users.id, { onDelete: 'cascade' }),
-  encryptedTokens: text('encrypted_tokens').notNull(),
-  updatedAt: isoTimestamp('updated_at').notNull().defaultNow(),
 });
 
 /** One signed-in browser, keyed by the SHA-256 of its bearer token. */
