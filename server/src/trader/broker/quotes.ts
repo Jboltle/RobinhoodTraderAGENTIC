@@ -12,9 +12,25 @@ import { BrokerUnavailableError } from './errors.js';
 import { instrumentKey } from './instrument.js';
 import { READY_TIMEOUT_MS } from '../robinhood/mcpClient.js';
 import type { McpRegistry } from './registry.js';
-import type { Broker, Instrument } from './types.js';
+import type { Broker, Instrument, UserBroker } from './types.js';
 
 const log = createLogger('trader:quotes');
+
+/**
+ * What a monitor prices an account's holding at: the account's own broker,
+ * or the shared source for an option when that broker prices none (SnapTrade).
+ * A contract's price is the same whoever asks, and the shared read costs the
+ * account none of its request budget.
+ */
+export function markFor(
+  account: UserBroker,
+  quotes: QuoteSource,
+  instrument: Instrument
+): Promise<number | null> {
+  return instrument.kind === 'option' && !account.quotesOptions
+    ? quotes.getMark(instrument)
+    : account.broker.getMark(instrument);
+}
 
 /** How long getMark keeps serving a price before asking the broker again. */
 export const MARK_CACHE_MS = 15_000;

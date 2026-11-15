@@ -29,7 +29,7 @@ import type { AccountRow, BrokerSession, OptionInstrument } from '../broker/type
 import { TraderEvents } from '../events.js';
 import { FILL_POLL_ACTIVE_MS, sweepFills } from '../fills.js';
 import { sweepLadders } from '../ladderMonitor.js';
-import { resolveOptionEntry, sweepMaxLoss, warnOfUnprotectedAccounts } from '../maxLoss.js';
+import { FLATTEN_RETRY_MS, resolveOptionEntry, sweepMaxLoss, warnOfUnprotectedAccounts } from '../maxLoss.js';
 import {
   BTO_QQQ_PUT,
   TRIM_QQQ_FIRST,
@@ -53,7 +53,7 @@ import {
 } from '../snaptrade/__tests__/fakeClient.js';
 import { optionOrder, optionOrderPlaced, optionPosition } from '../snaptrade/__tests__/fixtures/unverified.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
-import { makeFakeBroker, placedOrders, type FakeBroker } from './harness.js';
+import { makeFakeBroker, markReads, placedOrders, type FakeBroker } from './harness.js';
 
 // Broker-side stops are off unless a test turns them on for itself.
 afterEach(() => {
@@ -248,6 +248,26 @@ function workingBuy(orderType: 'market' | 'limit', limitPrice: number | null, me
 }
 
 const decisionsOf = async (db: FakeDb, accountId: string): Promise<Decision[]> => db.listDecisions(accountId, 10);
+const maxLossExitsOf = async (db: FakeDb, accountId: string): Promise<Decision[]> =>
+  (await decisionsOf(db, accountId)).filter((decision) => decision.kind === 'max_loss_exit');
+
+/** What the monitors are handed besides the clock: the world, and the quote source that reads through it. */
+const monitorDeps = (world: World) => ({
+  db: world.db,
+  brokers: world.brokers,
+  quotes: createQuoteSource({ db: world.db, brokers: world.brokers }),
+  events: world.events,
+});
+
+/** The Robinhood session now prices every option at `mark`: where a SnapTrade account's marks come from. */
+const robinhoodPricesOptionsAt = (world: World, mark: number): void => {
+  world.robinhoodBroker.getMark.mockImplementation(async (instrument) =>
+    instrument.kind === 'option' ? mark : QQQ_SPOT
+  );
+};
+
+const sweepMaxLossOf = (world: World, at: Date = NOW, flattening = new Map<string, number>()): Promise<void> =>
+  sweepMaxLoss({ ...monitorDeps(world), enqueue: (_accountId, run) => run(), now: () => at }, flattening);
 
 describe('which deployments have the SnapTrade adapter', () => {
   it('nothing is built while any of the three settings is absent', () => {
@@ -405,10 +425,11 @@ describe('a paper_only deployment with the SnapTrade adapter', () => {
     expect((await decisionsOf(world.db, LIVE.id)).map((decision) => decision.kind)).not.toContain('submitted');
   });
 
-  it('Max Loss, the stop rest and the own-target ladder ask nothing of SnapTrade and place nothing anywhere', async () => {
+  /** Every account holds the same filled lot (3 contracts at 1.59) under Max Loss 50% and a one-level ladder. */
+  function protectedWorld(): World {
     const MESSAGE_ID = 'msg-filled-lot';
     const protect: TradeSettings = { maxLossPct: 50, exitMode: 'ladder', trimLevels: [{ gainPct: 50, portionPct: 50 }] };
-    const world = makePaperOnlyWorld({ paperSettings: protect });
+    const world = makePaperOnlyWorld({ paperSettings: protect, answers: { positions: held(optionPosition()) } });
     world.db.seedSettings(ROBINHOOD.id, { ...TRADING, ...protect });
     world.db.seedMessage({ messageId: MESSAGE_ID, sentAt: NOW.toISOString() });
     for (const account of [PAPER, LIVE, ROBINHOOD]) {
@@ -417,15 +438,45 @@ describe('a paper_only deployment with the SnapTrade adapter', () => {
         order: { ...workingBuy('limit', 1.6).order!, orderId: 'filled-buy', status: 'filled', averageFillPrice: 1.59 },
       });
     }
+    return world;
+  }
+
+  it('with no session pricing the option, Max Loss, the stop rest and the own-target ladder ask nothing of SnapTrade and place nothing anywhere', async () => {
+    const world = protectedWorld();
     // Something still open, so the fill sweep has work and reaches the stop rest.
     world.db.seedDecision(ROBINHOOD.id, workingBuy('limit', 1.6));
-    const { db, brokers, events } = world;
 
-    await sweepMaxLoss({ db, brokers, events, enqueue: (_accountId, run) => run(), now: () => NOW }, new Map());
-    await sweepFills({ db, brokers, events, executionMode: PAPER_ONLY, now: () => NOW });
-    expect(await sweepLadders({ db, brokers, events, executionMode: PAPER_ONLY })).toBe(0);
+    await sweepMaxLossOf(world);
+    await sweepFills({ ...monitorDeps(world), executionMode: PAPER_ONLY, now: () => NOW });
+    expect(await sweepLadders({ ...monitorDeps(world), executionMode: PAPER_ONLY })).toBe(0);
 
     expect(world.sdk.calls).toEqual([]);
+    expectNoWriteButPaper(world);
+  });
+
+  it('Max Loss, priced by the Robinhood session, closes the paper lot alone', async () => {
+    const world = protectedWorld();
+    robinhoodPricesOptionsAt(world, 0.7);
+
+    await sweepMaxLossOf(world);
+
+    expect(requestsFor(world, PAPER)).toEqual([POSITIONS_READ, OPTION_ORDER]);
+    expect(await maxLossExitsOf(world.db, PAPER.id)).toMatchObject([
+      { order: { side: 'sell', orderType: 'market', quantity: SPY_CALL_CONTRACTS } },
+    ]);
+    // The live SnapTrade account's breach is seen and its close refused before SnapTrade is asked to place it.
+    expect(requestsFor(world, LIVE)).toEqual([POSITIONS_READ]);
+    expectNoWriteButPaper(world);
+  });
+
+  it('the own-target ladder, priced by the Robinhood session, sells the paper level alone', async () => {
+    const world = protectedWorld();
+    robinhoodPricesOptionsAt(world, 2.5);
+
+    expect(await sweepLadders({ ...monitorDeps(world), executionMode: PAPER_ONLY })).toBe(1);
+
+    expect(requestsFor(world, PAPER)).toEqual([POSITIONS_READ, OPTION_ORDER]);
+    expect(requestsFor(world, LIVE)).toEqual([]);
     expectNoWriteButPaper(world);
   });
 });
@@ -733,6 +784,8 @@ describe('the request budget of a SnapTrade account', () => {
   };
 
   const requestsOf = (world: World, call: string): number => callNames(world.sdk).filter((name) => name === call).length;
+  /** The contracts the Robinhood session was asked to price, in order. */
+  const markReadsOf = (world: World) => markReads(world.robinhoodBroker, 'option');
 
   /** Sweeps as the fill monitor does while an order is open: every FILL_POLL_ACTIVE_MS, for `durationMs`. */
   async function sweepFor(world: World, durationMs: number, mode: TradeExecutionMode = 'immediate'): Promise<void> {
@@ -805,63 +858,155 @@ describe('the request budget of a SnapTrade account', () => {
   describe('the sweeps that would read it on a timer', () => {
     afterEach(() => vi.restoreAllMocks());
 
-    it('Max Loss leaves it out, and still scans the Robinhood account', async () => {
-      const world = makeWorld({ paperSettings: MAX_LOSS });
-      world.db.seedSettings(ROBINHOOD.id, MAX_LOSS);
-      const queued: string[] = [];
+    const LADDER: TradeSettings = { ...TRADING, exitMode: 'ladder', trimLevels: [{ gainPct: 50, portionPct: 50 }] };
+    /** Under half the 1.59 paid: past a 50% Max Loss. */
+    const LOSING_MARK = 0.7;
+    /** Past +50% of the 1.59 paid. */
+    const WINNING_MARK = 2.5;
 
-      await sweepMaxLoss(
-        {
-          db: world.db,
-          brokers: world.brokers,
-          events: world.events,
-          enqueue: (accountId, run) => {
-            queued.push(accountId);
-            return run();
-          },
-          now: () => NOW,
-        },
-        new Map()
-      );
-
-      expect(queued).toEqual([ROBINHOOD.id]);
-      expect(world.robinhoodBroker.getPositions).toHaveBeenCalled();
-      expect(world.sdk.calls).toEqual([]);
-    });
-
-    it('the own-target ladder costs it nothing and sells nothing: its broker prices no option', async () => {
-      const world = makeWorld({
-        paperSettings: { ...TRADING, exitMode: 'ladder', trimLevels: [{ gainPct: 50, portionPct: 50 }] },
-      });
+    /** The SnapTrade account holds the filled lot, at the broker as in the ledger. */
+    function worldHoldingLot(paperSettings: TradeSettings, positions = held(optionPosition())): World {
+      const world = makeWorld({ paperSettings, answers: { positions } });
       world.db.seedMessage({ messageId: FILLED_LOT_MESSAGE_ID, sentAt: NOW.toISOString() });
       world.db.seedDecision(PAPER.id, filledLot);
+      return world;
+    }
 
-      const placed = await sweepLadders({
-        db: world.db,
-        brokers: world.brokers,
-        events: world.events,
-        executionMode: 'immediate',
-      });
+    it('Max Loss looks for a breach in its lots, priced by the Robinhood session, and asks SnapTrade nothing while there is none', async () => {
+      const world = worldHoldingLot(MAX_LOSS);
+      robinhoodPricesOptionsAt(world, 1.5);
 
-      expect(placed).toBe(0);
+      const SWEEPS = 4;
+      for (let sweep = 0; sweep < SWEEPS; sweep += 1) await sweepMaxLossOf(world);
+
+      expect(markReadsOf(world)).toEqual(Array.from({ length: SWEEPS }, () => SPY_CALL));
       expect(world.sdk.calls).toEqual([]);
     });
 
-    it('the monitor says so once per account when it starts, with what the account asked for', async () => {
-      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-      const world = makeWorld({ paperSettings: { ...MAX_LOSS, exitMode: 'ladder' } });
-      world.db.seedSettings(ROBINHOOD.id, MAX_LOSS);
+    it('a lot in breach costs two requests, the positions read and the close, and the close names the lot', async () => {
+      const world = worldHoldingLot(MAX_LOSS);
+      robinhoodPricesOptionsAt(world, LOSING_MARK);
+      const flattening = new Map<string, number>();
 
-      await warnOfUnprotectedAccounts(world);
+      await sweepMaxLossOf(world, NOW, flattening);
+      await sweepMaxLossOf(world, NOW, flattening);
 
-      const warnings = stderr.mock.calls
-        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
-        .filter((line) => line.level === 'warn');
-      expect(warnings).toMatchObject([
-        { accountId: PAPER.id, adapter: 'snaptrade', maxLossPct: 50, exitMode: 'ladder' },
+      expect(callNames(world.sdk)).toEqual([POSITIONS_READ, OPTION_ORDER]);
+      expect(world.sdk.calls[1]![1]).toMatchObject({
+        accountId: PAPER_SNAPTRADE_ID,
+        order_type: 'MARKET',
+        legs: [{ instrument: { symbol: 'SPY   261021C00772000' }, action: 'SELL_TO_CLOSE', units: SPY_CALL_CONTRACTS }],
+      });
+      expect(await maxLossExitsOf(world.db, PAPER.id)).toMatchObject([
+        {
+          order: {
+            side: 'sell',
+            quantity: SPY_CALL_CONTRACTS,
+            lots: [{ lotId: FILLED_LOT_MESSAGE_ID, quantity: SPY_CALL_CONTRACTS }],
+          },
+        },
       ]);
-      expect(warnings).toHaveLength(1);
+      // The close took the lot out of the ledger, so nothing is left to breach.
+      expect(await world.db.listOpenOptionLots(PAPER.id)).toEqual([]);
+    });
+
+    it('sells no more than the broker still holds', async () => {
+      const world = worldHoldingLot(MAX_LOSS, held(optionPosition({ units: '1' })));
+      robinhoodPricesOptionsAt(world, LOSING_MARK);
+
+      await sweepMaxLossOf(world);
+
+      expect(world.sdk.calls[1]![1]).toMatchObject({ legs: [{ action: 'SELL_TO_CLOSE', units: 1 }] });
+    });
+
+    it(`a lot whose contracts the broker no longer holds is read once, sells nothing, and is not read again for ${FLATTEN_RETRY_MS / 60_000} minutes`, async () => {
+      const world = worldHoldingLot(MAX_LOSS, held());
+      robinhoodPricesOptionsAt(world, LOSING_MARK);
+      const flattening = new Map<string, number>();
+
+      await sweepMaxLossOf(world, NOW, flattening);
+      await sweepMaxLossOf(world, new Date(NOW.getTime() + FLATTEN_RETRY_MS - 1), flattening);
+      expect(callNames(world.sdk)).toEqual([POSITIONS_READ]);
+
+      await sweepMaxLossOf(world, new Date(NOW.getTime() + FLATTEN_RETRY_MS), flattening);
+      expect(callNames(world.sdk)).toEqual([POSITIONS_READ, POSITIONS_READ]);
+      expect((await decisionsOf(world.db, PAPER.id)).map((decision) => decision.kind)).toEqual(['submitted']);
+    });
+
+    it('Max Loss off for the account: its lots are not priced at all', async () => {
+      const world = worldHoldingLot(TRADING);
+      robinhoodPricesOptionsAt(world, LOSING_MARK);
+
+      await sweepMaxLossOf(world);
+
+      expect(markReadsOf(world)).toEqual([]);
       expect(world.sdk.calls).toEqual([]);
+    });
+
+    it('the own-target ladder sells a level the Robinhood session shows reached, for two requests: what it holds, then the sell', async () => {
+      const world = worldHoldingLot(LADDER);
+      robinhoodPricesOptionsAt(world, WINNING_MARK);
+
+      expect(await sweepLadders({ ...monitorDeps(world), executionMode: 'immediate' })).toBe(1);
+
+      expect(callNames(world.sdk)).toEqual([POSITIONS_READ, OPTION_ORDER]);
+      expect(world.sdk.calls[1]![1]).toMatchObject({
+        accountId: PAPER_SNAPTRADE_ID,
+        order_type: 'LIMIT',
+        limit_price: '2.38',
+        legs: [{ instrument: { symbol: 'SPY   261021C00772000' }, action: 'SELL_TO_CLOSE', units: 1 }],
+      });
+      // The level is sold: the next sweep places nothing more and asks SnapTrade nothing.
+      expect(await sweepLadders({ ...monitorDeps(world), executionMode: 'immediate' })).toBe(0);
+      expect(callNames(world.sdk)).toEqual([POSITIONS_READ, OPTION_ORDER]);
+    });
+
+    it('the ladder reads no positions while no level is reached', async () => {
+      const world = worldHoldingLot(LADDER);
+      robinhoodPricesOptionsAt(world, 1.7);
+
+      expect(await sweepLadders({ ...monitorDeps(world), executionMode: 'immediate' })).toBe(0);
+
+      expect(world.sdk.calls).toEqual([]);
+    });
+
+    it('with no session pricing the option, the ladder and Max Loss cost it nothing and sell nothing', async () => {
+      const world = worldHoldingLot({ ...LADDER, maxLossPct: 50 });
+
+      await sweepMaxLossOf(world);
+      expect(await sweepLadders({ ...monitorDeps(world), executionMode: 'immediate' })).toBe(0);
+
+      expect(world.sdk.calls).toEqual([]);
+    });
+
+    describe('the warning when the monitor starts', () => {
+      const warningsOf = async (world: World): Promise<Record<string, unknown>[]> => {
+        const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        await warnOfUnprotectedAccounts(monitorDeps(world));
+        return stderr.mock.calls
+          .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+          .filter((line) => line.level === 'warn');
+      };
+
+      it('says nothing while a connected session prices options', async () => {
+        const world = makeWorld({ paperSettings: { ...MAX_LOSS, exitMode: 'ladder' } });
+
+        expect(await warningsOf(world)).toEqual([]);
+        expect(world.sdk.calls).toEqual([]);
+      });
+
+      it('names each SnapTrade account once, with what it asked for, when none does', async () => {
+        const world = makeWorld({ paperSettings: { ...MAX_LOSS, exitMode: 'ladder' } });
+        await world.db.deleteBrokerTokens(ROBINHOOD.id);
+
+        const warnings = await warningsOf(world);
+
+        expect(warnings).toMatchObject([
+          { accountId: PAPER.id, adapter: 'snaptrade', maxLossPct: 50, exitMode: 'ladder' },
+        ]);
+        expect(warnings).toHaveLength(1);
+        expect(world.sdk.calls).toEqual([]);
+      });
     });
   });
 

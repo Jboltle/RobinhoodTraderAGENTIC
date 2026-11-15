@@ -266,6 +266,7 @@ describe('the monitors, with a connected account whose adapter is not deployed',
       {
         db,
         brokers,
+        quotes: createQuoteSource({ db, brokers }),
         events,
         enqueue: (accountId, run) => {
           queued.push(accountId);
@@ -288,7 +289,7 @@ describe('the monitors, with a connected account whose adapter is not deployed',
       WINNING_MARK
     );
 
-    expect(await sweepLadders({ db, brokers, events, executionMode: 'immediate' })).toBe(1);
+    expect(await sweepLadders({ db, brokers, quotes: createQuoteSource({ db, brokers }), events, executionMode: 'immediate' })).toBe(1);
 
     expect(scopedCalls(db, UNSUPPORTED.id)).toEqual([]);
     expect(opened).toEqual([ROBINHOOD.id]);

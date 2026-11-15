@@ -96,7 +96,7 @@ async function main(): Promise<void> {
   // Fill read-back: keeps placed orders' broker state current. Read-only, so
   // it runs under every TRADE_EXECUTION_MODE.
   startFillMonitor({ db, brokers, events, lookbackMs: config.fillLookbackMs, executionMode });
-  startLadderMonitor({ db, brokers, events, executionMode });
+  startLadderMonitor({ db, brokers, quotes, events, executionMode });
 
   // The tracked-callout book: marks, simulated ladder fills and expiry
   // settlement for every Caller entry. Read-only like the fill monitor.
@@ -106,6 +106,7 @@ async function main(): Promise<void> {
   startMaxLossMonitor({
     db,
     brokers,
+    quotes,
     events,
     enqueue: (accountId, run) => processor.enqueue(accountId, run),
   });

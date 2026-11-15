@@ -7,11 +7,11 @@
  * both. The account that is not paper must see no write call on its adapter.
  *
  * A paper account is a SnapTrade account, and a SnapTrade account meters its
- * requests (broker/requestBudget.ts): Max Loss and the stop rest leave it out
- * whatever the mode. So under paper_only neither writes for anyone: the mode
- * would let a paper account's through, and the budget rule never attempts it.
+ * requests (broker/requestBudget.ts): the stop rest leaves it out whatever the
+ * mode, so under paper_only no stop is rested for anyone. Max Loss and the
+ * own-target ladder do act on it, from its ledger lots.
  * The fakes here price options, which SnapTrade does not; the real adapter
- * under paper_only is in snaptradeWiring.test.ts.
+ * under paper_only, priced by the shared quote source, is in snaptradeWiring.test.ts.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -27,7 +27,7 @@ import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { BrokerWritesDisabledError } from '../broker/errors.js';
 import { isPaperAccount } from '../broker/paperAccount.js';
 import { brokerStops } from '../brokerStops.js';
-import { createQuoteSource } from '../broker/quotes.js';
+import { createQuoteSource, type QuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry, type McpRegistry } from '../broker/registry.js';
 import { isRequestMetered } from '../broker/requestBudget.js';
 import type { AccountRow, BrokerOrder, OrderRequest } from '../broker/types.js';
@@ -146,6 +146,7 @@ interface World {
   readonly db: FakeDb;
   readonly events: TraderEvents;
   readonly brokers: McpRegistry;
+  readonly quotes: QuoteSource;
   /** The broker behind each account's adapter: what a write would reach. */
   readonly behind: (account: AccountRow) => FakeBroker;
 }
@@ -191,7 +192,13 @@ function makeWorld(other: AccountRow, options: WorldOptions = {}): World {
     })),
     PAPER_ONLY
   );
-  return { db, events: new TraderEvents(), brokers, behind: (account) => fakeOf(account.id) };
+  return {
+    db,
+    events: new TraderEvents(),
+    brokers,
+    quotes: createQuoteSource({ db, brokers }),
+    behind: (account) => fakeOf(account.id),
+  };
 }
 
 /** Both accounts hold the same open lot under the same settings. */
@@ -328,30 +335,29 @@ describe.each(NOT_PAPER)('paper_only: a paper account beside %s', (_name, other)
   });
 
   describe('the monitors', () => {
-    it('Max Loss sells on neither: the paper account is not scanned (its adapter meters requests), the other is refused', async () => {
-      const { db, events, brokers, behind } = worldWithOpenLots(other, MAX_LOSS, { optionMark: LOSING_MARK });
+    it("Max Loss closes the paper account's losing lot; the other account's close is refused", async () => {
+      const { db, events, brokers, quotes, behind } = worldWithOpenLots(other, MAX_LOSS, { optionMark: LOSING_MARK });
       const reachedGuard = vi.spyOn(brokers.for(other).broker, 'placeOrder');
 
       await sweepMaxLoss(
-        { db, brokers, events, enqueue: (_accountId, run) => run(), now: () => REGULAR_HOURS },
+        { db, brokers, quotes, events, enqueue: (_accountId, run) => run(), now: () => REGULAR_HOURS },
         new Map()
       );
 
-      // Not attempted on the paper account: it is neither opened nor read.
-      expect(brokers.existing(PAPER.id)).toBeUndefined();
-      expect(scopedCalls(db, PAPER)).toEqual([]);
-      // A Robinhood account's breach gets as far as the guard; a SnapTrade one is not scanned either.
-      expect(reachedGuard).toHaveBeenCalledTimes(isRequestMetered(other) ? 0 : 1);
-      for (const account of [PAPER, other]) {
-        expect(writes(behind(account))).toBe(0);
-        expect((await decisionsOf(db, account)).filter((d) => d.kind === 'max_loss_exit')).toEqual([]);
-      }
+      expect(placedOrders(behind(PAPER), 'option')).toMatchObject([
+        { side: 'sell', type: 'market', quantity: OPEN_LOT_CONTRACTS },
+      ]);
+      expect((await decisionsOf(db, PAPER)).filter((d) => d.kind === 'max_loss_exit')).toHaveLength(1);
+      // The other account's breach gets as far as the guard, whichever adapter it is behind, and no further.
+      expect(reachedGuard).toHaveBeenCalledTimes(1);
+      expect(writes(behind(other))).toBe(0);
+      expect((await decisionsOf(db, other)).filter((d) => d.kind === 'max_loss_exit')).toEqual([]);
     });
 
     it('the own-target ladder sells the paper level and never reads the other', async () => {
-      const { db, events, brokers, behind } = worldWithOpenLots(other, LADDER, { optionMark: WINNING_MARK });
+      const { db, events, brokers, quotes, behind } = worldWithOpenLots(other, LADDER, { optionMark: WINNING_MARK });
 
-      expect(await sweepLadders({ db, brokers, events, executionMode: PAPER_ONLY })).toBe(1);
+      expect(await sweepLadders({ db, brokers, quotes, events, executionMode: PAPER_ONLY })).toBe(1);
 
       expect(placedOrders(behind(PAPER), 'option')).toMatchObject([{ side: 'sell', type: 'limit' }]);
       expect(writes(behind(other))).toBe(0);
@@ -435,9 +441,9 @@ describe.each(NOT_PAPER)('paper_only: a paper account beside %s', (_name, other)
     });
 
     it('the own-target ladder: no sell is placed or recorded for the other account', async () => {
-      const { db, events, brokers, behind } = worldWithOpenLots(other, LADDER, { optionMark: WINNING_MARK });
+      const { db, events, brokers, quotes, behind } = worldWithOpenLots(other, LADDER, { optionMark: WINNING_MARK });
 
-      expect(await sweepLadders({ db, brokers, events, executionMode: 'immediate' })).toBe(1);
+      expect(await sweepLadders({ db, brokers, quotes, events, executionMode: 'immediate' })).toBe(1);
 
       expect(placedOrders(behind(PAPER), 'option')).toHaveLength(1);
       expect(writes(behind(other))).toBe(0);
@@ -495,10 +501,10 @@ describe('the modes that hold every account alike', () => {
     '%s: the own-target ladder lists no account, as before, and sells nothing',
     async (executionMode) => {
       const other = fakeAccount(OTHER_ID, OWNER);
-      const { db, events, brokers, behind } = worldWithOpenLots(other, LADDER, { optionMark: WINNING_MARK });
+      const { db, events, brokers, quotes, behind } = worldWithOpenLots(other, LADDER, { optionMark: WINNING_MARK });
       const listed = vi.spyOn(db, 'listConnectedAccounts');
 
-      expect(await sweepLadders({ db, brokers, events, executionMode })).toBe(0);
+      expect(await sweepLadders({ db, brokers, quotes, events, executionMode })).toBe(0);
 
       expect(listed).not.toHaveBeenCalled();
       expect(writes(behind(PAPER)) + writes(behind(other))).toBe(0);

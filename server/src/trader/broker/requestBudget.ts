@@ -5,8 +5,9 @@
  * together, and its SDK answers a refusal (HTTP 429) by sleeping 5, 10, then
  * 20 seconds inside the call. So nothing reads such an account on a timer:
  * its orders are read only while one is working, its dashboard figures are
- * kept between polls, and the sweeps that would read it every 15 seconds
- * leave it out. What is left of the budget is the callouts'.
+ * kept between polls, the stop rest leaves it out, and Max Loss watches its
+ * ledger lots at the shared quote source's price, reading the account only
+ * once a lot is in breach. What is left of the budget is the callouts'.
  */
 import type { AccountRow } from './types.js';
 

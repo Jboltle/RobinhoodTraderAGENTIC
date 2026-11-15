@@ -16,11 +16,12 @@ import {
 import { brokerStops } from './brokerStops.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
-import { sameOption, type OpenOptionLot } from './lots.js';
+import { allocateFifo, sameOption, type OpenOptionLot } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
 import { isRegularUsTradingHours } from './pipeline/riskFilter.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
-import { instrumentKey } from './broker/instrument.js';
+import { instrumentKey, instrumentOf } from './broker/instrument.js';
+import { markFor, type QuoteSource } from './broker/quotes.js';
 import { supportedAccounts, type McpRegistry } from './broker/registry.js';
 import { isRequestMetered } from './broker/requestBudget.js';
 import type {
@@ -111,6 +112,8 @@ export function lossBreached(input: LossInput): boolean {
 export interface MaxLossDeps {
   readonly db: TraderDb;
   readonly brokers: McpRegistry;
+  /** Prices the lots of an account whose own broker prices no option. */
+  readonly quotes: QuoteSource;
   readonly events: TraderEvents;
   readonly enqueue: <T>(accountId: string, run: () => Promise<T>) => Promise<T>;
   readonly now?: () => Date;
@@ -148,18 +151,15 @@ export async function sweepMaxLoss(
   const now = deps.now?.() ?? new Date();
   if (!isRegularUsTradingHours(now)) return;
 
-  // ponytail: a request-metered account (SnapTrade) is left out. A scan reads
-  // positions and orders every 15 s, 8 of the 10 requests a minute the account
-  // is allowed, and its broker prices no option, so a scan could not see an
-  // option's loss anyway. Upgrade path: entry from the ledger lots, mark from
-  // the shared quote source, and a positions read only when those show a breach.
-  const accounts = (await supportedAccounts(deps.db, deps.brokers)).filter(
-    (account) => !isRequestMetered(account)
-  );
+  const accounts = await supportedAccounts(deps.db, deps.brokers);
   await Promise.all(
     accounts.map((account) =>
       deps
-        .enqueue(account.id, () => scanAccount(account, deps, flattening, now, entries))
+        .enqueue(account.id, () =>
+          isRequestMetered(account)
+            ? scanMeteredAccount(account, deps, flattening, now)
+            : scanAccount(account, deps, flattening, now, entries)
+        )
         .catch((err: unknown) =>
           log.warn('max-loss account scan failed', {
             accountId: account.id,
@@ -171,15 +171,20 @@ export async function sweepMaxLoss(
 }
 
 /**
- * Said once per account when the monitor starts: a request-metered account
- * (SnapTrade) has no Max Loss, no resting stop and no own-target exit, whatever
- * its settings ask for. Its positions close only on the Caller's exits.
+ * Said once per account when the monitor starts, on a deployment where no
+ * connected session prices options (staging has no Robinhood login): a
+ * request-metered account (SnapTrade) is priced by the shared quote source
+ * alone, so until one connects it has no Max Loss and no own-target exit,
+ * whatever its settings ask for, and closes only on the Caller's exits.
  */
-export async function warnOfUnprotectedAccounts(deps: Pick<MaxLossDeps, 'db' | 'brokers'>): Promise<void> {
-  for (const account of await supportedAccounts(deps.db, deps.brokers)) {
-    if (!isRequestMetered(account)) continue;
+export async function warnOfUnprotectedAccounts(
+  deps: Pick<MaxLossDeps, 'db' | 'brokers' | 'quotes'>
+): Promise<void> {
+  const metered = (await supportedAccounts(deps.db, deps.brokers)).filter(isRequestMetered);
+  if (metered.length === 0 || (await deps.quotes.broker()) !== null) return;
+  for (const account of metered) {
     const settings = await deps.db.getSettings(account.id);
-    log.warn('account trades without Max Loss, a resting stop or own targets: its broker meters requests', {
+    log.warn('account trades without Max Loss or own targets: no connected session prices options for it', {
       accountId: account.id,
       adapter: account.adapter,
       maxLossPct: settings.maxLossPct,
@@ -291,6 +296,80 @@ async function scanAccount(
 }
 
 /**
+ * Max Loss for a request-metered account (SnapTrade). Its 10 requests a minute
+ * rule out reading its positions and orders every sweep, and its broker prices
+ * no option. So a breach is looked for where it costs the account nothing: its
+ * own open lots, priced by the shared quote source. Its positions are read
+ * only once a contract is in breach, so the close sells no more than the
+ * account still holds, and the close names its lots so the ledger closes with it.
+ *
+ * Option lots only: an equity position the account holds is not watched.
+ * ponytail: a close the broker keeps refusing is re-sent every sweep, two
+ * requests each, as for any account. Upgrade path: back off per contract.
+ */
+async function scanMeteredAccount(
+  account: AccountRow,
+  deps: MaxLossDeps,
+  flattening: Map<string, number>,
+  now: Date
+): Promise<null> {
+  const accountId = account.id;
+  const settings = await deps.db.getSettings(accountId);
+  if (!lossEnabled(settings.maxLossPct, settings.maxLossUsd)) return null;
+
+  const userBroker = deps.brokers.for(account);
+  try {
+    await userBroker.session.ensureReady();
+  } catch (err) {
+    if (err instanceof BrokerUnavailableError) return null;
+    throw err;
+  }
+
+  const lotsByContract = new Map<string, OpenOptionLot[]>();
+  for (const lot of await deps.db.listOpenOptionLots(accountId)) {
+    if (!(lot.entryPrice > 0)) continue;
+    const key = instrumentKey(instrumentOf({ symbol: lot.symbol, assetType: 'option', option: lot.option }));
+    lotsByContract.set(key, [...(lotsByContract.get(key) ?? []), lot]);
+  }
+
+  for (const [key, lots] of lotsByContract) {
+    const { symbol, option } = lots[0]!;
+    const instrument = instrumentOf({ symbol, assetType: 'option', option });
+    const contracts = lots.reduce((sum, lot) => sum + lot.openQty, 0);
+    await considerPosition({
+      accountId,
+      ownerUserId: account.userId,
+      deps,
+      flattening,
+      now,
+      broker: userBroker.broker,
+      settings,
+      key,
+      symbol,
+      quantity: contracts,
+      assetType: 'option',
+      option,
+      entry: lots.reduce((sum, lot) => sum + lot.entryPrice * lot.openQty, 0) / contracts,
+      mark: await markFor(userBroker, deps.quotes, instrument).catch(() => null),
+      multiplier: OPTION_MULTIPLIER,
+      lots,
+      heldAtBroker: async () =>
+        (await userBroker.broker.getPositions('option'))
+          .filter((position) => instrumentKey(position.instrument) === key)
+          .reduce((sum, position) => sum + position.quantity, 0),
+    });
+  }
+
+  // As in scanAccount: a close whose lots are gone has completed.
+  for (const inflight of flattening.keys()) {
+    if (inflight.startsWith(`${accountId}:`) && !lotsByContract.has(inflight.slice(accountId.length + 1))) {
+      flattening.delete(inflight);
+    }
+  }
+  return null;
+}
+
+/**
  * The account's submitted orders, re-read from the trades table only when the
  * cached copy may be stale: the first sweep, the sweep after any decision is
  * logged for the account (a buy opens a position, an add re-averages one), and a
@@ -350,6 +429,13 @@ interface ConsiderArgs {
   readonly entry: number | null;
   readonly mark: number | null;
   readonly multiplier: number;
+  /** The open lots the position was read from; the close then names the ones it sells. */
+  readonly lots?: readonly OpenOptionLot[];
+  /**
+   * For a position read from the ledger: the contracts the broker still holds,
+   * asked only once a breach is seen. The close sells no more than that.
+   */
+  readonly heldAtBroker?: () => Promise<number>;
 }
 
 async function considerPosition(args: ConsiderArgs): Promise<void> {
@@ -385,16 +471,28 @@ async function considerPosition(args: ConsiderArgs): Promise<void> {
 
   flattening.set(inflight, args.now.getTime());
   try {
+    let contracts = Math.floor(quantity);
+    if (args.heldAtBroker) {
+      contracts = Math.min(contracts, Math.floor(await args.heldAtBroker()));
+      if (contracts < 1) {
+        // The lots outlived their contracts (sold in the broker's app, expired).
+        // The in-flight key stays set, so the broker is asked again only after
+        // FLATTEN_RETRY_MS, not every sweep.
+        log.info('max-loss skipped: the broker no longer holds the contracts', { accountId, key });
+        return;
+      }
+    }
     const sized: SubmittedOrder = {
       symbol: args.symbol,
       side: 'sell',
       assetType: args.assetType,
-      quantity: Math.floor(quantity),
+      quantity: contracts,
       orderType: 'market',
       limitPrice: null,
       option: args.option,
       orderId: null,
       status: null,
+      ...(args.lots ? { lots: allocateFifo(args.lots, contracts) } : {}),
     };
     const placed = await submitOrder(sized, args.broker);
     // A dead submit-time status means nothing will fill: surface it as a

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TradeSettingsSchema, type Decision, type OptionContract, type TradeSettings } from '../../shared/types.js';
 import { brokerStops } from '../brokerStops.js';
+import { createQuoteSource } from '../broker/quotes.js';
 import type { Broker, BrokerOrder, BrokerPosition, Instrument } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
 import {
@@ -88,7 +89,7 @@ function setup(opts: {
   const brokers = makeFakeRegistry(() => ({ session, broker }));
   return {
     db,
-    deps: { db, brokers, events: new TraderEvents(), executionMode: 'immediate' },
+    deps: { db, brokers, quotes: createQuoteSource({ db, brokers }), events: new TraderEvents(), executionMode: 'immediate' },
     place,
     cancel,
     positions,

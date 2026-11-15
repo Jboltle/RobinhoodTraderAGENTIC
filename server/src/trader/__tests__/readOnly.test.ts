@@ -13,6 +13,7 @@ import {
   type TradeExecutionMode,
 } from '../../shared/types.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
+import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry } from '../broker/registry.js';
 import { brokerStops } from '../brokerStops.js';
 import type { AccountRow, Broker, BrokerAdapter, Instrument, OrderRequest } from '../broker/types.js';
@@ -374,6 +375,7 @@ describe('read_only deployment: the write paths cannot write', () => {
     const placed = await sweepLadders({
       db,
       brokers,
+      quotes: createQuoteSource({ db, brokers }),
       events: new TraderEvents(),
       executionMode: 'immediate',
     });

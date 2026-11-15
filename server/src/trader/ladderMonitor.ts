@@ -14,6 +14,7 @@ import { unheldAccounts, type McpRegistry } from './broker/registry.js';
 import type { AccountRow } from './broker/types.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
 import { instrumentOf } from './broker/instrument.js';
+import { markFor, type QuoteSource } from './broker/quotes.js';
 import { cancelStops } from './stops.js';
 
 const log = createLogger('trader:ladder');
@@ -47,6 +48,8 @@ function firstTime(key: string): boolean {
 export interface LadderDeps {
   readonly db: TraderDb;
   readonly brokers: McpRegistry;
+  /** Prices the lots of an account whose own broker prices no option. */
+  readonly quotes: QuoteSource;
   readonly events: TraderEvents;
   readonly executionMode: TradeExecutionMode;
 }
@@ -97,9 +100,11 @@ async function sweepAccount(account: AccountRow, deps: LadderDeps): Promise<numb
   let placed = 0;
   for (const lot of lots) {
     if (lot.entryPrice <= 0) continue;
-    const mark = await broker.broker
-      .getMark(instrumentOf({ symbol: lot.symbol, assetType: 'option', option: lot.option }))
-      .catch(() => null);
+    const mark = await markFor(
+      broker,
+      deps.quotes,
+      instrumentOf({ symbol: lot.symbol, assetType: 'option', option: lot.option })
+    ).catch(() => null);
     if (mark === null) continue;
     for (const level of contractsAtLevel(lot.originalQty, settings.trimLevels)) {
       if (level.contracts < 1) continue;

@@ -17,6 +17,7 @@ import {
   type MaxLossDeps,
 } from '../maxLoss.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
+import { createQuoteSource } from '../broker/quotes.js';
 import type { BrokerOrder, OptionInstrument } from '../broker/types.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
 import { createFakeDb, fakeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
@@ -825,7 +826,7 @@ describe('sweepMaxLoss across two accounts of one user', () => {
     await sweepMaxLoss(
       {
         db,
-        brokers: makeFakeRegistry((accountId) => ({ session, broker: brokers.get(accountId)! })),
+        ...brokersAndQuotes(db, (accountId) => ({ session, broker: brokers.get(accountId)! })),
         events: new TraderEvents(),
         enqueue: enqueue as MaxLossDeps['enqueue'],
         now: () => RTH,
@@ -870,7 +871,7 @@ describe('sweepMaxLoss across two accounts of one user', () => {
     } as unknown as RobinhoodMcpClient;
     const deps: MaxLossDeps = {
       db,
-      brokers: makeFakeRegistry((accountId) => ({ session, broker: brokers.get(accountId)! })),
+      ...brokersAndQuotes(db, (accountId) => ({ session, broker: brokers.get(accountId)! })),
       events: new TraderEvents(),
       enqueue: (_accountId, run) => run(),
       now: () => RTH,
@@ -1006,7 +1007,7 @@ describe('sweepMaxLoss entry price from the account ledger', () => {
     await sweepMaxLoss(
       {
         db,
-        brokers: makeFakeRegistry((accountId) => ({ session, broker: brokers.get(accountId)! })),
+        ...brokersAndQuotes(db, (accountId) => ({ session, broker: brokers.get(accountId)! })),
         events: new TraderEvents(),
         enqueue: (_accountId, run) => run(),
         now: () => RTH,
@@ -1825,16 +1826,25 @@ function setupMonitor(opts: {
     isConnected: vi.fn().mockReturnValue(true),
     ensureReady: opts.ensureReady ?? vi.fn().mockResolvedValue(undefined),
   } as unknown as RobinhoodMcpClient;
-  const brokers = makeFakeRegistry(() => ({ session: mcp, broker }), opts.executionMode);
   const enqueue = vi.fn(<T,>(_userId: string, run: () => Promise<T>) => run());
   const flattening = new Map<string, number>();
   const nowRef = { value: RTH };
   const deps = {
     db,
-    brokers,
+    ...brokersAndQuotes(db, () => ({ session: mcp, broker }), opts.executionMode),
     events: new TraderEvents(),
     enqueue: enqueue as MaxLossDeps['enqueue'],
     now: () => nowRef.value,
   };
   return { db, broker, enqueue, flattening, deps, nowRef };
+}
+
+/** A registry over the given fakes, and the quote source that reads through it. */
+function brokersAndQuotes(
+  db: FakeDb,
+  open: Parameters<typeof makeFakeRegistry>[0],
+  executionMode?: TradeExecutionMode
+): Pick<MaxLossDeps, 'brokers' | 'quotes'> {
+  const brokers = makeFakeRegistry(open, executionMode);
+  return { brokers, quotes: createQuoteSource({ db, brokers }) };
 }

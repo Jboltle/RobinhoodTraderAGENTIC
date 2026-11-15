@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TradeSettingsSchema, type OptionContract } from '../../shared/types.js';
 import { brokerStops } from '../brokerStops.js';
+import { createQuoteSource } from '../broker/quotes.js';
 import type { Broker, BrokerOrder, BrokerPosition } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
 import { sweepLadders } from '../ladderMonitor.js';
@@ -388,7 +389,13 @@ describe('own-target ladder over a stop that had already filled', () => {
     });
     const session = { ensureReady: vi.fn().mockResolvedValue(undefined) } as unknown as RobinhoodMcpClient;
     const brokers = makeFakeRegistry(() => ({ session, broker }));
-    const deps = { db, brokers, events: new TraderEvents(), executionMode: 'immediate' as const };
+    const deps = {
+      db,
+      brokers,
+      quotes: createQuoteSource({ db, brokers }),
+      events: new TraderEvents(),
+      executionMode: 'immediate' as const,
+    };
 
     expect(await sweepLadders(deps)).toBe(0);
     expect(place).not.toHaveBeenCalled();
