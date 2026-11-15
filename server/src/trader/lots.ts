@@ -7,6 +7,7 @@
  * contracts in the same symbol.
  */
 import type { ExitPortion, OptionContract, SubmittedOrder } from '../shared/types.js';
+import type { BrokerPosition } from './broker/types.js';
 
 export interface LotLink {
   readonly lotId: string;
@@ -38,6 +39,8 @@ export interface OpenOptionLot {
   readonly buyOrder: SubmittedOrder;
   /** Contracts already sold at each own-target gain, including working sells. */
   readonly soldAtGain: Readonly<Record<number, number>>;
+  /** Every own-target sell tried for this lot and when, dead and failed ones included. */
+  readonly ownTargetSells: readonly { readonly gainPct: number; readonly at: string }[];
 }
 
 export interface TrimLevel {
@@ -73,9 +76,18 @@ function buyFilledQty(order: SubmittedOrder): number {
 export function openOptionLots(rows: readonly LotRow[]): OpenOptionLot[] {
   const consumed = new Map<string, number>();
   const byGain = new Map<string, Map<number, number>>();
+  const ownTargetSells = new Map<string, { gainPct: number; at: string }[]>();
   for (const row of rows) {
-    if (row.action === 'buy' || !row.order?.lots || !countsAsSold(row.order)) continue;
+    if (row.action === 'buy' || !row.order?.lots) continue;
+    const sold = countsAsSold(row.order);
     for (const link of row.order.lots) {
+      if (link.gainPct !== undefined) {
+        ownTargetSells.set(link.lotId, [
+          ...(ownTargetSells.get(link.lotId) ?? []),
+          { gainPct: link.gainPct, at: row.at },
+        ]);
+      }
+      if (!sold) continue;
       consumed.set(link.lotId, (consumed.get(link.lotId) ?? 0) + link.quantity);
       if (link.gainPct === undefined) continue;
       const gains = byGain.get(link.lotId) ?? new Map<number, number>();
@@ -106,6 +118,7 @@ export function openOptionLots(rows: readonly LotRow[]): OpenOptionLot[] {
       stopOrderId: order.stopOrderId ?? null,
       buyOrder: order,
       soldAtGain: gains ? Object.fromEntries(gains) : {},
+      ownTargetSells: ownTargetSells.get(row.id) ?? [],
     });
   }
   return lots.sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.lotId.localeCompare(b.lotId));
@@ -150,6 +163,54 @@ export function sameOption(lot: OpenOptionLot, symbol: string, option: OptionCon
     lot.option.strike === option.strike &&
     lot.option.expiration === option.expiration
   );
+}
+
+/** The account's open position in this contract, or null when it holds none. */
+export function openOptionPosition(
+  positions: readonly BrokerPosition[],
+  symbol: string,
+  option: OptionContract
+): BrokerPosition | null {
+  return (
+    positions.find(
+      ({ instrument, quantity }) =>
+        instrument.kind === 'option' &&
+        instrument.symbol.toUpperCase() === symbol &&
+        instrument.optionType === option.optionType &&
+        instrument.expiration === option.expiration &&
+        Math.abs(instrument.strike - option.strike) < 0.0001 &&
+        quantity > 0
+    ) ?? null
+  );
+}
+
+/**
+ * How many of each open lot's contracts the account really holds, by lot id.
+ *
+ * The ledger can claim more than the position: a sale made in the broker's
+ * own app never closes its lot. Exits close the oldest lot first, so what is still
+ * held belongs to the newest lots: the position is handed out newest first and
+ * a lot it does not reach gets 0. The total never exceeds the position.
+ *
+ * ponytail: contracts tied up in a working sell still count as held, so a lot
+ * can be handed contracts the broker will not free. Upgrade path: subtract
+ * working sells from the option order list.
+ */
+export function heldByLot(
+  lots: readonly OpenOptionLot[],
+  positions: readonly BrokerPosition[]
+): Map<string, number> {
+  const unassigned = new Map<string, number>();
+  const held = new Map<string, number>();
+  for (const lot of [...lots].sort((a, b) => b.openedAt.localeCompare(a.openedAt) || b.lotId.localeCompare(a.lotId))) {
+    const contract = `${lot.symbol}|${lot.option.optionType}|${lot.option.strike}|${lot.option.expiration}`;
+    const left =
+      unassigned.get(contract) ?? Math.floor(openOptionPosition(positions, lot.symbol, lot.option)?.quantity ?? 0);
+    const take = Math.min(lot.openQty, left);
+    held.set(lot.lotId, take);
+    unassigned.set(contract, left - take);
+  }
+  return held;
 }
 
 /**

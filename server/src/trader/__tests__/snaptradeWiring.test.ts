@@ -22,6 +22,7 @@ import { deployedAdapters } from '../adapters.js';
 import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
 import { createQuoteSource } from '../broker/quotes.js';
+import { brokerStops } from '../brokerStops.js';
 import { createMcpRegistry, supportedAccounts, type McpRegistry } from '../broker/registry.js';
 import { METERED_DASHBOARD_READ_INTERVAL_MS, METERED_ORDER_READ_INTERVAL_MS } from '../broker/requestBudget.js';
 import type { AccountRow, BrokerSession, OptionInstrument } from '../broker/types.js';
@@ -53,6 +54,11 @@ import {
 import { optionOrder, optionOrderPlaced, optionPosition } from '../snaptrade/__tests__/fixtures/unverified.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, placedOrders, type FakeBroker } from './harness.js';
+
+// Broker-side stops are off unless a test turns them on for itself.
+afterEach(() => {
+  brokerStops.enabled = false;
+});
 
 /** Tuesday 2026-09-08 10:30 ET: inside regular US hours, when the monitors sweep. */
 const NOW = new Date('2026-09-08T14:30:00.000Z');
@@ -776,9 +782,14 @@ describe('the request budget of a SnapTrade account', () => {
       expect(world.robinhoodBroker.getOrders).toHaveBeenCalled();
     });
 
-    it('rests no stop on it, and still rests the Robinhood one', async () => {
+    it('with broker-side stops on, rests no stop on it, and still rests the Robinhood one', async () => {
+      brokerStops.enabled = true;
       const world = makeWorld({ answers: { orders: WORKING }, paperSettings: MAX_LOSS });
       world.db.seedSettings(ROBINHOOD.id, MAX_LOSS);
+      // A stop is rested only on contracts the account is seen to hold.
+      world.robinhoodBroker.getPositions.mockResolvedValue([
+        { instrument: SPY_CALL, quantity: SPY_CALL_CONTRACTS, averageEntryPrice: null },
+      ]);
       world.db.seedMessage({ messageId: FILLED_LOT_MESSAGE_ID, sentAt: NOW.toISOString() });
       for (const account of [PAPER, ROBINHOOD]) world.db.seedDecision(account.id, filledLot);
       // Something still open, so the sweep has work and reaches the stop rest.

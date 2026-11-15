@@ -47,6 +47,11 @@ export interface BrokerOrder {
    */
   readonly fillPricePerShare?: boolean;
   readonly quantity: number;
+  /**
+   * Units filled so far, only when the broker's row says so. Unlike
+   * `quantity`, it never falls back to the order's size.
+   */
+  readonly filledQuantity?: number | null;
   /** ISO timestamp; the ordering key for "most recently opened". */
   readonly createdAt: string | null;
 }
@@ -87,8 +92,12 @@ export interface Broker {
    * where equity and option positions are separate calls.
    */
   getPositions(kind?: Instrument['kind']): Promise<readonly BrokerPosition[]>;
-  /** Order history. Null when the broker offers none. */
-  getOrders(): Promise<readonly BrokerOrder[] | null>;
+  /**
+   * Order history. Null when the broker offers none. `orderId` narrows the
+   * read to that order where the broker can; match the id on the result,
+   * since a broker that cannot narrows nothing.
+   */
+  getOrders(orderId?: string): Promise<readonly BrokerOrder[] | null>;
   placeOrder(order: OrderRequest): Promise<PlacedOrder>;
   cancelOrder(orderId: string): Promise<void>;
 }

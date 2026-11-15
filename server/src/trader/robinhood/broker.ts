@@ -69,8 +69,8 @@ export class RobinhoodBroker implements Broker {
   }
 
   // ponytail: option orders only; the MCP advertises no equity order history.
-  async getOrders(): Promise<readonly BrokerOrder[] | null> {
-    const history = await this.tools.getOptionOrders();
+  async getOrders(orderId?: string): Promise<readonly BrokerOrder[] | null> {
+    const history = await this.tools.getOptionOrders(orderId);
     return history === null ? null : history.orders.map(optionOrder);
   }
 
@@ -149,6 +149,7 @@ function optionOrder(order: OptionOrder): BrokerOrder {
     status: order.state,
     fillPrice: order.averagePrice,
     quantity: order.quantity,
+    filledQuantity: order.processedQuantity ?? null,
     createdAt: order.createdAt,
   };
 }

@@ -19,6 +19,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Decision } from '../../shared/types.js';
 import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import type { StoredCallout } from '../db.js';
+import { brokerStops } from '../brokerStops.js';
+import type { Broker, BrokerOrder } from '../broker/types.js';
 import { fakeTokens, firstAccountId } from './fakeDb.js';
 import { equityPosition, makeHarness, markReads, optionPosition, type Harness } from './harness.js';
 
@@ -66,6 +68,10 @@ const send = (method: 'PUT' | 'POST', url: string, body: unknown) =>
 beforeEach(() => {
   harness = makeHarness();
   harness.db.addUser(USER, TOKEN);
+});
+
+afterEach(() => {
+  brokerStops.enabled = false;
 });
 
 // ---------------------------------------------------------------------------
@@ -123,7 +129,8 @@ describe('/api/trades/:messageId/approve|reject', () => {
     expect((await harness.db.listDecisions(ACCOUNT_ID, 10))[0]!.kind).toBe('submitted');
   });
 
-  it("approving an option sell cancels the lot's resting stop, then places the sell", async () => {
+  it("with broker-side stops on, approving an option sell cancels the lot's resting stop, then places the sell", async () => {
+    brokerStops.enabled = true;
     const contract = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
     const optionOrder = {
       symbol: 'QQQ',
@@ -242,6 +249,140 @@ describe('/api/trades/:messageId/approve|reject', () => {
     const { decision } = response.json() as { decision: Decision };
     expect(decision.kind).toBe('execution_failed');
     expect(decision.reason).toContain('MCP transport closed');
+  });
+
+  // Production's stop cancels all answered 403; a stop the broker lists as dead
+  // must not keep an approved sell from going out.
+  it('approve sells over a stop the broker refuses to cancel but lists as cancelled', async () => {
+    brokerStops.enabled = true;
+    const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    const optionOrder = { symbol: 'QQQ', assetType: 'option' as const, option, orderType: 'limit' as const };
+    harness.db.seedMessage({ messageId: 'buy-lot', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'caller-1' });
+    harness.db.seedDecision(
+      ACCOUNT_ID,
+      decisionFixture('buy-lot', {
+        at: '2026-06-11T13:00:00.000Z',
+        ticker: 'QQQ',
+        order: {
+          ...optionOrder,
+          side: 'buy',
+          quantity: 3,
+          limitPrice: 1,
+          orderId: 'buy-1',
+          status: 'filled',
+          filledQuantity: 3,
+          averageFillPrice: 1,
+          stopOrderId: 'stop-1',
+        },
+      })
+    );
+    // A trim: the pending row's own links already count as sold, so only a
+    // lot it leaves partly open is still there for the stop cancel to find.
+    harness.db.seedDecision(
+      ACCOUNT_ID,
+      decisionFixture('msg-exit', {
+        kind: 'pending_approval',
+        ticker: 'QQQ',
+        action: 'sell',
+        order: {
+          ...optionOrder,
+          side: 'sell',
+          quantity: 1,
+          limitPrice: 1.5,
+          orderId: null,
+          status: null,
+          lots: [{ lotId: 'buy-lot', quantity: 1 }],
+        },
+      })
+    );
+    const deadStop: BrokerOrder = {
+      orderId: 'stop-1',
+      instrument: { kind: 'option', symbol: 'QQQ', ...option },
+      side: 'sell',
+      status: 'cancelled',
+      fillPrice: null,
+      quantity: 0,
+      filledQuantity: 0,
+      createdAt: null,
+    };
+    harness.configureBroker(ACCOUNT_ID, {
+      overrides: {
+        cancelOrder: vi
+          .fn<Broker['cancelOrder']>()
+          .mockRejectedValue(new Error('API error 403: {"detail":"Order cannot be cancelled at this time."}')),
+        getOrders: vi.fn<Broker['getOrders']>().mockResolvedValue([deadStop]),
+      },
+    });
+
+    const response = await send('POST', '/api/trades/msg-exit/approve', {});
+
+    expect(response.statusCode).toBe(200);
+    expect((response.json() as { decision: Decision }).decision.kind).toBe('submitted');
+    expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ instrument: { kind: 'option', symbol: 'QQQ', ...option }, side: 'sell', quantity: 1, limitPrice: 1.5 })
+    );
+    expect(harness.fakeBroker(ACCOUNT_ID).cancelOrder).toHaveBeenCalledExactlyOnceWith('stop-1');
+    const rows = await harness.db.listDecisions(ACCOUNT_ID, 10);
+    expect(rows.find((row) => row.messageId === 'buy-lot')?.order?.stopOrderId).toBeNull();
+  });
+
+  it('with broker-side stops off: approve sells with no cancel attempt and leaves the stored stop id', async () => {
+    const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    const optionOrder = { symbol: 'QQQ', assetType: 'option' as const, option, orderType: 'limit' as const };
+    harness.db.seedMessage({ messageId: 'buy-lot', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'caller-1' });
+    harness.db.seedDecision(
+      ACCOUNT_ID,
+      decisionFixture('buy-lot', {
+        at: '2026-06-11T13:00:00.000Z',
+        ticker: 'QQQ',
+        order: {
+          ...optionOrder,
+          side: 'buy',
+          quantity: 3,
+          limitPrice: 1,
+          orderId: 'buy-1',
+          status: 'filled',
+          filledQuantity: 3,
+          averageFillPrice: 1,
+          stopOrderId: 'stop-1',
+        },
+      })
+    );
+    harness.db.seedDecision(
+      ACCOUNT_ID,
+      decisionFixture('msg-exit', {
+        kind: 'pending_approval',
+        ticker: 'QQQ',
+        action: 'sell',
+        order: {
+          ...optionOrder,
+          side: 'sell',
+          quantity: 1,
+          limitPrice: 1.5,
+          orderId: null,
+          status: null,
+          lots: [{ lotId: 'buy-lot', quantity: 1 }],
+        },
+      })
+    );
+    // A stop still working at the broker: its cancel would be refused and, switched on, the approve would fail.
+    const cancelOrder = vi
+      .fn<Broker['cancelOrder']>()
+      .mockRejectedValue(new Error('API error 403: {"detail":"Order cannot be cancelled at this time."}'));
+    const getOrders = vi.fn<Broker['getOrders']>().mockResolvedValue([]);
+    harness.configureBroker(ACCOUNT_ID, { overrides: { cancelOrder, getOrders } });
+
+    const response = await send('POST', '/api/trades/msg-exit/approve', {});
+
+    expect(response.statusCode).toBe(200);
+    expect((response.json() as { decision: Decision }).decision.kind).toBe('submitted');
+    expect(harness.fakeBroker(ACCOUNT_ID).placeOrder).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ instrument: { kind: 'option', symbol: 'QQQ', ...option }, side: 'sell', quantity: 1, limitPrice: 1.5 })
+    );
+    expect(cancelOrder).not.toHaveBeenCalled();
+    expect(getOrders).not.toHaveBeenCalled();
+    const rows = await harness.db.listDecisions(ACCOUNT_ID, 10);
+    expect(rows.find((row) => row.messageId === 'buy-lot')?.order?.stopOrderId).toBe('stop-1');
   });
 
   // A stale warm session must not spend money; the row must survive so the
@@ -784,6 +925,54 @@ describe('GET /api/trades/performance', () => {
     };
     expect(positions.find((p) => p.symbol === 'AAPL')).toMatchObject({ entryPrice: 100, currentPrice: 110 });
     expect(positions.find((p) => p.symbol === 'SPY')).toMatchObject({ entryPrice: 1.59, currentPrice: 1.5 });
+  });
+
+  // Paid 1.59 on a 1.60 limit, now worth 8.00: order history reports the fill
+  // per contract (159), and 159 / 8.00 is under the mark's own 20x test. No
+  // message names the buy's Caller, so it is no ledger lot and the entry is
+  // rebuilt from that history.
+  it("reads a per-contract fill of the system's own limit buy as the premium it was", async () => {
+    const option = { optionType: 'call' as const, strike: 707, expiration: '2026-06-11' };
+    harness.configureBroker(ACCOUNT_ID, {
+      positions: [optionPosition('QQQ', option.optionType, option.strike, option.expiration, 2)],
+      optionMark: 8,
+      orders: [
+        {
+          orderId: 'opt-001',
+          instrument: { kind: 'option', symbol: 'QQQ', ...option },
+          side: 'buy',
+          status: 'filled',
+          fillPrice: 159,
+          quantity: 2,
+          createdAt: '2026-07-14T14:00:00.000Z',
+        },
+      ],
+    });
+    harness.db.seedDecision(
+      ACCOUNT_ID,
+      decisionFixture('opt', {
+        ticker: 'QQQ',
+        order: {
+          symbol: 'QQQ',
+          side: 'buy',
+          assetType: 'option',
+          quantity: 2,
+          orderType: 'limit',
+          limitPrice: 1.6,
+          option,
+          orderId: 'opt-001',
+          status: 'filled',
+        },
+      })
+    );
+
+    const { positions } = (await get('/api/trades/performance')).json() as {
+      positions: Array<{ symbol: string; entryPrice: number; pctChange: number }>;
+    };
+
+    expect(positions).toHaveLength(1);
+    expect(positions[0]!.entryPrice).toBeCloseTo(1.59);
+    expect(positions[0]!.pctChange).toBeCloseTo(((8 - 1.59) / 1.59) * 100);
   });
 
   it('returns a clear error payload when Robinhood MCP is unavailable', async () => {
@@ -1356,13 +1545,15 @@ describe('GET /api/stream', () => {
           },
         })
       );
-      vi.spyOn(harness.db, 'listOpenOptionLots').mockRejectedValueOnce(new Error('db down'));
+      const lots = vi.spyOn(harness.db, 'listOpenOptionLots').mockRejectedValueOnce(new Error('db down'));
       const stream = await openStream();
       try {
-        // Without the lots the row is priced from order history, as it was before the ledger.
-        await stream.readUntil('"entryPrice":159');
-        await vi.advanceTimersByTimeAsync(TICK_MS);
+        // Without the lots the row is priced from order history, where the
+        // fill is read against the buy's own limit: the same 1.59.
         await stream.readUntil('"entryPrice":1.59');
+        const readsSoFar = lots.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(TICK_MS);
+        expect(lots.mock.calls.length).toBeGreaterThan(readsSoFar);
       } finally {
         await stream.close();
       }

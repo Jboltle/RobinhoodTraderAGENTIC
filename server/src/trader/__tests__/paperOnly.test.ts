@@ -26,6 +26,7 @@ import {
 import { VIEWED_ACCOUNT_HEADER } from '../auth.js';
 import { BrokerWritesDisabledError } from '../broker/errors.js';
 import { isPaperAccount } from '../broker/paperAccount.js';
+import { brokerStops } from '../brokerStops.js';
 import { createQuoteSource } from '../broker/quotes.js';
 import { createMcpRegistry, type McpRegistry } from '../broker/registry.js';
 import { isRequestMetered } from '../broker/requestBudget.js';
@@ -67,6 +68,11 @@ const NOT_PAPER: ReadonlyArray<readonly [string, AccountRow]> = [
 /** Tuesday 2026-09-08 10:30 ET: inside regular US hours, when Max Loss sweeps. */
 const REGULAR_HOURS = new Date('2026-09-08T14:30:00.000Z');
 
+// Broker-side stops are off unless a test turns them on for itself.
+afterEach(() => {
+  brokerStops.enabled = false;
+});
+
 /** Auto-executing and following everyone, with the calendar guards relaxed. */
 const IMMEDIATE: TradeSettings = {
   executionMode: 'immediate',
@@ -80,6 +86,9 @@ const ENTRY_ENVELOPE = envelopeFromFixture(BTO_QQQ_PUT);
 const ENTRY_OPTION = BTO_QQQ_PUT.expectedCallout.option!;
 /** Near the entry's strike, so the entry check has nothing to hold the callout for. */
 const QQQ_SPOT = 710;
+
+/** The entry's contract is still live: what the stop rest asks before it rests one. */
+const ON_EXPIRATION_DAY = new Date(`${ENTRY_OPTION.expiration}T14:30:00.000Z`);
 
 const OPEN_LOT_MESSAGE_ID = 'open-lot';
 const OPEN_LOT_ORDER_ID = 'buy-1';
@@ -404,7 +413,8 @@ describe.each(NOT_PAPER)('paper_only: a paper account beside %s', (_name, other)
       expect(placedOrders(behind(PAPER), 'option')).toHaveLength(1);
     });
 
-    it('cancelStops: the resting stop is neither cancelled nor forgotten', async () => {
+    it('cancelStops, with broker-side stops on: the resting stop is neither cancelled nor forgotten', async () => {
+      brokerStops.enabled = true;
       const { db, brokers, behind } = worldWithOpenLots(other, MAX_LOSS, { stopOrderId: RESTING_STOP_ID });
 
       await expect(
@@ -434,14 +444,16 @@ describe.each(NOT_PAPER)('paper_only: a paper account beside %s', (_name, other)
       expect(await decisionsOf(db, other)).toHaveLength(1);
     });
 
-    it('the fill sweep: no stop is rested for the other account, and none is attempted on the paper one', async () => {
+    it('the fill sweep, with broker-side stops on: no stop is rested for the other account, and none is attempted on the paper one', async () => {
+      brokerStops.enabled = true;
       const { db, events, brokers, behind } = worldWithOpenLots(other, MAX_LOSS, {
         status: 'unconfirmed',
         orders: [FILLED_AT_BROKER],
       });
       const reachedGuard = vi.spyOn(brokers.for(other).broker, 'placeOrder');
 
-      await sweepFills({ db, brokers, events, executionMode: 'immediate', now: () => REGULAR_HOURS });
+      // On the contract's last day: an expired contract is rested no stop at all.
+      await sweepFills({ db, events, brokers, executionMode: 'immediate', now: () => ON_EXPIRATION_DAY });
 
       // A Robinhood account's stop gets as far as the guard; a SnapTrade one's is never sent (metered).
       expect(reachedGuard).toHaveBeenCalledTimes(isRequestMetered(other) ? 0 : 1);

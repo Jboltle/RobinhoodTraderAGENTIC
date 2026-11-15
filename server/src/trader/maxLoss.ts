@@ -13,6 +13,7 @@ import {
   type OptionContract,
   type SubmittedOrder,
 } from '../shared/types.js';
+import { brokerStops } from './brokerStops.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
 import { sameOption, type OpenOptionLot } from './lots.js';
@@ -63,6 +64,14 @@ const MAX_FILL_TO_LIMIT = 2;
  * fills far under it, and the limit is then no measure of what was paid.
  */
 const LIMIT_STANDS_FOR_FILL_WITHIN = 0.1;
+
+/**
+ * A buy never fills above its limit, so a broker average of at least this many
+ * times the order's own limit is not a premium: it is the per-contract figure
+ * (159 for a 1.59 fill). The mark cannot tell once the option is worth about
+ * five times its entry, and Max Loss then sold a winner as a 95% loss.
+ */
+const OWN_LIMIT_PER_CONTRACT_FACTOR = 20;
 
 /** How far back we look for the buy that opened a position. Same depth as performance. */
 const ENTRY_HISTORY_LIMIT = 500;
@@ -224,9 +233,10 @@ async function scanAccount(
     if (instrument.kind === 'option' && openLots === null) continue;
     const lots = openLots ?? [];
     // A resting broker stop is this position's Max Loss. Selling here too would
-    // double-close it. ponytail: the dollar cap does not fire while that stop
+    // double-close it. With broker stops off a stored stop id is ignored. ponytail: the dollar cap does not fire while that stop
     // rests. Upgrade path: cancel the stop and software-flatten only the usd breach.
     const stopped =
+      brokerStops.enabled &&
       instrument.kind === 'option' &&
       lots.some(
         (lot) =>
@@ -710,6 +720,8 @@ function hasTrustedPrice(lot: OpenOptionLot, buys: readonly BrokerOrder[]): bool
  * fills first (average_price of filled buys from get_option_orders, newest
  * lots covering the open contracts), else the submitted limit premiums the
  * same way. Position rows carry no cost data, so fills are the best source.
+ * A fill of one of the account's own recorded limit buys is checked against
+ * that limit first; see OWN_LIMIT_PER_CONTRACT_FACTOR.
  */
 function rebuildOptionEntry(
   submitted: readonly Decision[],
@@ -721,13 +733,34 @@ function rebuildOptionEntry(
   const fillLots = bought
     .filter((o) => o.status === null || o.status === 'filled')
     .map((o) => ({
-      price: o.fillPricePerShare ? o.fillPrice! : normalizeOptionPremium(o.fillPrice!, mark),
+      price: o.fillPricePerShare
+        ? o.fillPrice!
+        : fillPremium(o.fillPrice!, ownBuyLimit(submitted, o.orderId), mark),
       quantity: o.quantity > 0 ? o.quantity : 1,
     }));
   return (
     weightedAverageEntry(fillLots, openQuantity) ??
     findOptionEntry(submitted, contract, openQuantity)
   );
+}
+
+/** The limit of the user's recorded limit buy with this broker order id, else null. */
+function ownBuyLimit(submitted: readonly Decision[], orderId: string | null): number | null {
+  if (orderId === null) return null;
+  const order = submitted.find((d) => d.order!.orderId === orderId)?.order;
+  if (!order || order.side !== 'buy' || order.orderType !== 'limit') return null;
+  return order.limitPrice !== null && order.limitPrice > 0 ? order.limitPrice : null;
+}
+
+/**
+ * A filled buy's premium per share. Only ever lower than normalizeOptionPremium
+ * alone would give, and a lower entry can only make Max Loss sell less.
+ */
+function fillPremium(average: number, ownLimit: number | null, mark: number | null): number {
+  if (ownLimit !== null && average >= OWN_LIMIT_PER_CONTRACT_FACTOR * ownLimit) {
+    return average / OPTION_MULTIPLIER;
+  }
+  return normalizeOptionPremium(average, mark);
 }
 
 /** Robinhood sometimes reports 159 when the premium is 1.59. */

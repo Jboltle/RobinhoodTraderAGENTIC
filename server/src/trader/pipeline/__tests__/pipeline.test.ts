@@ -3,7 +3,7 @@
  * with a mocked parser, the shared fake broker and the in-memory db.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   Callout,
@@ -23,8 +23,10 @@ import {
   type FakeBroker,
   type FakeBrokerOptions,
 } from '../../__tests__/harness.js';
+import { brokerStops } from '../../brokerStops.js';
 import { TraderEvents } from '../../events.js';
 import type { McpRegistry } from '../../broker/registry.js';
+import type { Broker, BrokerOrder } from '../../broker/types.js';
 import {
   BrokerUnavailableError,
   BrokerWritesDisabledError,
@@ -47,6 +49,11 @@ import {
   HYPE_BANG,
   envelopeFromFixture,
 } from './fixtures/discordMessages.js';
+
+// Broker-side stops are off unless a test turns them on for itself.
+afterEach(() => {
+  brokerStops.enabled = false;
+});
 
 const USER = 'user-1';
 const OTHER_USER = 'user-2';
@@ -334,7 +341,8 @@ describe('fan-out — TRIM exit', () => {
     expect(placedOrders(broker, 'option')).toHaveLength(0);
   });
 
-  it("cancels a stop resting on the caller's lot, then places the sell", async () => {
+  it("with broker-side stops on, cancels a stop resting on the caller's lot, then places the sell", async () => {
+    brokerStops.enabled = true;
     const { db, deps, broker } = setup(TRIM_QQQ_FIRST.expectedCallout);
     db.seedMessage({ messageId: 'buy-caller', sentAt: '2026-06-11T13:00:00.000Z', authorId: 'test-author' });
     db.seedDecision(USER, {
@@ -1649,3 +1657,182 @@ describe('Jev engine — decider through the fan-out, with a mocked Jev', () => 
   });
 });
 
+
+describe('fan-out — option exit over a resting Max Loss stop', () => {
+  const EXIT_ID = envelopeFromFixture(TRIM_QQQ_FIRST).messageId;
+  /** What production logged on every stop cancel, as withRetry rethrows it. */
+  const REFUSED =
+    'cancel_option_order failed after 3 attempts: Tool cancel_option_order returned error: ' +
+    'API error 403: {"detail":"Order cannot be cancelled at this time."}';
+
+  interface StopLot {
+    readonly lotId: string;
+    readonly quantity: number;
+    readonly stopOrderId: string;
+    /** Broker state of the stop when its cancel is refused; absent when the cancel works. */
+    readonly refusedState?: string;
+  }
+
+  async function exitOver(
+    lots: readonly StopLot[],
+    readError?: Error
+  ): Promise<{ decision: Decision; broker: FakeBroker; db: FakeDb; stopIds: (string | null)[] }> {
+    const cancelOrder = vi.fn<Broker['cancelOrder']>(async (orderId) => {
+      if (lots.some((lot) => lot.stopOrderId === orderId && lot.refusedState !== undefined)) {
+        throw new Error(REFUSED);
+      }
+    });
+    const getOrders = vi.fn<Broker['getOrders']>(async (orderId) => {
+      if (readError) throw readError;
+      return lots
+        .filter((lot) => lot.stopOrderId === orderId && lot.refusedState !== undefined)
+        .map(
+          (lot): BrokerOrder => ({
+            orderId: lot.stopOrderId,
+            instrument: { kind: 'option', symbol: 'QQQ', optionType: 'call', strike: 707, expiration: '2026-06-11' },
+            side: 'sell',
+            status: lot.refusedState!,
+            fillPrice: null,
+            quantity: lot.quantity,
+            createdAt: null,
+          })
+        );
+    });
+    const { db, deps, broker } = setup(TRIM_QQQ_FIRST.expectedCallout, { overrides: { cancelOrder, getOrders } });
+    lots.forEach((lot, index) => {
+      const at = `2026-06-11T13:0${index}:00.000Z`;
+      db.seedMessage({ messageId: lot.lotId, sentAt: at, authorId: 'test-author' });
+      db.seedDecision(USER, {
+        at,
+        messageId: lot.lotId,
+        kind: 'submitted',
+        code: null,
+        reason: 'filled',
+        ticker: 'QQQ',
+        action: 'buy',
+        order: {
+          symbol: 'QQQ',
+          side: 'buy',
+          assetType: 'option',
+          quantity: lot.quantity,
+          orderType: 'limit',
+          limitPrice: 1,
+          option: { optionType: 'call', strike: 707, expiration: '2026-06-11' },
+          orderId: `buy-${lot.lotId}`,
+          status: 'filled',
+          filledQuantity: lot.quantity,
+          averageFillPrice: 1,
+          stopOrderId: lot.stopOrderId,
+        },
+      });
+    });
+
+    await createMessageProcessor(deps).process(envelopeFromFixture(TRIM_QQQ_FIRST));
+
+    const rows = await db.listDecisions(USER, 10);
+    return {
+      decision: rows.find((row) => row.messageId === EXIT_ID)!,
+      broker,
+      db,
+      stopIds: lots.map((lot) => rows.find((row) => row.messageId === lot.lotId)?.order?.stopOrderId ?? null),
+    };
+  }
+
+  const placed = (broker: FakeBroker) => placedOrders(broker, 'option');
+
+  beforeEach(() => {
+    brokerStops.enabled = true;
+  });
+  afterEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  it('with broker-side stops off: no cancel attempt, the same sell, the stored id left alone', async () => {
+    const on = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);
+    brokerStops.enabled = false;
+    // A stop whose cancel the broker would refuse: with the switch on this exit fails.
+    const off = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState: 'confirmed' }]);
+
+    expect(off.decision.kind).toBe('submitted');
+    expect(off.decision.order).toEqual(on.decision.order);
+    expect(off.decision.reason).toBe(on.decision.reason);
+    expect(placed(off.broker)).toEqual(placed(on.broker));
+    expect(off.broker.cancelOrder).not.toHaveBeenCalled();
+    expect(off.broker.getOrders).not.toHaveBeenCalled();
+    expect(off.stopIds).toEqual(['stop-a']);
+  });
+
+  it('cancels the stop, clears its id and sells, without reading the order', async () => {
+    const { decision, broker, stopIds } = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);
+
+    expect(decision.kind).toBe('submitted');
+    expect(decision.order?.lots).toEqual([{ lotId: 'lot-a', quantity: 1 }]);
+    expect(placed(broker)).toHaveLength(1);
+    expect(broker.cancelOrder).toHaveBeenCalledExactlyOnceWith('stop-a');
+    expect(broker.getOrders).not.toHaveBeenCalled();
+    expect(stopIds).toEqual([null]);
+  });
+
+  it.each(['cancelled', 'rejected', 'failed', 'voided'])(
+    'places the very same sell when the refused stop is %s',
+    async (refusedState) => {
+      const normal = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a' }]);
+      const refused = await exitOver([{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState }]);
+
+      expect(refused.decision.kind).toBe('submitted');
+      expect(refused.decision.order).toEqual(normal.decision.order);
+      expect(refused.decision.reason).toBe(normal.decision.reason);
+      expect(placed(refused.broker)).toEqual(placed(normal.broker));
+      expect(refused.stopIds).toEqual([null]);
+    }
+  );
+
+  it.each(['confirmed', 'queued', 'partially_filled', 'pending_cancelled'])(
+    'fails as before and sells nothing while the refused stop is %s',
+    async (refusedState) => {
+      const { decision, broker, stopIds } = await exitOver([
+        { lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState },
+      ]);
+
+      expect(decision).toMatchObject({ kind: 'execution_failed', code: 'execution_error', reason: REFUSED });
+      expect(placed(broker)).toHaveLength(0);
+      expect(stopIds).toEqual(['stop-a']);
+    }
+  );
+
+  it('fails as before and sells nothing when the stop cannot be read', async () => {
+    const { decision, broker, stopIds } = await exitOver(
+      [{ lotId: 'lot-a', quantity: 2, stopOrderId: 'stop-a', refusedState: 'cancelled' }],
+      new Error('get_option_orders failed after 3 attempts: fetch failed')
+    );
+
+    expect(decision).toMatchObject({ kind: 'execution_failed', code: 'execution_error', reason: REFUSED });
+    expect(placed(broker)).toHaveLength(0);
+    expect(stopIds).toEqual(['stop-a']);
+  });
+
+  it('sells after the older lot\'s dead stop and the newer lot\'s live one', async () => {
+    const { decision, broker, stopIds } = await exitOver([
+      { lotId: 'lot-old', quantity: 2, stopOrderId: 'stop-old', refusedState: 'cancelled' },
+      { lotId: 'lot-new', quantity: 3, stopOrderId: 'stop-new' },
+    ]);
+
+    expect(decision.kind).toBe('submitted');
+    expect(placed(broker)).toHaveLength(1);
+    expect(stopIds).toEqual([null, null]);
+  });
+
+  it('sells nothing when the refused stop had already filled, and closes that lot', async () => {
+    const { decision, broker, db, stopIds } = await exitOver([
+      { lotId: 'lot-old', quantity: 2, stopOrderId: 'stop-old', refusedState: 'filled' },
+      { lotId: 'lot-new', quantity: 3, stopOrderId: 'stop-new' },
+    ]);
+
+    expect(decision).toMatchObject({ kind: 'execution_failed', code: 'execution_error' });
+    expect(decision.reason).toMatch(/already filled/);
+    expect(placed(broker)).toHaveLength(0);
+    // The surviving lot keeps its working stop.
+    expect(stopIds).toEqual([null, 'stop-new']);
+    expect((await db.listOpenOptionLots(USER)).map((lot) => lot.lotId)).toEqual(['lot-new']);
+  });
+});

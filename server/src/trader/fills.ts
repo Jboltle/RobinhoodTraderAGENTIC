@@ -17,6 +17,7 @@
  */
 import { createLogger, errorFields } from '../shared/logger.js';
 import { isTerminalOrderState, type Decision, type SubmittedOrder, type TradeExecutionMode } from '../shared/types.js';
+import { brokerStops } from './brokerStops.js';
 import type { OpenOrderRow, TraderDb } from './db.js';
 import { restMissingStops } from './stops.js';
 import type { TraderEvents } from './events.js';
@@ -31,7 +32,10 @@ const log = createLogger('trader:fills');
 
 /** Tick while any order is open: a market order fills in seconds. */
 export const FILL_POLL_ACTIVE_MS = 5_000;
-/** Tick while nothing is open: one cheap indexed query. */
+/**
+ * Tick while nothing is open: one cheap indexed query. With broker stops on
+ * it is database reads only, unless a held lot is missing its stop.
+ */
 export const FILL_POLL_IDLE_MS = 30_000;
 /**
  * How far back the sweep looks by default. A day order dies at the close, so
@@ -95,7 +99,8 @@ export async function sweepFills(
   const rows = await deps.db.listOpenOrders(
     since ?? new Date(now.getTime() - (deps.lookbackMs ?? FILL_LOOKBACK_MS))
   );
-  if (rows.length === 0) return { open: 0, updated: 0 };
+  // With broker stops on, the stop loop below must run on idle sweeps too.
+  if (rows.length === 0 && !brokerStops.enabled) return { open: 0, updated: 0 };
 
   // Only accounts with a connection of record, as Max Loss does: reaching for
   // a disconnected account's session would start an OAuth flow nobody asked for.
@@ -125,7 +130,7 @@ export async function sweepFills(
       log.warn('fill sync failed for account', { accountId, error: err instanceof Error ? err.message : String(err) });
     }
   }
-  if (deps.executionMode !== undefined) {
+  if (brokerStops.enabled && deps.executionMode !== undefined) {
     for (const account of await unheldAccounts(deps.db, deps.brokers, deps.executionMode)) {
       try {
         // ponytail: no stop is rested on a request-metered account (SnapTrade).
@@ -134,12 +139,16 @@ export async function sweepFills(
         // path: rest it once that is known, and remember a refusal.
         if (isRequestMetered(account)) continue;
         const broker = deps.brokers.for(account);
-        await broker.session.ensureReady();
+        // Runs with no order open too: a stop that could not be rested in the
+        // sweep that saw the fill (position not shown yet, read failed, sell
+        // failed after its stop was cancelled) is rested by a later one.
         await restMissingStops({
           accountId: account.id,
           db: deps.db,
           broker: broker.broker,
           executionMode: executionModeFor(deps.executionMode, account),
+          now,
+          ensureReady: () => broker.session.ensureReady(),
         });
       } catch (err: unknown) {
         if (err instanceof BrokerUnavailableError) continue;

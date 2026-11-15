@@ -23,7 +23,7 @@ export function guardWrites(broker: Broker, mode: AccountExecutionMode): Broker 
     getMark: (instrument) => broker.getMark(instrument),
     confirmInstrument: (instrument) => broker.confirmInstrument(instrument),
     getPositions: (kind) => broker.getPositions(kind),
-    getOrders: () => broker.getOrders(),
+    getOrders: (orderId) => broker.getOrders(orderId),
     placeOrder: async (order) => {
       throw new BrokerWritesDisabledError(`placed ${describeOrder(order)}`);
     },

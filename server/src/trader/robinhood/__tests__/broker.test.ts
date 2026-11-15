@@ -4,13 +4,14 @@
  * calls, with the same arguments and in the same order, as the RobinhoodTools
  * call the pipeline and monitors made before the port existed.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { TradeSettingsSchema, type Decision, type SubmittedOrder } from '../../../shared/types.js';
 import { createFakeDb, type FakeDb } from '../../__tests__/fakeDb.js';
 import { SymbolNotFoundError } from '../../broker/errors.js';
 import { roundPremiumToTick } from '../../broker/instrument.js';
 import type { Instrument, OrderRequest } from '../../broker/types.js';
+import { brokerStops } from '../../brokerStops.js';
 import { stopTrigger } from '../../lots.js';
 import { submitOrder } from '../../pipeline/execute.js';
 import { cancelStops, restMissingStops } from '../../stops.js';
@@ -18,6 +19,11 @@ import { RobinhoodBroker } from '../broker.js';
 import type { RobinhoodMcpClient } from '../mcpClient.js';
 import { RobinhoodTools, TOOL_NAMES } from '../tools.js';
 import type { CallToolResult } from '../types.js';
+
+// Broker-side stops are off unless a test turns them on for itself.
+afterEach(() => {
+  brokerStops.enabled = false;
+});
 
 const ACCOUNT = 'ACC-0001';
 const OPTION_ID = 'opt-uuid-1';
@@ -283,6 +289,7 @@ describe('RobinhoodBroker reads', () => {
         // limit as its reference, so it stays with the callers that have one.
         fillPrice: 159,
         quantity: 3,
+        filledQuantity: 3,
         createdAt: '2026-10-21T15:18:06Z',
       },
     ]);
@@ -290,6 +297,18 @@ describe('RobinhoodBroker reads', () => {
       { name: 'get_accounts', args: {} },
       { name: 'get_option_orders', args: { account_number: ACCOUNT } },
     ]);
+  });
+
+  it('getOrders narrowed to one order asks Robinhood for that order alone', async () => {
+    const { tools, wire } = connect();
+
+    await new RobinhoodBroker(tools).getOrders('ord-1');
+
+    expect(wire).toStrictEqual(await legacyWire((t) => t.getOptionOrders('ord-1')));
+    expect(wire.at(-1)).toStrictEqual({
+      name: 'get_option_orders',
+      args: { account_number: ACCOUNT, order_id: 'ord-1' },
+    });
   });
 
   it('getOrders is null, with no call, when the server offers no order history', async () => {
@@ -648,8 +667,15 @@ describe("the trader's write paths over RobinhoodBroker", () => {
     );
   });
 
-  it('restMissingStops rests the stop it did and records its id on the lot', async () => {
-    const { tools, wire } = connect();
+  it('restMissingStops, with broker-side stops on, reads what the account holds, then rests the stop and records its id on the lot', async () => {
+    brokerStops.enabled = true;
+    /** The account holds every contract the lot claims. */
+    const holding = {
+      [TOOL_NAMES.optionPositions]: {
+        results: [{ option_id: OPTION_ID, chain_symbol: 'SPY', quantity: `${LOT_CONTRACTS}.0000`, type: 'long' }],
+      },
+    };
+    const { tools, wire } = connect(holding);
     const db = dbWithLot();
 
     await restMissingStops({
@@ -657,6 +683,8 @@ describe("the trader's write paths over RobinhoodBroker", () => {
       db,
       broker: new RobinhoodBroker(tools),
       executionMode: 'immediate',
+      // The lot's contract is still live.
+      now: new Date(`${CONTRACT.expiration}T15:00:00.000Z`),
     });
 
     expect(wire.at(-1)!.args).toMatchObject({
@@ -666,8 +694,9 @@ describe("the trader's write paths over RobinhoodBroker", () => {
       stop_price: '0.2',
     });
     expect(wire).toStrictEqual(
-      await legacyWire((t) =>
-        t.placeOptionsOrder({
+      await legacyWire(async (t) => {
+        await t.getOptionPositions();
+        await t.placeOptionsOrder({
           symbol: 'SPY',
           ...CONTRACT,
           contracts: LOT_CONTRACTS,
@@ -675,13 +704,14 @@ describe("the trader's write paths over RobinhoodBroker", () => {
           orderType: 'stop_market',
           stopPrice: roundPremiumToTick(stopTrigger(ENTRY_FILL, MAX_LOSS_PCT), 'sell', null),
           timeInForce: 'gtc',
-        })
-      )
+        });
+      }, holding)
     );
     expect((await db.listOpenOptionLots(USER))[0]!.stopOrderId).toBe('opt-ord-9');
   });
 
-  it('cancelStops cancels the resting stop as it did and clears it from the lot', async () => {
+  it('cancelStops, with broker-side stops on, cancels the resting stop as it did and clears it from the lot', async () => {
+    brokerStops.enabled = true;
     const { tools, wire } = connect();
     const db = dbWithLot('stop-1');
 

@@ -7,17 +7,42 @@ import { createLogger, errorFields } from '../shared/logger.js';
 import { optionLabel, type Decision, type SubmittedOrder, type TradeExecutionMode } from '../shared/types.js';
 import type { TraderDb } from './db.js';
 import type { TraderEvents } from './events.js';
-import { contractsAtLevel } from './lots.js';
+import { contractsAtLevel, heldByLot } from './lots.js';
 import { submitOrder } from './pipeline/execute.js';
+import { startOfDay } from './pipeline/riskFilter.js';
 import { unheldAccounts, type McpRegistry } from './broker/registry.js';
 import type { AccountRow } from './broker/types.js';
-import { BrokerUnavailableError } from './broker/errors.js';
+import { BrokerUnavailableError, BrokerWritesDisabledError } from './broker/errors.js';
 import { instrumentOf } from './broker/instrument.js';
 import { cancelStops } from './stops.js';
 
 const log = createLogger('trader:ladder');
 
 export const LADDER_INTERVAL_MS = 15_000;
+
+/**
+ * Sells of one level of one lot per day: the first and two retries. A level
+ * whose sell died is due again on the next sweep, and each sell is a recorded
+ * trade that counts toward the daily trade cap and renews the buy cooldown, so
+ * a sell Robinhood keeps rejecting would use the cap up within minutes and
+ * block every callout, exits included. Two retries cover a rejection that
+ * clears on its own, such as a stop whose cancel had not settled.
+ */
+export const MAX_LADDER_PLACEMENTS_PER_DAY = 3;
+
+/** A sell status the lot ledger reads as dead: its contracts stay open. */
+const FAILED_SELL_STATUS = 'failed';
+
+// ponytail: what was already logged (a lot not held, a level left alone for the
+// day), kept for the process so a sweep every 15 s logs it once. Upgrade path:
+// close stale lots in the ledger; show a level left alone on the dashboard.
+const loggedOnce = new Set<string>();
+
+function firstTime(key: string): boolean {
+  if (loggedOnce.has(key)) return false;
+  loggedOnce.add(key);
+  return true;
+}
 
 export interface LadderDeps {
   readonly db: TraderDb;
@@ -27,8 +52,16 @@ export interface LadderDeps {
 }
 
 export function startLadderMonitor(deps: LadderDeps): () => void {
+  // Two sweeps at once both see a level as due and both sell it.
+  let sweeping = false;
   const timer = setInterval(() => {
-    void sweepLadders(deps).catch((err: unknown) => log.error('ladder sweep failed', errorFields(err)));
+    if (sweeping) return;
+    sweeping = true;
+    void sweepLadders(deps)
+      .catch((err: unknown) => log.error('ladder sweep failed', errorFields(err)))
+      .finally(() => {
+        sweeping = false;
+      });
   }, LADDER_INTERVAL_MS);
   timer.unref();
   return () => clearInterval(timer);
@@ -57,6 +90,10 @@ async function sweepAccount(account: AccountRow, deps: LadderDeps): Promise<numb
   const broker = deps.brokers.for(account);
   await broker.session.ensureReady();
   const lots = await deps.db.listOpenOptionLots(accountId);
+  // The same day the daily trade cap counts.
+  const dayStart = startOfDay().getTime();
+  // Read on the first due level, so a sweep with nothing to sell adds no call.
+  let held: Map<string, number> | null = null;
   let placed = 0;
   for (const lot of lots) {
     if (lot.entryPrice <= 0) continue;
@@ -70,9 +107,41 @@ async function sweepAccount(account: AccountRow, deps: LadderDeps): Promise<numb
       if (due < 1) continue;
       const target = lot.entryPrice * (1 + level.gainPct / 100);
       if (mark < target) continue;
-      const quantity = Math.min(due, lot.openQty);
-      if (quantity < 1) continue;
-      const messageId = `ladder:${lot.lotId}:${level.gainPct}`;
+      const placedToday = lot.ownTargetSells.filter(
+        (sell) => sell.gainPct === level.gainPct && Date.parse(sell.at) >= dayStart
+      ).length;
+      if (placedToday >= MAX_LADDER_PLACEMENTS_PER_DAY) {
+        if (firstTime(`${lot.lotId}:${level.gainPct}:${dayStart}`)) {
+          log.warn('ladder level left alone until tomorrow: its sells keep dying', {
+            accountId,
+            lotId: lot.lotId,
+            symbol: lot.symbol,
+            option: optionLabel(lot.option),
+            gainPct: level.gainPct,
+            placedToday,
+          });
+        }
+        continue;
+      }
+      // The ledger alone can claim contracts sold in the broker's own app. A
+      // failed read throws: nothing is cancelled or sold on a guess.
+      held ??= heldByLot(lots, await broker.broker.getPositions('option'));
+      const quantity = Math.min(due, lot.openQty, held.get(lot.lotId) ?? 0);
+      if (quantity < 1) {
+        if (firstTime(lot.lotId)) {
+          log.info('ladder skipped lot: account does not hold the contract', {
+            accountId,
+            lotId: lot.lotId,
+            symbol: lot.symbol,
+            option: optionLabel(lot.option),
+            openQty: lot.openQty,
+          });
+        }
+        break;
+      }
+      // Unique per placement: recordDecision drops a repeated id, and a level
+      // whose sell died is placed again.
+      const messageId = `ladder:${lot.lotId}:${level.gainPct}:${Date.now()}`;
       const order: SubmittedOrder = {
         symbol: lot.symbol,
         side: 'sell',
@@ -86,19 +155,31 @@ async function sweepAccount(account: AccountRow, deps: LadderDeps): Promise<numb
         lots: [{ lotId: lot.lotId, quantity, gainPct: level.gainPct }],
       };
       await cancelStops(deps.db, accountId, broker.broker, lot.symbol, lot.option);
-      const result = await submitOrder(order, broker.broker);
+      // A submit that throws is recorded too, so it counts toward the day's
+      // maximum. It closes nothing and is not a trade for the daily cap. A
+      // deployment that holds writes refused it before the broker was asked:
+      // that is no dead sell, and nothing is recorded for it.
+      const result = await submitOrder(order, broker.broker).catch((err: unknown) =>
+        err instanceof Error ? err : new Error(String(err))
+      );
+      if (result instanceof BrokerWritesDisabledError) throw result;
+      const failed = result instanceof Error;
+      const ownTarget = `own target +${level.gainPct}% on ${lot.symbol} ${optionLabel(lot.option)}`;
       const decision: Decision = {
         at: new Date().toISOString(),
         messageId,
-        kind: 'submitted',
-        code: null,
-        reason: `own target +${level.gainPct}% on ${lot.symbol} ${optionLabel(lot.option)}`,
+        kind: failed ? 'execution_failed' : 'submitted',
+        code: failed ? 'execution_error' : null,
+        reason: failed ? `${ownTarget} failed: ${result.message}` : ownTarget,
         ticker: lot.symbol,
         action: 'sell',
-        order: { ...order, orderId: result.orderId, status: result.status ?? 'submitted' },
+        order: failed
+          ? { ...order, status: FAILED_SELL_STATUS }
+          : { ...order, orderId: result.orderId, status: result.status ?? 'submitted' },
       };
       await deps.db.recordDecision(accountId, decision);
       deps.events.emitDecision(accountId, decision);
+      if (failed) throw result;
       placed += 1;
       break;
     }

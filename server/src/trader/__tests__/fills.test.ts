@@ -1,13 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TradeSettingsSchema, type Decision, type SubmittedOrder } from '../../shared/types.js';
+import { brokerStops } from '../brokerStops.js';
 import { TraderEvents } from '../events.js';
 import { applyBrokerState, sweepFills, type FillMonitorDeps } from '../fills.js';
 import { BrokerUnavailableError } from '../broker/errors.js';
 import type { RobinhoodMcpClient } from '../robinhood/mcpClient.js';
-import type { BrokerOrder } from '../broker/types.js';
+import type { BrokerOrder, BrokerPosition } from '../broker/types.js';
 import { createFakeDb, fakeAccount, fakeTokens } from './fakeDb.js';
-import { makeFakeBroker, makeFakeRegistry, placedOrders } from './harness.js';
+import { makeFakeBroker, makeFakeRegistry, optionPosition, placedOrders } from './harness.js';
 
 const USER = 'user-1';
 const NOW = new Date('2026-10-21T15:18:30.000Z');
@@ -198,18 +199,158 @@ describe('sweepFills', () => {
     expect(result.updated).toBe(1);
     expect((await db.listDecisions(USER, 10))[0]!.order).toMatchObject({ status: 'filled', averageFillPrice: 0.4 });
   });
+});
+
+describe('sweepFills — resting Max Loss stops', () => {
+  const HELD = optionPosition('SPY', CONTRACT.optionType, CONTRACT.strike, CONTRACT.expiration, 3);
+  const STOP = { side: 'sell', type: 'stop', quantity: 3 };
+
+  beforeEach(() => {
+    brokerStops.enabled = true;
+  });
+  afterEach(() => {
+    brokerStops.enabled = false;
+  });
+
+  describe('with broker-side stops off (production)', () => {
+    beforeEach(() => {
+      brokerStops.enabled = false;
+    });
+
+    it('a filled buy gets no stop, on the sweep that sees the fill or on a later one', async () => {
+      const { db, deps, place, positions } = restSetup({ orders: [liveOrder()], positions: async () => [HELD] });
+      seedBuy(db, placed());
+
+      expect(await sweepFills(deps)).toEqual({ open: 1, updated: 1 });
+      expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+      expect(place).not.toHaveBeenCalled();
+      expect(positions).not.toHaveBeenCalled();
+      expect((await db.listOpenOptionLots(USER))[0]?.stopOrderId).toBeNull();
+    });
+
+    it('an idle sweep is the open-orders query and nothing else', async () => {
+      const { db, deps, ensureReady, broker } = restSetup({ positions: async () => [HELD] });
+      seedBuy(db, placed({ status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }));
+      const accounts = vi.spyOn(db, 'listConnectedAccounts');
+      const settings = vi.spyOn(db, 'getSettings');
+      const ledger = vi.spyOn(db, 'listOpenOptionLots');
+
+      expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+      expect(accounts).not.toHaveBeenCalled();
+      expect(settings).not.toHaveBeenCalled();
+      expect(ledger).not.toHaveBeenCalled();
+      expect(ensureReady).not.toHaveBeenCalled();
+      expect(broker.getOrders).not.toHaveBeenCalled();
+    });
+
+    it('an active sweep lists the accounts once, for the fill sync only', async () => {
+      const { db, deps } = restSetup({ orders: [liveOrder()], positions: async () => [HELD] });
+      seedBuy(db, placed());
+      const accounts = vi.spyOn(db, 'listConnectedAccounts');
+      const settings = vi.spyOn(db, 'getSettings');
+
+      await sweepFills(deps);
+
+      expect(accounts).toHaveBeenCalledOnce();
+      expect(settings).not.toHaveBeenCalled();
+    });
+  });
+
+  function restSetup(opts: { orders?: BrokerOrder[]; positions: () => Promise<readonly BrokerPosition[]> }) {
+    const base = setup({ orders: opts.orders });
+    base.db.seedSettings(USER, TradeSettingsSchema.parse({ maxLossPct: 80 }));
+    let stops = 0;
+    const place = base.broker.placeOrder.mockImplementation(async () => ({
+      orderId: `stop-${(stops += 1)}`,
+      status: 'unconfirmed',
+    }));
+    const positions = base.broker.getPositions.mockImplementation(opts.positions);
+    const ensureReady = base.deps.brokers.for(fakeAccount(USER)).session.ensureReady as ReturnType<typeof vi.fn>;
+    const deps: FillMonitorDeps = { ...base.deps, executionMode: 'immediate' };
+    return { ...base, deps, place, positions, ensureReady };
+  }
+
+  function seedBuy(db: ReturnType<typeof createFakeDb>, order: SubmittedOrder): void {
+    db.seedMessage({ messageId: `msg-${order.orderId}`, sentAt: '2026-10-21T15:18:00.000Z', authorId: 'caller-1' });
+    db.seedDecision(USER, submitted(order));
+  }
 
   it("an immediate deployment rests the Max Loss stop on the account's own filled lot", async () => {
-    const { db, deps, broker } = setup({ orders: [liveOrder()] });
-    const buy = submitted(placed());
-    db.seedSettings(USER, TradeSettingsSchema.parse({ maxLossPct: 50 }));
-    db.seedMessage({ messageId: buy.messageId, sentAt: buy.at });
-    db.seedDecision(USER, buy);
+    const { db, deps, broker } = restSetup({ orders: [liveOrder()], positions: async () => [HELD] });
+    seedBuy(db, placed());
 
-    await sweepFills({ ...deps, executionMode: 'immediate' });
+    await sweepFills(deps);
 
-    expect(placedOrders(broker, 'option')).toMatchObject([{ side: 'sell', type: 'stop', quantity: 3 }]);
-    expect((await db.listOpenOptionLots(USER)).map((lot) => lot.stopOrderId)).toEqual(['opt-001']);
+    expect(placedOrders(broker, 'option')).toMatchObject([STOP]);
+    expect((await db.listOpenOptionLots(USER)).map((lot) => lot.stopOrderId)).toEqual(['stop-1']);
+  });
+
+  it('a fill the positions read does not show yet gets its stop on the next idle sweep', async () => {
+    const shown: BrokerPosition[][] = [[], [HELD]];
+    const { db, deps, place } = restSetup({
+      orders: [liveOrder()],
+      positions: async () => shown.shift() ?? [HELD],
+    });
+    seedBuy(db, placed());
+
+    expect(await sweepFills(deps)).toEqual({ open: 1, updated: 1 });
+    expect(place).not.toHaveBeenCalled();
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+    expect(place).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(STOP));
+    expect((await db.listOpenOptionLots(USER))[0]?.stopOrderId).toBe('stop-1');
+  });
+
+  it('a fill whose positions read failed gets its stop on the next idle sweep', async () => {
+    let reads = 0;
+    const { db, deps, place } = restSetup({
+      orders: [liveOrder()],
+      positions: async () => {
+        if ((reads += 1) === 1) throw new Error('get_option_positions failed after 3 attempts: fetch failed');
+        return [HELD];
+      },
+    });
+    seedBuy(db, placed());
+
+    await sweepFills(deps);
+    expect(place).not.toHaveBeenCalled();
+
+    await sweepFills(deps);
+    expect(place).toHaveBeenCalledOnce();
+  });
+
+  it('an idle sweep reaches for no session when the account has no lot', async () => {
+    const { deps, positions, ensureReady } = restSetup({ positions: async () => [] });
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+    expect(ensureReady).not.toHaveBeenCalled();
+    expect(positions).not.toHaveBeenCalled();
+  });
+
+  it('an idle sweep reaches for no session when every lot without a stop is on an expired contract', async () => {
+    const { db, deps, positions, place, ensureReady } = restSetup({ positions: async () => [] });
+    const expired = { ...CONTRACT, expiration: '2026-10-20' };
+    seedBuy(db, placed({ option: expired, status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }));
+
+    expect(await sweepFills(deps)).toEqual({ open: 0, updated: 0 });
+
+    expect(ensureReady).not.toHaveBeenCalled();
+    expect(positions).not.toHaveBeenCalled();
+    expect(place).not.toHaveBeenCalled();
+  });
+
+  it('an idle sweep costs one positions read while a held lot has no stop it can rest', async () => {
+    const { db, deps, positions, place, ensureReady } = restSetup({ positions: async () => [] });
+    seedBuy(db, placed({ status: 'filled', filledQuantity: 3, averageFillPrice: 0.86 }));
+
+    await sweepFills(deps);
+
+    expect(ensureReady).toHaveBeenCalledOnce();
+    expect(positions).toHaveBeenCalledOnce();
+    expect(place).not.toHaveBeenCalled();
   });
 });
 

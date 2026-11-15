@@ -20,6 +20,7 @@ import {
 } from '../../shared/types.js';
 import { instrumentOf } from '../broker/instrument.js';
 import type { Broker, BrokerPosition, PlacedOrder } from '../broker/types.js';
+import { openOptionPosition } from '../lots.js';
 
 const log = createLogger('trader:pipeline');
 
@@ -297,18 +298,7 @@ async function findOpenOptionPosition(
   symbol: string,
   option: OptionContract
 ): Promise<BrokerPosition | null> {
-  const positions = await broker.getPositions('option');
-  return (
-    positions.find(
-      ({ instrument, quantity }) =>
-        instrument.kind === 'option' &&
-        instrument.symbol.toUpperCase() === symbol &&
-        instrument.optionType === option.optionType &&
-        instrument.expiration === option.expiration &&
-        Math.abs(instrument.strike - option.strike) < 0.0001 &&
-        quantity > 0
-    ) ?? null
-  );
+  return openOptionPosition(await broker.getPositions('option'), symbol, option);
 }
 
 function resolveExitContracts(callout: Callout, risk: RiskAllow, heldContracts: number): number {

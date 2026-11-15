@@ -77,6 +77,11 @@ export interface OptionOrder extends OptionContract {
    */
   readonly averagePrice: number | null;
   readonly quantity: number;
+  /**
+   * Contracts filled so far, only when the row carries `processed_quantity`.
+   * Unlike `quantity`, it never falls back to the order's size.
+   */
+  readonly processedQuantity?: number | null;
   /** ISO timestamp; the ordering key for "most recently opened". */
   readonly createdAt: string | null;
   readonly raw: unknown;

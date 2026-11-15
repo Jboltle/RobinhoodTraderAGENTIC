@@ -4,7 +4,7 @@
  * read-only deployment makes no write call on any adapter — including through
  * a caller whose own policy check would have let the write through.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   TradeSettingsSchema,
@@ -14,6 +14,7 @@ import {
 } from '../../shared/types.js';
 import { BrokerUnavailableError, BrokerWritesDisabledError } from '../broker/errors.js';
 import { createMcpRegistry } from '../broker/registry.js';
+import { brokerStops } from '../brokerStops.js';
 import type { AccountRow, Broker, BrokerAdapter, Instrument, OrderRequest } from '../broker/types.js';
 import { TraderEvents } from '../events.js';
 import { sweepLadders } from '../ladderMonitor.js';
@@ -27,6 +28,11 @@ import { optionOrderPlaced } from '../snaptrade/__tests__/fixtures/unverified.js
 import { cancelStops, restMissingStops } from '../stops.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, makeFakeRegistry, type FakeBroker } from './harness.js';
+
+// Broker-side stops are off unless a test turns them on for itself.
+afterEach(() => {
+  brokerStops.enabled = false;
+});
 
 const USER = 'user-1';
 const CONTRACT: OptionContract = { optionType: 'call', strike: 707, expiration: '2026-06-11' };
@@ -339,7 +345,8 @@ describe('read_only deployment: the write paths cannot write', () => {
     expectNoWrite(fake);
   });
 
-  it('cancelStops: the resting stop is neither cancelled nor forgotten', async () => {
+  it('cancelStops, with broker-side stops on: the resting stop is neither cancelled nor forgotten', async () => {
+    brokerStops.enabled = true;
     const { db, fake, broker } = setup({ stopOrderId: RESTING_STOP_ID });
 
     await expect(cancelStops(db, USER, broker, 'QQQ', CONTRACT)).rejects.toBeInstanceOf(
