@@ -51,7 +51,12 @@ import {
   type FakeSnapTradeAnswers,
   type FakeSnapTradeClient,
 } from '../snaptrade/__tests__/fakeClient.js';
-import { optionOrder, optionOrderPlaced, optionPosition } from '../snaptrade/__tests__/fixtures/unverified.js';
+import {
+  equityQuote,
+  optionOrder,
+  optionOrderPlaced,
+  optionPosition,
+} from '../snaptrade/__tests__/fixtures/unverified.js';
 import { createFakeDb, fakeAccount, fakeSnapTradeAccount, fakeTokens, type FakeDb } from './fakeDb.js';
 import { makeFakeBroker, markReads, placedOrders, type FakeBroker } from './harness.js';
 
@@ -113,9 +118,11 @@ const HELD_QQQ_CALL = optionPosition(
   }
 );
 
+/** When SnapTrade says it read the held rows from the brokerage. */
+const HELD_AS_OF = '2026-06-11T14:00:00Z';
 const held = (...results: AccountPosition[]): AllAccountPositionsResponse => ({
   results,
-  data_freshness: { as_of: '2026-06-11T14:00:00Z' },
+  data_freshness: { as_of: HELD_AS_OF },
 });
 
 /** What a Robinhood login in progress offers; a SnapTrade account must never be handed it. */
@@ -554,9 +561,89 @@ describe('the dashboard routes, viewing a SnapTrade account that stores no crede
 
     expect(portfolio.json()).toEqual({ portfolioValueUsd: null, buyingPowerUsd: 10_000, openPositions: 1 });
     expect(performance.json()).toMatchObject({
-      positions: [{ assetType: 'option', symbol: 'QQQ', quantity: 2, strike: 707, currentPrice: null }],
+      positions: [{ assetType: 'option', symbol: 'QQQ', quantity: 2, strike: 707, currentPrice: 1.75 }],
     });
     for (const [, sent] of world.sdk.calls) expect(sent).toMatchObject({ accountId: PAPER_SNAPTRADE_ID });
+  });
+
+  describe('a row of the positions table', () => {
+    /** HELD_QQQ_CALL as its row reads, before what was paid for it and what it is worth. */
+    const QQQ_CALL_ROW = {
+      assetType: 'option',
+      symbol: 'QQQ',
+      quantity: 2,
+      optionType: 'call',
+      strike: 707,
+      expiration: '2026-06-11',
+    };
+    const HELD_AAPL: AccountPosition = {
+      instrument: { kind: 'stock', id: 'symbol-aapl', symbol: 'AAPL', raw_symbol: 'AAPL', currency: 'USD' },
+      units: '5',
+      price: '180.5',
+      cost_basis: '175',
+      currency: 'USD',
+    };
+    const AAPL_ROW = { assetType: 'equity', symbol: 'AAPL', quantity: 5, entryPrice: 175 };
+
+    /** The rows the dashboard is sent while the account holds `positions` and has placed no order. */
+    async function rowsOf(world: World): Promise<unknown> {
+      const performance = await serve(world)({ method: 'GET', url: '/api/trades/performance' });
+      return (performance.json() as { positions: unknown }).positions;
+    }
+    const holding = (answers: FakeSnapTradeAnswers): World =>
+      makeWorld({ answers: { orders: { orders: [] }, ...answers } });
+
+    it('an option shows the price its SnapTrade row last carried, and when that row was read', async () => {
+      const world = holding({ positions: held(HELD_QQQ_CALL) });
+
+      expect(await rowsOf(world)).toStrictEqual([
+        { ...QQQ_CALL_ROW, entryPrice: 1.59, currentPrice: 1.75, priceAsOf: HELD_AS_OF, pctChange: expect.closeTo(10.06, 2) },
+      ]);
+      // SnapTrade quotes no option: the price cost no request of its own.
+      expect(callNames(world.sdk).sort()).toEqual([ORDERS_READ, POSITIONS_READ].sort());
+    });
+
+    it('an option whose row carries no price has none, and no time for one', async () => {
+      const world = holding({ positions: held({ ...HELD_QQQ_CALL, price: null }) });
+
+      expect(await rowsOf(world)).toStrictEqual([
+        { ...QQQ_CALL_ROW, entryPrice: 1.59, currentPrice: null, pctChange: null },
+      ]);
+    });
+
+    it('a price SnapTrade gives no time for is shown without one', async () => {
+      const world = holding({ positions: { results: [HELD_QQQ_CALL], data_freshness: { as_of: '' } } });
+
+      expect(await rowsOf(world)).toMatchObject([{ currentPrice: 1.75, priceAsOf: null }]);
+    });
+
+    it('an option bought outside the system is entered at the cost basis on its row, and has no entry when the row has none', async () => {
+      const costed = holding({ positions: held({ ...HELD_QQQ_CALL, cost_basis: '2.5' }) });
+      const uncosted = holding({ positions: held({ ...HELD_QQQ_CALL, cost_basis: null }) });
+
+      expect(await rowsOf(costed)).toMatchObject([{ entryPrice: 2.5, currentPrice: 1.75, pctChange: -30 }]);
+      expect(await rowsOf(uncosted)).toMatchObject([{ entryPrice: null, currentPrice: 1.75, pctChange: null }]);
+    });
+
+    it('an option this system bought keeps the entry its own orders give, whatever cost basis the row carries', async () => {
+      const world = holding({
+        positions: held(optionPosition({ cost_basis: '1.80' })),
+        orders: { orders: [optionOrder()] },
+      });
+      world.db.seedDecision(PAPER.id, workingBuy('limit', 1.6));
+
+      expect(await rowsOf(world)).toMatchObject([{ symbol: 'SPY', entryPrice: 1.59 }]);
+    });
+
+    it('a share with a live quote shows the quote, with no time; with none, the price on its row', async () => {
+      const quoted = holding({ positions: held(HELD_AAPL), quotes: [equityQuote('AAPL', 182)] });
+      const unquoted = holding({ positions: held(HELD_AAPL), quotes: [] });
+
+      expect(await rowsOf(quoted)).toStrictEqual([{ ...AAPL_ROW, currentPrice: 182, pctChange: 4 }]);
+      expect(await rowsOf(unquoted)).toStrictEqual([
+        { ...AAPL_ROW, currentPrice: 180.5, priceAsOf: HELD_AS_OF, pctChange: expect.closeTo(3.14, 2) },
+      ]);
+    });
   });
 
   it('Approve places the sized order at SnapTrade, for one request', async () => {
@@ -977,6 +1064,23 @@ describe('the request budget of a SnapTrade account', () => {
       expect(await sweepLadders({ ...monitorDeps(world), executionMode: 'immediate' })).toBe(0);
 
       expect(world.sdk.calls).toEqual([]);
+    });
+
+    it('the price on its position row is no mark: however far past Max Loss or a ladder level it sits, nothing is sold on it', async () => {
+      const PAST_MAX_LOSS = held(optionPosition({ price: '0.10' }));
+      const PAST_THE_LADDER = held(optionPosition({ price: '9.99' }));
+      const world = worldHoldingLot({ ...LADDER, maxLossPct: 50 }, PAST_MAX_LOSS);
+      // The live mark: between the two, where neither has anything to do.
+      robinhoodPricesOptionsAt(world, 1.6);
+
+      for (const positions of [PAST_MAX_LOSS, PAST_THE_LADDER]) {
+        world.sdk.answers.positions = positions;
+        await sweepMaxLossOf(world);
+        expect(await sweepLadders({ ...monitorDeps(world), executionMode: 'immediate' })).toBe(0);
+      }
+
+      expect(world.sdk.calls).toEqual([]);
+      expect((await decisionsOf(world.db, PAPER.id)).map((decision) => decision.kind)).toEqual(['submitted']);
     });
 
     describe('the warning when the monitor starts', () => {

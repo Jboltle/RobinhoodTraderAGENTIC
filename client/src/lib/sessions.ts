@@ -12,7 +12,7 @@ import type { BookResponse, RecapTrade, TrackedPosition, TrackedResult } from '.
 
 /** Swift's nominal position for an entry with no stated size; mirrors book/ladder.ts. */
 export const NOMINAL_POSITION_USD = 5000
-const OPTION_MULTIPLIER = 100
+export const OPTION_MULTIPLIER = 100
 
 export interface SessionTrade {
   key: string

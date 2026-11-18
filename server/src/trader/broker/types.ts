@@ -25,6 +25,14 @@ export interface BrokerPosition {
   readonly quantity: number;
   /** Per-unit average cost from the broker's own position row; null when the row carries none. */
   readonly averageEntryPrice: number | null;
+  /**
+   * The per-unit price the broker's own position row last carried, and when
+   * that row was read from the brokerage (null when the broker gave no time).
+   * It can be a day old, so it is for display alone: whatever decides an order
+   * prices through getMark or the shared quote source, never this. Absent
+   * where the row carries no price.
+   */
+  readonly lastKnownPrice?: { readonly price: number; readonly asOf: string | null };
 }
 
 export interface BrokerOrder {

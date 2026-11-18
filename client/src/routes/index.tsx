@@ -4,6 +4,7 @@ import type { UseQueryResult } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
 import { CalloutCard } from '../components/CalloutCard'
+import { PositionsTable } from '../components/PositionsTable'
 import { Outcome, TradesTable, chipClass } from '../components/TradesTable'
 import { ClosedRow } from '../components/book/ClosedRow'
 import { KpiGrid } from '../components/book/KpiGrid'
@@ -50,6 +51,12 @@ function Dashboard() {
   })
   const performance = useQuery<PerformanceRow[]>({
     queryKey: ['performance'],
+    enabled: false,
+  })
+  // Why the stream's latest performance frame carried no positions; null
+  // while they are arriving.
+  const performanceError = useQuery<string | null>({
+    queryKey: ['performance-error'],
     enabled: false,
   })
   // Every callout the pipeline has recorded, each carrying this user's own
@@ -106,6 +113,23 @@ function Dashboard() {
         settings={settings}
         decisionByMessageId={decisionByMessageId}
       />
+
+      <section>
+        <SectionTitle>My positions</SectionTitle>
+        <div className="flex flex-col gap-4">
+          {performanceError.data && (
+            <p className="inline-flex self-start rounded-md bg-warn/10 px-3 py-1.5 text-xs text-warn">
+              Positions unavailable ({performanceError.data})
+            </p>
+          )}
+          {/* A failed read keeps the last positions on screen under the notice. */}
+          {performance.data ? (
+            <PositionsTable positions={performance.data} />
+          ) : (
+            !performanceError.data && <EmptyState>Loading…</EmptyState>
+          )}
+        </div>
+      </section>
 
       <section>
         <SectionTitle>My trades</SectionTitle>

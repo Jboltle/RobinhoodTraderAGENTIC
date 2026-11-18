@@ -70,6 +70,12 @@ function positionsOf(...results: AccountPosition[]): AllAccountPositionsResponse
   return { ...MARGIN_POSITIONS, results };
 }
 
+/** When each recording says its rows were read from the brokerage. */
+const CASH_READ_AT = '2026-11-12T07:10:11Z';
+const MARGIN_READ_AT = '2026-11-12T07:10:12Z';
+/** The price the option row fixture carries, as every row built on the margin recording reports it. */
+const SPY_CALL_LAST_KNOWN = { price: 1.75, asOf: MARGIN_READ_AT };
+
 /** The SDK client on a Personal key is the adapter's client as it stands; never built here. */
 export type SdkClientFits = Snaptrade<PersonalApiKeyAuth> extends SnapTradeBrokerClient ? true : never;
 const SDK_CLIENT_FITS: SdkClientFits = true;
@@ -153,8 +159,18 @@ describe('SnapTradeBroker reads', () => {
       const { broker, calls } = fake({ positions: CASH_POSITIONS });
 
       expect(await broker.getPositions()).toStrictEqual([
-        { instrument: { kind: 'equity', symbol: 'NVDA' }, quantity: 12, averageEntryPrice: 115 },
-        { instrument: { kind: 'equity', symbol: 'GOOGL' }, quantity: 3, averageEntryPrice: 165 },
+        {
+          instrument: { kind: 'equity', symbol: 'NVDA' },
+          quantity: 12,
+          averageEntryPrice: 115,
+          lastKnownPrice: { price: 120, asOf: CASH_READ_AT },
+        },
+        {
+          instrument: { kind: 'equity', symbol: 'GOOGL' },
+          quantity: 3,
+          averageEntryPrice: 165,
+          lastKnownPrice: { price: 170, asOf: CASH_READ_AT },
+        },
       ]);
       expect(calls).toStrictEqual([['accountInformation.getAllAccountPositions', { accountId: ACCOUNT_ID }]]);
     });
@@ -163,18 +179,54 @@ describe('SnapTradeBroker reads', () => {
       const { broker } = fake({ positions: MARGIN_POSITIONS });
 
       expect(await broker.getPositions()).toStrictEqual([
-        { instrument: { kind: 'equity', symbol: 'AAPL' }, quantity: 5, averageEntryPrice: 175 },
-        { instrument: { kind: 'equity', symbol: 'SPY' }, quantity: 15, averageEntryPrice: 540 },
+        {
+          instrument: { kind: 'equity', symbol: 'AAPL' },
+          quantity: 5,
+          averageEntryPrice: 175,
+          lastKnownPrice: { price: 180.5, asOf: MARGIN_READ_AT },
+        },
+        {
+          instrument: { kind: 'equity', symbol: 'SPY' },
+          quantity: 15,
+          averageEntryPrice: 540,
+          lastKnownPrice: { price: 558.25, asOf: MARGIN_READ_AT },
+        },
       ]);
     });
 
-    it('returns an option with its contract and its cost per share as reported', async () => {
+    it('returns an option with its contract, and its cost and last price per share as reported', async () => {
       const { broker } = fake({ positions: positionsOf(optionPosition(), ...MARGIN_POSITIONS.results) });
 
-      // 1.59 stays 1.59: SnapTrade reports an option's cost basis per share, so nothing is divided by 100.
+      // 1.59 and 1.75 stay as they are: SnapTrade reports both per share, so nothing is divided by 100.
       expect(await broker.getPositions('option')).toStrictEqual([
-        { instrument: SPY_CALL, quantity: 3, averageEntryPrice: 1.59 },
+        { instrument: SPY_CALL, quantity: 3, averageEntryPrice: 1.59, lastKnownPrice: SPY_CALL_LAST_KNOWN },
       ]);
+    });
+
+    it('reports no last price for a row that carries none, or carries zero', async () => {
+      const { broker } = fake({
+        positions: positionsOf(
+          optionPosition({ price: null }),
+          optionPosition({ price: undefined }),
+          optionPosition({ price: '0' }),
+          optionPosition({ price: 'n/a' })
+        ),
+      });
+
+      const unpriced = { instrument: SPY_CALL, quantity: 3, averageEntryPrice: 1.59 };
+      expect(await broker.getPositions()).toStrictEqual([unpriced, unpriced, unpriced, unpriced]);
+    });
+
+    it('gives the last price no time when SnapTrade says none, rather than make one up', async () => {
+      const unreadable: AllAccountPositionsResponse = { results: [optionPosition()], data_freshness: { as_of: '' } };
+      // The SDK types the freshness as always there; a response without it is still read.
+      const absent = { results: [optionPosition()] } as AllAccountPositionsResponse;
+
+      for (const positions of [unreadable, absent]) {
+        expect(await fake({ positions }).broker.getPositions()).toStrictEqual([
+          { instrument: SPY_CALL, quantity: 3, averageEntryPrice: 1.59, lastKnownPrice: { price: 1.75, asOf: null } },
+        ]);
+      }
     });
 
     it('returns equity before options, and one read serves either kind', async () => {
@@ -204,9 +256,9 @@ describe('SnapTradeBroker reads', () => {
       });
 
       expect(await broker.getPositions()).toStrictEqual([
-        { instrument: SPY_CALL, quantity: 0, averageEntryPrice: null },
-        { instrument: SPY_CALL, quantity: 0, averageEntryPrice: null },
-        { instrument: SPY_CALL, quantity: 3, averageEntryPrice: null },
+        { instrument: SPY_CALL, quantity: 0, averageEntryPrice: null, lastKnownPrice: SPY_CALL_LAST_KNOWN },
+        { instrument: SPY_CALL, quantity: 0, averageEntryPrice: null, lastKnownPrice: SPY_CALL_LAST_KNOWN },
+        { instrument: SPY_CALL, quantity: 3, averageEntryPrice: null, lastKnownPrice: SPY_CALL_LAST_KNOWN },
       ]);
     });
 
@@ -245,7 +297,7 @@ describe('SnapTradeBroker reads', () => {
       });
 
       expect(await broker.getPositions()).toStrictEqual([
-        { instrument: SPY_CALL, quantity: 3, averageEntryPrice: 1.59 },
+        { instrument: SPY_CALL, quantity: 3, averageEntryPrice: 1.59, lastKnownPrice: SPY_CALL_LAST_KNOWN },
       ]);
     });
   });

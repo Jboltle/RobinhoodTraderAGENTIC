@@ -229,10 +229,12 @@ export class SnapTradeBroker implements Broker {
 
   /** One read returns every kind, so `kind` saves no request here; it only filters. */
   async getPositions(kind?: Instrument['kind']): Promise<readonly BrokerPosition[]> {
-    const { results } = await call('the positions read', () =>
+    const { results, data_freshness: freshness } = await call('the positions read', () =>
       this.client.accountInformation.getAllAccountPositions({ accountId: this.accountId })
     );
-    const positions = results.flatMap((row) => brokerPosition(row) ?? []);
+    // When SnapTrade read the rows from the brokerage; a time it does not give is not made up.
+    const asOf = Number.isNaN(Date.parse(freshness?.as_of ?? '')) ? null : freshness.as_of;
+    const positions = results.flatMap((row) => brokerPosition(row, asOf) ?? []);
     return (['equity', 'option'] as const)
       .filter((wanted) => kind === undefined || kind === wanted)
       .flatMap((wanted) => positions.filter((position) => position.instrument.kind === wanted));
@@ -349,7 +351,7 @@ function isShares(instrument: SnapTradeInstrument): instrument is ShareInstrumen
 }
 
 /** Null for a holding the port has no instrument for, and for an option row that names no contract. */
-function brokerPosition(position: AccountPosition): BrokerPosition | null {
+function brokerPosition(position: AccountPosition, asOf: string | null): BrokerPosition | null {
   const held = position.instrument;
   let instrument: Instrument | null = null;
   if (isShares(held)) {
@@ -363,12 +365,16 @@ function brokerPosition(position: AccountPosition): BrokerPosition | null {
     });
   }
   if (instrument === null) return null;
+  // Per share on every kind too. A price of zero is read as none, as a quote's is.
+  // unverified: that the account's broker reports an option's price per share.
+  const price = positiveNumber(position.price);
   return {
     instrument,
     quantity: finiteNumber(position.units) ?? 0,
     // Per share on every kind, options included, so it is the premium as it stands.
     // unverified: that the account's broker reports an option's cost basis per share.
     averageEntryPrice: positiveNumber(position.cost_basis),
+    ...(price === null ? {} : { lastKnownPrice: { price, asOf } }),
   };
 }
 

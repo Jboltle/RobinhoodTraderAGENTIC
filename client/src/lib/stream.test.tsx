@@ -113,6 +113,26 @@ test('a frame still arriving on the closed stream never reaches the cache', asyn
   expect(queryClient.getQueryData(['decisions'])).toBeUndefined()
 })
 
+test('a failed positions read keeps the last positions and says why; the next good read clears it', async () => {
+  const { queryClient } = renderStream({ enabled: true, viewedAccountId: 'account-paper' })
+  await waitFor(() => expect(opened).toHaveLength(1))
+  const performanceFrame = (event: { positions: unknown[] | null; error: string | null }): string =>
+    `event: performance\ndata: ${JSON.stringify(event)}\n\n`
+
+  opened[0].push(performanceFrame({ positions: [{ symbol: 'AAPL' }], error: null }))
+  opened[0].push(performanceFrame({ positions: null, error: 'SnapTrade failed the positions read (HTTP 429)' }))
+  await waitFor(() =>
+    expect(queryClient.getQueryData(['performance-error'])).toBe(
+      'SnapTrade failed the positions read (HTTP 429)',
+    ),
+  )
+  expect(queryClient.getQueryData(['performance'])).toEqual([{ symbol: 'AAPL' }])
+
+  opened[0].push(performanceFrame({ positions: [], error: null }))
+  await waitFor(() => expect(queryClient.getQueryData(['performance-error'])).toBeNull())
+  expect(queryClient.getQueryData(['performance'])).toEqual([])
+})
+
 test('rerendering with the same account keeps the stream open', async () => {
   const { rerender } = renderStream({ enabled: true, viewedAccountId: 'account-robinhood' })
   await waitFor(() => expect(opened).toHaveLength(1))

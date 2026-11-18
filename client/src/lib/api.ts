@@ -211,6 +211,12 @@ export interface PerformanceRow {
   expiration?: string
   entryPrice: number | null
   currentPrice: number | null
+  /**
+   * Set when currentPrice is no live mark but the price the broker's own
+   * position row last carried: when that row was read from the brokerage,
+   * null when the broker gave no time. Absent on a live mark.
+   */
+  priceAsOf?: string | null
   pctChange: number | null
 }
 

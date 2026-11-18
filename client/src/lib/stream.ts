@@ -118,13 +118,14 @@ function applyEvent(queryClient: QueryClient, event: string, data: string): void
       return
     }
     case 'performance': {
-      const { positions } = JSON.parse(data) as PerformanceEvent
-      // ponytail: error-shaped events (Robinhood down/unauthed) keep the last
-      // good snapshot rather than surfacing an error. Upgrade path: mirror the
-      // error field into the cache if the dashboard needs to display it.
+      const { positions, error } = JSON.parse(data) as PerformanceEvent
+      // An error-shaped event (broker down, unauthed, not connected) keeps
+      // the last good snapshot; its reason goes beside it for the positions
+      // table to show, and the next good frame clears it.
       if (positions) {
         queryClient.setQueryData<PerformanceRow[]>(['performance'], positions)
       }
+      queryClient.setQueryData<string | null>(['performance-error'], error)
       return
     }
     case 'book':

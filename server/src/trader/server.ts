@@ -47,7 +47,7 @@ import { readTokenStatus } from './robinhood/mcpClient.js';
 import { executionModeFor } from './broker/paperAccount.js';
 import type { McpRegistry } from './broker/registry.js';
 import { createSpacedRead, METERED_DASHBOARD_READ_INTERVAL_MS } from './broker/requestBudget.js';
-import type { AccountRow, Broker, UserBroker } from './broker/types.js';
+import type { AccountRow, Broker, BrokerPosition, UserBroker } from './broker/types.js';
 import type { TokenState } from './robinhood/types.js';
 import type { SnapTradeAccess, SnapTradeClient } from './snaptrade/client.js';
 import { planSnapTradeSync, type SnapTradeSyncPlan } from './snaptrade/sync.js';
@@ -1152,11 +1152,31 @@ interface PerformanceRow {
    * the limit price of the user's most recent submitted buy. Null when
    * neither exists (e.g. a market fill on a position with no broker cost
    * data). Resolution lives in maxLoss.ts and is shared with the max-loss
-   * monitor.
+   * monitor. An option none of those price shows the average cost on the
+   * broker's own position row, where it carries one.
    */
   readonly entryPrice: number | null;
   readonly currentPrice: number | null;
+  /**
+   * Set when currentPrice is no live mark but the price the broker's own
+   * position row last carried: the time that row was read from the brokerage,
+   * null when the broker gave none. Absent on a live mark.
+   */
+  readonly priceAsOf?: string | null;
   readonly pctChange: number | null;
+}
+
+/**
+ * The price a position's row shows: the live mark, else the price the broker's
+ * own row last carried. That one can be a day old, so it stops here: the row
+ * is for the dashboard, and nothing that places an order reads it.
+ */
+function shownPrice(
+  mark: number | null,
+  { lastKnownPrice }: BrokerPosition
+): Pick<PerformanceRow, 'currentPrice' | 'priceAsOf'> {
+  if (mark !== null || !lastKnownPrice) return { currentPrice: mark };
+  return { currentPrice: lastKnownPrice.price, priceAsOf: lastKnownPrice.asOf };
 }
 
 async function collectPerformance(
@@ -1184,7 +1204,8 @@ async function collectPerformance(
     .filter((position) => position.quantity > 0)
     .map(async (position): Promise<PerformanceRow> => {
       const { instrument, quantity } = position;
-      const currentPrice = await broker.getMark(instrument);
+      const mark = await broker.getMark(instrument);
+      const shown = shownPrice(mark, position);
       if (instrument.kind === 'equity') {
         const entryPrice = resolveEquityEntry(submitted, position);
         return {
@@ -1192,18 +1213,17 @@ async function collectPerformance(
           symbol: instrument.symbol,
           quantity,
           entryPrice,
-          currentPrice,
-          pctChange: pctChange(entryPrice, currentPrice),
+          ...shown,
+          pctChange: pctChange(entryPrice, shown.currentPrice),
         };
       }
-      const entryPrice = resolveOptionEntry(
-        openLots,
-        submitted,
-        instrument,
-        quantity,
-        orders,
-        currentPrice
-      );
+      // The entry is resolved from the live mark alone, as the Max Loss sweep
+      // resolves it. A contract neither the ledger nor the order history
+      // prices was bought outside the system: the broker's own average cost
+      // is shown for it.
+      const entryPrice =
+        resolveOptionEntry(openLots, submitted, instrument, quantity, orders, mark) ??
+        position.averageEntryPrice;
       return {
         assetType: 'option',
         symbol: instrument.symbol,
@@ -1212,8 +1232,8 @@ async function collectPerformance(
         strike: instrument.strike,
         expiration: instrument.expiration,
         entryPrice,
-        currentPrice,
-        pctChange: pctChange(entryPrice, currentPrice),
+        ...shown,
+        pctChange: pctChange(entryPrice, shown.currentPrice),
       };
     });
 

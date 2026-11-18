@@ -115,7 +115,7 @@ function CallerPriceCell({ data }: { data: TradeRowData }) {
   )
 }
 
-const SHORT_TIME: Intl.DateTimeFormatOptions = {
+export const SHORT_TIME: Intl.DateTimeFormatOptions = {
   month: 'short',
   day: 'numeric',
   hour: 'numeric',
